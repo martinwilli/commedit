@@ -2,9 +2,12 @@
 //! "implicit amend + auto-rebase" core. Message editing is implemented here;
 //! tree/hunk editing reuses the same transaction shape.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use jj_lib::backend::{CommitId, Signature};
 use jj_lib::repo::Repo as _;
+use jj_lib::rewrite::{
+    move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
+};
 
 use crate::history::parse_timestamp;
 use crate::repo::Repo;
@@ -92,6 +95,56 @@ impl Repo {
 
         self.repo = pollster::block_on(tx.commit("commedit: edit commit identity"))
             .context("committing rewrite")?;
+        self.reattach_head()?;
+        self.sync_worktree(old_head)?;
+        Ok(())
+    }
+
+    /// Move `target` to a new slot in the linear history: rebased onto
+    /// `new_parent_ids`, with `new_child_ids` rebased on top of it, cascading to
+    /// all descendants. `new_tip` is the (pre-move) id of the commit that should
+    /// end up as the branch head once the dust settles. Exported to git in one
+    /// transaction.
+    ///
+    /// Reordering is a true rebase — each moved commit's diff is re-applied onto
+    /// its new parent — so commits that don't commute may rebase with conflicts.
+    pub fn reorder_commit(
+        &mut self,
+        target: &CommitId,
+        new_parent_ids: Vec<CommitId>,
+        new_child_ids: Vec<CommitId>,
+        new_tip: &CommitId,
+    ) -> Result<()> {
+        let old_head = self.head_commit();
+        let loc = MoveCommitsLocation {
+            new_parent_ids,
+            new_child_ids,
+            target: MoveCommitsTarget::Commits(vec![target.clone()]),
+        };
+
+        let mut tx = self.repo.start_transaction();
+        let stats = pollster::block_on(move_commits(
+            tx.repo_mut(),
+            &loc,
+            &RebaseOptions::default(),
+        ))
+        .context("reordering commit")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        // Point the branch at the new head. A reorder need not rewrite the old
+        // head commit, so jj's automatic bookmark moves can leave the branch
+        // behind; set it explicitly. The head keeps its change id, but its commit
+        // id changes if it was rebased onto a new parent.
+        let new_tip_id = match stats.rebased_commits.get(new_tip) {
+            Some(RebasedCommit::Rewritten(commit)) => commit.id().clone(),
+            Some(RebasedCommit::Abandoned { .. }) => bail!("the new head commit became empty"),
+            None => new_tip.clone(),
+        };
+        self.set_head_bookmark(tx.repo_mut(), new_tip_id);
+
+        transparency::export_to_git(tx.repo_mut())?;
+        self.repo = pollster::block_on(tx.commit("commedit: reorder commit"))
+            .context("committing reorder")?;
         self.reattach_head()?;
         self.sync_worktree(old_head)?;
         Ok(())

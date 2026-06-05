@@ -94,3 +94,51 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn reorders_commit_to_a_new_position_visible_to_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let by = |s: &str| {
+        commits
+            .iter()
+            .find(|c| c.subject == s)
+            .unwrap_or_else(|| panic!("{s} commit present"))
+    };
+    let third = by("third");
+    let second = by("second");
+    let first = by("first");
+
+    // Move "third" (the tip) down to the oldest position: parent the root, with
+    // "first" rebased on top of it, so "second" becomes the new head.
+    repo.reorder_commit(
+        &third.id,
+        first.parents.clone(),
+        vec![first.id.clone()],
+        &second.id,
+    )
+    .expect("reorder");
+
+    // The branch now reads second <- first <- third <- root, and the diffs were
+    // re-applied (distinct files commute, so nothing is empty or conflicted).
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["second", "first", "third"]
+    );
+
+    // Transparency invariants: HEAD attached, clean tree, intact repo.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

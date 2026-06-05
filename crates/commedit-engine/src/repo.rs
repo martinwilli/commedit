@@ -9,9 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use jj_lib::backend::CommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions};
-use jj_lib::repo::{ReadonlyRepo, StoreFactories};
+use jj_lib::op_store::RefTarget;
+use jj_lib::ref_name::RefNameBuf;
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, StoreFactories};
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace::{default_working_copy_factories, Workspace};
 
@@ -81,6 +84,20 @@ impl Repo {
             crate::transparency::reattach_head(self.workspace.workspace_root(), branch)?;
         }
         Ok(())
+    }
+
+    /// Point the originally checked-out branch at `target` inside `mut_repo`.
+    /// Reordering can produce a new history head that is not a rewrite of the old
+    /// head, so jj's automatic bookmark moves don't always follow; callers set it
+    /// explicitly. No-op if HEAD was detached when the repo was opened.
+    pub(crate) fn set_head_bookmark(&self, mut_repo: &mut MutableRepo, target: CommitId) {
+        if let Some(branch) = &self.git_head_branch {
+            let name: RefNameBuf = branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .into();
+            mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
+        }
     }
 
     /// The git commit HEAD currently points at — capture this before a rewrite

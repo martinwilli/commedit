@@ -3,12 +3,13 @@
 //! commit and rebases descendants via the engine.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use commedit_engine::diff::{
-    apply_patch, commit_changes, parse_diff_lines, unified_diff, ChangeKind, DiffLineKind,
-    FileChange,
+    apply_patch, commit_changes, parse_diff_lines, render_diff, ChangeKind, ContextExpansion,
+    DiffLineKind, FileChange, HunkInfo,
 };
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::patch_edit::{
@@ -28,6 +29,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 const APP_ID: &str = "net.willi.commedit";
+
+/// A reference-counted, re-entrant "render the current diff" callback. Boxed so
+/// the embedded expand-context buttons can hold and invoke it after they widen a
+/// hunk (the renderer rebuilds the buffer and the buttons themselves).
+type Renderer = Rc<dyn Fn()>;
 
 fn main() {
     let repo_path = std::env::args()
@@ -92,6 +98,28 @@ fn apply_patch_edit(buffer: &sourceview5::Buffer, editing: &Rc<Cell<bool>>, edit
     buffer.place_cursor(&cursor);
 }
 
+/// The fraction of the visible height at which buffer `line`'s top currently
+/// sits in `view` (0.0 = top edge, 1.0 = bottom). Used to keep a clicked hunk
+/// header at the same place across a re-render. Falls back to a third down.
+fn vertical_fraction_of_line(
+    view: &sourceview5::View,
+    buffer: &sourceview5::Buffer,
+    line: usize,
+) -> f64 {
+    let Some(vadjustment) = view.vadjustment() else {
+        return 0.3;
+    };
+    let page = vadjustment.page_size();
+    if page <= 0.0 {
+        return 0.3;
+    }
+    let Some(iter) = buffer.iter_at_line(line as i32) else {
+        return 0.3;
+    };
+    let line_top = view.iter_location(&iter).y() as f64;
+    ((line_top - vadjustment.value()) / page).clamp(0.0, 1.0)
+}
+
 fn change_label(change: &FileChange) -> String {
     let sigil = match change.kind {
         ChangeKind::Added => "+",
@@ -115,6 +143,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let selected_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let changes: Rc<RefCell<Vec<FileChange>>> = Rc::new(RefCell::new(Vec::new()));
     let current_file: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Per-file hunk context expansion, keyed by path. Reset when the selected
+    // commit changes (see `load_changes`).
+    let expansions: Rc<RefCell<HashMap<String, ContextExpansion>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // --- History pane (left) ---
     let list = ListBox::new();
@@ -209,6 +241,142 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     window.set_titlebar(Some(&header));
 
+    // Render the current file's diff into the buffer with its per-hunk context
+    // expansion, appending a click-to-expand cue to each expandable `@@` header.
+    // Self-referential (via `render_cell`) so a click can request a re-render
+    // after widening a hunk.
+    let render_cell: Rc<RefCell<Option<Renderer>>> = Rc::new(RefCell::new(None));
+    // Hunks of the diff currently in the buffer, so an expand click can scroll
+    // its (now re-rendered) hunk back into view instead of jumping to the top.
+    let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    let render_diff_view: Renderer = {
+        let changes = changes.clone();
+        let current_file = current_file.clone();
+        let file_buffer = file_buffer.clone();
+        let editing = editing.clone();
+        let expansions = expansions.clone();
+        let rendered_hunks = rendered_hunks.clone();
+        Rc::new(move || {
+            let Some(path) = current_file.borrow().clone() else {
+                return;
+            };
+            let change = changes.borrow().iter().find(|c| c.path == path).cloned();
+            let Some(change) = change else { return };
+            let Some(new) = change.new_text.as_deref() else {
+                return;
+            };
+            let old = change.old_text.as_deref().unwrap_or("");
+            let rendered = {
+                let mut map = expansions.borrow_mut();
+                let exp = map.entry(path.clone()).or_default();
+                render_diff(old, new, &path, exp)
+            };
+            editing.set(true);
+            file_buffer.set_text(&rendered.text);
+            // Append a click-to-expand cue to each expandable @@ header. The
+            // click is handled by a GestureClick on the view (see below); we must
+            // not embed a real widget in the buffer, because removing it during
+            // the next `set_text` crashes GTK.
+            for hunk in &rendered.hunks {
+                let cue = match (hunk.can_expand_up, hunk.can_expand_down) {
+                    (true, true) => "    ↕ expand context",
+                    (true, false) => "    ↑ expand context",
+                    (false, true) => "    ↓ expand context",
+                    (false, false) => continue,
+                };
+                if let Some(mut iter) = file_buffer.iter_at_line(hunk.header_line as i32) {
+                    iter.forward_to_line_end();
+                    file_buffer.insert(&mut iter, cue);
+                }
+            }
+            *rendered_hunks.borrow_mut() = rendered.hunks.clone();
+            editing.set(false);
+        })
+    };
+    *render_cell.borrow_mut() = Some(render_diff_view.clone());
+
+    // Clicking a @@ header line (anywhere on it, including the "expand context"
+    // cue) widens that hunk's context. The re-render is deferred to an idle so it
+    // runs outside the gesture's event handling.
+    let expand_click = gtk::GestureClick::new();
+    expand_click.set_button(gdk::BUTTON_PRIMARY);
+    expand_click.set_propagation_phase(PropagationPhase::Capture);
+    expand_click.connect_pressed({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let rendered_hunks = rendered_hunks.clone();
+        let expansions = expansions.clone();
+        let render_cell = render_cell.clone();
+        let current_file = current_file.clone();
+        move |gesture, _n_press, x, y| {
+            let (bx, by) = file_view.window_to_buffer_coords(
+                gtk::TextWindowType::Widget,
+                x as i32,
+                y as i32,
+            );
+            let Some(iter) = file_view.iter_at_location(bx, by) else {
+                return;
+            };
+            let line = iter.line() as usize;
+            let hit = rendered_hunks
+                .borrow()
+                .iter()
+                .find(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
+                .map(|h| (h.first_group, h.last_group));
+            let Some((first, last)) = hit else { return };
+            let Some(path) = current_file.borrow().clone() else {
+                return;
+            };
+            // We own this click: don't let the view also place the caret.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+
+            // Record where the clicked header sits in the viewport now, so that
+            // after re-rendering (which resets the scroll and shifts lines down
+            // as context appears above) we can pin that same header back to the
+            // same spot — expansion then grows around it instead of jumping.
+            let frac = vertical_fraction_of_line(&file_view, &file_buffer, line);
+
+            let expansions = expansions.clone();
+            let render_cell = render_cell.clone();
+            let rendered_hunks = rendered_hunks.clone();
+            let file_buffer = file_buffer.clone();
+            let file_view = file_view.clone();
+            glib::idle_add_local_once(move || {
+                expansions
+                    .borrow_mut()
+                    .entry(path)
+                    .or_default()
+                    .expand(first, last);
+                if let Some(render) = render_cell.borrow().clone() {
+                    render();
+                }
+                // Pin the (possibly moved or merged) hunk header to its prior
+                // viewport position. scroll_to_iter defers until the new text is
+                // laid out, so the fraction lands correctly.
+                let header = rendered_hunks
+                    .borrow()
+                    .iter()
+                    .find(|h| h.first_group <= first && last <= h.last_group)
+                    .map(|h| h.header_line);
+                if let Some(line) = header {
+                    if let Some(iter) = file_buffer.iter_at_line(line as i32) {
+                        // Scroll via a mark, not an iter: set_text just reset the
+                        // layout, so iter-based scrolling uses stale line heights
+                        // and lands wrong. scroll_to_mark defers until the new
+                        // text is validated. The mark is recreated each render
+                        // (set_text clears all marks anyway).
+                        if let Some(old) = file_buffer.mark("expand-scroll") {
+                            file_buffer.delete_mark(&old);
+                        }
+                        let mark = file_buffer.create_mark(Some("expand-scroll"), &iter, true);
+                        file_view.scroll_to_mark(&mark, 0.0, true, 0.0, frac);
+                    }
+                }
+            });
+        }
+    });
+    file_view.add_controller(expand_click);
+
     // Show the file at `idx` of the current changes in the editor.
     let show_file: Rc<dyn Fn(usize)> = {
         let changes = changes.clone();
@@ -216,27 +384,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
+        let render_diff_view = render_diff_view.clone();
         Rc::new(move |idx: usize| {
             let change = changes.borrow().get(idx).cloned();
             let Some(change) = change else { return };
             *current_file.borrow_mut() = Some(change.path.clone());
-            editing.set(true);
             match (&change.new_text, change.is_binary) {
-                (Some(new), _) => {
-                    let old = change.old_text.as_deref().unwrap_or("");
-                    file_buffer.set_text(&unified_diff(old, new, &change.path));
+                (Some(_), _) => {
                     file_view.set_editable(true);
+                    render_diff_view();
                 }
-                (None, true) => {
-                    file_buffer.set_text("<binary file — not editable>");
-                    file_view.set_editable(false);
-                }
-                (None, false) => {
-                    file_buffer.set_text("<file removed by this commit>");
+                (None, binary) => {
+                    editing.set(true);
+                    file_buffer.set_text(if binary {
+                        "<binary file — not editable>"
+                    } else {
+                        "<file removed by this commit>"
+                    });
+                    editing.set(false);
                     file_view.set_editable(false);
                 }
             }
-            editing.set(false);
         })
     };
 
@@ -421,10 +589,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
+        let expansions = expansions.clone();
         Rc::new(move |commit: &CommitInfo| {
             let loaded = commit_changes(&repo.borrow().repo, &commit.id).unwrap_or_default();
             *changes.borrow_mut() = loaded;
             *current_file.borrow_mut() = None;
+            expansions.borrow_mut().clear();
             let labels: Vec<String> = changes.borrow().iter().map(change_label).collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             file_dropdown.set_model(Some(&StringList::new(&refs)));
@@ -654,6 +824,11 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
     add("meta", &|t| t.set_foreground(Some("#6e7781")));
     add("add-word", &|t| t.set_background(Some("#abf2bc")));
     add("del-word", &|t| t.set_background(Some("#ffc0bd")));
+    // The clickable "expand context" cue appended to expandable @@ headers.
+    add("expand-hint", &|t| {
+        t.set_foreground(Some("#0969da"));
+        t.set_weight(700);
+    });
 }
 
 /// Look up (or lazily create and cache, via the buffer's tag table) a foreground
@@ -701,6 +876,18 @@ fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxS
             DiffLineKind::Hunk => {
                 old_hl = HighlightLines::new(syntax, theme);
                 new_hl = HighlightLines::new(syntax, theme);
+                // Accent the trailing "expand context" cue (everything past the
+                // closing `@@`) so it reads as a clickable control.
+                if let Some(pos) = raw.rfind("@@") {
+                    let cue_start = pos + 2;
+                    if cue_start < raw.len() {
+                        if let Some(tag) = buffer.tag_table().lookup("expand-hint") {
+                            let cs = raw[..cue_start].chars().count() as i32;
+                            let ce = raw.chars().count() as i32;
+                            apply_cols(buffer, li as i32, cs, ce, &tag);
+                        }
+                    }
+                }
                 continue;
             }
             DiffLineKind::Header | DiffLineKind::Meta => continue,

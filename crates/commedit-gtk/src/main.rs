@@ -6,10 +6,13 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use commedit_engine::diff::{commit_changes, ChangeKind, FileChange};
+use commedit_engine::diff::{
+    commit_changes, reconstruct_from_diff, unified_diff, ChangeKind, FileChange,
+};
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::repo::Repo;
 use gtk::prelude::*;
+use sourceview5::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, HeaderBar, Label, ListBox,
     ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, StringList,
@@ -79,6 +82,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // --- File / diff pane (bottom-right) ---
     let file_dropdown = DropDown::from_strings(&[]);
     let file_buffer = sourceview5::Buffer::new(None);
+    if let Some(lang) = sourceview5::LanguageManager::default().language("diff") {
+        file_buffer.set_language(Some(&lang));
+    }
     let file_view = sourceview5::View::with_buffer(&file_buffer);
     file_view.set_monospace(true);
     file_view.set_left_margin(8);
@@ -142,8 +148,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Some(change) = change else { return };
             *current_file.borrow_mut() = Some(change.path.clone());
             match (&change.new_text, change.is_binary) {
-                (Some(text), _) => {
-                    file_buffer.set_text(text);
+                (Some(new), _) => {
+                    let old = change.old_text.as_deref().unwrap_or("");
+                    file_buffer.set_text(&unified_diff(old, new));
                     file_view.set_editable(true);
                 }
                 (None, true) => {
@@ -277,7 +284,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
 
-            // File content edit (if a file is selected and changed).
+            // File content edit (if an editable file is selected and changed).
             let path = current_file.borrow().clone();
             if let Some(path) = path {
                 let original = changes
@@ -285,13 +292,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     .iter()
                     .find(|c| c.path == path)
                     .and_then(|c| c.new_text.clone());
-                let new_content = buffer_text(&file_buffer);
-                // Only write editable (text) files that actually changed.
-                if original.is_some() && Some(&new_content) != original.as_ref() {
-                    if let Err(err) = repo.borrow_mut().rewrite_file(&commit_id, &path, &new_content)
-                    {
-                        eprintln!("commedit: file save failed: {err:?}");
-                        return;
+                if let Some(original) = original {
+                    let mut content = reconstruct_from_diff(&buffer_text(&file_buffer));
+                    // Preserve the original file's trailing-newline style.
+                    if !original.is_empty() && !original.ends_with('\n') && content.ends_with('\n') {
+                        content.pop();
+                    }
+                    if content != original {
+                        if let Err(err) =
+                            repo.borrow_mut().rewrite_file(&commit_id, &path, &content)
+                        {
+                            eprintln!("commedit: file save failed: {err:?}");
+                            return;
+                        }
                     }
                 }
             }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use similar::{ChangeTag, TextDiff};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::repo::{ReadonlyRepo, Repo};
@@ -71,6 +72,52 @@ pub fn commit_changes(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Vec<F
     Ok(changes)
 }
 
+/// Render an editable full-context line diff of `old` → `new`. Every line is
+/// prefixed with ` ` (context), `-` (removed) or `+` (added). Inputs are
+/// normalized to end with a newline so each diff line is newline-terminated;
+/// full context (no elision) makes the diff reconstructible from the buffer
+/// alone — see [`reconstruct_from_diff`].
+pub fn unified_diff(old: &str, new: &str) -> String {
+    let old = ensure_trailing_newline(old);
+    let new = ensure_trailing_newline(new);
+    let diff = TextDiff::from_lines(old.as_ref(), new.as_ref());
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Equal => ' ',
+            ChangeTag::Delete => '-',
+            ChangeTag::Insert => '+',
+        };
+        out.push(sign);
+        out.push_str(change.value());
+    }
+    out
+}
+
+/// Ensure non-empty text ends with a newline (leaves empty text untouched).
+fn ensure_trailing_newline(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_empty() || text.ends_with('\n') {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(format!("{text}\n"))
+    }
+}
+
+/// Reconstruct file content from a (possibly edited) full-context diff produced
+/// by [`unified_diff`]: keep context (` `) and added (`+`) lines, drop removed
+/// (`-`) lines and any other markers. This mirrors how `git add -e` interprets an
+/// edited diff, and round-trips `unified_diff` exactly when unedited.
+pub fn reconstruct_from_diff(edited: &str) -> String {
+    let mut out = String::new();
+    for line in edited.split_inclusive('\n') {
+        match line.chars().next() {
+            Some(' ') | Some('+') => out.push_str(&line[1..]),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Read a file value as UTF-8 text. Returns `(None, true)` for binary content,
 /// `(None, false)` for non-file/absent values.
 fn read_text(
@@ -87,5 +134,49 @@ fn read_text(
     match String::from_utf8(buf) {
         Ok(text) => Ok((Some(text), false)),
         Err(_) => Ok((None, true)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconstruct_from_diff, unified_diff};
+
+    /// An unedited diff reconstructs the new content (newline-normalized).
+    fn assert_roundtrip(old: &str, new: &str) {
+        let diff = unified_diff(old, new);
+        let expected = if new.is_empty() || new.ends_with('\n') {
+            new.to_string()
+        } else {
+            format!("{new}\n")
+        };
+        assert_eq!(reconstruct_from_diff(&diff), expected, "diff was:\n{diff}");
+    }
+
+    #[test]
+    fn roundtrips() {
+        assert_roundtrip("a\nb\nc\n", "a\nB\nc\n");
+        assert_roundtrip("", "added\nlines\n");
+        assert_roundtrip("removed\nlines\n", "");
+        assert_roundtrip("a\nb\nc\n", "a\nb\nc\n");
+        // No trailing newline (normalized to one on reconstruct).
+        assert_roundtrip("x\ny", "x\nY");
+        // Content lines that themselves start with diff sigils.
+        assert_roundtrip(" +keep\n-keep\n", " +keep\n-keep\n+extra\n");
+    }
+
+    #[test]
+    fn editing_an_added_line_changes_output() {
+        let diff = unified_diff("a\n", "a\nb\n");
+        // The added line "+b" -> edit to "+B".
+        let edited = diff.replace("+b\n", "+B\n");
+        assert_eq!(reconstruct_from_diff(&edited), "a\nB\n");
+    }
+
+    #[test]
+    fn flipping_a_removed_line_to_kept_restores_it() {
+        let diff = unified_diff("keep\ndrop\n", "keep\n");
+        // Turn the "-drop" line into a context line by replacing its sigil.
+        let edited = diff.replace("-drop\n", " drop\n");
+        assert_eq!(reconstruct_from_diff(&edited), "keep\ndrop\n");
     }
 }

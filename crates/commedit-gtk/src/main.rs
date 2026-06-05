@@ -6,15 +6,21 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use commedit_engine::diff::{apply_patch, commit_changes, unified_diff, ChangeKind, FileChange};
+use commedit_engine::diff::{
+    apply_patch, commit_changes, parse_diff_lines, unified_diff, ChangeKind, DiffLineKind,
+    FileChange,
+};
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::repo::Repo;
+use gtk::glib;
 use gtk::prelude::*;
-use sourceview5::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, StringList,
+    ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, StringList, TextTag,
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 const APP_ID: &str = "net.willi.commedit";
 
@@ -79,10 +85,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // --- File / diff pane (bottom-right) ---
     let file_dropdown = DropDown::from_strings(&[]);
+    // We render the diff with our own text tags (line backgrounds, syntect
+    // language coloring, intra-line emphasis) rather than a GtkSourceView
+    // grammar, so no language is set on the buffer.
     let file_buffer = sourceview5::Buffer::new(None);
-    if let Some(lang) = sourceview5::LanguageManager::default().language("diff") {
-        file_buffer.set_language(Some(&lang));
-    }
+    install_diff_tags(&file_buffer);
     let file_view = sourceview5::View::with_buffer(&file_buffer);
     file_view.set_monospace(true);
     file_view.set_left_margin(8);
@@ -162,6 +169,53 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         })
     };
+
+    // Syntax-highlighting resources (loaded once). A light theme to sit on the
+    // light diff line backgrounds, like GitHub/delta.
+    let syntax_set = Rc::new(SyntaxSet::load_defaults_newlines());
+    let theme: Rc<Theme> = {
+        let themes = ThemeSet::load_defaults().themes;
+        let chosen = themes
+            .get("InspiredGitHub")
+            .or_else(|| themes.values().next())
+            .cloned()
+            .expect("at least one default theme");
+        Rc::new(chosen)
+    };
+
+    // Re-render the diff highlighting for whatever is currently in the buffer.
+    let highlight: Rc<dyn Fn()> = {
+        let file_buffer = file_buffer.clone();
+        let current_file = current_file.clone();
+        let syntax_set = syntax_set.clone();
+        let theme = theme.clone();
+        Rc::new(move || {
+            let path = current_file.borrow().clone();
+            highlight_diff(&file_buffer, path.as_deref(), &syntax_set, &theme);
+        })
+    };
+
+    // Re-highlight after edits, debounced/coalesced so typing stays responsive.
+    // (Applying tags does not emit `changed`, so this can't loop.)
+    let highlight_gen = Rc::new(RefCell::new(0u64));
+    file_buffer.connect_changed({
+        let highlight = highlight.clone();
+        let highlight_gen = highlight_gen.clone();
+        move |_| {
+            let mine = {
+                let mut g = highlight_gen.borrow_mut();
+                *g = g.wrapping_add(1);
+                *g
+            };
+            let highlight = highlight.clone();
+            let highlight_gen = highlight_gen.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                if *highlight_gen.borrow() == mine {
+                    highlight();
+                }
+            });
+        }
+    });
 
     file_dropdown.connect_selected_notify({
         let show_file = show_file.clone();
@@ -340,6 +394,162 @@ fn resolve_commit(
         .ok()?
         .into_iter()
         .find(|c| c.change_id_hex() == change_id)
+}
+
+/// Create the static, named tags used for diff line backgrounds and intra-line
+/// emphasis (idempotent). Per-syntax foreground tags are created lazily in
+/// [`fg_tag`]. Colors follow GitHub's light diff palette.
+fn install_diff_tags(buffer: &sourceview5::Buffer) {
+    let table = buffer.tag_table();
+    let add = |name: &str, build: &dyn Fn(&TextTag)| {
+        if table.lookup(name).is_none() {
+            let tag = TextTag::new(Some(name));
+            build(&tag);
+            table.add(&tag);
+        }
+    };
+    add("add-line", &|t| t.set_paragraph_background(Some("#e6ffec")));
+    add("del-line", &|t| t.set_paragraph_background(Some("#ffebe9")));
+    add("hunk", &|t| {
+        t.set_paragraph_background(Some("#ddf4ff"));
+        t.set_foreground(Some("#0550ae"));
+    });
+    add("meta", &|t| t.set_foreground(Some("#6e7781")));
+    add("add-word", &|t| t.set_background(Some("#abf2bc")));
+    add("del-word", &|t| t.set_background(Some("#ffc0bd")));
+}
+
+/// Look up (or lazily create and cache, via the buffer's tag table) a foreground
+/// color tag for a `#rrggbb` value produced by syntect.
+fn fg_tag(buffer: &sourceview5::Buffer, hex: &str) -> TextTag {
+    let name = format!("fg{hex}");
+    if let Some(tag) = buffer.tag_table().lookup(&name) {
+        return tag;
+    }
+    let tag = TextTag::new(Some(&name));
+    tag.set_foreground(Some(hex));
+    buffer.tag_table().add(&tag);
+    tag
+}
+
+/// Re-apply all diff highlighting tags to `buffer` for the unified diff it
+/// currently holds: line backgrounds by kind, syntect language coloring of the
+/// code portion (keeping separate parser state for the removed/added sides so
+/// multi-line constructs stay correct), and intra-line change emphasis.
+fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxSet, theme: &Theme) {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    let text = buffer.text(&start, &end, false).to_string();
+    buffer.remove_all_tags(&start, &end);
+
+    let raw_lines: Vec<&str> = text.split('\n').collect();
+    let parsed = parse_diff_lines(&text);
+
+    let syntax = path
+        .and_then(|p| std::path::Path::new(p).extension())
+        .and_then(|e| e.to_str())
+        .and_then(|ext| ps.find_syntax_by_extension(ext))
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    let mut old_hl = HighlightLines::new(syntax, theme);
+    let mut new_hl = HighlightLines::new(syntax, theme);
+
+    for (li, line) in parsed.iter().enumerate() {
+        let raw = raw_lines[li];
+        if let Some(name) = line_bg_tag(line.kind) {
+            apply_line_tag(buffer, li as i32, name);
+        }
+        match line.kind {
+            // Hunk boundary: reset both parser states (the shown regions are
+            // discontiguous, so state must not leak across the gap).
+            DiffLineKind::Hunk => {
+                old_hl = HighlightLines::new(syntax, theme);
+                new_hl = HighlightLines::new(syntax, theme);
+                continue;
+            }
+            DiffLineKind::Header | DiffLineKind::Meta => continue,
+            _ => {}
+        }
+
+        let prefix = if raw.is_empty() { 0 } else { 1 };
+        let code = &raw[prefix..];
+        let owned = format!("{code}\n");
+        let spans = match line.kind {
+            DiffLineKind::Removed => old_hl.highlight_line(&owned, ps),
+            DiffLineKind::Added => new_hl.highlight_line(&owned, ps),
+            // Context advances both sides; color from the (identical) new side.
+            DiffLineKind::Context => {
+                let _ = old_hl.highlight_line(&owned, ps);
+                new_hl.highlight_line(&owned, ps)
+            }
+            _ => continue,
+        };
+        if let Ok(spans) = spans {
+            let mut byte = 0usize;
+            for (style, piece) in spans {
+                if byte >= code.len() {
+                    break;
+                }
+                let plen = piece.len().min(code.len() - byte); // clip the trailing '\n'
+                if plen > 0 {
+                    let cs = prefix + code[..byte].chars().count();
+                    let ce = prefix + code[..byte + plen].chars().count();
+                    let fg = style.foreground;
+                    let hex = format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b);
+                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &fg_tag(buffer, &hex));
+                }
+                byte += plen;
+            }
+        }
+
+        if !line.intra.is_empty() {
+            let word_tag = if line.kind == DiffLineKind::Added {
+                "add-word"
+            } else {
+                "del-word"
+            };
+            if let Some(tag) = buffer.tag_table().lookup(word_tag) {
+                for &(s, e) in &line.intra {
+                    let cs = prefix + code[..s].chars().count();
+                    let ce = prefix + code[..e].chars().count();
+                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &tag);
+                }
+            }
+        }
+    }
+}
+
+/// The line-background tag name for a diff line kind (`None` = context, no bg).
+fn line_bg_tag(kind: DiffLineKind) -> Option<&'static str> {
+    match kind {
+        DiffLineKind::Added => Some("add-line"),
+        DiffLineKind::Removed => Some("del-line"),
+        DiffLineKind::Hunk => Some("hunk"),
+        DiffLineKind::Header | DiffLineKind::Meta => Some("meta"),
+        DiffLineKind::Context => None,
+    }
+}
+
+/// Apply a named tag across the whole of buffer line `li` (including its newline,
+/// so paragraph backgrounds fill the row).
+fn apply_line_tag(buffer: &sourceview5::Buffer, li: i32, name: &str) {
+    let Some(tag) = buffer.tag_table().lookup(name) else {
+        return;
+    };
+    let Some(s) = buffer.iter_at_line(li) else {
+        return;
+    };
+    let e = buffer.iter_at_line(li + 1).unwrap_or_else(|| buffer.end_iter());
+    buffer.apply_tag(&tag, &s, &e);
+}
+
+/// Apply `tag` over the character-column range `[cs, ce)` of buffer line `li`.
+fn apply_cols(buffer: &sourceview5::Buffer, li: i32, cs: i32, ce: i32, tag: &TextTag) {
+    if let (Some(s), Some(e)) = (
+        buffer.iter_at_line_offset(li, cs),
+        buffer.iter_at_line_offset(li, ce),
+    ) {
+        buffer.apply_tag(tag, &s, &e);
+    }
 }
 
 fn labelled_editor(title: &str, view: &sourceview5::View) -> GtkBox {

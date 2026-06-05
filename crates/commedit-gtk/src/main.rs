@@ -165,9 +165,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_dropdown.set_margin_start(8);
     file_dropdown.set_margin_end(8);
     file_dropdown.set_margin_bottom(4);
+    // Transient feedback line for blocked edits and save errors.
+    let status_label = Label::builder()
+        .xalign(0.0)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .wrap(true)
+        .build();
+    status_label.add_css_class("dim-label");
+    status_label.set_visible(false);
     files_box.append(&files_header);
     files_box.append(&file_dropdown);
     files_box.append(&file_scroll);
+    files_box.append(&status_label);
 
     let right_paned = Paned::builder()
         .orientation(Orientation::Vertical)
@@ -275,6 +287,33 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
+    // Show a message in the status line for a few seconds, then clear it (a
+    // generation counter coalesces rapid messages so only the latest clears).
+    let status_gen = Rc::new(RefCell::new(0u64));
+    let show_status: Rc<dyn Fn(&str)> = {
+        let status_label = status_label.clone();
+        let status_gen = status_gen.clone();
+        Rc::new(move |msg: &str| {
+            status_label.set_text(msg);
+            status_label.set_visible(true);
+            let mine = {
+                let mut g = status_gen.borrow_mut();
+                *g = g.wrapping_add(1);
+                *g
+            };
+            let status_label = status_label.clone();
+            let status_gen = status_gen.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                if *status_gen.borrow() == mine {
+                    status_label.set_text("");
+                    status_label.set_visible(false);
+                }
+            });
+        })
+    };
+
+    const READ_ONLY_HINT: &str = "Edit blocked — only added (+) lines are freely editable.";
+
     // Firewall: every interactive mutation of the diff buffer goes through the
     // structured-edit planner so it can never produce a patch that fails to
     // apply. Programmatic loads/edits set the `editing` guard and pass straight
@@ -282,6 +321,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // drag and selection deletes.
     file_buffer.connect_insert_text({
         let editing = editing.clone();
+        let show_status = show_status.clone();
         move |buffer, iter, text| {
             if editing.get() {
                 return;
@@ -294,6 +334,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 EditPlan::Allow => {}
                 EditPlan::Block => {
                     buffer.stop_signal_emission_by_name("insert-text");
+                    show_status(READ_ONLY_HINT);
                 }
                 EditPlan::Edit(edit) => {
                     buffer.stop_signal_emission_by_name("insert-text");
@@ -304,6 +345,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     });
     file_buffer.connect_delete_range({
         let editing = editing.clone();
+        let show_status = show_status.clone();
         move |buffer, start, end| {
             if editing.get() {
                 return;
@@ -318,6 +360,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             };
             if !deletion_is_safe(&buffer_text(buffer), s, e) {
                 buffer.stop_signal_emission_by_name("delete-range");
+                show_status(READ_ONLY_HINT);
             }
         }
     });
@@ -333,6 +376,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
+        let show_status = show_status.clone();
         move |_, keyval, _, _| {
             if !file_view.is_editable() {
                 return glib::Propagation::Proceed;
@@ -345,7 +389,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             };
             match plan_edit(&buffer_text(&file_buffer), buffer_selection(&file_buffer), gesture) {
                 EditPlan::Allow => glib::Propagation::Proceed,
-                EditPlan::Block => glib::Propagation::Stop,
+                EditPlan::Block => {
+                    show_status(READ_ONLY_HINT);
+                    glib::Propagation::Stop
+                }
                 EditPlan::Edit(edit) => {
                     apply_patch_edit(&file_buffer, &editing, &edit);
                     glib::Propagation::Stop
@@ -458,6 +505,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_dropdown = file_dropdown.clone();
         let selected_change = selected_change.clone();
         let refresh = refresh.clone();
+        let show_status = show_status.clone();
         Rc::new(move || {
             let Some(change_id) = selected_change.borrow().clone() else {
                 return;
@@ -480,7 +528,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let new_message = buffer_text(&message_buffer);
             if new_message != original_message {
                 if let Err(err) = repo.borrow_mut().rewrite_message(&commit_id, &new_message) {
-                    eprintln!("commedit: message save failed: {err:?}");
+                    show_status(&format!("Message save failed: {err}"));
                     return;
                 }
                 // The commit id changed; re-resolve by change id.
@@ -508,13 +556,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                                     if let Err(err) =
                                         repo.borrow_mut().rewrite_file(&commit_id, &path, &content)
                                     {
-                                        eprintln!("commedit: file save failed: {err:?}");
+                                        show_status(&format!("File save failed: {err}"));
                                         return;
                                     }
                                 }
                             }
                             Err(err) => {
-                                eprintln!("commedit: cannot apply edited patch: {err:#}");
+                                // The firewall should make this unreachable; if
+                                // it ever fires, surface it instead of silently
+                                // dropping the save.
+                                show_status(&format!("Cannot apply edited patch: {err}"));
                                 return;
                             }
                         }

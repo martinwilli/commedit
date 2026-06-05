@@ -11,7 +11,7 @@ use commedit_engine::diff::{
     apply_patch, commit_changes, parse_diff_lines, render_diff, ChangeKind, ContextExpansion,
     DiffLineKind, FileChange, HunkInfo,
 };
-use commedit_engine::history::{history, CommitInfo};
+use commedit_engine::history::{history, plan_reorder, CommitInfo};
 use commedit_engine::patch_edit::{
     deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
 };
@@ -20,9 +20,9 @@ use commedit_engine::rewrite::Identity;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    gdk, Application, ApplicationWindow, Box as GtkBox, Button, Calendar, CallbackAction, DropDown,
-    Entry, EventControllerKey, Grid, HeaderBar, Label, ListBox, ListBoxRow, MenuButton,
-    Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
+    gdk, Application, ApplicationWindow, Box as GtkBox, Button, Calendar, CallbackAction, DragSource,
+    DropDown, DropTarget, Entry, EventControllerKey, Grid, HeaderBar, Label, ListBox, ListBoxRow,
+    MenuButton, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
     ShortcutController, ShortcutTrigger, StringList, TextTag,
 };
 use syntect::easy::HighlightLines;
@@ -782,6 +782,66 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         })
     };
+
+    // Drag-and-drop to reorder commits. The drag carries the source row's index;
+    // dropping computes the target slot from the drop's y coordinate, then the
+    // engine rebases the commit into place and we reload. The reorder is applied
+    // immediately — there is no separate Save step for it.
+    let drag_source = DragSource::new();
+    drag_source.set_actions(gdk::DragAction::MOVE);
+    drag_source.connect_prepare({
+        let list = list.clone();
+        move |source, _x, y| {
+            let row = list.row_at_y(y as i32)?;
+            // Show the dragged row under the cursor for feedback.
+            let paintable = gtk::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&paintable), 0, 0);
+            Some(gdk::ContentProvider::for_value(&row.index().to_value()))
+        }
+    });
+    list.add_controller(drag_source);
+
+    let drop_target = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
+    drop_target.connect_drop({
+        let list = list.clone();
+        let commits = commits.clone();
+        let repo = repo.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        move |_target, value, _x, y| {
+            let Ok(from) = value.get::<i32>() else {
+                return false;
+            };
+            let n = commits.borrow().len();
+            // Map the drop y to an insertion gap: onto a row's lower half drops
+            // below it; past the last row drops at the bottom; above the first,
+            // at the top.
+            let to = match list.row_at_y(y as i32) {
+                Some(row) => {
+                    let alloc = row.allocation();
+                    let below = (y as i32) > alloc.y() + alloc.height() / 2;
+                    row.index() as usize + usize::from(below)
+                }
+                None if y <= 0.0 => 0,
+                None => n,
+            };
+            let Some(mv) = plan_reorder(&commits.borrow(), from as usize, to) else {
+                return false;
+            };
+            if let Err(err) = repo.borrow_mut().reorder_commit(
+                &mv.target,
+                mv.new_parents,
+                mv.new_children,
+                &mv.new_tip,
+            ) {
+                show_status(&format!("Reorder failed: {err}"));
+                return false;
+            }
+            refresh();
+            true
+        }
+    });
+    list.add_controller(drop_target);
 
     // Save: rewrite the message and/or the selected file's content, then reload.
     // Reloading re-selects the commit, which cascades through `row-selected` ->

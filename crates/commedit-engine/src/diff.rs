@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, DiffOp, TextDiff};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::repo::{ReadonlyRepo, Repo};
@@ -81,10 +81,288 @@ pub fn unified_diff(old: &str, new: &str, path: &str) -> String {
     let diff = TextDiff::from_lines(old.as_ref(), new.as_ref());
     let mut formatter = diff.unified_diff();
     formatter
-        .context_radius(3)
+        .context_radius(DEFAULT_CONTEXT)
         .missing_newline_hint(false)
         .header(&format!("a/{path}"), &format!("b/{path}"));
     formatter.to_string()
+}
+
+/// Default number of context lines shown around each change, matching the usual
+/// `diff -u` radius.
+pub const DEFAULT_CONTEXT: usize = 3;
+
+/// How many context lines one "expand" step reveals on each side of a hunk.
+pub const CONTEXT_STEP: usize = 3;
+
+/// Extra context lines (beyond [`DEFAULT_CONTEXT`]) requested above (`before`)
+/// and below (`after`) each *change group*, indexed by the group's order within
+/// the file. A change group is a maximal run of added/removed lines; the gaps of
+/// unchanged lines between them are what hunk context is drawn from. Missing
+/// entries mean no extra context, so [`ContextExpansion::default`] reproduces a
+/// standard `diff -u`.
+#[derive(Debug, Clone, Default)]
+pub struct ContextExpansion {
+    pub before: Vec<usize>,
+    pub after: Vec<usize>,
+}
+
+impl ContextExpansion {
+    fn before_of(&self, group: usize) -> usize {
+        self.before.get(group).copied().unwrap_or(0)
+    }
+    fn after_of(&self, group: usize) -> usize {
+        self.after.get(group).copied().unwrap_or(0)
+    }
+
+    /// Widen the context above and below `group` by [`CONTEXT_STEP`] lines,
+    /// growing the backing vectors as needed.
+    pub fn expand(&mut self, first_group: usize, last_group: usize) {
+        grow(&mut self.before, first_group);
+        grow(&mut self.after, last_group);
+        self.before[first_group] += CONTEXT_STEP;
+        self.after[last_group] += CONTEXT_STEP;
+    }
+}
+
+fn grow(v: &mut Vec<usize>, idx: usize) {
+    if v.len() <= idx {
+        v.resize(idx + 1, 0);
+    }
+}
+
+/// A hunk in a [`RenderedDiff`], mapped back to the change groups it covers so
+/// the UI can request more context for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkInfo {
+    /// Zero-based line of this hunk's `@@` header within [`RenderedDiff::text`].
+    pub header_line: usize,
+    /// Inclusive range of change-group indices this hunk covers. Expanding the
+    /// hunk widens context above `first_group` and below `last_group`.
+    pub first_group: usize,
+    pub last_group: usize,
+    /// Whether hidden unchanged lines remain just above / below the hunk, i.e.
+    /// whether expanding in that direction would reveal anything.
+    pub can_expand_up: bool,
+    pub can_expand_down: bool,
+}
+
+/// A unified diff rendered with per-hunk context, plus the hunk metadata needed
+/// to drive context expansion from the UI.
+#[derive(Debug, Clone, Default)]
+pub struct RenderedDiff {
+    pub text: String,
+    pub hunks: Vec<HunkInfo>,
+    /// Total number of change groups in the file (bounds valid group indices).
+    pub group_count: usize,
+}
+
+/// Render a unified diff of `old` → `new` like [`unified_diff`], but with the
+/// context radius of each hunk controlled by `exp`. With the default (empty)
+/// expansion this matches `unified_diff`'s output. The returned [`RenderedDiff`]
+/// maps each `@@` hunk back to its change groups so the caller can ask for more
+/// surrounding context per hunk; the text always reverse-applies via
+/// [`apply_patch`].
+pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> RenderedDiff {
+    let old_n = ensure_trailing_newline(old);
+    let new_n = ensure_trailing_newline(new);
+    let old_lines: Vec<&str> = old_n.lines().collect();
+    let new_lines: Vec<&str> = new_n.lines().collect();
+    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+
+    // Flatten the line ops into a single sequence of segments, tracking each
+    // line's old/new index for the `@@` header.
+    #[derive(Clone, Copy)]
+    enum Tag {
+        Ctx,
+        Del,
+        Ins,
+    }
+    struct Seg<'a> {
+        tag: Tag,
+        old: usize,
+        new: usize,
+        text: &'a str,
+    }
+    let mut segs: Vec<Seg> = Vec::new();
+    for op in diff.ops() {
+        match *op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for k in 0..len {
+                    segs.push(Seg {
+                        tag: Tag::Ctx,
+                        old: old_index + k,
+                        new: new_index + k,
+                        text: old_lines[old_index + k],
+                    });
+                }
+            }
+            DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+            } => {
+                for k in 0..old_len {
+                    segs.push(Seg {
+                        tag: Tag::Del,
+                        old: old_index + k,
+                        new: new_index,
+                        text: old_lines[old_index + k],
+                    });
+                }
+            }
+            DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => {
+                for k in 0..new_len {
+                    segs.push(Seg {
+                        tag: Tag::Ins,
+                        old: old_index,
+                        new: new_index + k,
+                        text: new_lines[new_index + k],
+                    });
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                for k in 0..old_len {
+                    segs.push(Seg {
+                        tag: Tag::Del,
+                        old: old_index + k,
+                        new: new_index,
+                        text: old_lines[old_index + k],
+                    });
+                }
+                for k in 0..new_len {
+                    segs.push(Seg {
+                        tag: Tag::Ins,
+                        old: old_index,
+                        new: new_index + k,
+                        text: new_lines[new_index + k],
+                    });
+                }
+            }
+        }
+    }
+
+    // Maximal runs of changed segments — the "change groups".
+    let is_change = |s: &Seg| !matches!(s.tag, Tag::Ctx);
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < segs.len() {
+        if is_change(&segs[i]) {
+            let start = i;
+            while i < segs.len() && is_change(&segs[i]) {
+                i += 1;
+            }
+            groups.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    let group_count = groups.len();
+    if group_count == 0 {
+        return RenderedDiff::default();
+    }
+
+    let cb = |g: usize| DEFAULT_CONTEXT + exp.before_of(g);
+    let ca = |g: usize| DEFAULT_CONTEXT + exp.after_of(g);
+
+    // Join consecutive groups into hunks while the gap between them is fully
+    // covered by the two groups' context (then there is no point in a split).
+    let mut hunk_groups: Vec<(usize, usize)> = Vec::new();
+    let mut a = 0;
+    while a < group_count {
+        let mut b = a;
+        while b + 1 < group_count {
+            let gap = groups[b + 1].0 - groups[b].1;
+            if ca(b) + cb(b + 1) >= gap {
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        hunk_groups.push((a, b));
+        a = b + 1;
+    }
+
+    // Each hunk is the contiguous segment slice [top_start, bottom_end): the
+    // groups it spans, their (fully shown) interior gaps, plus clamped context.
+    let slices: Vec<(usize, usize, usize, usize)> = hunk_groups
+        .iter()
+        .map(|&(a, b)| {
+            let top_avail = if a == 0 { groups[0].0 } else { groups[a].0 - groups[a - 1].1 };
+            let bot_avail = if b + 1 == group_count {
+                segs.len() - groups[b].1
+            } else {
+                groups[b + 1].0 - groups[b].1
+            };
+            let top_start = groups[a].0 - cb(a).min(top_avail);
+            let bottom_end = groups[b].1 + ca(b).min(bot_avail);
+            (top_start, bottom_end, a, b)
+        })
+        .collect();
+
+    let mut lines: Vec<String> = vec![format!("--- a/{path}"), format!("+++ b/{path}")];
+    let mut hunks = Vec::with_capacity(slices.len());
+    for (idx, &(ts, be, a, b)) in slices.iter().enumerate() {
+        let first = &segs[ts];
+        let (mut old_count, mut new_count) = (0usize, 0usize);
+        for s in &segs[ts..be] {
+            match s.tag {
+                Tag::Ctx => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Tag::Del => old_count += 1,
+                Tag::Ins => new_count += 1,
+            }
+        }
+        let header_line = lines.len();
+        lines.push(format!(
+            "@@ -{},{} +{},{} @@",
+            first.old + 1,
+            old_count,
+            first.new + 1,
+            new_count
+        ));
+        for s in &segs[ts..be] {
+            let prefix = match s.tag {
+                Tag::Ctx => ' ',
+                Tag::Del => '-',
+                Tag::Ins => '+',
+            };
+            lines.push(format!("{prefix}{}", s.text));
+        }
+        // Separate hunks always have hidden lines between them (otherwise they
+        // would have merged), so only the outermost edges can hit a file bound.
+        hunks.push(HunkInfo {
+            header_line,
+            first_group: a,
+            last_group: b,
+            can_expand_up: if idx == 0 { ts > 0 } else { true },
+            can_expand_down: if idx + 1 == slices.len() {
+                be < segs.len()
+            } else {
+                true
+            },
+        });
+    }
+
+    RenderedDiff {
+        text: format!("{}\n", lines.join("\n")),
+        hunks,
+        group_count,
+    }
 }
 
 /// The role of a single line within a unified diff, for display/highlighting.
@@ -395,7 +673,73 @@ fn read_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_patch, parse_diff_lines, unified_diff, DiffLineKind};
+    use super::{
+        apply_patch, parse_diff_lines, render_diff, unified_diff, ContextExpansion, DiffLineKind,
+    };
+
+    /// Build a 20-line file and a copy with two far-apart single-line edits.
+    fn two_change_file() -> (String, String) {
+        let old: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+        let new: String = (1..=20)
+            .map(|n| match n {
+                3 => "L3\n".to_string(),
+                15 => "L15\n".to_string(),
+                _ => format!("l{n}\n"),
+            })
+            .collect();
+        (old, new)
+    }
+
+    #[test]
+    fn render_diff_default_matches_unified_diff() {
+        let (old, new) = two_change_file();
+        let rendered = render_diff(&old, &new, "f", &ContextExpansion::default());
+        assert_eq!(rendered.text, unified_diff(&old, &new, "f"));
+    }
+
+    #[test]
+    fn render_diff_splits_then_merges_on_expansion() {
+        let (old, new) = two_change_file();
+        let mut exp = ContextExpansion::default();
+        let rendered = render_diff(&old, &new, "f", &exp);
+        assert_eq!(rendered.group_count, 2);
+        assert_eq!(rendered.hunks.len(), 2, "two distant edits start as two hunks");
+        // The first edit (line 3) sits two lines from the top, so there is
+        // nothing more to reveal above it; below, the second hunk follows.
+        assert!(!rendered.hunks[0].can_expand_up);
+        assert!(rendered.hunks[0].can_expand_down);
+
+        // Widen the gap-facing side of each hunk until the gap is covered: the
+        // two hunks then render as one.
+        exp.expand(0, 0); // after group 0 +3 -> 6
+        exp.expand(1, 1); // before group 1 +3 -> 6 ; 6+6 >= 11 gap
+        let merged = render_diff(&old, &new, "f", &exp);
+        assert_eq!(merged.hunks.len(), 1, "expanded context merges the hunks");
+        assert_eq!(apply_patch(&old, &merged.text).unwrap(), new);
+    }
+
+    #[test]
+    fn render_diff_expansion_reveals_more_context_and_still_applies() {
+        let (old, new) = two_change_file();
+        let base = render_diff(&old, &new, "f", &ContextExpansion::default());
+        let base_lines = base.text.lines().count();
+        let mut exp = ContextExpansion::default();
+        exp.expand(0, 0);
+        let wider = render_diff(&old, &new, "f", &exp);
+        assert!(
+            wider.text.lines().count() > base_lines,
+            "expanding reveals additional context lines"
+        );
+        assert_eq!(apply_patch(&old, &wider.text).unwrap(), new);
+    }
+
+    #[test]
+    fn render_diff_empty_when_unchanged() {
+        let rendered = render_diff("a\nb\n", "a\nb\n", "f", &ContextExpansion::default());
+        assert_eq!(rendered.group_count, 0);
+        assert!(rendered.text.is_empty());
+        assert!(rendered.hunks.is_empty());
+    }
 
     /// Concatenate the substrings a line's intra ranges select from its code.
     fn marked(code: &str, ranges: &[(usize, usize)]) -> String {

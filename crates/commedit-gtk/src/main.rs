@@ -18,9 +18,10 @@ use commedit_engine::repo::Repo;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown, HeaderBar,
-    Label, ListBox, ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, Shortcut,
-    ShortcutController, ShortcutTrigger, StringList, TextTag,
+    gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown,
+    EventControllerKey, HeaderBar, Label, ListBox, ListBoxRow, Orientation, Paned, PolicyType,
+    PropagationPhase, ScrolledWindow, Shortcut, ShortcutController, ShortcutTrigger, StringList,
+    TextTag,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -50,6 +51,29 @@ fn iter_at(buffer: &sourceview5::Buffer, c: &Cursor) -> gtk::TextIter {
     buffer
         .iter_at_line_offset(c.line as i32, c.col as i32)
         .unwrap_or_else(|| buffer.end_iter())
+}
+
+/// The current selection (or a collapsed caret) as a structured-edit
+/// [`Selection`].
+fn buffer_selection(buffer: &sourceview5::Buffer) -> Selection {
+    if let Some((s, e)) = buffer.selection_bounds() {
+        Selection {
+            anchor: Cursor {
+                line: s.line() as usize,
+                col: s.line_offset() as usize,
+            },
+            end: Cursor {
+                line: e.line() as usize,
+                col: e.line_offset() as usize,
+            },
+        }
+    } else {
+        let it = buffer.iter_at_offset(buffer.cursor_position());
+        Selection::caret(Cursor {
+            line: it.line() as usize,
+            col: it.line_offset() as usize,
+        })
+    }
 }
 
 /// Apply a planned [`PatchEdit`] as a single undo step. The `editing` guard marks
@@ -297,6 +321,39 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         }
     });
+
+    // Enter / Backspace / Delete carry structural intent that a plain
+    // insert/delete can't express (split a line, un-remove a line, join added
+    // lines), so handle them as gestures via the planner. Printable keys are left
+    // alone so input methods keep working — they flow through `insert-text`. The
+    // controller runs in the capture phase to pre-empt the view's own handling.
+    let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(PropagationPhase::Capture);
+    key_controller.connect_key_pressed({
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let editing = editing.clone();
+        move |_, keyval, _, _| {
+            if !file_view.is_editable() {
+                return glib::Propagation::Proceed;
+            }
+            let gesture = match keyval {
+                gdk::Key::Return | gdk::Key::KP_Enter => EditGesture::Newline,
+                gdk::Key::BackSpace => EditGesture::Backspace,
+                gdk::Key::Delete | gdk::Key::KP_Delete => EditGesture::Delete,
+                _ => return glib::Propagation::Proceed,
+            };
+            match plan_edit(&buffer_text(&file_buffer), buffer_selection(&file_buffer), gesture) {
+                EditPlan::Allow => glib::Propagation::Proceed,
+                EditPlan::Block => glib::Propagation::Stop,
+                EditPlan::Edit(edit) => {
+                    apply_patch_edit(&file_buffer, &editing, &edit);
+                    glib::Propagation::Stop
+                }
+            }
+        }
+    });
+    file_view.add_controller(key_controller);
 
     file_dropdown.connect_selected_notify({
         let show_file = show_file.clone();

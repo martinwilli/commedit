@@ -159,7 +159,7 @@ pub fn parse_diff_lines(diff: &str) -> Vec<DiffLine> {
 
 /// Classify a single unified-diff line by its leading marker. Heuristic: assumes
 /// the well-formed output of [`unified_diff`] (one file-header pair at the top).
-fn classify_line(line: &str) -> DiffLineKind {
+pub(crate) fn classify_line(line: &str) -> DiffLineKind {
     if line.starts_with("@@") {
         DiffLineKind::Hunk
     } else if line.starts_with("--- ") || line.starts_with("+++ ") {

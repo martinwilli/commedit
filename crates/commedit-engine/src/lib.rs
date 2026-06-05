@@ -5,6 +5,7 @@
 
 pub mod diff;
 pub mod history;
+pub mod patch_edit;
 pub mod repo;
 pub mod rewrite;
 pub mod transparency;

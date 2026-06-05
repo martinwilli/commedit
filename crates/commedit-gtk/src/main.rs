@@ -232,9 +232,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let header = HeaderBar::new();
     header.pack_start(&save_button);
 
+    // Title with the repository folder name, e.g. "Commit editor - commedit".
+    let folder = repo
+        .borrow()
+        .workspace
+        .workspace_root()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "commedit".to_string());
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("commedit")
+        .title(format!("Commit editor - {folder}"))
         .default_width(1400)
         .default_height(900)
         .child(&paned)

@@ -1,0 +1,59 @@
+# Baseline configuration for the embedded jj-lib engine.
+#
+# jj-lib ships no defaults of its own (the jj CLI supplies them), yet it reads a
+# number of keys eagerly when building UserSettings and the Signer. This mirrors
+# jj's bundled defaults, adjusted for commedit's needs. User identity is layered
+# on top at runtime.
+
+[debug]
+# commit-timestamp = <now>
+# operation-timestamp = <now>
+# randomness-seed = <random>
+
+[fsmonitor]
+backend = "none"
+
+[git]
+abandon-unreachable-commits = true
+auto-local-bookmark = true
+executable-path = "git"
+write-change-id-header = true
+
+[merge]
+hunk-level = "line"
+same-change = "accept"
+
+[operation]
+hostname = "commedit"
+username = "commedit"
+
+[signing]
+backend = "none"
+# Rewriting a commit changes its content, so existing signatures can never be
+# preserved; drop them rather than carrying stale signatures forward.
+behavior = "drop"
+
+[signing.backends.gpg]
+allow-expired-keys = false
+program = "gpg"
+
+[signing.backends.gpgsm]
+allow-expired-keys = false
+program = "gpgsm"
+
+[signing.backends.ssh]
+program = "ssh-keygen"
+
+[ui]
+conflict-marker-style = "diff"
+
+[user]
+email = ""
+name = ""
+
+[working-copy]
+eol-conversion = "none"
+exec-bit-change = "auto"
+
+[experimental]
+record-predecessors-in-commit = true

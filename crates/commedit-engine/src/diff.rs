@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
-use similar::TextDiff;
+use similar::{ChangeTag, TextDiff};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::repo::{ReadonlyRepo, Repo};
@@ -74,7 +74,7 @@ pub fn commit_changes(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Vec<F
 
 /// Render a standard unified diff of `old` → `new` with `@@` hunk headers and
 /// the usual context (3 lines). Inputs are newline-normalized. The result is
-/// meant to be edited and fed back to [`apply_patch`]!
+/// meant to be edited and fed back to [`apply_patch`].
 pub fn unified_diff(old: &str, new: &str, path: &str) -> String {
     let old = ensure_trailing_newline(old);
     let new = ensure_trailing_newline(new);
@@ -85,6 +85,203 @@ pub fn unified_diff(old: &str, new: &str, path: &str) -> String {
         .missing_newline_hint(false)
         .header(&format!("a/{path}"), &format!("b/{path}"));
     formatter.to_string()
+}
+
+/// The role of a single line within a unified diff, for display/highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    /// A ` ` context line, unchanged.
+    Context,
+    /// A `+` line, added by the new side.
+    Added,
+    /// A `-` line, removed from the old side.
+    Removed,
+    /// An `@@ … @@` hunk header.
+    Hunk,
+    /// A `--- a/…` / `+++ b/…` file header.
+    Header,
+    /// Any other structural line (`\ No newline…`, `diff`/`index`).
+    Meta,
+}
+
+/// A classified line of a unified diff, with intra-line word changes.
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    /// Byte ranges *within the code portion* (after the leading prefix char)
+    /// that actually differ from the paired opposite line. Empty unless this is
+    /// one of an aligned removed/added line pair. Useful for intra-line
+    /// emphasis (the specific characters/tokens that changed).
+    pub intra: Vec<(usize, usize)>,
+}
+
+/// Classify each `\n`-separated line of a unified diff and, for aligned
+/// removed/added line pairs, compute the intra-line (character-level) ranges
+/// that differ. The result is aligned 1:1 with `diff.split('\n')`, so a text view can
+/// tag its lines by index.
+pub fn parse_diff_lines(diff: &str) -> Vec<DiffLine> {
+    let lines: Vec<&str> = diff.split('\n').collect();
+    let mut out: Vec<DiffLine> = lines
+        .iter()
+        .map(|l| DiffLine {
+            kind: classify_line(l),
+            intra: Vec::new(),
+        })
+        .collect();
+
+    // Pair each maximal run of removed lines with the following run of added
+    // lines and word-diff the aligned members (i-th removed ↔ i-th added).
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].kind != DiffLineKind::Removed {
+            i += 1;
+            continue;
+        }
+        let rem_start = i;
+        while i < out.len() && out[i].kind == DiffLineKind::Removed {
+            i += 1;
+        }
+        let add_start = i;
+        while i < out.len() && out[i].kind == DiffLineKind::Added {
+            i += 1;
+        }
+        let pairs = (add_start - rem_start).min(i - add_start);
+        for k in 0..pairs {
+            let old_code = &lines[rem_start + k][1..];
+            let new_code = &lines[add_start + k][1..];
+            let (old_ranges, new_ranges) = intra_change_ranges(old_code, new_code);
+            out[rem_start + k].intra = old_ranges;
+            out[add_start + k].intra = new_ranges;
+        }
+    }
+    out
+}
+
+/// Classify a single unified-diff line by its leading marker. Heuristic: assumes
+/// the well-formed output of [`unified_diff`] (one file-header pair at the top).
+fn classify_line(line: &str) -> DiffLineKind {
+    if line.starts_with("@@") {
+        DiffLineKind::Hunk
+    } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+        DiffLineKind::Header
+    } else if line.starts_with('\\') || line.starts_with("diff ") || line.starts_with("index ") {
+        DiffLineKind::Meta
+    } else if line.starts_with('+') {
+        DiffLineKind::Added
+    } else if line.starts_with('-') {
+        DiffLineKind::Removed
+    } else {
+        DiffLineKind::Context
+    }
+}
+
+/// Maximum fraction of a line that intra-line emphasis may cover before it is
+/// dropped entirely: beyond this the change is a near-rewrite and per-token
+/// highlighting is just noise — the line background already conveys it.
+const MAX_INTRA_COVERAGE: f32 = 0.66;
+
+/// A list of `[start, end)` byte ranges within a line of code.
+type Ranges = Vec<(usize, usize)>;
+
+/// Compute the changed byte ranges on each side (deletions in `old`, insertions
+/// in `new`) for intra-line emphasis. A character-level diff *locates* the
+/// minimal edits, then each range is **snapped out to whole-word boundaries** so
+/// a sub-word change highlights the entire token instead of speckling individual
+/// characters — the way `git --word-diff`, delta and GitHub present it. If the
+/// result would blanket most of the line, emphasis is dropped so only the line
+/// background remains.
+fn intra_change_ranges(old: &str, new: &str) -> (Ranges, Ranges) {
+    let diff = TextDiff::from_chars(old, new);
+    let (mut old_raw, mut new_raw) = (Vec::new(), Vec::new());
+    let (mut old_off, mut new_off) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_off += len;
+                new_off += len;
+            }
+            ChangeTag::Delete => {
+                old_raw.push((old_off, old_off + len));
+                old_off += len;
+            }
+            ChangeTag::Insert => {
+                new_raw.push((new_off, new_off + len));
+                new_off += len;
+            }
+        }
+    }
+    let old_ranges = merge_ranges(snap_to_words(old_raw, old));
+    let new_ranges = merge_ranges(snap_to_words(new_raw, new));
+
+    // Drop emphasis on both sides if it would blanket most of either line.
+    if too_noisy(&old_ranges, old) || too_noisy(&new_ranges, new) {
+        return (Vec::new(), Vec::new());
+    }
+    (old_ranges, new_ranges)
+}
+
+/// Grow each range to cover any word (`\w`-run) it overlaps, so a sub-word edit
+/// highlights the whole token rather than scattered characters.
+fn snap_to_words(ranges: Ranges, text: &str) -> Ranges {
+    let words = word_spans(text);
+    ranges
+        .into_iter()
+        .map(|(a, b)| {
+            let (mut na, mut nb) = (a, b);
+            for &(ws, we) in &words {
+                if ws < b && we > a {
+                    na = na.min(ws);
+                    nb = nb.max(we);
+                }
+            }
+            (na, nb)
+        })
+        .collect()
+}
+
+/// Byte ranges of maximal word-character (alphanumeric or `_`) runs in `text`.
+fn word_spans(text: &str) -> Ranges {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let is_word = c.is_alphanumeric() || c == '_';
+        match (is_word, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                spans.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+}
+
+/// Coalesce overlapping or touching ranges into disjoint, ordered spans.
+fn merge_ranges(mut ranges: Ranges) -> Ranges {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
+/// True if the emphasized ranges cover more than [`MAX_INTRA_COVERAGE`] of the
+/// (non-empty) line.
+fn too_noisy(ranges: &[(usize, usize)], text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let covered: usize = ranges.iter().map(|&(s, e)| e - s).sum();
+    covered as f32 > text.len() as f32 * MAX_INTRA_COVERAGE
 }
 
 /// Apply a (possibly edited) unified diff to `old`, returning the new content.
@@ -198,7 +395,69 @@ fn read_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_patch, unified_diff};
+    use super::{apply_patch, parse_diff_lines, unified_diff, DiffLineKind};
+
+    /// Concatenate the substrings a line's intra ranges select from its code.
+    fn marked(code: &str, ranges: &[(usize, usize)]) -> String {
+        ranges.iter().map(|&(s, e)| &code[s..e]).collect()
+    }
+
+    #[test]
+    fn classifies_diff_line_kinds() {
+        let patch = unified_diff("a\nb\n", "a\nB\n", "f");
+        let lines = parse_diff_lines(&patch);
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Header));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Context));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Removed));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Added));
+    }
+
+    #[test]
+    fn word_diff_marks_only_the_changed_token() {
+        let old = "let r = f(a, b);";
+        let new = "let r = f(a, c);";
+        let lines = parse_diff_lines(&unified_diff(&format!("{old}\n"), &format!("{new}\n"), "f"));
+        let removed = lines.iter().find(|l| l.kind == DiffLineKind::Removed).unwrap();
+        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
+        assert_eq!(marked(old, &removed.intra), "b");
+        assert_eq!(marked(new, &added.intra), "c");
+    }
+
+    #[test]
+    fn word_diff_pairs_aligned_lines_within_a_hunk() {
+        let old = "a = alpha;\nb = beta;\n";
+        let new = "a = alphaX;\nb = betaY;\n";
+        let lines = parse_diff_lines(&unified_diff(old, new, "f"));
+        let removed: Vec<_> = lines.iter().filter(|l| l.kind == DiffLineKind::Removed).collect();
+        let added: Vec<_> = lines.iter().filter(|l| l.kind == DiffLineKind::Added).collect();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(added.len(), 2);
+        // Each added line marks the whole changed token, not just the new char.
+        assert_eq!(marked("a = alphaX;", &added[0].intra), "alphaX");
+        assert_eq!(marked("b = betaY;", &added[1].intra), "betaY");
+    }
+
+    #[test]
+    fn intra_diff_snaps_subword_change_to_whole_token() {
+        // A single changed character inside a token highlights the whole token
+        // as one contiguous span — no per-character speckle.
+        let lines = parse_diff_lines(&unified_diff("value = foobar;\n", "value = fooBar;\n", "f"));
+        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
+        assert_eq!(added.intra.len(), 1);
+        assert_eq!(marked("value = fooBar;", &added.intra), "fooBar");
+    }
+
+    #[test]
+    fn intra_diff_dropped_when_line_mostly_rewritten() {
+        // A near-total rewrite would blanket the line, so emphasis is dropped and
+        // only the line background remains.
+        let lines = parse_diff_lines(&unified_diff("abcdefgh\n", "12345678\n", "f"));
+        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
+        let removed = lines.iter().find(|l| l.kind == DiffLineKind::Removed).unwrap();
+        assert!(added.intra.is_empty());
+        assert!(removed.intra.is_empty());
+    }
 
     fn norm(s: &str) -> String {
         if s.is_empty() || s.ends_with('\n') {

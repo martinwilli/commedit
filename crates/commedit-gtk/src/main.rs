@@ -6,9 +6,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use commedit_engine::diff::{
-    commit_changes, reconstruct_from_diff, unified_diff, ChangeKind, FileChange,
-};
+use commedit_engine::diff::{apply_patch, commit_changes, unified_diff, ChangeKind, FileChange};
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::repo::Repo;
 use gtk::prelude::*;
@@ -150,7 +148,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             match (&change.new_text, change.is_binary) {
                 (Some(new), _) => {
                     let old = change.old_text.as_deref().unwrap_or("");
-                    file_buffer.set_text(&unified_diff(old, new));
+                    file_buffer.set_text(&unified_diff(old, new, &change.path));
                     file_view.set_editable(true);
                 }
                 (None, true) => {
@@ -287,23 +285,32 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // File content edit (if an editable file is selected and changed).
             let path = current_file.borrow().clone();
             if let Some(path) = path {
-                let original = changes
-                    .borrow()
-                    .iter()
-                    .find(|c| c.path == path)
-                    .and_then(|c| c.new_text.clone());
-                if let Some(original) = original {
-                    let mut content = reconstruct_from_diff(&buffer_text(&file_buffer));
-                    // Preserve the original file's trailing-newline style.
-                    if !original.is_empty() && !original.ends_with('\n') && content.ends_with('\n') {
-                        content.pop();
-                    }
-                    if content != original {
-                        if let Err(err) =
-                            repo.borrow_mut().rewrite_file(&commit_id, &path, &content)
-                        {
-                            eprintln!("commedit: file save failed: {err:?}");
-                            return;
+                let change = changes.borrow().iter().find(|c| c.path == path).cloned();
+                if let Some(change) = change {
+                    if let Some(original) = change.new_text {
+                        let old = change.old_text.as_deref().unwrap_or("");
+                        match apply_patch(old, &buffer_text(&file_buffer)) {
+                            Ok(mut content) => {
+                                // Preserve the original file's trailing-newline style.
+                                if !original.is_empty()
+                                    && !original.ends_with('\n')
+                                    && content.ends_with('\n')
+                                {
+                                    content.pop();
+                                }
+                                if content != original {
+                                    if let Err(err) =
+                                        repo.borrow_mut().rewrite_file(&commit_id, &path, &content)
+                                    {
+                                        eprintln!("commedit: file save failed: {err:?}");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("commedit: cannot apply edited patch: {err:#}");
+                                return;
+                            }
                         }
                     }
                 }

@@ -239,7 +239,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     let files_box = GtkBox::new(Orientation::Vertical, 0);
     file_dropdown.set_margin_start(8);
-    file_dropdown.set_margin_top(8);
+    file_dropdown.set_margin_top(0);
     file_dropdown.set_margin_end(8);
     file_dropdown.set_margin_bottom(4);
     // Transient feedback line for blocked edits and save errors.
@@ -253,9 +253,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     status_label.add_css_class("dim-label");
     status_label.set_visible(false);
+
+    // Action bar along the bottom of the file pane. The Save button is
+    // right-aligned behind a flexible spacer, which leaves room for more
+    // buttons later. Living inside `files_box` keeps it only as wide as the
+    // file/diff editing field rather than spanning the whole window.
+    let save_button = Button::with_label("Save");
+    save_button.add_css_class("suggested-action");
+    let bottom_bar = GtkBox::new(Orientation::Horizontal, 4);
+    bottom_bar.set_margin_start(8);
+    bottom_bar.set_margin_end(8);
+    bottom_bar.set_margin_top(4);
+    bottom_bar.set_margin_bottom(8);
+    let bottom_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    bottom_spacer.set_hexpand(true);
+    bottom_bar.append(&bottom_spacer);
+    bottom_bar.append(&save_button);
+
     files_box.append(&file_dropdown);
     files_box.append(&file_scroll);
     files_box.append(&status_label);
+    files_box.append(&bottom_bar);
 
     let right_paned = Paned::builder()
         .orientation(Orientation::Vertical)
@@ -271,10 +289,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .position(480)
         .build();
 
-    let save_button = Button::with_label("Save");
-    save_button.add_css_class("suggested-action");
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    paned.set_vexpand(true);
+    root.append(&paned);
+
+    // An (otherwise empty) header bar keeps the window title and the window
+    // controls; the Save action now lives in the bottom action bar.
     let header = HeaderBar::new();
-    header.pack_start(&save_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -289,7 +310,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .title(format!("Commit editor - {folder}"))
         .default_width(1400)
         .default_height(900)
-        .child(&paned)
+        .child(&root)
         .build();
     window.set_titlebar(Some(&header));
 

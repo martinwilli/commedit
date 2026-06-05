@@ -149,6 +149,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let expansions: Rc<RefCell<HashMap<String, ContextExpansion>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // Styling for drag-and-drop reordering: the insertion gap placeholder and the
+    // dimmed row being dragged. Installed once for the display.
+    if let Some(display) = gdk::Display::default() {
+        let css = gtk::CssProvider::new();
+        css.load_from_data(
+            ".drop-placeholder { background-color: rgba(53, 132, 228, 0.22); \
+             border: 1px dashed rgb(53, 132, 228); border-radius: 5px; margin: 1px 6px; } \
+             row.commit-dragging { opacity: 0.35; }",
+        );
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
     // --- History pane (left) ---
     let list = ListBox::new();
     let history_scroll = ScrolledWindow::builder()
@@ -783,48 +799,164 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Drag-and-drop to reorder commits. The drag carries the source row's index;
-    // dropping computes the target slot from the drop's y coordinate, then the
-    // engine rebases the commit into place and we reload. The reorder is applied
-    // immediately — there is no separate Save step for it.
+    // Drag-and-drop to reorder commits. While dragging, a placeholder row opens a
+    // gap at the hover position (the surrounding commits slide to make room) and
+    // the dragged row is dimmed; dropping rebases the commit into that slot via
+    // the engine and reloads. The reorder is applied immediately — there is no
+    // separate Save step for it.
+    let placeholder = ListBoxRow::new();
+    placeholder.set_selectable(false);
+    placeholder.set_activatable(false);
+    placeholder.set_height_request(28);
+    placeholder.add_css_class("drop-placeholder");
+    // The row currently being dragged, so it can be un-dimmed when the drag ends.
+    let drag_row: Rc<RefCell<Option<ListBoxRow>>> = Rc::new(RefCell::new(None));
+    // The insertion gap (newest-first index, 0..=len) the placeholder marks.
+    let drop_gap: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+
+    // Map a y coordinate to an insertion gap: onto a row's lower half drops below
+    // it; past the last row drops at the bottom; above the first, at the top. The
+    // placeholder must not be inserted when this runs, or row indices are off.
+    let gap_at: Rc<dyn Fn(f64) -> usize> = {
+        let list = list.clone();
+        let commits = commits.clone();
+        Rc::new(move |y: f64| -> usize {
+            let n = commits.borrow().len();
+            match list.row_at_y(y as i32) {
+                Some(row) => {
+                    let alloc = row.allocation();
+                    let below = (y as i32) > alloc.y() + alloc.height() / 2;
+                    (row.index() as usize + usize::from(below)).min(n)
+                }
+                None if y <= 0.0 => 0,
+                None => n,
+            }
+        })
+    };
+
+    // Move the placeholder to the gap under `y`, but only when that gap actually
+    // changes — re-inserting it on every motion event makes the rows below
+    // flicker. The placeholder occupies list index == its gap, so a row hit at
+    // that index is the placeholder (gap unchanged); other rows' indices are
+    // mapped back past it to commit coordinates.
+    let show_gap: Rc<dyn Fn(f64)> = {
+        let list = list.clone();
+        let placeholder = placeholder.clone();
+        let commits = commits.clone();
+        let drop_gap = drop_gap.clone();
+        Rc::new(move |y: f64| {
+            let n = commits.borrow().len();
+            let current = drop_gap.get();
+            let new_gap = match list.row_at_y(y as i32) {
+                Some(row) => {
+                    let li = row.index() as usize;
+                    if current == Some(li) {
+                        return; // hovering the placeholder: the gap is unchanged
+                    }
+                    let alloc = row.allocation();
+                    let below = (y as i32) > alloc.y() + alloc.height() / 2;
+                    let ci = match current {
+                        Some(g) if li > g => li - 1,
+                        _ => li,
+                    };
+                    (ci + usize::from(below)).min(n)
+                }
+                None if y <= 0.0 => 0,
+                None => n,
+            };
+            if current == Some(new_gap) {
+                return;
+            }
+            if placeholder.parent().is_some() {
+                list.remove(&placeholder);
+            }
+            drop_gap.set(Some(new_gap));
+            list.insert(&placeholder, new_gap as i32);
+        })
+    };
+    let clear_gap: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let placeholder = placeholder.clone();
+        let drop_gap = drop_gap.clone();
+        Rc::new(move || {
+            if placeholder.parent().is_some() {
+                list.remove(&placeholder);
+            }
+            drop_gap.set(None);
+        })
+    };
+
     let drag_source = DragSource::new();
     drag_source.set_actions(gdk::DragAction::MOVE);
     drag_source.connect_prepare({
         let list = list.clone();
+        let drag_row = drag_row.clone();
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
             // Show the dragged row under the cursor for feedback.
             let paintable = gtk::WidgetPaintable::new(Some(&row));
             source.set_icon(Some(&paintable), 0, 0);
+            *drag_row.borrow_mut() = Some(row.clone());
             Some(gdk::ContentProvider::for_value(&row.index().to_value()))
+        }
+    });
+    drag_source.connect_drag_begin({
+        let drag_row = drag_row.clone();
+        move |_source, _drag| {
+            if let Some(row) = drag_row.borrow().as_ref() {
+                row.add_css_class("commit-dragging");
+            }
+        }
+    });
+    drag_source.connect_drag_end({
+        let drag_row = drag_row.clone();
+        let clear_gap = clear_gap.clone();
+        move |_source, _drag, _delete| {
+            if let Some(row) = drag_row.borrow_mut().take() {
+                row.remove_css_class("commit-dragging");
+            }
+            clear_gap();
         }
     });
     list.add_controller(drag_source);
 
     let drop_target = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
+    drop_target.connect_enter({
+        let show_gap = show_gap.clone();
+        move |_target, _x, y| {
+            show_gap(y);
+            gdk::DragAction::MOVE
+        }
+    });
+    drop_target.connect_motion({
+        let show_gap = show_gap.clone();
+        move |_target, _x, y| {
+            show_gap(y);
+            gdk::DragAction::MOVE
+        }
+    });
+    drop_target.connect_leave({
+        let clear_gap = clear_gap.clone();
+        move |_target| clear_gap()
+    });
     drop_target.connect_drop({
-        let list = list.clone();
         let commits = commits.clone();
         let repo = repo.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
+        let gap_at = gap_at.clone();
+        let clear_gap = clear_gap.clone();
+        let drop_gap = drop_gap.clone();
         move |_target, value, _x, y| {
             let Ok(from) = value.get::<i32>() else {
                 return false;
             };
-            let n = commits.borrow().len();
-            // Map the drop y to an insertion gap: onto a row's lower half drops
-            // below it; past the last row drops at the bottom; above the first,
-            // at the top.
-            let to = match list.row_at_y(y as i32) {
-                Some(row) => {
-                    let alloc = row.allocation();
-                    let below = (y as i32) > alloc.y() + alloc.height() / 2;
-                    row.index() as usize + usize::from(below)
-                }
-                None if y <= 0.0 => 0,
-                None => n,
+            // Prefer the gap the placeholder marked; fall back to the drop point.
+            let to = match drop_gap.get() {
+                Some(to) => to,
+                None => gap_at(y),
             };
+            clear_gap();
             let Some(mv) = plan_reorder(&commits.borrow(), from as usize, to) else {
                 return false;
             };

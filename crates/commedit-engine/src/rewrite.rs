@@ -14,6 +14,7 @@ impl Repo {
     /// descendants onto the rewritten commit, and export the result to git in a
     /// single transaction.
     pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<()> {
+        let old_head = self.head_commit();
         let commit = self
             .repo
             .store()
@@ -35,6 +36,7 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: edit commit message"))
             .context("committing rewrite")?;
         self.reattach_head()?;
+        self.sync_worktree(old_head)?;
         Ok(())
     }
 }

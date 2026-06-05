@@ -43,6 +43,44 @@ pub fn ensure_jj_excluded(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The commit sha HEAD currently resolves to, or `None` if it can't be read.
+pub fn head_commit(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Update the index and working tree from `old_rev` to `new_rev` with a two-way
+/// merge, so the working tree mirrors the rewritten tip while preserving any
+/// genuine local edits. Errors if local edits conflict with the update. A no-op
+/// when the trees are identical (e.g. a message-only rewrite).
+pub fn sync_worktree(workspace_root: &Path, old_rev: &str, new_rev: &str) -> Result<()> {
+    if old_rev == new_rev {
+        return Ok(());
+    }
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["read-tree", "-m", "-u", old_rev, new_rev])
+        .output()
+        .context("running git read-tree")?;
+    if !output.status.success() {
+        bail!(
+            "failed to update working tree to rewritten tip: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// The full ref name (e.g. `refs/heads/main`) HEAD symbolically points at, or
 /// `None` if HEAD is detached.
 pub fn head_branch(workspace_root: &Path) -> Option<String> {

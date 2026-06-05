@@ -209,10 +209,12 @@ name = "commedit-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "futures",
  "jj-lib",
  "pollster",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

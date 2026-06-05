@@ -83,6 +83,22 @@ impl Repo {
         Ok(())
     }
 
+    /// The git commit HEAD currently points at — capture this before a rewrite
+    /// so the working tree can be synced to the new tip afterwards.
+    pub(crate) fn head_commit(&self) -> Option<String> {
+        crate::transparency::head_commit(self.workspace.workspace_root())
+    }
+
+    /// Update the working tree from the pre-rewrite tip (`old_head`) to the
+    /// current HEAD, keeping `git status` clean without clobbering local edits.
+    pub(crate) fn sync_worktree(&self, old_head: Option<String>) -> Result<()> {
+        let root = self.workspace.workspace_root();
+        if let (Some(old), Some(new)) = (old_head, crate::transparency::head_commit(root)) {
+            crate::transparency::sync_worktree(root, &old, &new)?;
+        }
+        Ok(())
+    }
+
     /// Pull git refs and HEAD into jj's view as a single transaction. No-op
     /// (empty operation) when jj is already in sync with git.
     fn import_git(&mut self) -> Result<()> {

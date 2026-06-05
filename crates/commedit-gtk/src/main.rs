@@ -439,6 +439,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // as context appears above) we can pin that same header back to the
             // same spot — expansion then grows around it instead of jumping.
             let frac = vertical_fraction_of_line(&file_view, &file_buffer, line);
+            // The view is monospace and never wraps, so every line is the same
+            // height. Measure it now (layout is valid) to compute the post-render
+            // scroll offset arithmetically — see the idle below.
+            let line_height = file_view
+                .iter_location(&file_buffer.start_iter())
+                .height() as f64;
 
             let expansions = expansions.clone();
             let render_cell = render_cell.clone();
@@ -455,25 +461,39 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     render();
                 }
                 // Pin the (possibly moved or merged) hunk header to its prior
-                // viewport position. scroll_to_iter defers until the new text is
-                // laid out, so the fraction lands correctly.
+                // viewport position. set_text reset the scroll to the top; the
+                // deferred scrollers (scroll_to_mark / scroll_to_iter) only run on
+                // a later frame, so the top is painted first and *then* corrected —
+                // the visible jump-to-top flash. Instead, set the scroll offset
+                // synchronously here, before GTK paints, so the next paint already
+                // shows the final position. Line height is uniform (monospace, no
+                // wrap), so the header's offset is just `line * line_height`, and
+                // the document height is `lines * line_height + margins`. We set
+                // the adjustment's upper too, so set_value isn't clamped against
+                // the stale (pre-render) range; GTK's own validation later sets the
+                // same values, leaving the position unchanged.
                 let header = rendered_hunks
                     .borrow()
                     .iter()
                     .find(|h| h.first_group <= first && last <= h.last_group)
                     .map(|h| h.header_line);
-                if let Some(line) = header {
-                    if let Some(iter) = file_buffer.iter_at_line(line as i32) {
-                        // Scroll via a mark, not an iter: set_text just reset the
-                        // layout, so iter-based scrolling uses stale line heights
-                        // and lands wrong. scroll_to_mark defers until the new
-                        // text is validated. The mark is recreated each render
-                        // (set_text clears all marks anyway).
-                        if let Some(old) = file_buffer.mark("expand-scroll") {
-                            file_buffer.delete_mark(&old);
+                if let (Some(line), Some(vadj)) = (header, file_view.vadjustment()) {
+                    let page = vadj.page_size();
+                    if line_height > 0.0 && page > 0.0 {
+                        let top = file_view.top_margin() as f64;
+                        let bottom = file_view.bottom_margin() as f64;
+                        let height = file_buffer.line_count() as f64 * line_height + top + bottom;
+                        let upper = height.max(page);
+                        let target = (line as f64 * line_height + top - frac * page)
+                            .clamp(0.0, (upper - page).max(0.0));
+                        vadj.set_upper(upper);
+                        vadj.set_value(target);
+                        // Keep the cursor on the now-visible header so GTK's
+                        // validation doesn't scroll the (offset-0) caret back into
+                        // view and undo the offset we just set.
+                        if let Some(iter) = file_buffer.iter_at_line(line as i32) {
+                            file_buffer.place_cursor(&iter);
                         }
-                        let mark = file_buffer.create_mark(Some("expand-scroll"), &iter, true);
-                        file_view.scroll_to_mark(&mark, 0.0, true, 0.0, frac);
                     }
                 }
             });

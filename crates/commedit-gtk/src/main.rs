@@ -71,7 +71,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let history_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vexpand(true)
-        .width_request(320)
+        .width_request(480)
         .child(&list)
         .build();
 
@@ -126,7 +126,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .orientation(Orientation::Horizontal)
         .start_child(&history_scroll)
         .end_child(&right_paned)
-        .position(320)
+        .position(480)
         .build();
 
     let save_button = Button::with_label("Save");
@@ -137,8 +137,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("commedit")
-        .default_width(1100)
-        .default_height(750)
+        .default_width(1400)
+        .default_height(900)
         .child(&paned)
         .build();
     window.set_titlebar(Some(&header));
@@ -629,16 +629,27 @@ fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
         } else {
             &commit.subject
         };
-        let label = Label::builder()
-            .label(format!("{short}  {subject}"))
+        let id_label = Label::builder().xalign(0.0).build();
+        id_label.set_markup(&format!("<tt>{short}</tt>"));
+        let subject_label = Label::builder()
+            .label(subject)
             .xalign(0.0)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let row_box = GtkBox::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
             .margin_start(8)
             .margin_end(8)
             .margin_top(4)
             .margin_bottom(4)
             .build();
+        row_box.append(&id_label);
+        row_box.append(&subject_label);
         let row = ListBoxRow::new();
-        row.set_child(Some(&label));
+        row.set_child(Some(&row_box));
         list.append(&row);
     }
 }

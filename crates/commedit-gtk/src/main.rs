@@ -15,8 +15,9 @@ use commedit_engine::repo::Repo;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, DropDown, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, StringList, TextTag,
+    Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown, HeaderBar,
+    Label, ListBox, ListBoxRow, Orientation, Paned, PolicyType, ScrolledWindow, Shortcut,
+    ShortcutController, ShortcutTrigger, StringList, TextTag,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -301,16 +302,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     };
 
     // Save: rewrite the message and/or the selected file's content, then reload.
-    save_button.connect_clicked({
+    // Reloading re-selects the commit, which cascades through `row-selected` ->
+    // `load_changes` and resets the file dropdown to index 0 with the cursor at
+    // the start. We capture the selected file and cursor offset beforehand and
+    // restore them afterwards so a save is invisible to the user's place in the
+    // diff.
+    let save: Rc<dyn Fn()> = {
         let repo = repo.clone();
         let commits = commits.clone();
         let changes = changes.clone();
         let current_file = current_file.clone();
         let message_buffer = message_buffer.clone();
         let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let file_dropdown = file_dropdown.clone();
         let selected_change = selected_change.clone();
         let refresh = refresh.clone();
-        move |_| {
+        Rc::new(move || {
             let Some(change_id) = selected_change.borrow().clone() else {
                 return;
             };
@@ -322,6 +330,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Some((mut commit_id, original_message)) = target else {
                 return;
             };
+
+            // Remember where the user is so we can restore it after the reload.
+            let saved_file = current_file.borrow().clone();
+            let saved_cursor = file_buffer.cursor_position();
+            let file_had_focus = file_view.has_focus();
 
             // Message edit (if changed).
             let new_message = buffer_text(&message_buffer);
@@ -337,8 +350,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
 
             // File content edit (if an editable file is selected and changed).
-            let path = current_file.borrow().clone();
-            if let Some(path) = path {
+            if let Some(path) = saved_file.clone() {
                 let change = changes.borrow().iter().find(|c| c.path == path).cloned();
                 if let Some(change) = change {
                     if let Some(original) = change.new_text {
@@ -371,8 +383,42 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
 
             refresh();
-        }
+
+            // Restore the selected file and cursor (refresh reset both).
+            if let Some(path) = saved_file {
+                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                    file_dropdown.set_selected(idx as u32);
+                }
+            }
+            let offset = saved_cursor.min(file_buffer.char_count());
+            let cursor = file_buffer.iter_at_offset(offset);
+            file_buffer.place_cursor(&cursor);
+            file_view.scroll_to_mark(&file_buffer.get_insert(), 0.0, false, 0.0, 0.0);
+            if file_had_focus {
+                file_view.grab_focus();
+            }
+        })
+    };
+
+    save_button.connect_clicked({
+        let save = save.clone();
+        move |_| save()
     });
+
+    // Ctrl+S triggers the same save.
+    let save_shortcut = {
+        let save = save.clone();
+        let action = CallbackAction::new(move |_, _| {
+            save();
+            glib::Propagation::Stop
+        });
+        let trigger = ShortcutTrigger::parse_string("<Control>s")
+            .expect("valid shortcut trigger");
+        Shortcut::new(Some(trigger), Some(action))
+    };
+    let shortcuts = ShortcutController::new();
+    shortcuts.add_shortcut(save_shortcut);
+    window.add_controller(shortcuts);
 
     // Initial population and selection.
     refresh();

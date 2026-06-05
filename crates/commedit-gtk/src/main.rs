@@ -293,6 +293,31 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     window.set_titlebar(Some(&header));
 
+    // Syntax-highlighting resources (loaded once). A light theme to sit on the
+    // light diff line backgrounds, like GitHub/delta.
+    let syntax_set = Rc::new(SyntaxSet::load_defaults_newlines());
+    let theme: Rc<Theme> = {
+        let themes = ThemeSet::load_defaults().themes;
+        let chosen = themes
+            .get("InspiredGitHub")
+            .or_else(|| themes.values().next())
+            .cloned()
+            .expect("at least one default theme");
+        Rc::new(chosen)
+    };
+
+    // Re-render the diff highlighting for whatever is currently in the buffer.
+    let highlight: Rc<dyn Fn()> = {
+        let file_buffer = file_buffer.clone();
+        let current_file = current_file.clone();
+        let syntax_set = syntax_set.clone();
+        let theme = theme.clone();
+        Rc::new(move || {
+            let path = current_file.borrow().clone();
+            highlight_diff(&file_buffer, path.as_deref(), &syntax_set, &theme);
+        })
+    };
+
     // Render the current file's diff into the buffer with its per-hunk context
     // expansion, appending a click-to-expand cue to each expandable `@@` header.
     // Self-referential (via `render_cell`) so a click can request a re-render
@@ -308,6 +333,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let expansions = expansions.clone();
         let rendered_hunks = rendered_hunks.clone();
+        let highlight = highlight.clone();
         Rc::new(move || {
             let Some(path) = current_file.borrow().clone() else {
                 return;
@@ -342,6 +368,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
             *rendered_hunks.borrow_mut() = rendered.hunks.clone();
+            // Highlight in this same main-loop turn, before GTK paints, so the
+            // diff appears once fully colored instead of flashing plain first and
+            // then re-highlighting via the debounced `changed` handler (which is
+            // suppressed below while `editing` is set).
+            highlight();
             editing.set(false);
         })
     };
@@ -460,38 +491,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Syntax-highlighting resources (loaded once). A light theme to sit on the
-    // light diff line backgrounds, like GitHub/delta.
-    let syntax_set = Rc::new(SyntaxSet::load_defaults_newlines());
-    let theme: Rc<Theme> = {
-        let themes = ThemeSet::load_defaults().themes;
-        let chosen = themes
-            .get("InspiredGitHub")
-            .or_else(|| themes.values().next())
-            .cloned()
-            .expect("at least one default theme");
-        Rc::new(chosen)
-    };
-
-    // Re-render the diff highlighting for whatever is currently in the buffer.
-    let highlight: Rc<dyn Fn()> = {
-        let file_buffer = file_buffer.clone();
-        let current_file = current_file.clone();
-        let syntax_set = syntax_set.clone();
-        let theme = theme.clone();
-        Rc::new(move || {
-            let path = current_file.borrow().clone();
-            highlight_diff(&file_buffer, path.as_deref(), &syntax_set, &theme);
-        })
-    };
-
     // Re-highlight after edits, debounced/coalesced so typing stays responsive.
     // (Applying tags does not emit `changed`, so this can't loop.)
     let highlight_gen = Rc::new(RefCell::new(0u64));
     file_buffer.connect_changed({
         let highlight = highlight.clone();
         let highlight_gen = highlight_gen.clone();
+        let editing = editing.clone();
         move |_| {
+            // A full programmatic render highlights itself synchronously; don't
+            // also schedule a redundant (and flash-inducing) debounced pass.
+            if editing.get() {
+                return;
+            }
             let mine = {
                 let mut g = highlight_gen.borrow_mut();
                 *g = g.wrapping_add(1);

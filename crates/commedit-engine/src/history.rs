@@ -1,14 +1,12 @@
 //! Walk the repository into a flat, topologically ordered list of commits for
 //! the history view (children before parents, like gitk).
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::revset::{ResolvedRevsetExpression, RevsetExpression};
+use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
 
 /// A single row in the history view.
 #[derive(Debug, Clone)]
@@ -55,7 +53,18 @@ impl CommitInfo {
 /// List all visible commits in topological order (newest first), excluding the
 /// virtual root commit.
 pub fn history(repo: &ReadonlyRepo) -> Result<Vec<CommitInfo>> {
-    let expression: Arc<ResolvedRevsetExpression> = RevsetExpression::all();
+    // Mirror what `git log`/`gitk` show: commits reachable from the git refs and
+    // git HEAD. jj's `all()` additionally surfaces divergent (pre-rewrite) and
+    // working-copy commits, which git never created a ref for — they would show
+    // up here as confusing duplicates of the commits that replaced them.
+    let user_expression = RevsetExpression::git_refs()
+        .union(&RevsetExpression::git_head())
+        .ancestors();
+    let symbol_resolver =
+        SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
+    let expression = user_expression
+        .resolve_user_expression(repo, &symbol_resolver)
+        .context("resolving history revset")?;
     let revset = expression
         .evaluate(repo)
         .context("evaluating history revset")?;

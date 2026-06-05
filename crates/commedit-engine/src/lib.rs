@@ -5,4 +5,5 @@
 
 pub mod history;
 pub mod repo;
+pub mod rewrite;
 pub mod transparency;

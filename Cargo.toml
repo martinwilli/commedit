@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/commedit-engine",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Martin Willi <martin@strongswan.org>"]
+
+[workspace.dependencies]
+jj-lib = "=0.41.0"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"

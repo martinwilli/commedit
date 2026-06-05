@@ -1,0 +1,17 @@
+[package]
+name = "commedit-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "History rewrite engine for commedit, built on jj-lib"
+
+[dependencies]
+jj-lib.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+pollster = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

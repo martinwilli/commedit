@@ -2,7 +2,7 @@
 //! edit the content of files a commit changes. Saving transparently rewrites the
 //! commit and rebases descendants via the engine.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -11,6 +11,9 @@ use commedit_engine::diff::{
     FileChange,
 };
 use commedit_engine::history::{history, CommitInfo};
+use commedit_engine::patch_edit::{
+    deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
+};
 use commedit_engine::repo::Repo;
 use gtk::glib;
 use gtk::prelude::*;
@@ -40,6 +43,29 @@ fn buffer_text(buffer: &sourceview5::Buffer) -> String {
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), false)
         .to_string()
+}
+
+/// Buffer iter at a structured-edit [`Cursor`] (line + character column).
+fn iter_at(buffer: &sourceview5::Buffer, c: &Cursor) -> gtk::TextIter {
+    buffer
+        .iter_at_line_offset(c.line as i32, c.col as i32)
+        .unwrap_or_else(|| buffer.end_iter())
+}
+
+/// Apply a planned [`PatchEdit`] as a single undo step. The `editing` guard marks
+/// the mutation as our own so the firewall signal handlers let it through.
+fn apply_patch_edit(buffer: &sourceview5::Buffer, editing: &Rc<Cell<bool>>, edit: &PatchEdit) {
+    editing.set(true);
+    buffer.begin_user_action();
+    let mut start = iter_at(buffer, &edit.start);
+    let mut end = iter_at(buffer, &edit.end);
+    buffer.delete(&mut start, &mut end);
+    let mut at = iter_at(buffer, &edit.start);
+    buffer.insert(&mut at, &edit.replacement);
+    buffer.end_user_action();
+    editing.set(false);
+    let cursor = iter_at(buffer, &edit.cursor);
+    buffer.place_cursor(&cursor);
 }
 
 fn change_label(change: &FileChange) -> String {
@@ -95,6 +121,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_view.set_monospace(true);
     file_view.set_left_margin(8);
     file_view.set_top_margin(8);
+    // Set while we mutate the diff buffer ourselves (loading a file, or applying
+    // a structured edit) so the firewall signal handlers below let it through
+    // instead of treating it as an interactive edit.
+    let editing = Rc::new(Cell::new(false));
     let file_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hexpand(true)
@@ -149,10 +179,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let current_file = current_file.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
+        let editing = editing.clone();
         Rc::new(move |idx: usize| {
             let change = changes.borrow().get(idx).cloned();
             let Some(change) = change else { return };
             *current_file.borrow_mut() = Some(change.path.clone());
+            editing.set(true);
             match (&change.new_text, change.is_binary) {
                 (Some(new), _) => {
                     let old = change.old_text.as_deref().unwrap_or("");
@@ -168,6 +200,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     file_view.set_editable(false);
                 }
             }
+            editing.set(false);
         })
     };
 
@@ -218,6 +251,53 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
+    // Firewall: every interactive mutation of the diff buffer goes through the
+    // structured-edit planner so it can never produce a patch that fails to
+    // apply. Programmatic loads/edits set the `editing` guard and pass straight
+    // through. `insert-text` covers typing and paste; `delete-range` covers cut,
+    // drag and selection deletes.
+    file_buffer.connect_insert_text({
+        let editing = editing.clone();
+        move |buffer, iter, text| {
+            if editing.get() {
+                return;
+            }
+            let caret = Selection::caret(Cursor {
+                line: iter.line() as usize,
+                col: iter.line_offset() as usize,
+            });
+            match plan_edit(&buffer_text(buffer), caret, EditGesture::Insert(text.to_string())) {
+                EditPlan::Allow => {}
+                EditPlan::Block => {
+                    buffer.stop_signal_emission_by_name("insert-text");
+                }
+                EditPlan::Edit(edit) => {
+                    buffer.stop_signal_emission_by_name("insert-text");
+                    apply_patch_edit(buffer, &editing, &edit);
+                }
+            }
+        }
+    });
+    file_buffer.connect_delete_range({
+        let editing = editing.clone();
+        move |buffer, start, end| {
+            if editing.get() {
+                return;
+            }
+            let s = Cursor {
+                line: start.line() as usize,
+                col: start.line_offset() as usize,
+            };
+            let e = Cursor {
+                line: end.line() as usize,
+                col: end.line_offset() as usize,
+            };
+            if !deletion_is_safe(&buffer_text(buffer), s, e) {
+                buffer.stop_signal_emission_by_name("delete-range");
+            }
+        }
+    });
+
     file_dropdown.connect_selected_notify({
         let show_file = show_file.clone();
         move |dd| {
@@ -236,6 +316,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_dropdown = file_dropdown.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
+        let editing = editing.clone();
         Rc::new(move |commit: &CommitInfo| {
             let loaded = commit_changes(&repo.borrow().repo, &commit.id).unwrap_or_default();
             *changes.borrow_mut() = loaded;
@@ -244,7 +325,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             file_dropdown.set_model(Some(&StringList::new(&refs)));
             if labels.is_empty() {
+                editing.set(true);
                 file_buffer.set_text("");
+                editing.set(false);
                 file_view.set_editable(false);
             } else {
                 // Triggers selected-notify -> show_file(0).

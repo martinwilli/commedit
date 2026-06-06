@@ -292,8 +292,10 @@ impl Repo {
                 let bytes = materialize_merge_result_to_bytes(&fc.contents, &fc.labels, &opts);
                 let text = String::from_utf8(bytes.to_vec())
                     .context("conflicted file is not valid UTF-8")?;
+                let text = strip_base_sections(&text, marker_len);
+                let text = simplify_marker_labels(&text, marker_len);
                 Ok(ConflictedFile {
-                    text: strip_base_sections(&text, marker_len),
+                    text,
                     marker_len,
                     num_sides: fc.ids.num_sides(),
                 })
@@ -439,4 +441,95 @@ fn strip_base_sections(text: &str, marker_len: usize) -> String {
         out.push_str(line);
     }
     out
+}
+
+/// Rewrite jj's verbose conflict-marker labels into something a plain-git user
+/// recognizes. jj annotates each side with its change id, git commit id,
+/// description and a role, e.g.
+/// `<<<<<<< lywxrykm c2eece18 "foo" (rebase destination)`. We keep the git short
+/// id and the description and drop the jj change id (meaningless without jj) and
+/// the trailing role annotation, leaving `<<<<<<< c2eece18 "foo"`. Labels are
+/// cosmetic — the round-trip parse keys on the marker run length, not the text
+/// after it — so this only affects what the user reads.
+fn simplify_marker_labels(text: &str, marker_len: usize) -> String {
+    let marker_run = |line: &str, ch: char| {
+        let n = line.chars().take_while(|&c| c == ch).count();
+        (n >= marker_len).then_some(n)
+    };
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let marker = ['<', '=', '>']
+            .into_iter()
+            .find_map(|ch| marker_run(body, ch).map(|n| (ch, n)));
+        match marker {
+            // Marker chars are ASCII, so the run length is also the byte offset of
+            // the label that follows it.
+            Some((_, run)) => {
+                let (prefix, rest) = body.split_at(run);
+                out.push_str(prefix);
+                let label = simplify_label(rest.trim());
+                if !label.is_empty() {
+                    out.push(' ');
+                    out.push_str(&label);
+                }
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Reduce one marker label to `<commit id> "<description>"`: drop the leading jj
+/// change-id token and any trailing ` (…)` role annotation. Returns an empty
+/// string for an empty label (e.g. the bare `=======` separator).
+fn simplify_label(label: &str) -> String {
+    if label.is_empty() {
+        return String::new();
+    }
+    // Drop the leading jj change-id token (jj always emits it first).
+    let rest = label
+        .split_once(char::is_whitespace)
+        .map(|(_, r)| r.trim())
+        .unwrap_or("");
+    // Drop a trailing " (role)" annotation; the last " (" can't fall inside the
+    // quoted description, which closes with `"` before the annotation begins.
+    match rest.rsplit_once(" (") {
+        Some((core, _)) if rest.ends_with(')') => core.trim().to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simplify_marker_labels;
+
+    #[test]
+    fn simplifies_jj_marker_labels() {
+        let input = "\
+<<<<<<< lywxrykm c2eece18 \"foo\" (rebase destination)
+keep ours
+=======
+keep theirs
+>>>>>>> mswnszso df01ec69 \"bar\" (rebased revision)
+";
+        let expected = "\
+<<<<<<< c2eece18 \"foo\"
+keep ours
+=======
+keep theirs
+>>>>>>> df01ec69 \"bar\"
+";
+        assert_eq!(simplify_marker_labels(input, 7), expected);
+    }
+
+    #[test]
+    fn handles_missing_description_and_bare_separator() {
+        let input = "<<<<<<< abcdefgh 1234abcd (rebase destination)\n=======\n";
+        let expected = "<<<<<<< 1234abcd\n=======\n";
+        assert_eq!(simplify_marker_labels(input, 7), expected);
+    }
 }

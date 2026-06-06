@@ -1065,28 +1065,39 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
                 DragOrigin::Trash => {
                     // Restoring a trashed commit: graft it back into the chain at
-                    // the drop gap, drop it from the trash, and select it.
-                    let info = trashed.borrow().get(from as usize).cloned();
-                    let Some(info) = info else {
-                        return false;
-                    };
-                    let plan = repo.borrow().plan_restore(&commits.borrow(), &info, to);
-                    let Some(mv) = plan else {
-                        return false;
-                    };
-                    if let Err(err) = repo.borrow_mut().restore_commit(
-                        &mv.target,
-                        mv.new_parents,
-                        mv.new_children,
-                        &mv.new_tip,
-                    ) {
-                        show_status(&format!("Restore failed: {err}"));
-                        return false;
-                    }
-                    trashed.borrow_mut().remove(from as usize);
-                    *selected_change.borrow_mut() = Some(info.change_id_hex());
-                    refresh();
-                    populate_trash(&trash_list, &trashed.borrow());
+                    // the drop gap, drop it from the trash, and select it. Deferred
+                    // to an idle tick (see `defer_drop` note below) because the
+                    // repopulate resizes the content-sized trash panel, which is
+                    // unsafe to do while the drop event is still on the stack.
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let trashed = trashed.clone();
+                    let trash_list = trash_list.clone();
+                    let selected_change = selected_change.clone();
+                    glib::idle_add_local_once(move || {
+                        let Some(info) = trashed.borrow().get(from as usize).cloned() else {
+                            return;
+                        };
+                        let plan = repo.borrow().plan_restore(&commits.borrow(), &info, to);
+                        let Some(mv) = plan else {
+                            return;
+                        };
+                        if let Err(err) = repo.borrow_mut().restore_commit(
+                            &mv.target,
+                            mv.new_parents,
+                            mv.new_children,
+                            &mv.new_tip,
+                        ) {
+                            show_status(&format!("Restore failed: {err}"));
+                            return;
+                        }
+                        trashed.borrow_mut().remove(from as usize);
+                        *selected_change.borrow_mut() = Some(info.change_id_hex());
+                        refresh();
+                        populate_trash(&trash_list, &trashed.borrow());
+                    });
                     true
                 }
             }
@@ -1166,24 +1177,36 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Ok(from) = value.get::<i32>() else {
                 return false;
             };
-            let info = commits.borrow().get(from as usize).cloned();
-            let Some(info) = info else {
-                return false;
-            };
-            // Only commits on the current branch's linear chain (and not its sole
-            // commit) can be dropped; refuse merges/off-branch/root rows.
-            let target = repo.borrow().plan_drop(&commits.borrow(), from as usize);
-            let Some(target) = target else {
-                show_status("Can't drop this commit");
-                return false;
-            };
-            if let Err(err) = repo.borrow_mut().abandon_commit(&target) {
-                show_status(&format!("Drop failed: {err}"));
-                return false;
-            }
-            trashed.borrow_mut().push(info);
-            refresh();
-            populate_trash(&trash_list, &trashed.borrow());
+            // Defer the rewrite + repopulate to an idle tick. Rebuilding the trash
+            // list resizes the panel (it sizes to its contents), and doing that
+            // synchronously inside the drop event re-enters GTK's layout while the
+            // drag-and-drop machinery is still unwinding — a use-after-free crash.
+            // Running it once the drop has returned is safe.
+            let repo = repo.clone();
+            let commits = commits.clone();
+            let refresh = refresh.clone();
+            let show_status = show_status.clone();
+            let trashed = trashed.clone();
+            let trash_list = trash_list.clone();
+            glib::idle_add_local_once(move || {
+                let Some(info) = commits.borrow().get(from as usize).cloned() else {
+                    return;
+                };
+                // Only commits on the current branch's linear chain (and not its
+                // sole commit) can be dropped; refuse merges/off-branch/root rows.
+                let target = repo.borrow().plan_drop(&commits.borrow(), from as usize);
+                let Some(target) = target else {
+                    show_status("Can't drop this commit");
+                    return;
+                };
+                if let Err(err) = repo.borrow_mut().abandon_commit(&target) {
+                    show_status(&format!("Drop failed: {err}"));
+                    return;
+                }
+                trashed.borrow_mut().push(info);
+                refresh();
+                populate_trash(&trash_list, &trashed.borrow());
+            });
             true
         }
     });

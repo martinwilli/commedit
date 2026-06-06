@@ -73,6 +73,12 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   rewrite transaction — both because the head commit isn't always rewritten, and
   so `finish_mutation` can read the new tip back from the bookmark to scope its
   conflict walk.
+- `abandon_commit` / `restore_commit` (`rewrite.rs`) + `plan_drop` /
+  `plan_restore` (`history.rs`) — drag-to-trash and drag-back. Dropping records
+  an abandon and rebases children onto the commit's parent; the abandoned commit
+  object lingers in the ODB (kept reachable so a later restore can graft it
+  back). Restore reuses the `reorder_commit` body. Both share the same
+  plan-then-rebase shape as reorder.
 
 ### Conflict resolution (`conflict.rs`)
 

@@ -6,18 +6,23 @@
 comm(ed)it is a GTK4 desktop application for editing the history of a git
 repository directly and visually — not just the latest commit, but any commit
 in the graph. Browse the history like in `gitk`, pick a commit, and edit its
-message or the actual content of the files it changed. Saving rewrites that
-commit in place and automatically rebases its descendants, so a one-line fix
-deep in the history is a couple of clicks rather than an interactive-rebase
-session.
+message, its author/committer identity and dates, or the actual content of the
+files it changed. Saving rewrites that commit in place and automatically rebases
+its descendants, so a one-line fix deep in the history is a couple of clicks
+rather than an interactive-rebase session.
+
+<p align="center">
+  <img src="assets/diffview.png" alt="comm(ed)it editing a commit: history list, identity fields, and an editable diff" width="800">
+</p>
 
 The file changes are presented as an editable unified diff. Editing is
 *structured*: a firewall intercepts every change to the diff so the result is
 always a patch that still applies — typing on a context line splits it into a
 removed/added pair, deleting a removed line restores it, and `@@` headers stay
 read-only. Each hunk carries an *expand context* control to reveal more of the
-surrounding file. The intent is that you edit hunks intuitively while never
-producing a broken patch.
+surrounding file, and the diff is syntax-highlighted per file type with changed
+words tinted within each line. The intent is that you edit hunks intuitively
+while never producing a broken patch.
 
 You can also **reorder** commits by dragging them in the history, or **drop**
 one into the trash (and drag it back to restore it). A reorder or drop is a
@@ -25,9 +30,12 @@ real rebase, so it can conflict. When it does, comm(ed)it never writes the
 conflict into your git history: the rewrite is held back — `git` still sees your
 original, untouched history — and the conflicted files are shown right in the
 diff pane with `<<<<<<<` / `=======` / `>>>>>>>` markers. Resolve each by hand or
-with the *Use ours / theirs / both* buttons; the rewrite is applied to git
-automatically once every conflict is gone, or you can abort it and leave history
-exactly as it was.
+with the *Use ours / theirs / both* buttons. When a rewrite conflicts across
+several files you resolve them one at a time, saving each in turn; the rewrite
+is applied to git automatically once the last conflict is cleared, or you can
+abort it and leave history exactly as it was. Some conflicts are structural
+(a directory, symlink, or submodule rather than text) and can't be resolved in
+the diff pane — for those, aborting the rewrite is the only way out.
 
 ## Building and running
 
@@ -60,6 +68,11 @@ rewrite logic carries no GTK dependency.
 This project has been completely vibe-coded. It rewrites git history, and it may
 eat your commits and your git repository. Use it only on repositories you can
 afford to lose, and keep a backup.
+
+As a recovery anchor, on startup comm(ed)it prints the commit your branch
+pointed at when you opened it — `commedit: use git reset --hard <id> to undo
+this session` — so you can roll the whole session back from the command line if
+a rewrite goes wrong.
 
 ## License
 

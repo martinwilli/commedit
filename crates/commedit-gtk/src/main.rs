@@ -1693,12 +1693,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let exit_conflict_mode = exit_conflict_mode.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
+        let list = list.clone();
         move |_| {
             if let Err(err) = repo.borrow_mut().abort() {
                 show_status(&format!("Abort failed: {err}"));
                 return;
             }
             exit_conflict_mode();
+            // The aborted commit is still selected, so `refresh` re-selecting it
+            // (rows are reused, not rebuilt) wouldn't re-fire `row-selected` —
+            // leaving the diff pane showing the abandoned conflict markers until
+            // the user clicks away and back. Drop the selection first so the
+            // reselect fires and reloads the now-conflict-free diff.
+            list.unselect_all();
             refresh();
             show_status("Rewrite aborted — history unchanged.");
         }

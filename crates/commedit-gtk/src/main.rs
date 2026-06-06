@@ -12,7 +12,7 @@ use commedit_engine::diff::{
     apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, render_diff, ChangeKind,
     ConflictLineKind, ContextExpansion, DiffLineKind, FileChange, HunkInfo,
 };
-use commedit_engine::history::{history, CommitInfo};
+use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
     collapse_diff, deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
 };
@@ -32,6 +32,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 const APP_ID: &str = "net.willi.commedit";
+
+/// How many history rows to load per page. The list starts with one page and
+/// grows by another whenever the user scrolls near the bottom (see the
+/// `history_scroll` edge handler), so opening a deep repo stays cheap.
+const HISTORY_PAGE: usize = 64;
 
 /// A reference-counted, re-entrant "render the current diff" callback. Boxed so
 /// the embedded expand-context buttons can hold and invoke it after they widen a
@@ -468,6 +473,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Shared UI state.
     let commits: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // How many history rows the normal (non-conflict) view currently loads, and
+    // whether older commits remain below them. `refresh` reads the limit and sets
+    // the flag; scrolling near the bottom bumps the limit by `HISTORY_PAGE`.
+    let history_limit: Rc<Cell<usize>> = Rc::new(Cell::new(HISTORY_PAGE));
+    let history_has_more: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let selected_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let changes: Rc<RefCell<Vec<FileChange>>> = Rc::new(RefCell::new(Vec::new()));
     let current_file: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -1477,14 +1487,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let list = list.clone();
         let selected_change = selected_change.clone();
         let identities = identities.clone();
+        let history_limit = history_limit.clone();
+        let history_has_more = history_has_more.clone();
         Rc::new(move || {
-            let loaded = {
+            let (loaded, has_more) = {
                 let r = repo.borrow();
                 match r.head_commit_id() {
-                    Some(head) => history(&r.repo, &head).unwrap_or_default(),
-                    None => Vec::new(),
+                    Some(head) => history_limited(&r.repo, &head, history_limit.get())
+                        .unwrap_or_default(),
+                    None => (Vec::new(), false),
                 }
             };
+            history_has_more.set(has_more);
             *commits.borrow_mut() = loaded;
             {
                 let cs = commits.borrow();
@@ -1518,6 +1532,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         })
     };
+
+    // Lazy paging: when the user scrolls to the bottom of the history and older
+    // commits remain, load another page and rebuild. Only in the normal diff view
+    // — conflict mode populates the list from a different (unbounded) walk, so we
+    // must not let a scroll clobber it. The grown limit persists across refreshes.
+    history_scroll.connect_edge_reached({
+        let history_limit = history_limit.clone();
+        let history_has_more = history_has_more.clone();
+        let pane_mode = pane_mode.clone();
+        let refresh = refresh.clone();
+        move |_, pos| {
+            if pos != gtk::PositionType::Bottom
+                || !history_has_more.get()
+                || !matches!(&*pane_mode.borrow(), PaneMode::Diff)
+            {
+                return;
+            }
+            history_limit.set(history_limit.get() + HISTORY_PAGE);
+            refresh();
+        }
+    });
 
     // Rebuild the history list from jj's pending (not-yet-exported) head while a
     // conflicted rewrite is being resolved, badging the still-conflicted commits

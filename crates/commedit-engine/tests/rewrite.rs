@@ -3,9 +3,39 @@
 
 mod common;
 
-use commedit_engine::history::history;
+use commedit_engine::history::{history, history_limited};
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
+
+#[test]
+fn history_limited_pages_newest_first_and_flags_more() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+            ("d.txt", "d\n", "fourth"),
+        ],
+    );
+
+    let repo = Repo::open(dir).expect("open");
+    let head = repo.head_commit_id().expect("head");
+
+    // A short page returns the newest commits and reports more below it.
+    let (page, has_more) = history_limited(&repo.repo, &head, 2).expect("history");
+    assert!(has_more);
+    let subjects: Vec<&str> = page.iter().map(|c| c.subject.as_str()).collect();
+    assert_eq!(subjects, vec!["fourth", "third"]);
+
+    // A limit at or above the history length loads everything and flags no more,
+    // matching the unbounded walk.
+    let (all, has_more) = history_limited(&repo.repo, &head, 10).expect("history");
+    assert!(!has_more);
+    assert_eq!(all.len(), history(&repo.repo, &head).unwrap().len());
+}
 
 #[test]
 fn rewrites_middle_commit_message_visible_to_git() {

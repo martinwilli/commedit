@@ -94,6 +94,19 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
 /// `git_head()` (which lags behind a rewrite until re-imported) keeps the view
 /// current without resurfacing stale, pre-rewrite commits.
 pub fn history(repo: &ReadonlyRepo, head: &CommitId) -> Result<Vec<CommitInfo>> {
+    Ok(history_limited(repo, head, usize::MAX)?.0)
+}
+
+/// Like [`history`], but stop after `limit` commits. Returns the loaded prefix
+/// (newest first) together with a flag that is `true` when more commits remain
+/// below it — i.e. the walk was cut short by the limit rather than reaching the
+/// root. The revset iterates newest-first lazily, so the cost is `O(limit)`, not
+/// `O(history length)`: this is what lets the UI page a deep history in chunks.
+pub fn history_limited(
+    repo: &ReadonlyRepo,
+    head: &CommitId,
+    limit: usize,
+) -> Result<(Vec<CommitInfo>, bool)> {
     let symbol_resolver =
         SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
     let expression = RevsetExpression::commits(vec![head.clone()])
@@ -107,15 +120,20 @@ pub fn history(repo: &ReadonlyRepo, head: &CommitId) -> Result<Vec<CommitInfo>> 
     let store = repo.store();
     let root = store.root_commit_id().clone();
     let mut commits = Vec::new();
+    let mut has_more = false;
     for entry in revset.commit_change_ids() {
         let (id, _change_id) = entry.context("iterating history")?;
         if id == root {
             continue;
         }
+        if commits.len() >= limit {
+            has_more = true;
+            break;
+        }
         let commit = store.get_commit(&id).context("loading commit")?;
         commits.push(CommitInfo::from_commit(&commit));
     }
-    Ok(commits)
+    Ok((commits, has_more))
 }
 
 /// A single-commit reorder, in the terms [`crate::repo::Repo::reorder_commit`]

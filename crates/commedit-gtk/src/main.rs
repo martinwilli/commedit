@@ -97,11 +97,40 @@ enum Side {
 /// lines — the same idiom as the diff view's "expand context" cue. Clicking the
 /// marker line keeps the indicated side(s) and drops the markers: "use ours"
 /// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
-const CUE_OURS: &str = " ➜ use ours ";
-const CUE_BOTH: &str = " ➜ use both ";
-const CUE_THEIRS: &str = " ➜ use theirs ";
-/// The glyph that introduces every cue, used to locate it for highlighting.
-const CUE_GLYPH: char = '➜';
+const CUE_OURS: &str = " ◖ ➜ use ours ◗";
+const CUE_BOTH: &str = " ◖ ➜ use both ◗";
+const CUE_THEIRS: &str = " ◖ ➜ use theirs ◗";
+/// The rounded end-caps that make a cue read as a pill-shaped button. Painted as
+/// a filled half-disc in the button colour against the line background, they
+/// round off the left/right ends of the solid-fill body that sits between them.
+/// The left cap also marks where the clickable button begins.
+const CUE_CAP_L: char = '◖';
+const CUE_CAP_R: char = '◗';
+
+/// Wrap a cue label in the pill caps, e.g. `↕ expand context` -> `◖ ↕ expand context ◗`.
+fn pill(label: &str) -> String {
+    format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
+}
+
+/// Paint the inline pill button on `raw` (buffer line `line`): the two end-caps
+/// get `cap_tag` (a coloured half-disc on the line background), the run between
+/// them gets `body_tag` (the solid button fill). No-op if the line has no caps.
+fn paint_pill(buffer: &sourceview5::Buffer, line: i32, raw: &str, cap_tag: &str, body_tag: &str) {
+    let (Some(lpos), Some(rpos)) = (raw.find(CUE_CAP_L), raw.rfind(CUE_CAP_R)) else {
+        return;
+    };
+    let table = buffer.tag_table();
+    let (Some(cap), Some(body)) = (table.lookup(cap_tag), table.lookup(body_tag)) else {
+        return;
+    };
+    let lc = raw[..lpos].chars().count() as i32;
+    let rc = raw[..rpos].chars().count() as i32;
+    apply_cols(buffer, line, lc, lc + 1, &cap);
+    if rc > lc + 1 {
+        apply_cols(buffer, line, lc + 1, rc, &body);
+    }
+    apply_cols(buffer, line, rc, rc + 1, &cap);
+}
 
 /// The inline cue text and the side it resolves to for a marker line, or `None`
 /// for a non-marker (content) line.
@@ -124,8 +153,40 @@ fn conflict_cue_side_at(text: &str, line: usize, col: usize) -> Option<Side> {
         .copied()
         .and_then(resolve_cue)?;
     let line_text = text.split('\n').nth(line).unwrap_or("");
-    let byte = line_text.find(CUE_GLYPH)?;
+    let byte = line_text.find(CUE_CAP_L)?;
     (col >= line_text[..byte].chars().count()).then_some(side)
+}
+
+/// The hunk group range to widen for a click/hover at buffer `(line, col)`, if it
+/// lands on an expandable `@@` header's inline pill cue. `line_text` is that
+/// line's text. The single hit test shared by the expand click and the hover
+/// cursor, restricting both to the pill rather than the whole header line.
+fn expand_cue_at(
+    hunks: &[HunkInfo],
+    line_text: &str,
+    line: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    let cap = line_text.find(CUE_CAP_L)?;
+    if col < line_text[..cap].chars().count() {
+        return None;
+    }
+    hunks
+        .iter()
+        .find(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
+        .map(|h| (h.first_group, h.last_group))
+}
+
+/// The text of buffer `line` (without its trailing newline).
+fn buffer_line_text(buffer: &sourceview5::Buffer, line: usize) -> String {
+    let Some(start) = buffer.iter_at_line(line as i32) else {
+        return String::new();
+    };
+    let mut end = start;
+    if !end.ends_line() {
+        end.forward_to_line_end();
+    }
+    buffer.text(&start, &end, false).to_string()
 }
 
 /// Append the inline quick-resolve cue to each conflict-marker line of the
@@ -752,15 +813,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // not embed a real widget in the buffer, because removing it during
             // the next `set_text` crashes GTK.
             for hunk in &rendered.hunks {
-                let cue = match (hunk.can_expand_up, hunk.can_expand_down) {
-                    (true, true) => "    ↕ expand context",
-                    (true, false) => "    ↑ expand context",
-                    (false, true) => "    ↓ expand context",
+                let label = match (hunk.can_expand_up, hunk.can_expand_down) {
+                    (true, true) => "↕ expand context",
+                    (true, false) => "↑ expand context",
+                    (false, true) => "↓ expand context",
                     (false, false) => continue,
                 };
                 if let Some(mut iter) = file_buffer.iter_at_line(hunk.header_line as i32) {
                     iter.forward_to_line_end();
-                    file_buffer.insert(&mut iter, cue);
+                    file_buffer.insert(&mut iter, &format!("  {}", pill(label)));
                 }
             }
             *rendered_hunks.borrow_mut() = rendered.hunks.clone();
@@ -822,11 +883,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 });
                 return;
             }
-            let hit = rendered_hunks
-                .borrow()
-                .iter()
-                .find(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
-                .map(|h| (h.first_group, h.last_group));
+            // Only the inline pill cue is clickable, not the whole @@ header.
+            let col = iter.line_offset() as usize;
+            let line_text = buffer_line_text(&file_buffer, line);
+            let hit = expand_cue_at(&rendered_hunks.borrow(), &line_text, line, col);
             let Some((first, last)) = hit else { return };
             let Some(path) = current_file.borrow().clone() else {
                 return;
@@ -902,8 +962,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_view.add_controller(expand_click);
 
     // Hover cursor: show a hand over the clickable affordances — the conflict
-    // "➜ use …" buttons and the diff "expand context" cues (the whole expandable
-    // @@ header line, which is what the click acts on) — and the text I-beam
+    // "use …" buttons and the diff "expand context" pills — and the text I-beam
     // everywhere else. GtkTextView otherwise only ever shows the I-beam over
     // content; we override it per the gtk hypertext pattern (set the widget
     // cursor from the motion handler). A `Cell` tracks the current state so we
@@ -921,14 +980,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
             let over_button = file_view.iter_at_location(bx, by).is_some_and(|iter| {
                 let line = iter.line() as usize;
+                let col = iter.line_offset() as usize;
                 if pane_mode.borrow().is_conflict() {
                     let text = buffer_text(&file_buffer);
-                    conflict_cue_side_at(&text, line, iter.line_offset() as usize).is_some()
+                    conflict_cue_side_at(&text, line, col).is_some()
                 } else {
-                    rendered_hunks
-                        .borrow()
-                        .iter()
-                        .any(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
+                    let line_text = buffer_line_text(&file_buffer, line);
+                    expand_cue_at(&rendered_hunks.borrow(), &line_text, line, col).is_some()
                 }
             });
             if over_button != hover_hand.get() {
@@ -2190,11 +2248,6 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
     add("meta", &|t| t.set_foreground(Some("#6e7781")));
     add("add-word", &|t| t.set_background(Some("#abf2bc")));
     add("del-word", &|t| t.set_background(Some("#ffc0bd")));
-    // The clickable "expand context" cue appended to expandable @@ headers.
-    add("expand-hint", &|t| {
-        t.set_foreground(Some("#0969da"));
-        t.set_weight(700);
-    });
     // Conflict-resolution pane: "our" side, "their" side, and the marker lines.
     add("ours-line", &|t| t.set_paragraph_background(Some("#e6ffec")));
     add("theirs-line", &|t| t.set_paragraph_background(Some("#ddf4ff")));
@@ -2204,14 +2257,28 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
-    // The inline conflict quick-resolve cue ("➜ use ours/theirs/both"), styled as
-    // a solid button — white on red — over just the cue's own character run.
-    // Added last so it outranks `conflict-marker` (GTK tag priority follows tag
-    // table insertion order), keeping the white text from being overridden by the
-    // marker line's red foreground.
+    // Inline pill buttons (the conflict "use …" cues and the diff "expand context"
+    // cues). Each is an inverse of its host line: a solid body filled in the
+    // line's accent colour with the line's background colour as text, end-capped
+    // by half-disc glyphs drawn in the body colour on the bare line background so
+    // they round the ends. Added last so the body's text colour outranks the host
+    // line's own foreground (GTK tag priority follows tag-table insertion order).
     add("resolve-cue", &|t| {
         t.set_background(Some("#cf222e"));
-        t.set_foreground(Some("#ffffff"));
+        t.set_foreground(Some("#ffd7d5"));
+        t.set_weight(700);
+    });
+    add("resolve-cue-cap", &|t| {
+        t.set_foreground(Some("#cf222e"));
+        t.set_weight(700);
+    });
+    add("expand-cue", &|t| {
+        t.set_background(Some("#0550ae"));
+        t.set_foreground(Some("#ddf4ff"));
+        t.set_weight(700);
+    });
+    add("expand-cue-cap", &|t| {
+        t.set_foreground(Some("#0550ae"));
         t.set_weight(700);
     });
 }
@@ -2261,18 +2328,8 @@ fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxS
             DiffLineKind::Hunk => {
                 old_hl = HighlightLines::new(syntax, theme);
                 new_hl = HighlightLines::new(syntax, theme);
-                // Accent the trailing "expand context" cue (everything past the
-                // closing `@@`) so it reads as a clickable control.
-                if let Some(pos) = raw.rfind("@@") {
-                    let cue_start = pos + 2;
-                    if cue_start < raw.len() {
-                        if let Some(tag) = buffer.tag_table().lookup("expand-hint") {
-                            let cs = raw[..cue_start].chars().count() as i32;
-                            let ce = raw.chars().count() as i32;
-                            apply_cols(buffer, li as i32, cs, ce, &tag);
-                        }
-                    }
-                }
+                // Paint the trailing "expand context" cue as a pill button.
+                paint_pill(buffer, li as i32, raw, "expand-cue-cap", "expand-cue");
                 continue;
             }
             DiffLineKind::Header | DiffLineKind::Meta => continue,
@@ -2361,16 +2418,8 @@ fn highlight_conflict(
             // A marker line is structural; reset the syntax parser so the next
             // region starts clean, and don't language-color the marker itself.
             hl = HighlightLines::new(syntax, theme);
-            // Paint the trailing "use ours/theirs/both" cue as a solid button so
-            // it reads as the clickable control (the click gesture restricts to
-            // this same region).
-            if let Some(byte) = raw.find(CUE_GLYPH) {
-                if let Some(tag) = buffer.tag_table().lookup("resolve-cue") {
-                    let cs = raw[..byte].chars().count() as i32;
-                    let ce = raw.chars().count() as i32;
-                    apply_cols(buffer, li as i32, cs, ce, &tag);
-                }
-            }
+            // Paint the trailing "use ours/theirs/both" cue as a pill button.
+            paint_pill(buffer, li as i32, raw, "resolve-cue-cap", "resolve-cue");
             continue;
         }
         // Unlike a unified diff, conflict lines carry no prefix char — column 0

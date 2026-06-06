@@ -112,7 +112,18 @@ fn buffer_selection(buffer: &sourceview5::Buffer) -> Selection {
 
 /// Apply a planned [`PatchEdit`] as a single undo step. The `editing` guard marks
 /// the mutation as our own so the firewall signal handlers let it through.
-fn apply_patch_edit(buffer: &sourceview5::Buffer, editing: &Rc<Cell<bool>>, edit: &PatchEdit) {
+///
+/// A structured edit can change a line's diff *kind* — splitting a context line
+/// into a `-orig`/`+edited` pair, or toggling a prefix — so it must re-highlight.
+/// Because the `editing` guard suppresses the buffer's debounced `changed`
+/// re-highlight (to avoid double work on a full render), do it here synchronously
+/// once the guard is cleared, so the new `+`/`-` line is colored immediately.
+fn apply_patch_edit(
+    buffer: &sourceview5::Buffer,
+    editing: &Rc<Cell<bool>>,
+    edit: &PatchEdit,
+    highlight: &dyn Fn(),
+) {
     editing.set(true);
     buffer.begin_user_action();
     let mut start = iter_at(buffer, &edit.start);
@@ -124,6 +135,7 @@ fn apply_patch_edit(buffer: &sourceview5::Buffer, editing: &Rc<Cell<bool>>, edit
     editing.set(false);
     let cursor = iter_at(buffer, &edit.cursor);
     buffer.place_cursor(&cursor);
+    highlight();
 }
 
 /// The fraction of the visible height at which buffer `line`'s top currently
@@ -674,6 +686,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_buffer.connect_insert_text({
         let editing = editing.clone();
         let show_status = show_status.clone();
+        let highlight = highlight.clone();
         move |buffer, iter, text| {
             if editing.get() {
                 return;
@@ -690,7 +703,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
                 EditPlan::Edit(edit) => {
                     buffer.stop_signal_emission_by_name("insert-text");
-                    apply_patch_edit(buffer, &editing, &edit);
+                    apply_patch_edit(buffer, &editing, &edit, &*highlight);
                 }
             }
         }
@@ -729,6 +742,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_view = file_view.clone();
         let editing = editing.clone();
         let show_status = show_status.clone();
+        let highlight = highlight.clone();
         move |_, keyval, _, _| {
             if !file_view.is_editable() {
                 return glib::Propagation::Proceed;
@@ -746,7 +760,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     glib::Propagation::Stop
                 }
                 EditPlan::Edit(edit) => {
-                    apply_patch_edit(&file_buffer, &editing, &edit);
+                    apply_patch_edit(&file_buffer, &editing, &edit, &*highlight);
                     glib::Propagation::Stop
                 }
             }

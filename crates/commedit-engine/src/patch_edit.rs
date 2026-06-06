@@ -380,6 +380,10 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
                 }
             }
         }
+        // A selection of whole `+` line(s) removes them outright.
+        if let Some(edit) = delete_added_lines(lines, lo, hi) {
+            return EditPlan::Edit(edit);
+        }
         return EditPlan::Block;
     }
     let caret = sel.end;
@@ -425,6 +429,40 @@ fn delete_from_context(line: &str, l: usize, s: usize, e: usize) -> PatchEdit {
         replacement: format!("-{body}\n+{edited}"),
         cursor: Cursor::at(l + 1, 1 + s),
     }
+}
+
+/// Delete the whole `+` line(s) a selection spans, when it starts at a line
+/// boundary and runs to one — the end of the last line's content, or the start
+/// of the line after it. Returns `None` unless every spanned line is a non-empty
+/// added line *and* the span covers them whole, so a partial selection never
+/// drags the rest of a line with it. Dropping `+` lines is always patch-safe:
+/// they are purely additive, so removing them just un-adds that content.
+fn delete_added_lines(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit> {
+    if lo.col != 0 {
+        return None; // selection doesn't start at a line boundary
+    }
+    let last = if hi.col == 0 {
+        hi.line.checked_sub(1)? // ends at the start of hi.line: exclude it
+    } else if hi.col >= char_len(lines.get(hi.line).copied()?) {
+        hi.line // ends at the end of hi.line's content: include it whole
+    } else {
+        return None; // last line only partially selected
+    };
+    if last < lo.line || last >= lines.len() {
+        return None;
+    }
+    if lines[lo.line..=last]
+        .iter()
+        .any(|l| l.is_empty() || classify_line(l) != DiffLineKind::Added)
+    {
+        return None;
+    }
+    Some(PatchEdit {
+        start: Cursor::at(lo.line, 0),
+        end: Cursor::at(last + 1, 0),
+        replacement: String::new(),
+        cursor: Cursor::at(lo.line, 0),
+    })
 }
 
 fn toggle_prefix(l: usize, new_prefix: char, col: usize) -> EditPlan {
@@ -848,6 +886,59 @@ mod tests {
         let patch = sample();
         let a = line_index(&patch, |l| l == " a");
         let plan = plan_edit(&patch, sel((a, 1), (a + 2, 1)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
+    }
+
+    #[test]
+    fn selection_deletes_a_whole_added_line() {
+        let patch = unified_diff("a\n", "a\nb\nc\n", "f");
+        let lb = line_index(&patch, |l| l == "+b");
+        // Select the whole "+b" line, including its trailing newline.
+        let plan = plan_edit(&patch, sel((lb, 0), (lb + 1, 0)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(!out.contains("+b"), "the line is gone:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nc\n");
+    }
+
+    #[test]
+    fn selection_deletes_a_whole_added_line_to_content_end() {
+        let patch = unified_diff("a\n", "a\nb\nc\n", "f");
+        let lb = line_index(&patch, |l| l == "+b");
+        // Select "+b" from its start to the end of its content (no newline) — as a
+        // line-select gesture yields — and delete it.
+        let plan = plan_edit(&patch, sel((lb, 0), (lb, 2)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(!out.contains("+b"), "the line is gone:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nc\n");
+    }
+
+    #[test]
+    fn selection_deletes_multiple_added_lines() {
+        let patch = unified_diff("a\n", "a\nb\nc\nd\n", "f");
+        let lb = line_index(&patch, |l| l == "+b");
+        // Select whole "+b" and "+c" (start of +b through start of +d).
+        let plan = plan_edit(&patch, sel((lb, 0), (lb + 2, 0)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(!out.contains("+b") && !out.contains("+c"), "both gone:\n{out}");
+        assert!(out.contains("+d\n"), "the untouched line stays:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nd\n");
+    }
+
+    #[test]
+    fn selection_spanning_a_context_line_is_blocked() {
+        // Whole-line deletion only applies when every spanned line is added.
+        let patch = unified_diff("a\n", "a\nb\n", "f");
+        let la = line_index(&patch, |l| l == " a");
+        let plan = plan_edit(&patch, sel((la, 0), (la + 2, 0)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
+    }
+
+    #[test]
+    fn partial_added_line_from_start_is_not_whole_deleted() {
+        // From a line boundary but stopping mid-content: must not eat the rest.
+        let patch = unified_diff("a\n", "a\nbcde\n", "f");
+        let lb = line_index(&patch, |l| l == "+bcde");
+        let plan = plan_edit(&patch, sel((lb, 0), (lb, 2)), EditGesture::Delete);
         assert_eq!(plan, EditPlan::Block);
     }
 

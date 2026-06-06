@@ -196,19 +196,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // pane. Dropping a commit here removes it from the branch; it stays listed so
     // it can be dragged back into the history above to restore it.
     let trash_list = ListBox::new();
+    // Size the panel to its contents (so it grows as commits pile up) but cap it
+    // so a full trash can never swallow the history list above; past the cap it
+    // scrolls.
     let trash_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
-        .height_request(140)
+        .propagate_natural_height(true)
+        .max_content_height(280)
         .child(&trash_list)
         .build();
-    let trash_header = Label::builder()
-        .label("Trash")
-        .xalign(0.0)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(4)
-        .margin_bottom(2)
-        .build();
+    let trash_header = gtk::Image::from_icon_name("user-trash-symbolic");
+    trash_header.set_halign(gtk::Align::Start);
+    trash_header.set_margin_start(8);
+    trash_header.set_margin_end(8);
+    trash_header.set_margin_top(4);
+    trash_header.set_margin_bottom(2);
+    trash_header.set_tooltip_text(Some("Trash — drop commits here to remove them"));
     trash_header.add_css_class("dim-label");
     let trash_box = GtkBox::new(Orientation::Vertical, 0);
     trash_box.append(&gtk::Separator::new(Orientation::Horizontal));

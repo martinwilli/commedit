@@ -29,3 +29,9 @@ and `git` itself see an ordinary, attached-HEAD git repository the whole time.
 The code is split into a headless `commedit-engine` crate (all repository logic,
 unit-tested against scratch repos) and a `commedit-gtk` crate (the UI), so the
 rewrite logic carries no GTK dependency.
+
+## Disclaimer
+
+This project has been completely vibe-coded. It rewrites git history, and it may
+eat your commits and your git repository. Use it only on repositories you can
+afford to lose, and keep a backup.

@@ -4,7 +4,7 @@
 //! the git backend is synchronous under the hood, so we drive them to
 //! completion with [`pollster::block_on`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -148,6 +148,39 @@ impl Repo {
     /// so the working tree can be synced to the new tip afterwards.
     pub(crate) fn head_commit(&self) -> Option<String> {
         crate::transparency::head_commit(self.workspace.workspace_root())
+    }
+
+    /// The current git HEAD commit id (hex), for display and recovery — e.g.
+    /// printed on startup so the user can `git reset --hard <id>` if a rewrite
+    /// goes wrong.
+    pub fn head_commit_hex(&self) -> Option<String> {
+        self.head_commit()
+    }
+
+    /// Snapshot every local branch (`refs/heads/*`) as git sees it now, to pair
+    /// with [`Self::protect_unrelated_heads`] across a rewrite.
+    pub(crate) fn snapshot_heads(&self) -> BTreeMap<String, String> {
+        crate::transparency::local_head_oids(self.workspace.workspace_root())
+    }
+
+    /// Backstop the per-bookmark confinement at the git-ref level: restore any
+    /// local branch other than the checked-out one to its pre-rewrite commit
+    /// (`before`), reverting an unintended move the ref export may have made.
+    /// Logs to stderr when it intervenes, so any remaining leak is visible
+    /// rather than silently corrupting an unrelated (e.g. backup) branch.
+    pub(crate) fn protect_unrelated_heads(&self, before: &BTreeMap<String, String>) {
+        let restored = crate::transparency::restore_unrelated_heads(
+            self.workspace.workspace_root(),
+            self.git_head_branch.as_deref(),
+            before,
+        );
+        if !restored.is_empty() {
+            eprintln!(
+                "commedit: reverted unintended move of branch(es) {}; \
+                 only the current branch is rewritten",
+                restored.join(", ")
+            );
+        }
     }
 
     /// HEAD as a [`CommitId`] — the tip of the branch being edited, used to scope

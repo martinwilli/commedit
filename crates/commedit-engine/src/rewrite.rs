@@ -34,6 +34,7 @@ impl Repo {
     pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<()> {
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
         let commit = self
             .repo
             .store()
@@ -56,6 +57,7 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: edit commit message"))
             .context("committing rewrite")?;
         self.reattach_head()?;
+        self.protect_unrelated_heads(&heads);
         self.sync_worktree(old_head.clone())?;
         if let Some(old) = old_head {
             self.prune_orphaned_keep_refs(&old);
@@ -72,6 +74,7 @@ impl Repo {
     pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<()> {
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
         let commit = self
             .repo
             .store()
@@ -105,6 +108,7 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: edit commit identity"))
             .context("committing rewrite")?;
         self.reattach_head()?;
+        self.protect_unrelated_heads(&heads);
         self.sync_worktree(old_head.clone())?;
         if let Some(old) = old_head {
             self.prune_orphaned_keep_refs(&old);
@@ -205,6 +209,7 @@ impl Repo {
     ) -> Result<()> {
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
         let loc = MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,
@@ -235,6 +240,7 @@ impl Repo {
         transparency::export_to_git(tx.repo_mut())?;
         self.repo = pollster::block_on(tx.commit(op_msg)).context("committing splice")?;
         self.reattach_head()?;
+        self.protect_unrelated_heads(&heads);
         self.sync_worktree(old_head.clone())?;
         if let Some(old) = old_head {
             self.prune_orphaned_keep_refs(&old);
@@ -249,6 +255,7 @@ impl Repo {
     pub fn abandon_commit(&mut self, target: &CommitId) -> Result<()> {
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
         let commit = self
             .repo
             .store()
@@ -267,6 +274,7 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: drop commit"))
             .context("committing drop")?;
         self.reattach_head()?;
+        self.protect_unrelated_heads(&heads);
         self.sync_worktree(old_head.clone())?;
         if let Some(old) = old_head {
             self.prune_orphaned_keep_refs(&old);

@@ -7,6 +7,7 @@
 //! tree-level edits the rewritten commit has the same working-tree content at
 //! HEAD, so the index/worktree stay consistent and `git status` reads clean.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -107,6 +108,88 @@ pub fn prune_orphaned_keep_refs(
             "failed to prune jj keep refs: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+    Ok(())
+}
+
+/// A snapshot of every local branch (`refs/heads/*`) and the commit it points
+/// at, taken straight from git. Used as the before-image for
+/// [`restore_unrelated_heads`], the backstop that guarantees a rewrite only ever
+/// moves the checked-out branch.
+pub fn local_head_oids(workspace_root: &Path) -> BTreeMap<String, String> {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"])
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(oid, name)| (name.to_string(), oid.to_string()))
+        .collect()
+}
+
+/// Force every local branch *except* `current` (a full ref name like
+/// `refs/heads/main`) back to the commit it pointed at in `before`, undoing any
+/// move jj's ref export made to a branch other than the one being edited. This
+/// is a git-level safety net behind the jj-bookmark confinement: whatever path
+/// nudges an unrelated branch — a backup sharing the rewritten tip, a tracked
+/// bookmark, a future jj quirk — it is reverted here before the user sees it.
+///
+/// Returns the branches it had to restore (empty in the common case), so callers
+/// can surface that a leak occurred. A branch that vanished is recreated; one
+/// that merely moved is reset. No-op when `current` is `None` (detached HEAD),
+/// matching the rest of the transparency layer.
+pub fn restore_unrelated_heads(
+    workspace_root: &Path,
+    current: Option<&str>,
+    before: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let after = local_head_oids(workspace_root);
+    let mut restored = Vec::new();
+    let mut updates = String::new();
+    for (name, oid) in before {
+        if Some(name.as_str()) == current {
+            continue;
+        }
+        if after.get(name).map(String::as_str) != Some(oid.as_str()) {
+            restored.push(name.clone());
+            updates.push_str(&format!("update {name} {oid}\n"));
+        }
+    }
+    if updates.is_empty() {
+        return restored;
+    }
+    let _ = run_update_ref_stdin(workspace_root, &updates);
+    restored
+}
+
+/// Pipe `commands` to `git update-ref --stdin`. Errors are returned for the
+/// caller to log; callers treat ref bookkeeping as best-effort.
+fn run_update_ref_stdin(workspace_root: &Path, commands: &str) -> Result<()> {
+    let mut child = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning git update-ref")?;
+    child
+        .stdin
+        .take()
+        .context("git update-ref stdin")?
+        .write_all(commands.as_bytes())
+        .context("writing ref updates")?;
+    let out = child.wait_with_output().context("running git update-ref")?;
+    if !out.status.success() {
+        bail!("git update-ref failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
 }

@@ -18,6 +18,9 @@
 //! * Deleting a selection over context lines removes the whole ones (→ `-`) and
 //!   edits any half-selected line at either end, the surviving text rejoining as
 //!   a `+` line — like a plain-editor delete lifted into the diff.
+//! * Deleting the current line (Ctrl+D) toggles its role: a `+` line is dropped
+//!   outright, a context line is marked removed (` ` → `-`), and a `-` line is
+//!   restored to context (`-` → ` `) — un-removing it.
 //! * Enter on a context line keeps it and inserts an empty `+` line below.
 //! * Header / `@@` / meta lines are read-only.
 //!
@@ -41,6 +44,9 @@ pub enum EditGesture {
     Backspace,
     /// Press Delete (delete forward).
     Delete,
+    /// Delete the whole current line (Ctrl+D): drop a `+` line, mark a context
+    /// line removed, or restore a `-` line to context.
+    DeleteLine,
 }
 
 /// A caret position: `line` indexes `text.split('\n')`; `col` is a character
@@ -118,6 +124,7 @@ pub fn plan_edit(text: &str, sel: Selection, gesture: EditGesture) -> EditPlan {
         EditGesture::Newline => plan_newline(&lines, sel),
         EditGesture::Backspace => plan_delete(&lines, sel, Dir::Back),
         EditGesture::Delete => plan_delete(&lines, sel, Dir::Forward),
+        EditGesture::DeleteLine => plan_delete_line(&lines, sel),
     }
 }
 
@@ -406,6 +413,52 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
         DiffLineKind::Context => delete_in_context(line, l, caret.col, dir),
         DiffLineKind::Added => delete_in_added(lines, l, caret.col, dir),
         _ => EditPlan::Block,
+    }
+}
+
+/// Delete the whole line under the caret (Ctrl+D), toggling its diff role: a `+`
+/// line is purely additive so it's dropped outright; a context line is marked
+/// removed (` ` → `-`) so it drops from the file; a `-` line is restored to
+/// context (`-` → ` `), un-removing it. Each keeps the patch applicable. Header /
+/// `@@` / meta lines and the trailing virtual EOF line are read-only.
+fn plan_delete_line(lines: &[&str], sel: Selection) -> EditPlan {
+    let l = sel.end.line;
+    let Some(&line) = lines.get(l) else {
+        return EditPlan::Block;
+    };
+    if line.is_empty() {
+        return EditPlan::Block;
+    }
+    match classify_line(line) {
+        DiffLineKind::Added => delete_whole_added_line(lines, l),
+        DiffLineKind::Context => toggle_prefix(l, '-', sel.end.col),
+        DiffLineKind::Removed => toggle_prefix(l, ' ', sel.end.col),
+        _ => EditPlan::Block,
+    }
+}
+
+/// Drop a whole `+` line, newline and all. Removing additive content can't break
+/// the patch. Normally the line plus its trailing `\n` is taken; for a final line
+/// with no following one, the preceding `\n` is consumed instead so no blank line
+/// is left behind.
+fn delete_whole_added_line(lines: &[&str], l: usize) -> EditPlan {
+    if l + 1 < lines.len() {
+        EditPlan::Edit(PatchEdit {
+            start: Cursor::at(l, 0),
+            end: Cursor::at(l + 1, 0),
+            replacement: String::new(),
+            cursor: Cursor::at(l, 0),
+        })
+    } else if l > 0 {
+        let prev_end = char_len(lines[l - 1]);
+        EditPlan::Edit(PatchEdit {
+            start: Cursor::at(l - 1, prev_end),
+            end: Cursor::at(l, char_len(lines[l])),
+            replacement: String::new(),
+            cursor: Cursor::at(l - 1, prev_end),
+        })
+    } else {
+        EditPlan::Block
     }
 }
 
@@ -1221,6 +1274,49 @@ mod tests {
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("+bx\n+y\n"), "got:\n{out}");
         assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nbx\ny\n");
+    }
+
+    #[test]
+    fn delete_line_drops_a_whole_added_line() {
+        let patch = unified_diff("a\n", "a\nb\nc\n", "f"); // "+b" / "+c"
+        let lb = line_index(&patch, |l| l == "+b");
+        // Caret anywhere on "+b": Ctrl+D drops the line.
+        let plan = plan_edit(&patch, caret(lb, 1), EditGesture::DeleteLine);
+        let out = apply(&patch, &edit(plan));
+        assert!(!out.contains("+b") && out.contains("+c\n"), "only +b gone:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nc\n");
+    }
+
+    #[test]
+    fn delete_line_marks_a_context_line_removed() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let li = line_index(&patch, |l| l == " a");
+        let plan = plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("-a\n"), "context line removed:\n{out}");
+        // 'a' is now dropped from the file.
+        assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "B\nc\n");
+    }
+
+    #[test]
+    fn delete_line_restores_a_removed_line_to_context() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let li = line_index(&patch, |l| l == "-b");
+        let plan = plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains(" b\n") && !out.contains("-b"), "un-removed:\n{out}");
+        // 'b' is no longer dropped.
+        assert!(apply_patch("a\nb\nc\n", &out).unwrap().contains('b'));
+    }
+
+    #[test]
+    fn delete_line_on_structural_lines_is_blocked() {
+        let patch = sample();
+        let hunk = line_index(&patch, |l| l.starts_with("@@"));
+        let header = line_index(&patch, |l| l.starts_with("---"));
+        for li in [hunk, header] {
+            assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine), EditPlan::Block);
+        }
     }
 
     fn collapse(text: &str, c: Cursor) -> (String, Cursor) {

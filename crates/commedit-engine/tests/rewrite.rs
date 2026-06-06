@@ -268,3 +268,91 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn drops_middle_commit_visible_to_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let from = commits.iter().position(|c| c.subject == "second").unwrap();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    repo.abandon_commit(&target).expect("drop");
+
+    // "second" is gone; its descendant "third" rebased onto "first".
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
+
+    // Transparency invariants: HEAD attached, clean tree, intact repo.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn drops_then_restores_commit_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let from = commits.iter().position(|c| c.subject == "second").unwrap();
+    // Remember the pre-drop commit (its id stays resolvable) like the trash does.
+    let second = commits[from].clone();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    repo.abandon_commit(&target).expect("drop");
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
+
+    // Graft it back between "third" and "first" (gap 1), reproducing the original
+    // order. This proves a dropped commit is still resolvable and re-graftable.
+    let commits = history(&repo.repo).expect("history"); // [third, first]
+    let mv = repo.plan_restore(&commits, &second, 1).expect("restore plan");
+    repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("restore");
+
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "second", "first"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn drops_branch_tip_moving_the_branch_to_its_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let target = repo.plan_drop(&commits, 0).expect("droppable"); // the tip "third"
+    repo.abandon_commit(&target).expect("drop");
+
+    // The branch bookmark followed to the parent "second"; the tree is clean.
+    assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

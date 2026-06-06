@@ -166,7 +166,7 @@ pub fn is_linear_history(commits: &[CommitInfo]) -> bool {
 /// interleaved in `commits` by topological order. Reordering only ever touches
 /// the current branch, so it is planned against this chain — foreign commits are
 /// skipped, not treated as parents/children.
-fn branch_chain(commits: &[CommitInfo], head: &CommitId) -> Vec<usize> {
+pub fn branch_chain(commits: &[CommitInfo], head: &CommitId) -> Vec<usize> {
     let mut chain = Vec::new();
     let mut id = head.clone();
     while let Some(pos) = commits.iter().position(|c| c.id == id) {
@@ -265,10 +265,77 @@ pub fn plan_reorder(
     plan_linear(&chain_commits, p, cg)
 }
 
+/// The commit id of the display row `index`, if it can be dropped from history:
+/// it must sit on the current branch's linear chain (see [`branch_chain`], which
+/// already excludes merges, off-branch rows and the root), and dropping it must
+/// not empty the branch (the chain has more than one commit). Returns `None`
+/// otherwise — the UI uses this both to gate the drop and to validate it.
+pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Option<CommitId> {
+    let chain = branch_chain(commits, head);
+    if chain.len() < 2 || !chain.contains(&index) {
+        return None;
+    }
+    Some(commits[index].id.clone())
+}
+
+/// Splice a commit that is *not* in the chain into gap `g` (`0..=len`). Mirrors
+/// [`plan_linear`] but without removing a dragged row, since the restored commit
+/// is being inserted rather than moved.
+fn plan_linear_insert(chain: &[&CommitInfo], restored: &CommitId, g: usize) -> Option<ReorderMove> {
+    let n = chain.len();
+    if g > n {
+        return None;
+    }
+    let new_children = if g >= 1 {
+        vec![chain[g - 1].id.clone()]
+    } else {
+        Vec::new() // restored at the top: it becomes the new head
+    };
+    let new_parents = if g < n {
+        vec![chain[g].id.clone()]
+    } else {
+        // Restored at the bottom: root it where the previously-oldest commit was.
+        chain[n - 1].parents.clone()
+    };
+    let new_tip = if g == 0 {
+        restored.clone()
+    } else {
+        chain[0].id.clone()
+    };
+    Some(ReorderMove {
+        target: restored.clone(),
+        new_parents,
+        new_children,
+        new_tip,
+    })
+}
+
+/// Plan grafting a trashed commit (one not currently in `commits`) back into the
+/// history at display gap `to` (`0..=len`). `head` is the current branch tip.
+/// Returns `None` for an out-of-range drop or when HEAD has no linear chain.
+///
+/// The drop point is mapped onto the branch chain the same way [`plan_reorder`]
+/// does, so commits interleaved from other branches/tags are ignored.
+pub fn plan_restore(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    restored: &CommitInfo,
+    to: usize,
+) -> Option<ReorderMove> {
+    if to > commits.len() {
+        return None;
+    }
+    let chain = branch_chain(commits, head);
+    let cg = chain.iter().filter(|&&i| i < to).count();
+    let chain_commits: Vec<&CommitInfo> = chain.iter().map(|&i| &commits[i]).collect();
+    plan_linear_insert(&chain_commits, &restored.id, cg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        format_timestamp, is_linear_history, parse_timestamp, plan_reorder, CommitInfo,
+        format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_reorder,
+        plan_restore, CommitInfo,
     };
     use jj_lib::backend::{ChangeId, CommitId};
 
@@ -403,6 +470,56 @@ mod tests {
         // Row 0 is the foreign commit "5", not on the current branch's chain.
         let h = history_with_foreign_branch();
         assert_eq!(plan_reorder(&h, &cid(4), 0, 3), None);
+    }
+
+    #[test]
+    fn drop_returns_an_on_chain_commit() {
+        // Row 1 ("2") is on the branch chain [3,2,1]; dropping it yields its id.
+        assert_eq!(plan_drop(&history(), &cid(3), 1), Some(cid(2)));
+    }
+
+    #[test]
+    fn dropping_a_foreign_commit_is_refused() {
+        // Row 0 is the foreign commit "5", not on the current branch's chain.
+        let h = history_with_foreign_branch();
+        assert_eq!(plan_drop(&h, &cid(4), 0), None);
+    }
+
+    #[test]
+    fn dropping_the_only_commit_is_refused() {
+        // Refuse to empty the branch: a single-commit chain has nothing to drop.
+        let h = vec![ci(1, 0)];
+        assert_eq!(plan_drop(&h, &cid(1), 0), None);
+    }
+
+    #[test]
+    fn restoring_at_the_top_makes_the_commit_the_head() {
+        // Graft "9" above the tip "3" (gap 0).
+        let mv = plan_restore(&history(), &cid(3), &ci(9, 0), 0).expect("restore");
+        assert_eq!(mv.target, cid(9));
+        assert_eq!(mv.new_parents, vec![cid(3)]); // onto the old tip
+        assert!(mv.new_children.is_empty()); // becomes the new head
+        assert_eq!(mv.new_tip, cid(9));
+    }
+
+    #[test]
+    fn restoring_in_the_middle_threads_the_chain() {
+        // Graft "9" between "2" and "1" (gap 2).
+        let mv = plan_restore(&history(), &cid(3), &ci(9, 0), 2).expect("restore");
+        assert_eq!(mv.target, cid(9));
+        assert_eq!(mv.new_parents, vec![cid(1)]); // parent the older "1"
+        assert_eq!(mv.new_children, vec![cid(2)]); // child the newer "2"
+        assert_eq!(mv.new_tip, cid(3)); // tip unchanged
+    }
+
+    #[test]
+    fn restoring_at_the_bottom_roots_the_commit() {
+        // Graft "9" below the oldest "1" (gap 3).
+        let mv = plan_restore(&history(), &cid(3), &ci(9, 0), 3).expect("restore");
+        assert_eq!(mv.target, cid(9));
+        assert_eq!(mv.new_parents, vec![cid(0)]); // onto the root
+        assert_eq!(mv.new_children, vec![cid(1)]); // old oldest becomes its child
+        assert_eq!(mv.new_tip, cid(3)); // tip unchanged
     }
 
     #[test]

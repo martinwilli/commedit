@@ -97,23 +97,24 @@ enum Side {
 /// lines — the same idiom as the diff view's "expand context" cue. Clicking the
 /// marker line keeps the indicated side(s) and drops the markers: "use ours"
 /// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
-const CUE_OURS: &str = " ◖ ➜ use ours ◗";
-const CUE_BOTH: &str = " ◖ ➜ use both ◗";
-const CUE_THEIRS: &str = " ◖ ➜ use theirs ◗";
-/// The rounded end-caps that make a cue read as a pill-shaped button. Painted as
-/// a filled half-disc in the button colour against the line background, they
-/// round off the left/right ends of the solid-fill body that sits between them.
-/// The left cap also marks where the clickable button begins.
-const CUE_CAP_L: char = '◖';
-const CUE_CAP_R: char = '◗';
+const CUE_OURS: &str = " ◀ ➜ use ours ▶";
+const CUE_BOTH: &str = " ◀ ➜ use both ▶";
+const CUE_THEIRS: &str = " ◀ ➜ use theirs ▶";
+/// The end-caps that make a cue read as a banner/tag-shaped button. Painted as a
+/// full-height triangle in the button colour against the line background, their
+/// flat (vertical) side sits flush against the solid-fill body between them, so
+/// they align in height and touch the block, giving pointed ends. The left cap
+/// also marks where the clickable button begins.
+const CUE_CAP_L: char = '◀';
+const CUE_CAP_R: char = '▶';
 
-/// Wrap a cue label in the pill caps, e.g. `↕ expand context` -> `◖ ↕ expand context ◗`.
+/// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
 fn pill(label: &str) -> String {
     format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
 }
 
-/// Paint the inline pill button on `raw` (buffer line `line`): the two end-caps
-/// get `cap_tag` (a coloured half-disc on the line background), the run between
+/// Paint the inline banner button on `raw` (buffer line `line`): the two end-caps
+/// get `cap_tag` (a coloured triangle on the line background), the run between
 /// them gets `body_tag` (the solid button fill). No-op if the line has no caps.
 fn paint_pill(buffer: &sourceview5::Buffer, line: i32, raw: &str, cap_tag: &str, body_tag: &str) {
     let (Some(lpos), Some(rpos)) = (raw.find(CUE_CAP_L), raw.rfind(CUE_CAP_R)) else {
@@ -2261,12 +2262,13 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
-    // Inline pill buttons (the conflict "use …" cues and the diff "expand context"
-    // cues). Each is an inverse of its host line: a solid body filled in the
-    // line's accent colour with the line's background colour as text, end-capped
-    // by half-disc glyphs drawn in the body colour on the bare line background so
-    // they round the ends. Added last so the body's text colour outranks the host
-    // line's own foreground (GTK tag priority follows tag-table insertion order).
+    // Inline banner buttons (the conflict "use …" cues and the diff "expand
+    // context" cues). Each is an inverse of its host line: a solid body filled in
+    // the line's accent colour with the line's background colour as text, end-
+    // capped by full-height triangles drawn in the body colour on the bare line
+    // background so the ends point outward and stay flush. Added last so the
+    // body's text colour outranks the host line's own foreground (GTK tag
+    // priority follows tag-table insertion order).
     add("resolve-cue", &|t| {
         t.set_background(Some("#cf222e"));
         t.set_foreground(Some("#ffd7d5"));

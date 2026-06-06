@@ -46,6 +46,23 @@ enum DragOrigin {
     Trash,
 }
 
+/// Run a drop's staged action, scheduled from the drag source's `drag-end`.
+///
+/// The action rewrites history and rebuilds the list widgets, which unparents
+/// the `GtkListBoxRow`s. If that happens while GTK still has drag-and-drop
+/// crossing events queued for the just-finished gesture, GTK walks a row it
+/// holds as the drop target after we've orphaned it (parent becomes NULL) and
+/// segfaults. Scheduling at idle priority — below GDK's event priority — runs
+/// the rebuild only once every pending crossing event has been drained, so the
+/// rows are alive for all of them. (Scheduling from `drag-end` rather than the
+/// drop handler matters too: an idle queued mid-gesture can fire between motion
+/// events, i.e. before the drag is over.)
+fn run_post_drag(post_drag: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>) {
+    if let Some(action) = post_drag.borrow_mut().take() {
+        glib::idle_add_local_once(move || action());
+    }
+}
+
 fn main() {
     let repo_path = std::env::args()
         .nth(1)
@@ -172,9 +189,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         css.load_from_data(
             ".drop-placeholder { background-color: rgba(53, 132, 228, 0.22); \
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; margin: 1px 6px; } \
-             row.commit-dragging { opacity: 0.35; } \
-             .trash-active { background-color: rgba(53, 132, 228, 0.12); \
-             border: 1px dashed rgb(53, 132, 228); border-radius: 5px; }",
+             row.commit-dragging { opacity: 0.35; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -888,10 +903,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     placeholder.set_activatable(false);
     placeholder.set_height_request(28);
     placeholder.add_css_class("drop-placeholder");
+    // The placeholder is a passive visual gap. Make it non-targetable so GTK's
+    // pointer/drop picking skips it: otherwise GTK can cache it as the drop-
+    // crossing target, and `clear_gap` later removes (unparents) it, leaving GTK
+    // to walk an orphaned row on the next event and segfault.
+    placeholder.set_can_target(false);
     // The row currently being dragged, so it can be un-dimmed when the drag ends.
     let drag_row: Rc<RefCell<Option<ListBoxRow>>> = Rc::new(RefCell::new(None));
     // The insertion gap (newest-first index, 0..=len) the placeholder marks.
     let drop_gap: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // A drop handler rewrites history and rebuilds both lists, which destroys the
+    // ListBoxRow widgets. Doing that while the drag is still in flight frees a row
+    // GTK still holds as the drop-crossing target, crashing the next pointer event
+    // (it walks the freed widget). So a drop only *stages* its work here; the drag
+    // source runs it from `drag-end`, once the gesture — and GTK's DnD bookkeeping
+    // — is fully torn down.
+    let post_drag: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
 
     // Map a y coordinate to an insertion gap: onto a row's lower half drops below
     // it; past the last row drops at the bottom; above the first, at the top. The
@@ -992,11 +1019,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     drag_source.connect_drag_end({
         let drag_row = drag_row.clone();
         let clear_gap = clear_gap.clone();
+        let post_drag = post_drag.clone();
         move |_source, _drag, _delete| {
             if let Some(row) = drag_row.borrow_mut().take() {
                 row.remove_css_class("commit-dragging");
             }
             clear_gap();
+            run_post_drag(&post_drag);
         }
     });
     list.add_controller(drag_source);
@@ -1031,7 +1060,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
         let trash_list = trash_list.clone();
+        let trash_scroll = trash_scroll.clone();
         let selected_change = selected_change.clone();
+        let post_drag = post_drag.clone();
         move |_target, value, _x, y| {
             let Ok(from) = value.get::<i32>() else {
                 return false;
@@ -1042,41 +1073,48 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 None => gap_at(y),
             };
             clear_gap();
+            // Stage the work; `drag-end` runs it once the gesture is fully over
+            // (rewriting history rebuilds these rows, which is unsafe mid-drag).
             match drag_origin.get() {
                 DragOrigin::History => {
-                    // Plan against the current branch's linear chain (the view may
-                    // also show other branches/tags); a no-op or off-branch drop
-                    // yields None.
-                    let plan = repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
-                    let Some(mv) = plan else {
-                        return false;
-                    };
-                    if let Err(err) = repo.borrow_mut().reorder_commit(
-                        &mv.target,
-                        mv.new_parents,
-                        mv.new_children,
-                        &mv.new_tip,
-                    ) {
-                        show_status(&format!("Reorder failed: {err}"));
-                        return false;
-                    }
-                    refresh();
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
+                        // Plan against the current branch's linear chain (the view
+                        // may also show other branches/tags); a no-op or off-branch
+                        // drop yields None.
+                        let plan =
+                            repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
+                        let Some(mv) = plan else {
+                            return;
+                        };
+                        if let Err(err) = repo.borrow_mut().reorder_commit(
+                            &mv.target,
+                            mv.new_parents,
+                            mv.new_children,
+                            &mv.new_tip,
+                        ) {
+                            show_status(&format!("Reorder failed: {err}"));
+                            return;
+                        }
+                        refresh();
+                    }));
                     true
                 }
                 DragOrigin::Trash => {
                     // Restoring a trashed commit: graft it back into the chain at
-                    // the drop gap, drop it from the trash, and select it. Deferred
-                    // to an idle tick (see `defer_drop` note below) because the
-                    // repopulate resizes the content-sized trash panel, which is
-                    // unsafe to do while the drop event is still on the stack.
+                    // the drop gap, drop it from the trash, and select it.
                     let repo = repo.clone();
                     let commits = commits.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let trashed = trashed.clone();
                     let trash_list = trash_list.clone();
+                    let trash_scroll = trash_scroll.clone();
                     let selected_change = selected_change.clone();
-                    glib::idle_add_local_once(move || {
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
                         let Some(info) = trashed.borrow().get(from as usize).cloned() else {
                             return;
                         };
@@ -1096,8 +1134,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         trashed.borrow_mut().remove(from as usize);
                         *selected_change.borrow_mut() = Some(info.change_id_hex());
                         refresh();
-                        populate_trash(&trash_list, &trashed.borrow());
-                    });
+                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    }));
                     true
                 }
             }
@@ -1139,27 +1177,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     trash_drag.connect_drag_end({
         let drag_row = drag_row.clone();
         let clear_gap = clear_gap.clone();
+        let post_drag = post_drag.clone();
         move |_source, _drag, _delete| {
             if let Some(row) = drag_row.borrow_mut().take() {
                 row.remove_css_class("commit-dragging");
             }
             clear_gap();
+            run_post_drag(&post_drag);
         }
     });
     trash_list.add_controller(trash_drag);
 
     let trash_drop = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
-    trash_drop.connect_enter({
-        let trash_box = trash_box.clone();
-        move |_target, _x, _y| {
-            trash_box.add_css_class("trash-active");
-            gdk::DragAction::MOVE
-        }
-    });
-    trash_drop.connect_leave({
-        let trash_box = trash_box.clone();
-        move |_target| trash_box.remove_css_class("trash-active")
-    });
+    // Deliberately no widget mutation in enter/leave (no hover highlight): those
+    // run inside GTK's drop-crossing synthesis, where touching the widget tree is
+    // unsafe. Enter just advertises that the trash accepts the drag.
+    trash_drop.connect_enter(move |_target, _x, _y| gdk::DragAction::MOVE);
     trash_drop.connect_drop({
         let commits = commits.clone();
         let repo = repo.clone();
@@ -1168,27 +1201,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
         let trash_list = trash_list.clone();
-        let trash_box = trash_box.clone();
+        let trash_scroll = trash_scroll.clone();
+        let post_drag = post_drag.clone();
         move |_target, value, _x, _y| {
-            trash_box.remove_css_class("trash-active");
             if drag_origin.get() != DragOrigin::History {
                 return false; // dragging within the trash: nothing to do
             }
             let Ok(from) = value.get::<i32>() else {
                 return false;
             };
-            // Defer the rewrite + repopulate to an idle tick. Rebuilding the trash
-            // list resizes the panel (it sizes to its contents), and doing that
-            // synchronously inside the drop event re-enters GTK's layout while the
-            // drag-and-drop machinery is still unwinding — a use-after-free crash.
-            // Running it once the drop has returned is safe.
+            // Stage the work; the history drag source runs it from `drag-end`,
+            // once the gesture is fully over (rewriting + rebuilding the rows
+            // mid-drag frees a row GTK still tracks, crashing the next event).
             let repo = repo.clone();
             let commits = commits.clone();
             let refresh = refresh.clone();
             let show_status = show_status.clone();
             let trashed = trashed.clone();
             let trash_list = trash_list.clone();
-            glib::idle_add_local_once(move || {
+            let trash_scroll = trash_scroll.clone();
+            *post_drag.borrow_mut() = Some(Box::new(move || {
                 let Some(info) = commits.borrow().get(from as usize).cloned() else {
                     return;
                 };
@@ -1205,13 +1237,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
                 trashed.borrow_mut().push(info);
                 refresh();
-                populate_trash(&trash_list, &trashed.borrow());
-            });
+                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+            }));
             true
         }
     });
     trash_box.add_controller(trash_drop);
-    populate_trash(&trash_list, &trashed.borrow());
+    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
 
     // Save: rewrite the message and/or the selected file's content, then reload.
     // Reloading re-selects the commit, which cascades through `row-selected` ->
@@ -1723,84 +1755,110 @@ fn set_identity_fields(fields: &[Entry; 4], commit: &CommitInfo) {
     fields[3].set_text(&commit.committer_time);
 }
 
-/// Replace the list's rows with one row per commit (short id + subject).
-fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    for commit in commits {
-        let short = commit.id_hex().chars().take(8).collect::<String>();
-        let subject = if commit.subject.is_empty() {
-            "(no description)"
-        } else {
-            &commit.subject
-        };
-        let id_label = Label::builder().xalign(0.0).build();
-        id_label.set_markup(&format!("<tt>{short}</tt>"));
-        let subject_label = Label::builder()
-            .label(subject)
-            .xalign(0.0)
-            .halign(gtk::Align::Fill)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        let row_box = GtkBox::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(8)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-        row_box.append(&id_label);
-        row_box.append(&subject_label);
-        let row = ListBoxRow::new();
-        row.set_child(Some(&row_box));
-        list.append(&row);
+/// Build the `short-id   subject` content box shown inside a history/trash row.
+fn commit_row_box(commit: &CommitInfo) -> GtkBox {
+    let short = commit.id_hex().chars().take(8).collect::<String>();
+    let subject = if commit.subject.is_empty() {
+        "(no description)"
+    } else {
+        &commit.subject
+    };
+    let id_label = Label::builder().xalign(0.0).build();
+    id_label.set_markup(&format!("<tt>{short}</tt>"));
+    let subject_label = Label::builder()
+        .label(subject)
+        .xalign(0.0)
+        .halign(gtk::Align::Fill)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    let row_box = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    row_box.append(&id_label);
+    row_box.append(&subject_label);
+    row_box
+}
+
+/// Update the content of a row's existing labels in place, without replacing the
+/// child widget — so the labels (and the row) survive a drag-triggered rebuild.
+/// Falls back to building a fresh child if the row has none yet.
+fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo) {
+    let short = commit.id_hex().chars().take(8).collect::<String>();
+    let subject = if commit.subject.is_empty() {
+        "(no description)"
+    } else {
+        &commit.subject
+    };
+    let row_box = row.child().and_downcast::<GtkBox>();
+    let id_label = row_box
+        .as_ref()
+        .and_then(|b| b.first_child())
+        .and_downcast::<Label>();
+    let subject_label = row_box
+        .as_ref()
+        .and_then(|b| b.last_child())
+        .and_downcast::<Label>();
+    match (id_label, subject_label) {
+        (Some(id_label), Some(subject_label)) => {
+            id_label.set_markup(&format!("<tt>{short}</tt>"));
+            subject_label.set_text(subject);
+        }
+        _ => row.set_child(Some(&commit_row_box(commit))),
     }
 }
 
-/// Fill the trash list with the session's dropped commits (one row per commit,
-/// same id+subject layout as the history list). When empty the list stays empty
-/// so the panel collapses to just its trash icon (the icon's drop target is what
-/// commits are dragged onto).
-fn populate_trash(list: &ListBox, commits: &[CommitInfo]) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
+/// Show one row per commit, **reusing** the existing `ListBoxRow` widgets in
+/// place (updating their labels) and **hiding** — never removing — any surplus
+/// rows.
+///
+/// This is load-bearing for drag-and-drop, not a micro-optimization. A drop
+/// rewrites history and repopulates immediately afterwards, while GTK still
+/// holds one of these rows as the drop-crossing target for the just-ended
+/// gesture (the trash sits below the list, so dragging to it leaves a lower row
+/// cached). GTK walks that cached widget's parent chain on the next pointer
+/// event; if we had unparented it (by removing or clearing rows) the walk hits a
+/// NULL parent and segfaults. Reusing rows and only *hiding* the surplus keeps
+/// every row parented, so the walk always terminates. Hidden rows are reused
+/// when the list grows again.
+fn populate_rows(list: &ListBox, commits: &[CommitInfo], selectable: bool) {
+    for (i, commit) in commits.iter().enumerate() {
+        let row = list.row_at_index(i as i32).unwrap_or_else(|| {
+            let row = ListBoxRow::new();
+            // Trash rows aren't editable; they exist only to be dragged back out.
+            row.set_selectable(selectable);
+            row.set_activatable(selectable);
+            list.append(&row);
+            row
+        });
+        row.set_visible(true);
+        set_row_commit(&row, commit);
     }
-    for commit in commits {
-        let short = commit.id_hex().chars().take(8).collect::<String>();
-        let subject = if commit.subject.is_empty() {
-            "(no description)"
-        } else {
-            &commit.subject
-        };
-        let id_label = Label::builder().xalign(0.0).build();
-        id_label.set_markup(&format!("<tt>{short}</tt>"));
-        let subject_label = Label::builder()
-            .label(subject)
-            .xalign(0.0)
-            .halign(gtk::Align::Fill)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        let row_box = GtkBox::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(8)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-        row_box.append(&id_label);
-        row_box.append(&subject_label);
-        let row = ListBoxRow::new();
-        // Trash rows aren't editable; they exist only to be dragged back out.
-        row.set_selectable(false);
-        row.set_activatable(false);
-        row.set_child(Some(&row_box));
-        list.append(&row);
+    // Hide surplus rows rather than removing them (see the note above).
+    let mut i = commits.len() as i32;
+    while let Some(extra) = list.row_at_index(i) {
+        extra.set_visible(false);
+        i += 1;
     }
+}
+
+/// Show the history commits in `list` (newest first), reusing rows. See
+/// [`populate_rows`].
+fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
+    populate_rows(list, commits, true);
+}
+
+/// Fill the trash list with the session's dropped commits, reusing rows. When
+/// empty, the scrolled list is hidden so the panel collapses to just its trash
+/// icon (the icon still carries the drop target).
+fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
+    scroll.set_visible(!commits.is_empty());
+    populate_rows(list, commits, false);
 }
 
 fn present_error(app: &Application, message: &str) {

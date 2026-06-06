@@ -7,7 +7,10 @@ use jj_lib::backend::{ChangeId, CommitId, Timestamp};
 use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
+use jj_lib::revset::{
+    RemoteRefSymbolExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension,
+};
+use jj_lib::str_util::StringExpression;
 
 /// A single row in the history view.
 #[derive(Debug, Clone)]
@@ -85,13 +88,29 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
 /// List all visible commits in topological order (newest first), excluding the
 /// virtual root commit.
 pub fn history(repo: &ReadonlyRepo) -> Result<Vec<CommitInfo>> {
-    // Mirror what `git log`/`gitk` show: commits reachable from the git refs and
-    // git HEAD. jj's `all()` additionally surfaces divergent (pre-rewrite) and
-    // working-copy commits, which git never created a ref for — they would show
-    // up here as confusing duplicates of the commits that replaced them.
-    let user_expression = RevsetExpression::git_refs()
+    // Mirror what `git log`/`gitk` show: commits reachable from real refs
+    // (branches, remote branches, tags) and git HEAD. Two sources would otherwise
+    // resurface stale, pre-rewrite commits as confusing duplicates of the commits
+    // that replaced them:
+    //   * `git_refs()` (which we avoid) also returns jj's internal `refs/jj/keep/*`
+    //     refs, created to retain commits abandoned by a rewrite/reorder;
+    //   * jj's `git_head()` keeps pointing at the old branch tip until re-imported,
+    //     so its ancestors are the whole pre-reorder chain.
+    // Intersecting with the ancestors of the *visible* heads drops those hidden
+    // commits whatever ref still pins them, while leaving normal history
+    // untouched. (`all()` is unsuitable: it deliberately includes hidden commits
+    // referenced by the expression.)
+    let any_remote = || RemoteRefSymbolExpression {
+        name: StringExpression::all(),
+        remote: StringExpression::all(),
+    };
+    let visible = RevsetExpression::visible_heads().ancestors();
+    let user_expression = RevsetExpression::bookmarks(StringExpression::all())
+        .union(&RevsetExpression::remote_bookmarks(any_remote(), None))
+        .union(&RevsetExpression::tags(StringExpression::all()))
         .union(&RevsetExpression::git_head())
-        .ancestors();
+        .ancestors()
+        .intersection(&visible);
     let symbol_resolver =
         SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
     let expression = user_expression

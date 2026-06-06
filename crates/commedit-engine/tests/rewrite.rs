@@ -144,6 +144,40 @@ fn reorders_commit_to_a_new_position_visible_to_git() {
 }
 
 #[test]
+fn history_has_no_duplicate_rows_after_a_reorder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+            ("d.txt", "d\n", "D"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history");
+    let from = commits.iter().position(|c| c.subject == "D").unwrap();
+    let mv = repo
+        .plan_reorder(&commits, from, commits.len())
+        .expect("plan");
+    repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder");
+
+    // The reorder abandons the pre-reorder commits, which jj keeps pinned (via
+    // `git_head` and `refs/jj/keep/*`). The history view must not surface those
+    // as duplicate rows — exactly four distinct commits, one per subject.
+    let after = history(&repo.repo).expect("history");
+    let mut subjects: Vec<_> = after.iter().map(|c| c.subject.clone()).collect();
+    subjects.sort();
+    assert_eq!(subjects, vec!["A", "B", "C", "D"]);
+    let unique_ids: std::collections::HashSet<_> = after.iter().map(|c| c.id.clone()).collect();
+    assert_eq!(unique_ids.len(), after.len());
+}
+
+#[test]
 fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

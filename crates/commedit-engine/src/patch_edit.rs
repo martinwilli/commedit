@@ -380,8 +380,9 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
                 }
             }
         }
-        // A selection of whole `+` line(s) removes them outright.
-        if let Some(edit) = delete_added_lines(lines, lo, hi) {
+        // A selection confined to `+` lines: remove whole lines, or join across
+        // them for a partial multi-line delete inside the added block.
+        if let Some(edit) = delete_added_span(lines, lo, hi) {
             return EditPlan::Edit(edit);
         }
         return EditPlan::Block;
@@ -431,22 +432,27 @@ fn delete_from_context(line: &str, l: usize, s: usize, e: usize) -> PatchEdit {
     }
 }
 
-/// Delete the whole `+` line(s) a selection spans, when it starts at a line
-/// boundary and runs to one — the end of the last line's content, or the start
-/// of the line after it. Returns `None` unless every spanned line is a non-empty
-/// added line *and* the span covers them whole, so a partial selection never
-/// drags the rest of a line with it. Dropping `+` lines is always patch-safe:
-/// they are purely additive, so removing them just un-adds that content.
-fn delete_added_lines(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit> {
-    if lo.col != 0 {
-        return None; // selection doesn't start at a line boundary
-    }
+/// Delete a selection confined to a run of `+` lines. `+` lines are purely
+/// additive, so any deletion that stays within them keeps the patch valid. Two
+/// shapes are accepted:
+///
+/// * **Mid-line start** (`lo.col >= 1`): keep the first line's `+` prefix and
+///   head, join it with the tail of the last line, and drop the lines between —
+///   an ordinary cross-line delete confined to the block, yielding one `+` line.
+/// * **Boundary start** (`lo.col == 0`): remove whole `+` lines, but only if the
+///   selection also *ends* on a boundary (the next line's start, or the last
+///   line's content end). Otherwise the join would strip the last line's `+`
+///   prefix and leave bare content, so it is refused.
+///
+/// Returns `None` when any consumed line isn't a (non-empty) added line, or the
+/// shape would corrupt the patch — leaving the caller to block it.
+fn delete_added_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit> {
+    // The last line is consumed only if the selection enters its content; an end
+    // at column 0 sits on the boundary above it.
     let last = if hi.col == 0 {
-        hi.line.checked_sub(1)? // ends at the start of hi.line: exclude it
-    } else if hi.col >= char_len(lines.get(hi.line).copied()?) {
-        hi.line // ends at the end of hi.line's content: include it whole
+        hi.line.checked_sub(1)?
     } else {
-        return None; // last line only partially selected
+        hi.line
     };
     if last < lo.line || last >= lines.len() {
         return None;
@@ -457,9 +463,26 @@ fn delete_added_lines(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdi
     {
         return None;
     }
+    if lo.col >= 1 {
+        // Keep the first line's prefix and join with the last line's tail; a raw
+        // delete of the span does exactly that and stays a single `+` line.
+        return Some(PatchEdit {
+            start: lo,
+            end: hi,
+            replacement: String::new(),
+            cursor: lo,
+        });
+    }
+    // Boundary start: only whole-line removal is safe. The end must also be a
+    // boundary, else dropping the last line's prefix would leave bare content.
+    let ends_on_boundary = hi.col == 0 || hi.col >= char_len(lines[hi.line]);
+    if !ends_on_boundary {
+        return None;
+    }
+    let end = if hi.col == 0 { hi.line } else { hi.line + 1 };
     Some(PatchEdit {
         start: Cursor::at(lo.line, 0),
-        end: Cursor::at(last + 1, 0),
+        end: Cursor::at(end, 0),
         replacement: String::new(),
         cursor: Cursor::at(lo.line, 0),
     })
@@ -939,6 +962,42 @@ mod tests {
         let patch = unified_diff("a\n", "a\nbcde\n", "f");
         let lb = line_index(&patch, |l| l == "+bcde");
         let plan = plan_edit(&patch, sel((lb, 0), (lb, 2)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
+    }
+
+    #[test]
+    fn partial_selection_joins_added_lines() {
+        // Select from mid "+bcd" to mid "+xyz": the kept head and tail join into a
+        // single `+` line, dropping what's between.
+        let patch = unified_diff("a\n", "a\nbcd\nxyz\n", "f");
+        let lb = line_index(&patch, |l| l == "+bcd");
+        // "+bcd": caret after 'b' is col 2; "+xyz": caret before 'y' is col 2.
+        let plan = plan_edit(&patch, sel((lb, 2), (lb + 1, 2)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("+byz\n"), "the lines join:\n{out}");
+        assert!(!out.contains("+bcd") && !out.contains("+xyz"), "originals gone:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nbyz\n");
+    }
+
+    #[test]
+    fn partial_selection_joins_across_whole_added_lines() {
+        // The join also swallows whole `+` lines caught in the middle.
+        let patch = unified_diff("a\n", "a\nbcd\nmid\nxyz\n", "f");
+        let lb = line_index(&patch, |l| l == "+bcd");
+        let plan = plan_edit(&patch, sel((lb, 2), (lb + 2, 2)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("+byz\n"), "got:\n{out}");
+        assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nbyz\n");
+    }
+
+    #[test]
+    fn partial_selection_join_stops_at_a_context_line() {
+        // A join may not cross a context line: that would touch unchanged content.
+        let patch = unified_diff("a\nm\n", "A\nm\nB\n", "f");
+        let la = line_index(&patch, |l| l == "+A");
+        let lb = line_index(&patch, |l| l == "+B");
+        assert!(lb > la, "context line sits between the two additions");
+        let plan = plan_edit(&patch, sel((la, 1), (lb, 1)), EditGesture::Delete);
         assert_eq!(plan, EditPlan::Block);
     }
 

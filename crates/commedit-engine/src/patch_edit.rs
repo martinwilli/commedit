@@ -8,7 +8,9 @@
 //!
 //! * Only `+` (added) line content is freely editable.
 //! * Typing into a context line splits it into a `-<orig>` / `+<edited>` pair.
-//! * Backspace/Delete on a `-` line un-removes it (→ context).
+//! * `-` lines are immutable per-character (piecemeal edits are rejected).
+//!   Selecting whole `-` line(s) and deleting restores them to context —
+//!   undoing the removal.
 //! * Backspace/Delete on a context line edits it like typing: dropping a
 //!   character splits it into a `-<orig>` / `+<edited>` pair. Backspace at the
 //!   content start / Delete at the content end have no character to remove there,
@@ -385,6 +387,10 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
         if let Some(edit) = delete_added_span(lines, lo, hi) {
             return EditPlan::Edit(edit);
         }
+        // A selection of whole `-` line(s) restores them to context.
+        if let Some(edit) = restore_removed_span(lines, lo, hi) {
+            return EditPlan::Edit(edit);
+        }
         return EditPlan::Block;
     }
     let caret = sel.end;
@@ -396,8 +402,10 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
         return EditPlan::Block;
     }
     match classify_line(line) {
-        // Un-remove: `-` → context, caret preserved.
-        DiffLineKind::Removed => toggle_prefix(l, ' ', caret.col),
+        // A `-` line is immutable per-character: a stray key un-removing it is
+        // confusing. Restore one by selecting the whole line (see
+        // `restore_removed_span`); reject piecemeal edits.
+        DiffLineKind::Removed => EditPlan::Block,
         DiffLineKind::Context => delete_in_context(line, l, caret.col, dir),
         DiffLineKind::Added => delete_in_added(lines, l, caret.col, dir),
         _ => EditPlan::Block,
@@ -485,6 +493,54 @@ fn delete_added_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit
         end: Cursor::at(end, 0),
         replacement: String::new(),
         cursor: Cursor::at(lo.line, 0),
+    })
+}
+
+/// Restore the whole `-` line(s) a selection covers back to context — undoing
+/// the removal so the lines stay in the file. The selection must cover the lines
+/// whole (it may include the newline just before or after them), and every
+/// covered line must be a non-empty removed line — so it stays confined to one
+/// `-` block. Returns `None` for a partial or mixed selection, leaving the
+/// caller to reject it. Flipping `-` to ` ` keeps the patch valid: the line
+/// already matches the base, it just stops being dropped.
+fn restore_removed_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit> {
+    // Resolve the selection ends to whole-line bounds. A start past a line's
+    // content (or a `\n`) begins at the next line; an end at column 0 sits on the
+    // boundary above hi.line.
+    let first = if lo.col == 0 {
+        lo.line
+    } else if lo.col >= char_len(lines.get(lo.line).copied()?) {
+        lo.line + 1
+    } else {
+        return None;
+    };
+    let last = if hi.col == 0 {
+        hi.line.checked_sub(1)?
+    } else if hi.col >= char_len(lines.get(hi.line).copied()?) {
+        hi.line
+    } else {
+        return None;
+    };
+    if first > last || last >= lines.len() {
+        return None;
+    }
+    if lines[first..=last]
+        .iter()
+        .any(|l| l.is_empty() || classify_line(l) != DiffLineKind::Removed)
+    {
+        return None;
+    }
+    let mut replacement = String::new();
+    for &line in &lines[first..=last] {
+        replacement.push(' ');
+        replacement.push_str(content(line));
+        replacement.push('\n');
+    }
+    Some(PatchEdit {
+        start: Cursor::at(first, 0),
+        end: Cursor::at(last + 1, 0),
+        replacement,
+        cursor: Cursor::at(first, 0),
     })
 }
 
@@ -684,24 +740,62 @@ mod tests {
     }
 
     #[test]
-    fn backspace_on_removed_line_restores_context() {
+    fn caret_delete_on_removed_line_is_rejected() {
+        // A stray Backspace/Delete on a `-` line no longer un-removes it; that is
+        // done by selecting the whole line (see the restore tests below).
         let patch = sample();
         let li = line_index(&patch, |l| l == "-b");
-        let plan = plan_edit(&patch, caret(li, 1), EditGesture::Backspace);
-        let out = apply(&patch, &edit(plan));
-        assert!(out.contains(" b\n"), "got:\n{out}");
-        // Applying restores 'b' in the file.
-        let applied = apply_patch("a\nb\nc\n", &out).unwrap();
-        assert!(applied.contains("a\nb\nB\nc\n") || applied == "a\nb\nB\nc\n");
+        assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Backspace), EditPlan::Block);
+        assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Delete), EditPlan::Block);
     }
 
     #[test]
-    fn delete_on_removed_line_restores_context() {
-        let patch = sample();
-        let li = line_index(&patch, |l| l == "-b");
-        let plan = plan_edit(&patch, caret(li, 1), EditGesture::Delete);
+    fn selection_restores_a_removed_line_to_context() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let lb = line_index(&patch, |l| l == "-b");
+        // Select the whole "-b" line, including its trailing newline.
+        let plan = plan_edit(&patch, sel((lb, 0), (lb + 1, 0)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
-        assert!(out.contains(" b\n"), "got:\n{out}");
+        assert!(out.contains(" b\n") && !out.contains("-b"), "restored to context:\n{out}");
+        // 'b' is no longer dropped from the file.
+        assert!(apply_patch("a\nb\nc\n", &out).unwrap().contains('b'));
+    }
+
+    #[test]
+    fn selection_restores_a_removed_line_without_trailing_newline() {
+        let patch = sample();
+        let lb = line_index(&patch, |l| l == "-b");
+        // Select just the "-b" content (no newline) — a line-select gesture.
+        let plan = plan_edit(&patch, sel((lb, 0), (lb, 2)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains(" b\n") && !out.contains("-b"), "got:\n{out}");
+    }
+
+    #[test]
+    fn selection_restores_multiple_removed_lines() {
+        let patch = unified_diff("a\nb\nc\n", "a\n", "f"); // " a" / "-b" / "-c"
+        let lb = line_index(&patch, |l| l == "-b");
+        let plan = plan_edit(&patch, sel((lb, 0), (lb + 2, 0)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains(" b\n") && out.contains(" c\n"), "both restored:\n{out}");
+        assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn partial_removed_line_selection_is_rejected() {
+        let patch = unified_diff("abc\nx\n", "x\n", "f"); // "-abc"
+        let li = line_index(&patch, |l| l == "-abc");
+        let plan = plan_edit(&patch, sel((li, 1), (li, 3)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
+    }
+
+    #[test]
+    fn selection_spanning_a_removed_block_and_context_is_rejected() {
+        let patch = unified_diff("a\nb\nc\n", "a\n", "f"); // " a" / "-b" / "-c"
+        let la = line_index(&patch, |l| l == " a");
+        // From the context " a" across the "-b"/"-c" block.
+        let plan = plan_edit(&patch, sel((la, 0), (la + 2, 0)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
     }
 
     #[test]
@@ -725,12 +819,18 @@ mod tests {
     }
 
     #[test]
-    fn context_removed_toggle_round_trips() {
+    fn context_removed_then_restored_round_trips() {
         let patch = sample();
         let li = line_index(&patch, |l| l == " c");
+        // Mark the context line removed (backspace at its start).
         let removed = apply(&patch, &edit(plan_edit(&patch, caret(li, 1), EditGesture::Backspace)));
-        // Now the line is "-c"; backspace again restores context.
-        let back = apply(&removed, &edit(plan_edit(&removed, caret(li, 1), EditGesture::Backspace)));
+        assert!(removed.contains("-c\n"), "got:\n{removed}");
+        // Restore it by selecting the whole "-c" line and deleting.
+        let lc = line_index(&removed, |l| l == "-c");
+        let back = apply(
+            &removed,
+            &edit(plan_edit(&removed, sel((lc, 0), (lc + 1, 0)), EditGesture::Delete)),
+        );
         assert!(back.contains(" c\n"), "got:\n{back}");
     }
 

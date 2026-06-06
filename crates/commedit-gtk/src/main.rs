@@ -108,6 +108,20 @@ const CUE_THEIRS: &str = " ◀ ➜ use theirs ▶";
 const CUE_CAP_L: char = '◀';
 const CUE_CAP_R: char = '▶';
 
+/// Tooltips for the action-bar buttons. The Save button means different things
+/// per pane mode — committing an edit in the diff view, resolving a file in the
+/// conflict view — so its tooltip is swapped when entering/leaving conflict mode.
+const SAVE_HINT_DIFF: &str =
+    "Save your edits to this commit — message, identity, or file content — \
+     rewriting it in place and rebasing its descendants onto the result.";
+const SAVE_HINT_CONFLICT: &str =
+    "Resolve the conflicted file shown above. When a rewrite conflicts across \
+     several files you resolve them one at a time — save each in turn; the \
+     rewrite is applied to git only once the last conflict is cleared.";
+const ABORT_HINT: &str =
+    "Discard the entire rewrite and roll the repository back to the state it had \
+     before you saved, leaving git untouched.";
+
 /// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
 fn pill(label: &str) -> String {
     format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
@@ -628,6 +642,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // file/diff editing field rather than spanning the whole window.
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
+    save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
     // Conflict-mode quick resolution is driven inline: clicking a block's marker
     // line (with its "use ours/theirs/both" cue) keeps that side — see
     // `append_resolve_cues` and the click gesture below. No toolbar buttons.
@@ -663,6 +678,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     let abort_button = Button::with_label("Abort rewrite");
     abort_button.add_css_class("destructive-action");
+    abort_button.set_tooltip_text(Some(ABORT_HINT));
     let conflict_banner = GtkBox::new(Orientation::Horizontal, 8);
     conflict_banner.add_css_class("error");
     conflict_banner.set_margin_start(8);
@@ -1573,11 +1589,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let conflict_banner = conflict_banner.clone();
         let prev_conflict_button = prev_conflict_button.clone();
         let next_conflict_button = next_conflict_button.clone();
+        let save_button = save_button.clone();
         Rc::new(move || {
             *pane_mode.borrow_mut() = PaneMode::Diff;
             conflict_banner.set_visible(false);
             prev_conflict_button.set_visible(false);
             next_conflict_button.set_visible(false);
+            save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
         })
     };
 
@@ -1592,6 +1610,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let refresh_conflict = refresh_conflict.clone();
         let prev_conflict_button = prev_conflict_button.clone();
         let next_conflict_button = next_conflict_button.clone();
+        let save_button = save_button.clone();
         Rc::new(move |commits: Vec<ConflictedCommit>| {
             let first = commits
                 .iter()
@@ -1604,6 +1623,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             conflict_banner.set_visible(true);
             prev_conflict_button.set_visible(true);
             next_conflict_button.set_visible(true);
+            save_button.set_tooltip_text(Some(SAVE_HINT_CONFLICT));
             if let Some(ch) = first {
                 *selected_change.borrow_mut() = Some(ch);
             }

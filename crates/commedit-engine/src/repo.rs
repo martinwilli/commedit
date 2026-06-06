@@ -87,17 +87,60 @@ impl Repo {
         Ok(())
     }
 
+    /// The originally checked-out branch as a jj bookmark name (its
+    /// `refs/heads/` prefix stripped), or `None` if HEAD was detached when the
+    /// repo was opened.
+    fn current_bookmark(&self) -> Option<RefNameBuf> {
+        self.git_head_branch
+            .as_ref()
+            .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).into())
+    }
+
     /// Point the originally checked-out branch at `target` inside `mut_repo`.
     /// Reordering can produce a new history head that is not a rewrite of the old
     /// head, so jj's automatic bookmark moves don't always follow; callers set it
     /// explicitly. No-op if HEAD was detached when the repo was opened.
     pub(crate) fn set_head_bookmark(&self, mut_repo: &mut MutableRepo, target: CommitId) {
-        if let Some(branch) = &self.git_head_branch {
-            let name: RefNameBuf = branch
-                .strip_prefix("refs/heads/")
-                .unwrap_or(branch)
-                .into();
+        if let Some(name) = self.current_bookmark() {
             mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
+        }
+    }
+
+    /// Snapshot every local bookmark's target as of the current (pre-rewrite)
+    /// repo view, to be handed to [`Self::confine_bookmark_moves`] after the
+    /// rewrite so the unrelated ones can be held in place.
+    pub(crate) fn local_bookmark_targets(&self) -> Vec<(RefNameBuf, RefTarget)> {
+        self.repo
+            .view()
+            .local_bookmarks()
+            .map(|(name, target)| (name.to_owned(), target.clone()))
+            .collect()
+    }
+
+    /// Hold every local bookmark *except* the current branch at the target it
+    /// had before the rewrite (`before`). jj moves every bookmark that pointed
+    /// at a rewritten commit onto the rewrite, and `export_to_git` would then
+    /// write all of them back to git — silently dragging unrelated branches
+    /// (e.g. a user's backup branch that happened to share the rewritten tip)
+    /// forward and clobbering them. Only the checked-out branch should follow
+    /// our rewrite into git; the others must keep pointing at the now-old
+    /// commits, which still exist in the object store. No-op on a detached HEAD,
+    /// where there is no current branch to single out (behavior unchanged).
+    pub(crate) fn confine_bookmark_moves(
+        &self,
+        mut_repo: &mut MutableRepo,
+        before: &[(RefNameBuf, RefTarget)],
+    ) {
+        let Some(current) = self.current_bookmark() else {
+            return;
+        };
+        for (name, target) in before {
+            if *name == current {
+                continue;
+            }
+            if mut_repo.get_local_bookmark(name) != *target {
+                mut_repo.set_local_bookmark_target(name, target.clone());
+            }
         }
     }
 

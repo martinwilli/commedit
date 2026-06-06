@@ -33,6 +33,7 @@ impl Repo {
     /// single transaction.
     pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<()> {
         let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
         let commit = self
             .repo
             .store()
@@ -49,6 +50,7 @@ impl Repo {
         .context("writing rewritten commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants())
             .context("rebasing descendants")?;
+        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
         transparency::export_to_git(tx.repo_mut())?;
 
         self.repo = pollster::block_on(tx.commit("commedit: edit commit message"))
@@ -69,6 +71,7 @@ impl Repo {
     /// edited values win over the side effects of message/content edits.
     pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<()> {
         let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
         let commit = self
             .repo
             .store()
@@ -96,6 +99,7 @@ impl Repo {
         )
         .context("writing rewritten commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
         transparency::export_to_git(tx.repo_mut())?;
 
         self.repo = pollster::block_on(tx.commit("commedit: edit commit identity"))
@@ -200,6 +204,7 @@ impl Repo {
         op_msg: &str,
     ) -> Result<()> {
         let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
         let loc = MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,
@@ -226,6 +231,7 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
+        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
         transparency::export_to_git(tx.repo_mut())?;
         self.repo = pollster::block_on(tx.commit(op_msg)).context("committing splice")?;
         self.reattach_head()?;
@@ -242,6 +248,7 @@ impl Repo {
     /// `git gc`), so [`Self::restore_commit`] can graft it back.
     pub fn abandon_commit(&mut self, target: &CommitId) -> Result<()> {
         let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
         let commit = self
             .repo
             .store()
@@ -254,6 +261,7 @@ impl Repo {
         // abandoned bookmarks rather than deleting them).
         tx.repo_mut().record_abandoned_commit(&commit);
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
         transparency::export_to_git(tx.repo_mut())?;
 
         self.repo = pollster::block_on(tx.commit("commedit: drop commit"))

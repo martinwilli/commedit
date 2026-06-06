@@ -311,6 +311,40 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
 }
 
 #[test]
+fn rewrite_leaves_a_backup_branch_on_the_same_tip_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+
+    // Linear main A <- B <- C, plus a `backup` branch pointing at the *same* tip
+    // C — the common "I made a backup before rewriting" shape. (init leaves us on
+    // main; `git branch` creates the ref without moving HEAD.)
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+    );
+    g(&["branch", "backup"]);
+    let backup_before = g(&["rev-parse", "backup"]);
+    let main_before = g(&["rev-parse", "main"]);
+    assert_eq!(backup_before, main_before, "backup starts on main's tip");
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let target = commits.iter().find(|c| c.subject == "B").expect("B present");
+    repo.rewrite_message(&target.id, "B (edited)").expect("rewrite");
+
+    // main is rewritten, but the backup branch must still point at the original
+    // commits — rewriting one branch must never drag an unrelated one along.
+    assert_eq!(common::git_log_subjects(dir), vec!["C", "B (edited)", "A"]);
+    assert_eq!(g(&["rev-parse", "backup"]), backup_before, "backup unmoved");
+    assert_ne!(g(&["rev-parse", "main"]), main_before, "main did move");
+    assert_eq!(g(&["log", "--format=%s", "backup"]), "C\nB\nA");
+    assert_eq!(g(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(g(&["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn drops_middle_commit_visible_to_git() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

@@ -8,7 +8,7 @@ use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
 
 fn second_commit_id(repo: &Repo) -> commedit_engine::history::CommitInfo {
-    history(&repo.repo)
+    history(&repo.repo, &repo.head_commit_id().expect("head"))
         .unwrap()
         .into_iter()
         .find(|c| c.subject == "second")
@@ -27,7 +27,7 @@ fn reports_file_changes_for_commit() {
         ],
     );
     let repo = Repo::open(dir).expect("open");
-    let target = history(&repo.repo)
+    let target = history(&repo.repo, &repo.head_commit_id().expect("head"))
         .unwrap()
         .into_iter()
         .find(|c| c.subject == "second")

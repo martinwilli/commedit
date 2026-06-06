@@ -71,10 +71,14 @@ Follow that pattern rather than introducing a runtime.
 
 ### History view
 
-`history.rs` walks `git_refs ∪ git_head` ancestors — deliberately **not** jj's
-`all()`, which would surface divergent/working-copy commits git never reffed and
-show them as confusing duplicates. `change_id` (stable across rewrites) is what
-the UI uses to re-select a commit after a save.
+`history.rs` walks the **ancestors of HEAD only** (`history(repo, head)` with
+`head` = `Repo::head_commit_id`, the live branch tip) — like `git log
+<current-branch>`. Other local branches, remote-tracking refs (`origin/*`) and
+tags off the current branch are intentionally excluded, and only commits on this
+chain are droppable/reorderable. Using the live head (not jj's `git_head()`,
+which lags a rewrite until re-imported) avoids resurfacing stale, pre-rewrite
+commits. `change_id` (stable across rewrites) is what the UI uses to re-select a
+commit after a save.
 
 ### Structured diff editing (the other hard part)
 

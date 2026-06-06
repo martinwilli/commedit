@@ -19,7 +19,7 @@ fn lists_history_newest_first() {
     );
 
     let repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
 
     // jj may add an empty working-copy commit on top; ignore empty subjects.
     let subjects: Vec<String> = commits

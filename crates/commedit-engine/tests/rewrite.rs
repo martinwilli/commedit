@@ -23,7 +23,7 @@ fn rewrites_middle_commit_message_visible_to_git() {
     let mut repo = Repo::open(dir).expect("open");
 
     // Find the middle commit ("second").
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let target = commits
         .iter()
         .find(|c| c.subject == "second")
@@ -57,7 +57,7 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let target = commits
         .iter()
         .find(|c| c.subject == "first")
@@ -109,7 +109,7 @@ fn reorders_commit_to_a_new_position_visible_to_git() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second, first]
     let by = |s: &str| {
         commits
             .iter()
@@ -158,7 +158,7 @@ fn history_has_no_duplicate_rows_after_a_reorder() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let from = commits.iter().position(|c| c.subject == "D").unwrap();
     let mv = repo
         .plan_reorder(&commits, from, commits.len())
@@ -169,7 +169,7 @@ fn history_has_no_duplicate_rows_after_a_reorder() {
     // The reorder abandons the pre-reorder commits, which jj keeps pinned (via
     // `git_head` and `refs/jj/keep/*`). The history view must not surface those
     // as duplicate rows — exactly four distinct commits, one per subject.
-    let after = history(&repo.repo).expect("history");
+    let after = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let mut subjects: Vec<_> = after.iter().map(|c| c.subject.clone()).collect();
     subjects.sort();
     assert_eq!(subjects, vec!["A", "B", "C", "D"]);
@@ -214,7 +214,7 @@ fn keep_ref_for_a_manual_jj_anonymous_head_is_preserved() {
 
     // commedit reorders its own branch.
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let from = commits.iter().position(|c| c.subject == "C").unwrap();
     let mv = repo.plan_reorder(&commits, from, commits.len()).expect("plan");
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
@@ -248,7 +248,7 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     g(&["checkout", "-q", "main"]);
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     // The view is a DAG (side diverges), yet reordering the linear main branch
     // must still work — this is what the over-strict whole-view gate broke.
     let third = commits.iter().find(|c| c.subject == "C").expect("C present");
@@ -283,7 +283,7 @@ fn drops_middle_commit_visible_to_git() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second, first]
     let from = commits.iter().position(|c| c.subject == "second").unwrap();
     let target = repo.plan_drop(&commits, from).expect("droppable");
     repo.abandon_commit(&target).expect("drop");
@@ -311,7 +311,7 @@ fn drops_then_restores_commit_round_trips() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second, first]
     let from = commits.iter().position(|c| c.subject == "second").unwrap();
     // Remember the pre-drop commit (its id stays resolvable) like the trash does.
     let second = commits[from].clone();
@@ -321,7 +321,7 @@ fn drops_then_restores_commit_round_trips() {
 
     // Graft it back between "third" and "first" (gap 1), reproducing the original
     // order. This proves a dropped commit is still resolvable and re-graftable.
-    let commits = history(&repo.repo).expect("history"); // [third, first]
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, first]
     let mv = repo.plan_restore(&commits, &second, 1).expect("restore plan");
     repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("restore");
@@ -346,7 +346,7 @@ fn drops_branch_tip_moving_the_branch_to_its_parent() {
     );
 
     let mut repo = Repo::open(dir).expect("open");
-    let commits = history(&repo.repo).expect("history"); // [third, second, first]
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second, first]
     let target = repo.plan_drop(&commits, 0).expect("droppable"); // the tip "third"
     repo.abandon_commit(&target).expect("drop");
 

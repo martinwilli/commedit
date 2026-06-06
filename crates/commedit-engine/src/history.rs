@@ -1,5 +1,7 @@
-//! Walk the repository into a flat, topologically ordered list of commits for
-//! the history view (children before parents, like gitk).
+//! Walk the current branch into a flat, topologically ordered list of commits
+//! for the history view (children before parents) — the ancestors of HEAD, like
+//! `git log <current-branch>`. Other branches, remote-tracking refs and tags are
+//! not shown.
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
@@ -7,10 +9,7 @@ use jj_lib::backend::{ChangeId, CommitId, Timestamp};
 use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::revset::{
-    RemoteRefSymbolExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension,
-};
-use jj_lib::str_util::StringExpression;
+use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
 
 /// A single row in the history view.
 #[derive(Debug, Clone)]
@@ -85,35 +84,20 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
     Ok(Timestamp::from_datetime(dt))
 }
 
-/// List all visible commits in topological order (newest first), excluding the
-/// virtual root commit.
-pub fn history(repo: &ReadonlyRepo) -> Result<Vec<CommitInfo>> {
-    // Mirror what `git log`/`gitk` show: commits reachable from real refs
-    // (branches, remote branches, tags) and git HEAD. Two sources would otherwise
-    // resurface stale, pre-rewrite commits as confusing duplicates of the commits
-    // that replaced them:
-    //   * `git_refs()` (which we avoid) also returns jj's internal `refs/jj/keep/*`
-    //     refs, created to retain commits abandoned by a rewrite/reorder;
-    //   * jj's `git_head()` keeps pointing at the old branch tip until re-imported,
-    //     so its ancestors are the whole pre-reorder chain.
-    // Intersecting with the ancestors of the *visible* heads drops those hidden
-    // commits whatever ref still pins them, while leaving normal history
-    // untouched. (`all()` is unsuitable: it deliberately includes hidden commits
-    // referenced by the expression.)
-    let any_remote = || RemoteRefSymbolExpression {
-        name: StringExpression::all(),
-        remote: StringExpression::all(),
-    };
-    let visible = RevsetExpression::visible_heads().ancestors();
-    let user_expression = RevsetExpression::bookmarks(StringExpression::all())
-        .union(&RevsetExpression::remote_bookmarks(any_remote(), None))
-        .union(&RevsetExpression::tags(StringExpression::all()))
-        .union(&RevsetExpression::git_head())
-        .ancestors()
-        .intersection(&visible);
+/// List the current branch's commits in topological order (newest first): the
+/// ancestors of `head` (the checked-out commit), excluding the virtual root.
+///
+/// This mirrors `git log <current-branch>` — only commits reachable from HEAD.
+/// Commits on other local branches, remote-tracking branches (e.g. `origin/*`)
+/// and tags that sit off the current branch are intentionally not shown. `head`
+/// is the live branch tip (`Repo::head_commit_id`); using it rather than jj's
+/// `git_head()` (which lags behind a rewrite until re-imported) keeps the view
+/// current without resurfacing stale, pre-rewrite commits.
+pub fn history(repo: &ReadonlyRepo, head: &CommitId) -> Result<Vec<CommitInfo>> {
     let symbol_resolver =
         SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
-    let expression = user_expression
+    let expression = RevsetExpression::commits(vec![head.clone()])
+        .ancestors()
         .resolve_user_expression(repo, &symbol_resolver)
         .context("resolving history revset")?;
     let revset = expression

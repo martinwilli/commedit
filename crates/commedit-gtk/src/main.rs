@@ -858,7 +858,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let selected_change = selected_change.clone();
         let identities = identities.clone();
         Rc::new(move || {
-            let loaded = history(&repo.borrow().repo).unwrap_or_default();
+            let loaded = {
+                let r = repo.borrow();
+                match r.head_commit_id() {
+                    Some(head) => history(&r.repo, &head).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
             *commits.borrow_mut() = loaded;
             {
                 let cs = commits.borrow();
@@ -1400,7 +1406,9 @@ fn resolve_commit(
     repo: &Rc<RefCell<Repo>>,
     change_id: &str,
 ) -> Option<commedit_engine::history::CommitInfo> {
-    history(&repo.borrow().repo)
+    let repo = repo.borrow();
+    let head = repo.head_commit_id()?;
+    history(&repo.repo, &head)
         .ok()?
         .into_iter()
         .find(|c| c.change_id_hex() == change_id)

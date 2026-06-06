@@ -9,7 +9,7 @@ use jj_lib::rewrite::{
     move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
 };
 
-use crate::history::parse_timestamp;
+use crate::history::{plan_reorder, parse_timestamp, CommitInfo, ReorderMove};
 use crate::repo::Repo;
 use crate::transparency;
 
@@ -98,6 +98,20 @@ impl Repo {
         self.reattach_head()?;
         self.sync_worktree(old_head)?;
         Ok(())
+    }
+
+    /// Plan a drag-to-reorder of the commit at display index `from` to the
+    /// insertion gap `to`, against the current branch's linear chain. Returns
+    /// `None` for an out-of-range/no-op drop, an off-branch row, or when HEAD is
+    /// unknown. See [`crate::history::plan_reorder`].
+    pub fn plan_reorder(
+        &self,
+        commits: &[CommitInfo],
+        from: usize,
+        to: usize,
+    ) -> Option<ReorderMove> {
+        let head = self.head_commit_id()?;
+        plan_reorder(commits, &head, from, to)
     }
 
     /// Move `target` to a new slot in the linear history: rebased onto

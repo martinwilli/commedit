@@ -106,6 +106,12 @@ impl Repo {
         crate::transparency::head_commit(self.workspace.workspace_root())
     }
 
+    /// HEAD as a [`CommitId`] — the tip of the branch being edited, used to scope
+    /// reordering to the current branch's linear chain.
+    pub fn head_commit_id(&self) -> Option<CommitId> {
+        CommitId::try_from_hex(self.head_commit()?)
+    }
+
     /// Update the working tree from the pre-rewrite tip (`old_head`) to the
     /// current HEAD, keeping `git status` clean without clobbering local edits.
     pub(crate) fn sync_worktree(&self, old_head: Option<String>) -> Result<()> {

@@ -126,16 +126,50 @@ pub struct ReorderMove {
     pub new_tip: CommitId,
 }
 
-/// Plan a drag of the commit at display index `from` (in a newest-first history)
-/// to the insertion gap `to` (`0..=len`, meaning "before row `to`"). Returns
-/// `None` for an out-of-range or no-op drop.
+/// Whether the visible history is a single linear chain: every commit has exactly
+/// one parent and is the sole parent of its predecessor in the list (newest
+/// first). The oldest commit's only parent is the root, which is not listed.
 ///
-/// History is newest-first, so a row's *upper* neighbour is its child (newer) and
-/// its *lower* neighbour is its parent (older). After conceptually removing the
-/// dragged commit, the gap `g` sits between `others[g - 1]` (the new child) and
-/// `others[g]` (the new parent).
-pub fn plan_reorder(commits: &[CommitInfo], from: usize, to: usize) -> Option<ReorderMove> {
-    let n = commits.len();
+/// Not used to gate reordering (the view legitimately shows other branches and
+/// tags); kept as a precise description of "linear" for tests and callers.
+pub fn is_linear_history(commits: &[CommitInfo]) -> bool {
+    commits.iter().enumerate().all(|(i, c)| {
+        c.parents.len() == 1
+            && commits.get(i + 1).is_none_or(|parent| c.parents[0] == parent.id)
+    })
+}
+
+/// The linear chain of the current branch, newest first: follow single-parent
+/// edges from `head` until a merge or the root. Returned as indices into
+/// `commits`.
+///
+/// The history view also shows other branches and tags, whose commits are
+/// interleaved in `commits` by topological order. Reordering only ever touches
+/// the current branch, so it is planned against this chain — foreign commits are
+/// skipped, not treated as parents/children.
+fn branch_chain(commits: &[CommitInfo], head: &CommitId) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut id = head.clone();
+    while let Some(pos) = commits.iter().position(|c| c.id == id) {
+        let c = &commits[pos];
+        // Stop at (and exclude) a merge or the root: the editable chain is the
+        // single-parent run descending from the branch tip.
+        if c.parents.len() != 1 {
+            break;
+        }
+        chain.push(pos);
+        id = c.parents[0].clone();
+    }
+    chain
+}
+
+/// Splice the commit at chain position `from` into chain gap `to` (`0..=len`).
+/// `chain` is a linear list newest-first, so a row's upper neighbour is its child
+/// and its lower neighbour is its parent. After removing the dragged commit, the
+/// gap `g` sits between `chain[g - 1]` (the new child) and `chain[g]` (the new
+/// parent).
+fn plan_linear(chain: &[&CommitInfo], from: usize, to: usize) -> Option<ReorderMove> {
+    let n = chain.len();
     if from >= n || to > n {
         return None;
     }
@@ -146,12 +180,12 @@ pub fn plan_reorder(commits: &[CommitInfo], from: usize, to: usize) -> Option<Re
         return None;
     }
     let others_len = n - 1;
-    // Index into `commits` skipping the dragged row.
+    // Index into `chain` skipping the dragged row.
     let other = |i: usize| -> &CommitInfo {
         if i < from {
-            &commits[i]
+            chain[i]
         } else {
-            &commits[i + 1]
+            chain[i + 1]
         }
     };
 
@@ -170,22 +204,53 @@ pub fn plan_reorder(commits: &[CommitInfo], from: usize, to: usize) -> Option<Re
     // The new head is the dragged commit if it went to the top, else the
     // unchanged newest commit.
     let new_tip = if g == 0 {
-        commits[from].id.clone()
+        chain[from].id.clone()
     } else {
         other(0).id.clone()
     };
 
     Some(ReorderMove {
-        target: commits[from].id.clone(),
+        target: chain[from].id.clone(),
         new_parents,
         new_children,
         new_tip,
     })
 }
 
+/// Plan a drag of the commit at display index `from` (in the newest-first view)
+/// to the insertion gap `to` (`0..=len`, meaning "before row `to`"). `head` is the
+/// current branch tip. Returns `None` for an out-of-range or no-op drop, or when
+/// the dragged row is not on the current branch's linear chain.
+///
+/// The drop point is mapped onto the branch chain (see [`branch_chain`]) by
+/// counting how many chain commits sit above it, so interleaved commits from
+/// other branches/tags in the view are ignored rather than mistaken for
+/// neighbours — which is what produced spurious empty merge commits and the
+/// `graph has cycle` abort.
+pub fn plan_reorder(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    from: usize,
+    to: usize,
+) -> Option<ReorderMove> {
+    let n = commits.len();
+    if from >= n || to > n {
+        return None;
+    }
+    let chain = branch_chain(commits, head);
+    // Map the dragged display row to its chain position; reject rows off-chain.
+    let p = chain.iter().position(|&i| i == from)?;
+    // Map the display gap to a chain gap: the chain commits above the drop point.
+    let cg = chain.iter().filter(|&&i| i < to).count();
+    let chain_commits: Vec<&CommitInfo> = chain.iter().map(|&i| &commits[i]).collect();
+    plan_linear(&chain_commits, p, cg)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_timestamp, parse_timestamp, plan_reorder, CommitInfo};
+    use super::{
+        format_timestamp, is_linear_history, parse_timestamp, plan_reorder, CommitInfo,
+    };
     use jj_lib::backend::{ChangeId, CommitId};
 
     /// A bare [`CommitInfo`] with id `id` and a single parent `parent`, enough to
@@ -218,14 +283,14 @@ mod tests {
     #[test]
     fn dropping_into_the_same_slot_is_a_noop() {
         let h = history();
-        assert_eq!(plan_reorder(&h, 1, 1), None); // onto its own upper half
-        assert_eq!(plan_reorder(&h, 1, 2), None); // onto its own lower half
+        assert_eq!(plan_reorder(&h, &cid(3), 1, 1), None); // onto its own upper half
+        assert_eq!(plan_reorder(&h, &cid(3), 1, 2), None); // onto its own lower half
     }
 
     #[test]
     fn moving_the_tip_down_to_the_oldest_position() {
         // Drag row 0 (tip "3") to the very bottom (gap 3).
-        let mv = plan_reorder(&history(), 0, 3).expect("move");
+        let mv = plan_reorder(&history(), &cid(3), 0, 3).expect("move");
         assert_eq!(mv.target, cid(3));
         assert_eq!(mv.new_parents, vec![cid(0)]); // onto the root
         assert_eq!(mv.new_children, vec![cid(1)]); // old oldest becomes its child
@@ -235,7 +300,7 @@ mod tests {
     #[test]
     fn moving_a_commit_up_to_the_top() {
         // Drag row 2 (oldest "1") to the top (gap 0).
-        let mv = plan_reorder(&history(), 2, 0).expect("move");
+        let mv = plan_reorder(&history(), &cid(3), 2, 0).expect("move");
         assert_eq!(mv.target, cid(1));
         assert_eq!(mv.new_parents, vec![cid(3)]); // onto the old tip
         assert!(mv.new_children.is_empty()); // becomes the new head
@@ -245,7 +310,7 @@ mod tests {
     #[test]
     fn moving_a_commit_into_the_middle() {
         // Drag row 0 (tip "3") down to sit between "2" and "1" (gap 2).
-        let mv = plan_reorder(&history(), 0, 2).expect("move");
+        let mv = plan_reorder(&history(), &cid(3), 0, 2).expect("move");
         assert_eq!(mv.target, cid(3));
         assert_eq!(mv.new_parents, vec![cid(1)]); // parent the older "1"
         assert_eq!(mv.new_children, vec![cid(2)]); // child the newer "2"
@@ -254,8 +319,71 @@ mod tests {
 
     #[test]
     fn out_of_range_is_rejected() {
-        assert_eq!(plan_reorder(&history(), 3, 0), None);
-        assert_eq!(plan_reorder(&history(), 0, 4), None);
+        assert_eq!(plan_reorder(&history(), &cid(3), 3, 0), None);
+        assert_eq!(plan_reorder(&history(), &cid(3), 0, 4), None);
+    }
+
+    /// A commit with an explicit set of parents, for building non-linear graphs.
+    fn merge(id: u8, parents: &[u8]) -> CommitInfo {
+        let mut c = ci(id, 0);
+        c.parents = parents.iter().map(|p| CommitId::new(vec![*p])).collect();
+        c
+    }
+
+    #[test]
+    fn recognizes_a_linear_chain() {
+        assert!(is_linear_history(&history()));
+    }
+
+    #[test]
+    fn a_merge_commit_makes_history_non_linear() {
+        // 3 is a merge of 2 and 1; 2 <- 1 <- root.
+        let h = vec![merge(3, &[2, 1]), ci(2, 1), ci(1, 0)];
+        assert!(!is_linear_history(&h));
+    }
+
+    #[test]
+    fn divergent_tips_make_history_non_linear() {
+        // Two single-parent tips (3 and 4) both rooted on 1: not a single chain,
+        // because 3's parent is 1, not the next listed row 4.
+        let h = vec![ci(3, 1), ci(4, 1), ci(1, 0)];
+        assert!(!is_linear_history(&h));
+    }
+
+    #[test]
+    fn reorder_of_a_merge_branch_tip_is_refused() {
+        // The branch tip itself is a merge: it has no single-parent chain to
+        // splice into, so every drag is refused rather than dropping a parent.
+        let h = vec![merge(3, &[2, 1]), ci(2, 1), ci(1, 0)];
+        assert_eq!(plan_reorder(&h, &cid(3), 0, 3), None);
+        assert_eq!(plan_reorder(&h, &cid(3), 2, 0), None);
+    }
+
+    /// A linear branch `4 <- 3 <- 2 <- 1 <- root` (head 4) whose view also shows a
+    /// foreign commit `5` (branched off `2`) interleaved at the top — the davici
+    /// shape: a clean branch plus a divergent ref in the gitk-style view.
+    fn history_with_foreign_branch() -> Vec<CommitInfo> {
+        vec![ci(5, 2), ci(4, 3), ci(3, 2), ci(2, 1), ci(1, 0)]
+    }
+
+    #[test]
+    fn reorder_ignores_interleaved_foreign_commits() {
+        // Drag the branch tip "4" (display row 1) to the bottom. Planning runs
+        // over the branch chain [4,3,2,1]; the foreign "5" at row 0 is skipped,
+        // not mistaken for a neighbour.
+        let h = history_with_foreign_branch();
+        let mv = plan_reorder(&h, &cid(4), 1, 5).expect("move");
+        assert_eq!(mv.target, cid(4));
+        assert_eq!(mv.new_parents, vec![cid(0)]); // onto the root
+        assert_eq!(mv.new_children, vec![cid(1)]); // old oldest becomes its child
+        assert_eq!(mv.new_tip, cid(3)); // "3" becomes the head
+    }
+
+    #[test]
+    fn dragging_a_foreign_commit_is_refused() {
+        // Row 0 is the foreign commit "5", not on the current branch's chain.
+        let h = history_with_foreign_branch();
+        assert_eq!(plan_reorder(&h, &cid(4), 0, 3), None);
     }
 
     #[test]

@@ -142,3 +142,44 @@ fn reorders_commit_to_a_new_position_visible_to_git() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+
+    // A linear main A <- B <- C, plus a divergent branch `side` (with commit X
+    // off A) left as a ref. This is the davici shape: the edited branch is
+    // linear, but the gitk-style view also shows the side branch.
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+    );
+    g(&["checkout", "-q", "-b", "side", "main~2"]);
+    std::fs::write(dir.join("x.txt"), "x\n").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "X"]);
+    g(&["checkout", "-q", "main"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history");
+    // The view is a DAG (side diverges), yet reordering the linear main branch
+    // must still work — this is what the over-strict whole-view gate broke.
+    let third = commits.iter().find(|c| c.subject == "C").expect("C present");
+    let from = commits.iter().position(|c| c.id == third.id).unwrap();
+    let mv = repo
+        .plan_reorder(&commits, from, commits.len())
+        .expect("a reorder plan for the linear branch");
+    repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder");
+
+    // main is rearranged and stays linear (no spurious merge), the side branch
+    // is untouched, and the repo is intact.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "C"]);
+    assert_eq!(common::git(dir, &["rev-list", "--merges", "--count", "main"]), "0");
+    assert_eq!(common::git(dir, &["log", "--format=%s", "side"]).lines().next(), Some("X"));
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

@@ -1,4 +1,7 @@
-# comm(ed)it: The git commit editor
+<p align="center">
+  <img src="assets/logo.svg" alt="comm(ed)it — the git commit editor" width="600">
+</p>
+
 
 comm(ed)it is a GTK4 desktop application for editing the history of a git
 repository directly and visually — not just the latest commit, but any commit

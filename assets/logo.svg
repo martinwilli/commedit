@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" font-family="'DejaVu Sans','Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#222F46"/>
+      <stop offset="1" stop-color="#161F30"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10192A"/>
+      <stop offset="1" stop-color="#0B1018"/>
+    </linearGradient>
+  </defs>
+
+  <!-- self-contained card so the mark reads on light or dark backgrounds -->
+  <rect x="8" y="16" width="744" height="188" rx="30" fill="url(#card)"/>
+
+  <!-- icon panel -->
+  <rect x="34" y="42" width="136" height="136" rx="30" fill="url(#tile)" stroke="#3C4F70" stroke-width="1.5"/>
+
+  <!-- git commit chain -->
+  <line x1="80" y1="84" x2="80" y2="156" stroke="#F0813A" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="80" cy="84"  r="9" fill="#F0813A"/>
+  <circle cx="80" cy="156" r="9" fill="#F0813A"/>
+
+  <!-- the commit being edited: active node + its diff content -->
+  <circle cx="80" cy="120" r="15" fill="#161F30" stroke="#F0813A" stroke-width="6"/>
+  <g stroke-width="6" stroke-linecap="round">
+    <line x1="102" y1="102" x2="152" y2="102" stroke="#3FB950"/>
+    <line x1="102" y1="120" x2="134" y2="120" stroke="#C7D2E0"/>
+    <line x1="102" y1="138" x2="152" y2="138" stroke="#F85149"/>
+  </g>
+  <!-- text caret on the edited line -->
+  <rect x="140" y="111" width="5" height="18" rx="2.5" fill="#FFFFFF"/>
+
+  <!-- wordmark (single text element so glyphs auto-flow without overlap) -->
+  <text x="206" y="124" font-size="60" font-weight="700">
+    <tspan fill="#E8ECF4">comm</tspan><tspan fill="#F0813A">(ed)</tspan><tspan fill="#E8ECF4">it</tspan>
+  </text>
+  <text x="209" y="160" font-size="21" font-weight="400" letter-spacing="2" fill="#8B97A8">the git commit editor</text>
+</svg>

@@ -135,6 +135,114 @@ pub fn deletion_is_safe(text: &str, start: Cursor, end: Cursor) -> bool {
     start.col >= 1 && end.col >= 1
 }
 
+/// Collapse no-op `-X`/`+X` pairs back into a single context line — the inverse
+/// of the context split [`insert_into_context`] performs. When the user edits a
+/// `+` line until it again equals the `-` line it replaced (i.e. undoes their
+/// change), that line is no longer a real diff and should fold back to plain
+/// context. Within each change block (a maximal run of `-` lines immediately
+/// followed by `+` lines) the leading and trailing lines that match between the
+/// removed and added side are converted to context; the genuinely-changed lines
+/// in the middle stay as `-`/`+`.
+///
+/// Returns the collapsed text and the cursor remapped onto the equivalent line
+/// (same column), so resuming an edit re-splits the line at the same spot — or
+/// `None` if nothing collapses. The result still reverse-applies as a patch:
+/// folding one `-`/`+` pair into a context line leaves the hunk's old/new line
+/// counts unchanged (a context line counts on both sides).
+pub fn collapse_diff(text: &str, cursor: Cursor) -> Option<(String, Cursor)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // For each input line, the output line index it ends up on (collapsed pairs
+    // map both the `-` and `+` line to the resulting context line).
+    let mut map: Vec<usize> = vec![0; lines.len()];
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < lines.len() {
+        if classify_line(lines[i]) == DiffLineKind::Removed {
+            let rem_start = i;
+            while i < lines.len() && classify_line(lines[i]) == DiffLineKind::Removed {
+                i += 1;
+            }
+            let add_start = i;
+            while i < lines.len() && classify_line(lines[i]) == DiffLineKind::Added {
+                i += 1;
+            }
+            collapse_block(&lines, rem_start, add_start, i, &mut out, &mut map, &mut changed);
+        } else {
+            map[i] = out.len();
+            out.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    let line = map
+        .get(cursor.line)
+        .copied()
+        .unwrap_or_else(|| out.len().saturating_sub(1));
+    Some((out.join("\n"), Cursor { line, col: cursor.col }))
+}
+
+/// Fold the matching ends of one `-`-run / `+`-run change block into context.
+/// `rem_start..add_start` are the removed lines, `add_start..add_end` the added.
+fn collapse_block(
+    lines: &[&str],
+    rem_start: usize,
+    add_start: usize,
+    add_end: usize,
+    out: &mut Vec<String>,
+    map: &mut [usize],
+    changed: &mut bool,
+) {
+    let removed: Vec<&str> = (rem_start..add_start).map(|j| content(lines[j])).collect();
+    let added: Vec<&str> = (add_start..add_end).map(|j| content(lines[j])).collect();
+    let (lr, la) = (removed.len(), added.len());
+
+    // Leading lines equal on both sides, then trailing lines equal on what's left.
+    let mut pre = 0;
+    while pre < lr && pre < la && removed[pre] == added[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < lr - pre && suf < la - pre && removed[lr - 1 - suf] == added[la - 1 - suf] {
+        suf += 1;
+    }
+
+    if pre == 0 && suf == 0 {
+        // Nothing matches: emit the block verbatim.
+        for j in rem_start..add_end {
+            map[j] = out.len();
+            out.push(lines[j].to_string());
+        }
+        return;
+    }
+    *changed = true;
+
+    // Leading matches → context, then the changed middle (removed then added),
+    // then trailing matches → context. This keeps each side's line order intact.
+    for k in 0..pre {
+        map[rem_start + k] = out.len();
+        map[add_start + k] = out.len();
+        out.push(format!(" {}", removed[k]));
+    }
+    for k in pre..lr - suf {
+        map[rem_start + k] = out.len();
+        out.push(format!("-{}", removed[k]));
+    }
+    for k in pre..la - suf {
+        map[add_start + k] = out.len();
+        out.push(format!("+{}", added[k]));
+    }
+    for k in 0..suf {
+        map[rem_start + (lr - suf) + k] = out.len();
+        map[add_start + (la - suf) + k] = out.len();
+        out.push(format!(" {}", removed[lr - suf + k]));
+    }
+}
+
 enum Dir {
     Back,
     Forward,
@@ -674,6 +782,82 @@ mod tests {
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("+bx\n+y\n"), "got:\n{out}");
         assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nbx\ny\n");
+    }
+
+    fn collapse(text: &str, c: Cursor) -> (String, Cursor) {
+        collapse_diff(text, c).expect("a collapse")
+    }
+
+    #[test]
+    fn collapse_folds_an_undone_pair_back_to_context() {
+        // " a / -b / +B / c"; the user edits +B back to +b, undoing the change.
+        let patch = sample().replace("+B", "+b");
+        let li = line_index(&patch, |l| l == "+b");
+        // Caret on the re-typed '+b' line (col 2, after 'b').
+        let (out, cur) = collapse(&patch, Cursor::at(li, 2));
+        assert!(out.contains(" b\n"), "the pair folds to context:\n{out}");
+        assert!(!out.contains("-b") && !out.contains("+b"), "no +/- left:\n{out}");
+        // Caret lands on the merged context line at the same column, so a further
+        // edit re-splits it there.
+        assert_eq!(cur, Cursor::at(line_index(&out, |l| l == " b"), 2));
+        // Still applies, now as a no-op against the base.
+        assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn collapse_returns_none_when_nothing_matches() {
+        // A genuine, still-present change must not be collapsed.
+        let patch = sample();
+        assert_eq!(collapse_diff(&patch, Cursor::at(0, 0)), None);
+    }
+
+    #[test]
+    fn collapse_keeps_the_changed_middle_of_a_block() {
+        // old "a b c" -> new "a X c": a multi-line block where only the middle
+        // differs. Re-typing the surrounding lines back to equal must fold just
+        // the matching ends, leaving the middle as a -/+ pair.
+        let old = "a\nb\nc\n";
+        let new = "A\nX\nC\n";
+        let patch = unified_diff(old, new, "f");
+        // Undo the first and last edits (A->a, C->c), keeping b->X.
+        let patch = patch.replace("+A", "+a").replace("+C", "+c");
+        let (out, _) = collapse(&patch, Cursor::at(0, 0));
+        assert!(out.contains(" a\n"), "leading match folds:\n{out}");
+        assert!(out.contains(" c\n"), "trailing match folds:\n{out}");
+        assert!(out.contains("-b\n") && out.contains("+X\n"), "middle stays:\n{out}");
+        assert_eq!(apply_patch(old, &out).unwrap(), "a\nX\nc\n");
+    }
+
+    #[test]
+    fn collapse_folds_a_whole_block_when_fully_undone() {
+        let old = "a\nb\n";
+        let new = "A\nB\n";
+        let patch = unified_diff(old, new, "f")
+            .replace("+A", "+a")
+            .replace("+B", "+b");
+        let (out, _) = collapse(&patch, Cursor::at(0, 0));
+        // No change lines remain (the `---`/`+++` headers are not Added/Removed).
+        for line in out.lines() {
+            let kind = classify_line(line);
+            assert!(
+                kind != DiffLineKind::Added && kind != DiffLineKind::Removed,
+                "leftover change line: {line:?}"
+            );
+        }
+        assert_eq!(apply_patch(old, &out).unwrap(), old);
+    }
+
+    #[test]
+    fn collapse_round_trips_with_a_context_split() {
+        // Folding then re-typing on the merged line reproduces a valid -/+ pair.
+        let patch = sample().replace("+B", "+b");
+        let li = line_index(&patch, |l| l == "+b");
+        let (folded, cur) = collapse(&patch, Cursor::at(li, 2));
+        // Type 'Z' at the caret on the merged context line.
+        let plan = plan_edit(&folded, Selection::caret(cur), EditGesture::Insert("Z".into()));
+        let resplit = apply(&folded, &edit(plan));
+        assert!(resplit.contains("-b\n+bZ\n"), "re-split at the caret:\n{resplit}");
+        assert!(apply_patch("a\nb\nc\n", &resplit).is_ok());
     }
 
     #[test]

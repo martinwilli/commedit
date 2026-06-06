@@ -51,17 +51,51 @@ time. This invariant drives much of the code:
 
 `rewrite.rs` / `tree.rs` all do: load target commit → `start_transaction` →
 `rewrite_commit(...).write()` (or `move_commits` for reorder) →
-`rebase_descendants()` → `transparency::export_to_git` → `tx.commit(...)` →
-`reattach_head()` → `sync_worktree(old_head)`. When adding a new kind of edit,
-mirror this sequence.
+`rebase_descendants()` → `self.finish_mutation(tx, ...)`. They return
+`Result<SaveOutcome>`, not `Result<()>`. When adding a new kind of edit, mirror
+this sequence and end in `finish_mutation`; do **not** call `export_to_git`
+inline.
+
+`finish_mutation` (`conflict.rs`) is the shared tail: it commits the jj
+transaction, then walks the branch tip's ancestors for `commit.has_conflict()`.
+If clean it runs the deferred export (`export_to_git` → `reattach_head` →
+`sync_worktree(old_head)` → `prune_orphaned_keep_refs`) in a second transaction
+and returns `SaveOutcome::Clean`. If conflicted it stores a `PendingResolution`
+and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — see
+"Conflict resolution" below.
 
 - `rewrite_message` / `rewrite_identity` — message + author/committer edits.
   Run identity **last** in a multi-part save: it overrides jj's habit of
   re-stamping the committer to "now".
 - `reorder_commit` (`rewrite.rs`) + `plan_reorder` (`history.rs`) — drag-to-reorder.
   Planning (pure index arithmetic on a newest-first list) is separate from the
-  rebase. Reorder may need an explicit bookmark move (`set_head_bookmark`)
-  because the head commit isn't always rewritten.
+  rebase. Reorder sets an explicit bookmark move (`set_head_bookmark`) in the
+  rewrite transaction — both because the head commit isn't always rewritten, and
+  so `finish_mutation` can read the new tip back from the bookmark to scope its
+  conflict walk.
+
+### Conflict resolution (`conflict.rs`)
+
+`rebase_descendants` can produce commits with conflicted trees. jj's git backend
+serializes those as `.jjconflict-*` subtrees, so exporting them would corrupt the
+git history. Transparency is preserved purely by **not moving any git ref /
+HEAD / worktree while the chain is conflicted** — the conflicted commit objects
+sit unreachable in the ODB (like keep-ref residue) and plain `git` keeps seeing
+the pre-rewrite history. The deferred export only runs once the whole chain is
+clean.
+
+While a `PendingResolution` is held, the UI drives it by **change id** (commit
+ids churn on every resolution step): `read_conflict(change_hex, path)`
+materializes a file with Git 2-way markers (jj's diff3 base section is stripped);
+`resolve_conflict(change_hex, path, text, marker_len)` parses the edit back
+(`update_from_content`), splices the resolved tree, re-rebases and re-settles —
+returning `Clean` (and auto-exporting) once the last conflict is gone. `abort()`
+rolls jj back to the captured pre-rewrite `Operation`; `jj_head_commit_id()`
+exposes the pending (not-yet-exported) tip so the UI can display the chain being
+resolved. Resolve **oldest-first**: fixing the earliest conflict often
+auto-clears its descendants on rebase. Non-file (structural) conflicts can't be
+resolved as text — they're flagged `resolvable: false` and the only escape is
+`abort`.
 
 ### jj-lib is async; we block
 

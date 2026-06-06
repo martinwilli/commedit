@@ -19,6 +19,16 @@ read-only. Each hunk carries an *expand context* control to reveal more of the
 surrounding file. The intent is that you edit hunks intuitively while never
 producing a broken patch.
 
+You can also **reorder** commits by dragging them in the history, or **drop**
+one into the trash (and drag it back to restore it). A reorder or drop is a
+real rebase, so it can conflict. When it does, comm(ed)it never writes the
+conflict into your git history: the rewrite is held back — `git` still sees your
+original, untouched history — and the conflicted files are shown right in the
+diff pane with `<<<<<<<` / `=======` / `>>>>>>>` markers. Resolve each by hand or
+with the *Use ours / theirs / both* buttons; the rewrite is applied to git
+automatically once every conflict is gone, or you can abort it and leave history
+exactly as it was.
+
 ## Building and running
 
 comm(ed)it is a Rust workspace; you need a Rust toolchain and the system

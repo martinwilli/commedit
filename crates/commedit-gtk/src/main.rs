@@ -37,6 +37,15 @@ const APP_ID: &str = "net.willi.commedit";
 /// hunk (the renderer rebuilds the buffer and the buttons themselves).
 type Renderer = Rc<dyn Fn()>;
 
+/// Which list a drag started in, so the shared drop handlers can tell a reorder
+/// (history → history), a drop (history → trash) and a restore (trash → history)
+/// apart. The carried value is just the source row index; this says where from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragOrigin {
+    History,
+    Trash,
+}
+
 fn main() {
     let repo_path = std::env::args()
         .nth(1)
@@ -149,6 +158,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // commit changes (see `load_changes`).
     let expansions: Rc<RefCell<HashMap<String, ContextExpansion>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    // Commits dropped to the trash this session, newest drop last. They are no
+    // longer on the branch but their objects survive, so they can be dragged back
+    // into history to restore them (see `Repo::restore_commit`).
+    let trashed: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // Which list the in-flight drag started in, set on drag prepare.
+    let drag_origin: Rc<Cell<DragOrigin>> = Rc::new(Cell::new(DragOrigin::History));
 
     // Styling for drag-and-drop reordering: the insertion gap placeholder and the
     // dimmed row being dragged. Installed once for the display.
@@ -157,7 +172,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         css.load_from_data(
             ".drop-placeholder { background-color: rgba(53, 132, 228, 0.22); \
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; margin: 1px 6px; } \
-             row.commit-dragging { opacity: 0.35; }",
+             row.commit-dragging { opacity: 0.35; } \
+             .trash-active { background-color: rgba(53, 132, 228, 0.12); \
+             border: 1px dashed rgb(53, 132, 228); border-radius: 5px; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -174,6 +191,33 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .width_request(480)
         .child(&list)
         .build();
+
+    // The trash panel: a short, always-visible list at the bottom of the history
+    // pane. Dropping a commit here removes it from the branch; it stays listed so
+    // it can be dragged back into the history above to restore it.
+    let trash_list = ListBox::new();
+    let trash_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .height_request(140)
+        .child(&trash_list)
+        .build();
+    let trash_header = Label::builder()
+        .label("Trash")
+        .xalign(0.0)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(2)
+        .build();
+    trash_header.add_css_class("dim-label");
+    let trash_box = GtkBox::new(Orientation::Vertical, 0);
+    trash_box.append(&gtk::Separator::new(Orientation::Horizontal));
+    trash_box.append(&trash_header);
+    trash_box.append(&trash_scroll);
+
+    let history_box = GtkBox::new(Orientation::Vertical, 0);
+    history_box.append(&history_scroll);
+    history_box.append(&trash_box);
 
     // --- Message pane (top-right) ---
     let message_buffer = sourceview5::Buffer::new(None);
@@ -301,7 +345,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     let paned = Paned::builder()
         .orientation(Orientation::Horizontal)
-        .start_child(&history_scroll)
+        .start_child(&history_box)
         .end_child(&right_paned)
         .position(480)
         .build();
@@ -923,12 +967,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     drag_source.connect_prepare({
         let list = list.clone();
         let drag_row = drag_row.clone();
+        let drag_origin = drag_origin.clone();
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
             // Show the dragged row under the cursor for feedback.
             let paintable = gtk::WidgetPaintable::new(Some(&row));
             source.set_icon(Some(&paintable), 0, 0);
             *drag_row.borrow_mut() = Some(row.clone());
+            drag_origin.set(DragOrigin::History);
             Some(gdk::ContentProvider::for_value(&row.index().to_value()))
         }
     });
@@ -979,6 +1025,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let gap_at = gap_at.clone();
         let clear_gap = clear_gap.clone();
         let drop_gap = drop_gap.clone();
+        let drag_origin = drag_origin.clone();
+        let trashed = trashed.clone();
+        let trash_list = trash_list.clone();
+        let selected_change = selected_change.clone();
         move |_target, value, _x, y| {
             let Ok(from) = value.get::<i32>() else {
                 return false;
@@ -989,26 +1039,153 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 None => gap_at(y),
             };
             clear_gap();
-            // Plan against the current branch's linear chain (the view may also
-            // show other branches/tags); a no-op or off-branch drop yields None.
-            let plan = repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
-            let Some(mv) = plan else {
-                return false;
-            };
-            if let Err(err) = repo.borrow_mut().reorder_commit(
-                &mv.target,
-                mv.new_parents,
-                mv.new_children,
-                &mv.new_tip,
-            ) {
-                show_status(&format!("Reorder failed: {err}"));
-                return false;
+            match drag_origin.get() {
+                DragOrigin::History => {
+                    // Plan against the current branch's linear chain (the view may
+                    // also show other branches/tags); a no-op or off-branch drop
+                    // yields None.
+                    let plan = repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
+                    let Some(mv) = plan else {
+                        return false;
+                    };
+                    if let Err(err) = repo.borrow_mut().reorder_commit(
+                        &mv.target,
+                        mv.new_parents,
+                        mv.new_children,
+                        &mv.new_tip,
+                    ) {
+                        show_status(&format!("Reorder failed: {err}"));
+                        return false;
+                    }
+                    refresh();
+                    true
+                }
+                DragOrigin::Trash => {
+                    // Restoring a trashed commit: graft it back into the chain at
+                    // the drop gap, drop it from the trash, and select it.
+                    let info = trashed.borrow().get(from as usize).cloned();
+                    let Some(info) = info else {
+                        return false;
+                    };
+                    let plan = repo.borrow().plan_restore(&commits.borrow(), &info, to);
+                    let Some(mv) = plan else {
+                        return false;
+                    };
+                    if let Err(err) = repo.borrow_mut().restore_commit(
+                        &mv.target,
+                        mv.new_parents,
+                        mv.new_children,
+                        &mv.new_tip,
+                    ) {
+                        show_status(&format!("Restore failed: {err}"));
+                        return false;
+                    }
+                    trashed.borrow_mut().remove(from as usize);
+                    *selected_change.borrow_mut() = Some(info.change_id_hex());
+                    refresh();
+                    populate_trash(&trash_list, &trashed.borrow());
+                    true
+                }
             }
-            refresh();
-            true
         }
     });
     list.add_controller(drop_target);
+
+    // The trash list mirrors the history list's drag-and-drop: a source so its
+    // rows can be dragged back into history (restore), and a drop target so
+    // history rows dragged onto it are dropped (abandoned). Reordering within the
+    // trash is meaningless, so trash→trash drops are ignored.
+    let trash_drag = DragSource::new();
+    trash_drag.set_actions(gdk::DragAction::MOVE);
+    trash_drag.connect_prepare({
+        let trash_list = trash_list.clone();
+        let trashed = trashed.clone();
+        let drag_row = drag_row.clone();
+        let drag_origin = drag_origin.clone();
+        move |source, _x, y| {
+            if trashed.borrow().is_empty() {
+                return None; // only the hint row is present
+            }
+            let row = trash_list.row_at_y(y as i32)?;
+            let paintable = gtk::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&paintable), 0, 0);
+            *drag_row.borrow_mut() = Some(row.clone());
+            drag_origin.set(DragOrigin::Trash);
+            Some(gdk::ContentProvider::for_value(&row.index().to_value()))
+        }
+    });
+    trash_drag.connect_drag_begin({
+        let drag_row = drag_row.clone();
+        move |_source, _drag| {
+            if let Some(row) = drag_row.borrow().as_ref() {
+                row.add_css_class("commit-dragging");
+            }
+        }
+    });
+    trash_drag.connect_drag_end({
+        let drag_row = drag_row.clone();
+        let clear_gap = clear_gap.clone();
+        move |_source, _drag, _delete| {
+            if let Some(row) = drag_row.borrow_mut().take() {
+                row.remove_css_class("commit-dragging");
+            }
+            clear_gap();
+        }
+    });
+    trash_list.add_controller(trash_drag);
+
+    let trash_drop = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
+    trash_drop.connect_enter({
+        let trash_box = trash_box.clone();
+        move |_target, _x, _y| {
+            trash_box.add_css_class("trash-active");
+            gdk::DragAction::MOVE
+        }
+    });
+    trash_drop.connect_leave({
+        let trash_box = trash_box.clone();
+        move |_target| trash_box.remove_css_class("trash-active")
+    });
+    trash_drop.connect_drop({
+        let commits = commits.clone();
+        let repo = repo.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        let drag_origin = drag_origin.clone();
+        let trashed = trashed.clone();
+        let trash_list = trash_list.clone();
+        let trash_box = trash_box.clone();
+        move |_target, value, _x, _y| {
+            trash_box.remove_css_class("trash-active");
+            if drag_origin.get() != DragOrigin::History {
+                return false; // dragging within the trash: nothing to do
+            }
+            let Ok(from) = value.get::<i32>() else {
+                return false;
+            };
+            let info = commits.borrow().get(from as usize).cloned();
+            let Some(info) = info else {
+                return false;
+            };
+            // Only commits on the current branch's linear chain (and not its sole
+            // commit) can be dropped; refuse merges/off-branch/root rows.
+            let target = repo.borrow().plan_drop(&commits.borrow(), from as usize);
+            let Some(target) = target else {
+                show_status("Can't drop this commit");
+                return false;
+            };
+            if let Err(err) = repo.borrow_mut().abandon_commit(&target) {
+                show_status(&format!("Drop failed: {err}"));
+                return false;
+            }
+            trashed.borrow_mut().push(info);
+            refresh();
+            populate_trash(&trash_list, &trashed.borrow());
+            true
+        }
+    });
+    trash_box.add_controller(trash_drop);
+    populate_trash(&trash_list, &trashed.borrow());
 
     // Save: rewrite the message and/or the selected file's content, then reload.
     // Reloading re-selects the commit, which cascades through `row-selected` ->
@@ -1552,6 +1729,65 @@ fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
         row_box.append(&id_label);
         row_box.append(&subject_label);
         let row = ListBoxRow::new();
+        row.set_child(Some(&row_box));
+        list.append(&row);
+    }
+}
+
+/// Fill the trash list with the session's dropped commits (one row per commit,
+/// same id+subject layout as the history list). When empty, show a single dim,
+/// non-selectable hint row so the panel reads as a drop target rather than blank.
+fn populate_trash(list: &ListBox, commits: &[CommitInfo]) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    if commits.is_empty() {
+        let hint = Label::builder()
+            .label("Drag a commit here to drop it")
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        hint.add_css_class("dim-label");
+        let row = ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+        row.set_child(Some(&hint));
+        list.append(&row);
+        return;
+    }
+    for commit in commits {
+        let short = commit.id_hex().chars().take(8).collect::<String>();
+        let subject = if commit.subject.is_empty() {
+            "(no description)"
+        } else {
+            &commit.subject
+        };
+        let id_label = Label::builder().xalign(0.0).build();
+        id_label.set_markup(&format!("<tt>{short}</tt>"));
+        let subject_label = Label::builder()
+            .label(subject)
+            .xalign(0.0)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let row_box = GtkBox::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        row_box.append(&id_label);
+        row_box.append(&subject_label);
+        let row = ListBoxRow::new();
+        // Trash rows aren't editable; they exist only to be dragged back out.
+        row.set_selectable(false);
+        row.set_activatable(false);
         row.set_child(Some(&row_box));
         list.append(&row);
     }

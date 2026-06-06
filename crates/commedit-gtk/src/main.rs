@@ -1761,28 +1761,12 @@ fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
 }
 
 /// Fill the trash list with the session's dropped commits (one row per commit,
-/// same id+subject layout as the history list). When empty, show a single dim,
-/// non-selectable hint row so the panel reads as a drop target rather than blank.
+/// same id+subject layout as the history list). When empty the list stays empty
+/// so the panel collapses to just its trash icon (the icon's drop target is what
+/// commits are dragged onto).
 fn populate_trash(list: &ListBox, commits: &[CommitInfo]) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
-    }
-    if commits.is_empty() {
-        let hint = Label::builder()
-            .label("Drag a commit here to drop it")
-            .xalign(0.0)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-        hint.add_css_class("dim-label");
-        let row = ListBoxRow::new();
-        row.set_selectable(false);
-        row.set_activatable(false);
-        row.set_child(Some(&hint));
-        list.append(&row);
-        return;
     }
     for commit in commits {
         let short = commit.id_hex().chars().take(8).collect::<String>();

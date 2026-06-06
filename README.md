@@ -19,6 +19,18 @@ read-only. Each hunk carries an *expand context* control to reveal more of the
 surrounding file. The intent is that you edit hunks intuitively while never
 producing a broken patch.
 
+## Building and running
+
+comm(ed)it is a Rust workspace; you need a Rust toolchain and the system
+GTK4 and libsourceview5 development libraries (e.g. `libgtk-4-dev` and
+`libgtksourceview-5-dev` on Debian/Ubuntu).
+
+```sh
+cargo build                 # build the workspace
+cargo test                  # run the engine and integration tests
+cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
+```
+
 ## Keyboard shortcuts
 
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.
@@ -38,3 +50,7 @@ rewrite logic carries no GTK dependency.
 This project has been completely vibe-coded. It rewrites git history, and it may
 eat your commits and your git repository. Use it only on repositories you can
 afford to lose, and keep a backup.
+
+## License
+
+comm(ed)it is licensed under the [MIT License](LICENSE).

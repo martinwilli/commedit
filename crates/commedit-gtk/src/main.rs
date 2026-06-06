@@ -421,11 +421,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Fold any `-X`/`+X` pair the user has undone (edited a `+` line back to
     // equal its `-` line) into a single context line. The caret is moved onto the
     // merged line at the same column, so resuming the edit re-splits it there. The
-    // rewrite is guarded so the firewall treats it as our own, and the scroll
-    // position is preserved so the small line-count change doesn't jump the view.
+    // rewrite is guarded so the firewall treats it as our own.
+    //
+    // We splice in only the span that actually changed (a localized delete+insert)
+    // rather than `set_text`-ing the whole buffer: `set_text` resets the scroll to
+    // the top, and re-pinning it afterwards fights GTK's deferred layout validation
+    // and loses. An in-place edit near the (visible) caret leaves the view exactly
+    // where it is, the same way ordinary typing does.
     let collapse: Rc<dyn Fn()> = {
         let file_buffer = file_buffer.clone();
-        let file_view = file_view.clone();
         let editing = editing.clone();
         Rc::new(move || {
             let text = buffer_text(&file_buffer);
@@ -437,15 +441,36 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Some((collapsed, new_cursor)) = collapse_diff(&text, cursor) else {
                 return;
             };
-            let scroll = file_view.vadjustment().map(|v| v.value());
+            // Reduce the whole-text change to its minimal differing span: the
+            // common leading/trailing characters are untouched, so we only delete
+            // and re-insert the lines that actually folded.
+            let old: Vec<char> = text.chars().collect();
+            let new: Vec<char> = collapsed.chars().collect();
+            let mut head = 0;
+            while head < old.len() && head < new.len() && old[head] == new[head] {
+                head += 1;
+            }
+            let mut tail = 0;
+            while tail < old.len() - head
+                && tail < new.len() - head
+                && old[old.len() - 1 - tail] == new[new.len() - 1 - tail]
+            {
+                tail += 1;
+            }
+            let middle: String = new[head..new.len() - tail].iter().collect();
+
             editing.set(true);
-            file_buffer.set_text(&collapsed);
+            file_buffer.begin_user_action();
+            let mut start = file_buffer.iter_at_offset(head as i32);
+            let mut end = file_buffer.iter_at_offset((old.len() - tail) as i32);
+            file_buffer.delete(&mut start, &mut end);
+            let mut at = file_buffer.iter_at_offset(head as i32);
+            file_buffer.insert(&mut at, &middle);
+            file_buffer.end_user_action();
             editing.set(false);
+
             let caret = iter_at(&file_buffer, &new_cursor);
             file_buffer.place_cursor(&caret);
-            if let (Some(v), Some(val)) = (file_view.vadjustment(), scroll) {
-                v.set_value(val);
-            }
         })
     };
 

@@ -333,21 +333,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_dropdown.set_margin_top(0);
     file_dropdown.set_margin_end(8);
     file_dropdown.set_margin_bottom(4);
-    // Transient feedback line for blocked edits and save errors.
+    // Transient feedback line for blocked edits and save errors. It lives at the
+    // left of the action bar below, so the message shows inline beside the Save
+    // button. It ellipsizes rather than expands: a flexible spacer (not the
+    // label) holds the slack, so the Save button stays pinned right whether or
+    // not the label is currently visible.
     let status_label = Label::builder()
         .xalign(0.0)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(4)
-        .margin_bottom(4)
-        .wrap(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .valign(gtk::Align::Center)
         .build();
     status_label.add_css_class("dim-label");
     status_label.set_visible(false);
 
     // Action bar along the bottom of the file pane. The Save button is
-    // right-aligned behind a flexible spacer, which leaves room for more
-    // buttons later. Living inside `files_box` keeps it only as wide as the
+    // right-aligned behind a flexible spacer; the status label sits to the left
+    // of that spacer. Living inside `files_box` keeps it only as wide as the
     // file/diff editing field rather than spanning the whole window.
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
@@ -358,12 +359,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     bottom_bar.set_margin_bottom(8);
     let bottom_spacer = GtkBox::new(Orientation::Horizontal, 0);
     bottom_spacer.set_hexpand(true);
+    bottom_bar.append(&status_label);
     bottom_bar.append(&bottom_spacer);
     bottom_bar.append(&save_button);
 
     files_box.append(&file_dropdown);
     files_box.append(&file_scroll);
-    files_box.append(&status_label);
     files_box.append(&bottom_bar);
 
     let right_paned = Paned::builder()
@@ -736,7 +737,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    const READ_ONLY_HINT: &str = "Edit blocked — only added (+) lines are freely editable.";
+    const READ_ONLY_HINT: &str = "Edit blocked — this change would break the patch structure.";
 
     // Firewall: every interactive mutation of the diff buffer goes through the
     // structured-edit planner so it can never produce a patch that fails to

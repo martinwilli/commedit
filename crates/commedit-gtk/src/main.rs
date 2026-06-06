@@ -114,6 +114,20 @@ fn resolve_cue(kind: ConflictLineKind) -> Option<(&'static str, Side)> {
     }
 }
 
+/// The quick-resolve [`Side`] for a buffer position `(line, col)` if it lands on
+/// a conflict block's inline "➜ use …" cue, else `None`. The single hit test
+/// shared by the click gesture (which acts on it) and the hover cursor (which
+/// shows a hand over it) so the two always agree. `col` is a character offset.
+fn conflict_cue_side_at(text: &str, line: usize, col: usize) -> Option<Side> {
+    let (_, side) = classify_conflict_lines(text)
+        .get(line)
+        .copied()
+        .and_then(resolve_cue)?;
+    let line_text = text.split('\n').nth(line).unwrap_or("");
+    let byte = line_text.find(CUE_GLYPH)?;
+    (col >= line_text[..byte].chars().count()).then_some(side)
+}
+
 /// Append the inline quick-resolve cue to each conflict-marker line of the
 /// buffer (which must already hold the materialized conflict text). Inserting at
 /// a line's end leaves line numbering unchanged, so the cached classification
@@ -793,20 +807,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // lines) fall through so the caret places normally for free-form edits.
             if pane_mode.borrow().is_conflict() {
                 let text = buffer_text(&file_buffer);
-                let kind = classify_conflict_lines(&text).get(line).copied();
-                let Some((_, side)) = kind.and_then(resolve_cue) else {
+                let col = iter.line_offset() as usize;
+                let Some(side) = conflict_cue_side_at(&text, line, col) else {
                     return;
                 };
-                // Restrict the hit area to the cue's own character run: a click
-                // left of the `➜` glyph is on the marker text, not the button.
-                let line_text = text.split('\n').nth(line).unwrap_or("");
-                let Some(byte) = line_text.find(CUE_GLYPH) else {
-                    return;
-                };
-                let cue_col = line_text[..byte].chars().count();
-                if (iter.line_offset() as usize) < cue_col {
-                    return;
-                }
                 // We own this click: don't let the view also place the caret in
                 // the marker line we're about to delete.
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -896,6 +900,44 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
     file_view.add_controller(expand_click);
+
+    // Hover cursor: show a hand over the clickable affordances — the conflict
+    // "➜ use …" buttons and the diff "expand context" cues (the whole expandable
+    // @@ header line, which is what the click acts on) — and the text I-beam
+    // everywhere else. GtkTextView otherwise only ever shows the I-beam over
+    // content; we override it per the gtk hypertext pattern (set the widget
+    // cursor from the motion handler). A `Cell` tracks the current state so we
+    // only touch the cursor when it actually flips.
+    let hover_hand = Rc::new(Cell::new(false));
+    let hover_motion = gtk::EventControllerMotion::new();
+    hover_motion.connect_motion({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let rendered_hunks = rendered_hunks.clone();
+        let pane_mode = pane_mode.clone();
+        let hover_hand = hover_hand.clone();
+        move |_, x, y| {
+            let (bx, by) =
+                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let over_button = file_view.iter_at_location(bx, by).is_some_and(|iter| {
+                let line = iter.line() as usize;
+                if pane_mode.borrow().is_conflict() {
+                    let text = buffer_text(&file_buffer);
+                    conflict_cue_side_at(&text, line, iter.line_offset() as usize).is_some()
+                } else {
+                    rendered_hunks
+                        .borrow()
+                        .iter()
+                        .any(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
+                }
+            });
+            if over_button != hover_hand.get() {
+                hover_hand.set(over_button);
+                file_view.set_cursor_from_name(Some(if over_button { "pointer" } else { "text" }));
+            }
+        }
+    });
+    file_view.add_controller(hover_motion);
 
     // Show the file at `idx` of the current changes in the editor.
     let show_file: Rc<dyn Fn(usize)> = {

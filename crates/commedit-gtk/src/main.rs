@@ -803,14 +803,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let show_status = show_status.clone();
         let highlight = highlight.clone();
-        move |_, keyval, _, _| {
+        move |_, keyval, _, state| {
             if !file_view.is_editable() {
                 return glib::Propagation::Proceed;
             }
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let gesture = match keyval {
                 gdk::Key::Return | gdk::Key::KP_Enter => EditGesture::Newline,
                 gdk::Key::BackSpace => EditGesture::Backspace,
                 gdk::Key::Delete | gdk::Key::KP_Delete => EditGesture::Delete,
+                gdk::Key::d | gdk::Key::D if ctrl => EditGesture::DeleteLine,
                 _ => return glib::Propagation::Proceed,
             };
             match plan_edit(&buffer_text(&file_buffer), buffer_selection(&file_buffer), gesture) {

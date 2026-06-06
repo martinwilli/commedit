@@ -15,6 +15,9 @@
 //!   character splits it into a `-<orig>` / `+<edited>` pair. Backspace at the
 //!   content start / Delete at the content end have no character to remove there,
 //!   so they mark the whole line removed (` ` → `-`) — a clean toggle.
+//! * Deleting a selection over context lines removes the whole ones (→ `-`) and
+//!   edits any half-selected line at either end, the surviving text rejoining as
+//!   a `+` line — like a plain-editor delete lifted into the diff.
 //! * Enter on a context line keeps it and inserts an empty `+` line below.
 //! * Header / `@@` / meta lines are read-only.
 //!
@@ -371,16 +374,10 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
         if deletion_is_safe_lines(lines, lo, hi) {
             return EditPlan::Allow;
         }
-        // A selection within one context line edits it: drop the selected span,
-        // splitting the line into a `-orig`/`+edited` pair like typing does.
-        if lo.line == hi.line {
-            if let Some(&line) = lines.get(lo.line) {
-                if !line.is_empty() && classify_line(line) == DiffLineKind::Context {
-                    let s = content_index(line, lo.col);
-                    let e = content_index(line, hi.col);
-                    return EditPlan::Edit(delete_from_context(line, lo.line, s, e));
-                }
-            }
+        // A selection over context line(s): remove the whole ones and edit any
+        // half-selected line at either end (the surviving text rejoins as `+`).
+        if let Some(edit) = delete_context_span(lines, lo, hi) {
+            return EditPlan::Edit(edit);
         }
         // A selection confined to `+` lines: remove whole lines, or join across
         // them for a partial multi-line delete inside the added block.
@@ -493,6 +490,61 @@ fn delete_added_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit
         end: Cursor::at(end, 0),
         replacement: String::new(),
         cursor: Cursor::at(lo.line, 0),
+    })
+}
+
+/// Delete a selection that spans context line(s). Every spanned context line is
+/// marked removed (`-`); unless the selection sat exactly on line boundaries,
+/// the surviving head of the first line and tail of the last line rejoin into a
+/// single edited `+` line (mirroring a plain-editor delete that merges the
+/// partial ends). Returns `None` unless every spanned line is a non-empty
+/// context line, leaving the caller to handle other kinds.
+fn delete_context_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEdit> {
+    // A selection sitting exactly on line boundaries removes whole lines; one
+    // entering a line's content edits it, so the surviving text rejoins as `+`.
+    let whole_lines = lo.col == 0 && hi.col == 0;
+    let last = if whole_lines { hi.line.checked_sub(1)? } else { hi.line };
+    if last < lo.line || last >= lines.len() {
+        return None;
+    }
+    if lines[lo.line..=last]
+        .iter()
+        .any(|l| l.is_empty() || classify_line(l) != DiffLineKind::Context)
+    {
+        return None;
+    }
+    // Mark every spanned context line removed.
+    let mut replacement = String::new();
+    for &line in &lines[lo.line..=last] {
+        replacement.push('-');
+        replacement.push_str(content(line));
+        replacement.push('\n');
+    }
+    // Unless whole lines were taken, the kept head/tail rejoin as one `+` line
+    // (empty when only a line's content was cleared), with the caret at the seam.
+    let cursor = if whole_lines {
+        Cursor::at(lo.line, 0)
+    } else {
+        let first = lines[lo.line];
+        let head = content_range(first, 0, content_index(first, lo.col));
+        let tail_line = lines[hi.line];
+        let tail = content_range(
+            tail_line,
+            content_index(tail_line, hi.col),
+            char_len(content(tail_line)),
+        );
+        let head_len = char_len(&head);
+        replacement.push('+');
+        replacement.push_str(&head);
+        replacement.push_str(&tail);
+        replacement.push('\n');
+        Cursor::at(hi.line + 1, 1 + head_len)
+    };
+    Some(PatchEdit {
+        start: Cursor::at(lo.line, 0),
+        end: Cursor::at(last + 1, 0),
+        replacement,
+        cursor,
     })
 }
 
@@ -644,6 +696,12 @@ fn content_index(line: &str, col: usize) -> usize {
 /// Byte offset of character index `ch` in `s` (or `s.len()` if past the end).
 fn byte_of_char(s: &str, ch: usize) -> usize {
     s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// The substring of a diff line's content covering character indices `[a, b)`.
+fn content_range(line: &str, a: usize, b: usize) -> String {
+    let body = content(line);
+    body[byte_of_char(body, a)..byte_of_char(body, b)].to_string()
 }
 
 /// Replace the character range `[from, to)` of `s` with `insert`.
@@ -877,6 +935,59 @@ mod tests {
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("-abc\n+a\n"), "got:\n{out}");
         assert!(apply_patch("abc\nx\n", &out).is_ok());
+    }
+
+    /// A file with three context lines around one change, to exercise multi-line
+    /// context selections: ` one` / ` two` / ` three` precede the `-x`/`+Y` edit.
+    fn context_block() -> String {
+        unified_diff("one\ntwo\nthree\nx\n", "one\ntwo\nthree\nY\n", "f")
+    }
+
+    #[test]
+    fn selection_deletes_whole_context_lines() {
+        let patch = context_block();
+        let l1 = line_index(&patch, |l| l == " one");
+        // Select " one".." three" whole (start of " one" to start of "-x").
+        let plan = plan_edit(&patch, sel((l1, 0), (l1 + 3, 0)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("-one\n-two\n-three\n"), "all removed:\n{out}");
+        // The three lines are dropped from the new file.
+        assert_eq!(apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(), "Y\n");
+    }
+
+    #[test]
+    fn selection_edits_half_selected_context_ends() {
+        let patch = context_block();
+        let l1 = line_index(&patch, |l| l == " one");
+        // From mid " one" (after 'o') to mid " three" (before 'e'): the kept head
+        // "o" and tail "ee" rejoin into one `+` line, all three lines removed.
+        let plan = plan_edit(&patch, sel((l1, 2), (l1 + 2, 4)), EditGesture::Delete);
+        let e = edit(plan);
+        let out = apply(&patch, &e);
+        assert!(out.contains("-one\n-two\n-three\n+oee\n"), "joined edit:\n{out}");
+        // Caret at the seam, just after the kept head "o".
+        assert_eq!(e.cursor, Cursor::at(line_index(&out, |l| l == "+oee"), 2));
+        assert_eq!(apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(), "oee\nY\n");
+    }
+
+    #[test]
+    fn selection_clears_a_single_context_line_to_empty() {
+        let patch = context_block();
+        let l1 = line_index(&patch, |l| l == " one");
+        // Select all of " one"'s content (not its newline): the line is emptied.
+        let plan = plan_edit(&patch, sel((l1, 0), (l1, 4)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("-one\n+\n"), "emptied, not removed:\n{out}");
+        assert_eq!(apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(), "\ntwo\nthree\nY\n");
+    }
+
+    #[test]
+    fn selection_mixing_context_and_change_lines_is_blocked() {
+        let patch = context_block();
+        let l3 = line_index(&patch, |l| l == " three");
+        // From " three" across the "-x" change line.
+        let plan = plan_edit(&patch, sel((l3, 0), (l3 + 2, 0)), EditGesture::Delete);
+        assert_eq!(plan, EditPlan::Block);
     }
 
     #[test]

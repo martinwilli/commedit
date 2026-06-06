@@ -241,6 +241,34 @@ impl Repo {
     }
 }
 
+/// Run a closure that drives jj-lib, turning any panic it raises into an error.
+///
+/// jj-lib signals internal invariant violations with `panic!` rather than a
+/// `Result` — e.g. "graph has cycle" when a rebase is asked to operate on a
+/// corrupt/divergent operation graph (a repo whose bookmark is itself conflicted
+/// and points at several divergent commits). Our mutations run inside GTK signal
+/// and idle callbacks, whose surrounding frames are C (`nounwind`), so an
+/// uncaught panic there aborts the whole process. Catching it here turns it into
+/// an ordinary error the UI can report, keeping the session alive.
+///
+/// Safe to recover from because every mutation only replaces `self.repo` (and
+/// sets `self.pending`) on its success path: a panic out of the jj call leaves
+/// the in-memory repo exactly as it was, so the caught error is non-destructive.
+pub(crate) fn catch_jj<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            anyhow::bail!("{what} failed inside jj-lib ({detail}); the repository may have divergent or conflicted history")
+        }
+    }
+}
+
 /// Embedded baseline config (see `default_config.toml`). jj-lib ships no
 /// defaults of its own; the jj CLI provides them, so we mirror them here.
 const DEFAULT_CONFIG: &str = include_str!("default_config.toml");

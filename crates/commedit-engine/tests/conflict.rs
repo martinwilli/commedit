@@ -191,3 +191,36 @@ fn resolving_works_despite_divergent_commits() {
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// jj-lib raises internal invariant violations with `panic!` (not a `Result`) —
+/// e.g. "graph has cycle" when a rebase runs over a divergent operation graph.
+/// Such a panic must surface as an ordinary `Err`: in the GTK app the mutation
+/// runs inside a C (`nounwind`) callback frame, where an uncaught panic aborts
+/// the whole process instead of just failing the action. Regression for that
+/// crash.
+#[test]
+fn a_jj_panic_becomes_a_recoverable_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    conflicting_repo(dir);
+
+    // Two instances at the same op head each reorder — divergent operations that
+    // a later open reconciles, leaving a graph a further reorder can't rebase.
+    let mut a = Repo::open(dir).expect("open a");
+    let mut b = Repo::open(dir).expect("open b");
+    let _ = reorder_a_to_top(&mut a);
+    let _ = reorder_a_to_top(&mut b);
+
+    let mut repo = Repo::open(dir).expect("open after divergence");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let mv = repo.plan_reorder(&commits, 1, 0).expect("reorder plan");
+    // jj panics "graph has cycle" deep inside this call; the engine must catch it.
+    let result = repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip);
+    assert!(
+        result.is_err(),
+        "a jj-lib panic should be reported as Err, not abort the process: {result:?}"
+    );
+    // The session survived: the repo is still usable and git is untouched.
+    assert!(repo.head_commit_id().is_some());
+    common::git(dir, &["fsck", "--no-progress"]);
+}

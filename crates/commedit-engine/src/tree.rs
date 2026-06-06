@@ -24,6 +24,17 @@ impl Repo {
         path: &str,
         new_content: &str,
     ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("editing the file", || {
+            self.rewrite_file_inner(target, path, new_content)
+        })
+    }
+
+    fn rewrite_file_inner(
+        &mut self,
+        target: &CommitId,
+        path: &str,
+        new_content: &str,
+    ) -> Result<SaveOutcome> {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();

@@ -177,6 +177,18 @@ impl Repo {
         edited_text: &str,
         marker_len: usize,
     ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("resolving the conflict", || {
+            self.resolve_conflict_inner(change_hex, path, edited_text, marker_len)
+        })
+    }
+
+    fn resolve_conflict_inner(
+        &mut self,
+        change_hex: &str,
+        path: &str,
+        edited_text: &str,
+        marker_len: usize,
+    ) -> Result<SaveOutcome> {
         if self.pending.is_none() {
             bail!("no conflict resolution in progress");
         }

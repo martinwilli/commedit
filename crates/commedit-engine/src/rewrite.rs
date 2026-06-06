@@ -32,6 +32,10 @@ impl Repo {
     /// descendants onto the rewritten commit, and export the result to git in a
     /// single transaction.
     pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("editing the message", || self.rewrite_message_inner(target, message))
+    }
+
+    fn rewrite_message_inner(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -70,6 +74,10 @@ impl Repo {
     /// stamping the committer to "now" on a rewrite; run it last in a save so the
     /// edited values win over the side effects of message/content edits.
     pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("editing the identity", || self.rewrite_identity_inner(target, id))
+    }
+
+    fn rewrite_identity_inner(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -203,6 +211,19 @@ impl Repo {
         new_tip: &CommitId,
         op_msg: &str,
     ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("moving the commit", || {
+            self.splice_commit_inner(target, new_parent_ids, new_child_ids, new_tip, op_msg)
+        })
+    }
+
+    fn splice_commit_inner(
+        &mut self,
+        target: &CommitId,
+        new_parent_ids: Vec<CommitId>,
+        new_child_ids: Vec<CommitId>,
+        new_tip: &CommitId,
+        op_msg: &str,
+    ) -> Result<SaveOutcome> {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -243,6 +264,10 @@ impl Repo {
     /// git. The commit object itself survives for the session (we never run
     /// `git gc`), so [`Self::restore_commit`] can graft it back.
     pub fn abandon_commit(&mut self, target: &CommitId) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("dropping the commit", || self.abandon_commit_inner(target))
+    }
+
+    fn abandon_commit_inner(&mut self, target: &CommitId) -> Result<SaveOutcome> {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();

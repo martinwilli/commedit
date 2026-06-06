@@ -13,7 +13,7 @@ use commedit_engine::diff::{
 };
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::patch_edit::{
-    deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
+    collapse_diff, deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
 };
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
@@ -418,6 +418,37 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         Rc::new(chosen)
     };
 
+    // Fold any `-X`/`+X` pair the user has undone (edited a `+` line back to
+    // equal its `-` line) into a single context line. The caret is moved onto the
+    // merged line at the same column, so resuming the edit re-splits it there. The
+    // rewrite is guarded so the firewall treats it as our own, and the scroll
+    // position is preserved so the small line-count change doesn't jump the view.
+    let collapse: Rc<dyn Fn()> = {
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let editing = editing.clone();
+        Rc::new(move || {
+            let text = buffer_text(&file_buffer);
+            let it = file_buffer.iter_at_offset(file_buffer.cursor_position());
+            let cursor = Cursor {
+                line: it.line() as usize,
+                col: it.line_offset() as usize,
+            };
+            let Some((collapsed, new_cursor)) = collapse_diff(&text, cursor) else {
+                return;
+            };
+            let scroll = file_view.vadjustment().map(|v| v.value());
+            editing.set(true);
+            file_buffer.set_text(&collapsed);
+            editing.set(false);
+            let caret = iter_at(&file_buffer, &new_cursor);
+            file_buffer.place_cursor(&caret);
+            if let (Some(v), Some(val)) = (file_view.vadjustment(), scroll) {
+                v.set_value(val);
+            }
+        })
+    };
+
     // Re-render the diff highlighting for whatever is currently in the buffer.
     let highlight: Rc<dyn Fn()> = {
         let file_buffer = file_buffer.clone();
@@ -627,6 +658,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // (Applying tags does not emit `changed`, so this can't loop.)
     let highlight_gen = Rc::new(RefCell::new(0u64));
     file_buffer.connect_changed({
+        let collapse = collapse.clone();
         let highlight = highlight.clone();
         let highlight_gen = highlight_gen.clone();
         let editing = editing.clone();
@@ -641,10 +673,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 *g = g.wrapping_add(1);
                 *g
             };
+            let collapse = collapse.clone();
             let highlight = highlight.clone();
             let highlight_gen = highlight_gen.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 if *highlight_gen.borrow() == mine {
+                    // Fold any undone change first, then highlight the result.
+                    collapse();
                     highlight();
                 }
             });

@@ -208,6 +208,31 @@ fn append_resolve_cues(buffer: &sourceview5::Buffer) {
     }
 }
 
+/// Buffer line indices of the conflict-block openers (`<<<<<<<`) in the
+/// currently-materialized conflict file, in document order — the scroll anchors
+/// the previous/next-conflict navigation jumps between.
+fn conflict_block_lines(buffer: &sourceview5::Buffer) -> Vec<usize> {
+    let text = buffer_text(buffer);
+    classify_conflict_lines(&text)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, kind)| *kind == ConflictLineKind::MarkerOurs)
+        .map(|(li, _)| li)
+        .collect()
+}
+
+/// Scroll the view so that buffer `line` sits at the top of the viewport and
+/// park the caret there. Used to anchor the conflict navigation on the opening
+/// marker of a block.
+fn scroll_to_line(view: &sourceview5::View, buffer: &sourceview5::Buffer, line: usize) {
+    if let Some(iter) = buffer.iter_at_line(line as i32) {
+        buffer.place_cursor(&iter);
+        // use_align with yalign 0.0 pins the line to the top edge. scroll_to_mark
+        // defers until layout is valid, so this is safe right after set_text.
+        view.scroll_to_mark(&buffer.get_insert(), 0.0, true, 0.0, 0.0);
+    }
+}
+
 /// Find the conflict block (the `<<<<<<< … >>>>>>>` region) containing
 /// `caret_line` in `text`, and compute the replacement that keeps the chosen
 /// side(s) and drops the markers. Returns `(start_line, end_line, replacement)`
@@ -606,6 +631,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Conflict-mode quick resolution is driven inline: clicking a block's marker
     // line (with its "use ours/theirs/both" cue) keeps that side — see
     // `append_resolve_cues` and the click gesture below. No toolbar buttons.
+    // Previous/next-conflict navigation jumps the view between blocks; only
+    // shown while resolving conflicts.
+    let prev_conflict_button = Button::with_label("◀");
+    prev_conflict_button.set_tooltip_text(Some("Scroll to the previous conflict"));
+    prev_conflict_button.set_visible(false);
+    let next_conflict_button = Button::with_label("▶");
+    next_conflict_button.set_tooltip_text(Some("Scroll to the next conflict"));
+    next_conflict_button.set_visible(false);
     let bottom_bar = GtkBox::new(Orientation::Horizontal, 4);
     bottom_bar.set_margin_start(8);
     bottom_bar.set_margin_end(8);
@@ -615,6 +648,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     bottom_spacer.set_hexpand(true);
     bottom_bar.append(&status_label);
     bottom_bar.append(&bottom_spacer);
+    bottom_bar.append(&prev_conflict_button);
+    bottom_bar.append(&next_conflict_button);
     bottom_bar.append(&save_button);
 
     // A banner above the file list, shown only while a conflicted rewrite is held
@@ -1143,6 +1178,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     editing.set(false);
                     file_view.set_editable(true);
                     highlight();
+                    // Land on the first conflict rather than the file's top.
+                    if let Some(&first) = conflict_block_lines(&file_buffer).first() {
+                        scroll_to_line(&file_view, &file_buffer, first);
+                    }
                 }
                 Err(err) => show_status(&format!("Can't read conflict: {err}")),
             }
@@ -1532,9 +1571,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let exit_conflict_mode: Rc<dyn Fn()> = {
         let pane_mode = pane_mode.clone();
         let conflict_banner = conflict_banner.clone();
+        let prev_conflict_button = prev_conflict_button.clone();
+        let next_conflict_button = next_conflict_button.clone();
         Rc::new(move || {
             *pane_mode.borrow_mut() = PaneMode::Diff;
             conflict_banner.set_visible(false);
+            prev_conflict_button.set_visible(false);
+            next_conflict_button.set_visible(false);
         })
     };
 
@@ -1547,6 +1590,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let conflict_banner = conflict_banner.clone();
         let selected_change = selected_change.clone();
         let refresh_conflict = refresh_conflict.clone();
+        let prev_conflict_button = prev_conflict_button.clone();
+        let next_conflict_button = next_conflict_button.clone();
         Rc::new(move |commits: Vec<ConflictedCommit>| {
             let first = commits
                 .iter()
@@ -1557,6 +1602,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 marker_len: 7,
             });
             conflict_banner.set_visible(true);
+            prev_conflict_button.set_visible(true);
+            next_conflict_button.set_visible(true);
             if let Some(ch) = first {
                 *selected_change.borrow_mut() = Some(ch);
             }
@@ -2191,6 +2238,58 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     save_button.connect_clicked({
         let save = save.clone();
         move |_| save()
+    });
+
+    // ◀ / ▶ jump the view to the previous/next conflict block, anchored on the
+    // caret line (which scroll_to_line parks on each block's opening marker, so
+    // repeated presses step through the file).
+    let goto_conflict: Rc<dyn Fn(bool)> = {
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let pane_mode = pane_mode.clone();
+        Rc::new(move |forward: bool| {
+            if !pane_mode.borrow().is_conflict() {
+                return;
+            }
+            let blocks = conflict_block_lines(&file_buffer);
+            let caret = file_buffer.iter_at_mark(&file_buffer.get_insert()).line() as usize;
+            let target = if forward {
+                blocks.iter().find(|&&l| l > caret).copied()
+            } else {
+                blocks.iter().rev().find(|&&l| l < caret).copied()
+            };
+            if let Some(line) = target {
+                scroll_to_line(&file_view, &file_buffer, line);
+            }
+        })
+    };
+    prev_conflict_button.connect_clicked({
+        let goto_conflict = goto_conflict.clone();
+        move |_| goto_conflict(false)
+    });
+    next_conflict_button.connect_clicked({
+        let goto_conflict = goto_conflict.clone();
+        move |_| goto_conflict(true)
+    });
+
+    // Keep the nav buttons enabled only while there's a conflict to jump to,
+    // relative to the caret. Driven off the cursor-position property, which the
+    // buffer fires on every caret move — clicks, typing, set_text (which resets
+    // the caret), and scroll_to_line's place_cursor — so this stays in sync as
+    // the file is navigated and conflicts get resolved away.
+    file_buffer.connect_cursor_position_notify({
+        let pane_mode = pane_mode.clone();
+        let prev_conflict_button = prev_conflict_button.clone();
+        let next_conflict_button = next_conflict_button.clone();
+        move |buffer| {
+            if !pane_mode.borrow().is_conflict() {
+                return;
+            }
+            let blocks = conflict_block_lines(buffer);
+            let caret = buffer.iter_at_mark(&buffer.get_insert()).line() as usize;
+            prev_conflict_button.set_sensitive(blocks.iter().any(|&l| l < caret));
+            next_conflict_button.set_sensitive(blocks.iter().any(|&l| l > caret));
+        }
     });
 
     // Ctrl+S triggers the same save.

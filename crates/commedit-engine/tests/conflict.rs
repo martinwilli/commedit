@@ -116,3 +116,78 @@ fn aborting_a_conflicted_reorder_restores_the_original_history() {
     assert_eq!(subjects, vec!["B", "A", "base"]);
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Two app instances opened at the same op head and each performing a conflicting
+/// reorder produce *divergent operations*; a later open reconciles them into
+/// divergent commits (one change id, several visible commits). Resolving a
+/// reorder on such a repo must still work: the resolver scopes change-id lookup
+/// to the current branch chain instead of the store-wide `resolve_change_id`,
+/// which would otherwise bail as "divergent commits". Regression for a reorder
+/// whose second commit could not be resolved.
+#[test]
+fn resolving_works_despite_divergent_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    conflicting_repo(dir);
+
+    // Two instances open at the same operation head (neither has mutated yet),
+    // then each rewrites the *same* commit's message — concurrent operations jj
+    // will later reconcile into divergent commits (the base commit ends up with
+    // two visible successors sharing its change id).
+    let base = {
+        let probe = Repo::open(dir).expect("probe");
+        let head = probe.head_commit_id().expect("head");
+        let commits = history(&probe.repo, &head).expect("history");
+        commits
+            .iter()
+            .find(|c| c.subject == "base")
+            .expect("base commit")
+            .id
+            .clone()
+    };
+    let mut a = Repo::open(dir).expect("open a");
+    let mut b = Repo::open(dir).expect("open b");
+    a.rewrite_message(&base, "base (a)").expect("edit a");
+    b.rewrite_message(&base, "base (b)").expect("edit b");
+
+    // A fresh open loads at head, reconciling the divergent operations; the
+    // change ids on the branch now resolve to multiple visible commits.
+    let mut repo = Repo::open(dir).expect("open after divergence");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "expected a conflict from the non-commuting reorder"
+    );
+
+    // Drive the resolution oldest-first to completion — this is what used to fail.
+    let mut steps = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        let change_hex = oldest.change_id_hex();
+        let file = repo.read_conflict(&change_hex, &path).expect("read conflict");
+        outcome = repo
+            .resolve_conflict(&change_hex, &path, "1\nR\n3\n", file.marker_len)
+            .expect("resolve");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending());
+
+    // Plain git sees the reordered, conflict-free history; the repo is intact.
+    // (The base's subject is whichever of the divergent message edits won the
+    // reconciliation — the point is A and B were reordered and resolved at all.)
+    let subjects = common::git_log_subjects(dir);
+    assert_eq!(subjects.len(), 3);
+    assert_eq!(&subjects[..2], &["A", "B"]);
+    assert!(subjects[2].starts_with("base"), "base commit: {}", subjects[2]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

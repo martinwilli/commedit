@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
 use jj_lib::conflicts::{
     choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
@@ -28,7 +28,7 @@ use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::RefNameBuf;
-use jj_lib::repo::{ReadonlyRepo, Repo as _};
+use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
 
@@ -182,7 +182,7 @@ impl Repo {
         }
         let path: &RepoPath = RepoPath::from_internal_string(path).context("invalid path")?;
         let store = self.repo.store().clone();
-        let commit_id = resolve_single_change(&self.repo, change_hex)?;
+        let commit_id = self.resolve_change_on_chain(change_hex)?;
         let commit = store
             .get_commit(&commit_id)
             .context("loading conflicted commit")?;
@@ -263,7 +263,7 @@ impl Repo {
     pub fn read_conflict(&self, change_hex: &str, path: &str) -> Result<ConflictedFile> {
         let path: &RepoPath = RepoPath::from_internal_string(path).context("invalid path")?;
         let store = self.repo.store();
-        let commit_id = resolve_single_change(&self.repo, change_hex)?;
+        let commit_id = self.resolve_change_on_chain(change_hex)?;
         let commit = store.get_commit(&commit_id).context("loading commit")?;
         let tree = commit.tree();
         let value = block_on(tree.path_value(path)).context("reading conflicted path")?;
@@ -291,6 +291,28 @@ impl Repo {
             }
             _ => bail!("path is not conflicted"),
         }
+    }
+
+    /// Resolve `change_hex` to the commit carrying it on the *current* branch
+    /// chain (the ancestors of jj's head — the same set [`Self::collect_conflicts`]
+    /// walks). Conflict resolution always targets a commit on the pending
+    /// rewritten chain, so scoping the lookup to that chain — rather than the
+    /// store-wide `resolve_change_id` — disambiguates change ids that have
+    /// divergent siblings left over from concurrent or earlier operations, which
+    /// would otherwise make the global resolver bail as ambiguous.
+    fn resolve_change_on_chain(&self, change_hex: &str) -> Result<CommitId> {
+        let change_id = ChangeId::try_from_hex(change_hex).context("invalid change id")?;
+        let head = self
+            .current_head_in_jj()
+            .context("no current branch head to resolve the conflict against")?;
+        let infos = crate::history::history(&self.repo, &head)?;
+        infos
+            .into_iter()
+            .find(|i| i.change_id == change_id)
+            .map(|i| i.id)
+            .with_context(|| {
+                format!("change {change_hex} is not on the current branch chain")
+            })
     }
 
     /// The branch tip as jj currently sees it (read from the checked-out
@@ -376,24 +398,6 @@ impl Repo {
         }
         Ok(())
     }
-}
-
-/// Resolve a change id to its single visible commit id in `repo`. Errors if the
-/// change is unknown, hidden, or divergent (two visible commits) — the last
-/// would make "which commit to resolve" ambiguous.
-fn resolve_single_change(repo: &ReadonlyRepo, change_hex: &str) -> Result<CommitId> {
-    let change_id = ChangeId::try_from_hex(change_hex).context("invalid change id")?;
-    let resolved = repo
-        .resolve_change_id(&change_id)
-        .map_err(|e| anyhow!("resolving change id: {e}"))?
-        .context("change id not found")?;
-    let mut visible = resolved
-        .into_visible()
-        .context("no visible commit for change id")?;
-    if visible.len() > 1 {
-        bail!("change id resolves to {} divergent commits", visible.len());
-    }
-    Ok(visible.swap_remove(0))
 }
 
 /// Turn jj's Git diff3-style markers (which include a `|||||||` base section)

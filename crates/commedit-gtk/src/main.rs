@@ -11,7 +11,7 @@ use commedit_engine::diff::{
     apply_patch, commit_changes, parse_diff_lines, render_diff, ChangeKind, ContextExpansion,
     DiffLineKind, FileChange, HunkInfo,
 };
-use commedit_engine::history::{history, plan_reorder, CommitInfo};
+use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::patch_edit::{
     deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, PatchEdit, Selection,
 };
@@ -989,7 +989,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 None => gap_at(y),
             };
             clear_gap();
-            let Some(mv) = plan_reorder(&commits.borrow(), from as usize, to) else {
+            // Plan against the current branch's linear chain (the view may also
+            // show other branches/tags); a no-op or off-branch drop yields None.
+            let plan = repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
+            let Some(mv) = plan else {
                 return false;
             };
             if let Err(err) = repo.borrow_mut().reorder_commit(

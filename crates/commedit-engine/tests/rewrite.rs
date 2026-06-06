@@ -144,6 +144,47 @@ fn reorders_commit_to_a_new_position_visible_to_git() {
 }
 
 #[test]
+fn reorder_stamps_the_git_configured_committer_not_jjs_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+    // The user's git identity, configured the ordinary way. The GUI launches with
+    // no GIT_AUTHOR_* env set, so this config is the only signal — the rebased
+    // commits must be stamped with it, not jj's generic "commedit" fallback.
+    common::git(dir, &["config", "user.name", "Repo Config"]);
+    common::git(dir, &["config", "user.email", "config@example.com"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let by = |s: &str| commits.iter().find(|c| c.subject == s).unwrap();
+    let (third, second, first) = (by("third"), by("second"), by("first"));
+
+    // Move "third" to the bottom; "first"/"second" get rebased and re-stamped.
+    repo.reorder_commit(
+        &third.id,
+        first.parents.clone(),
+        vec![first.id.clone()],
+        &second.id,
+    )
+    .expect("reorder");
+
+    // The new head "second" was rebased: its committer is the git-configured
+    // identity, while its original author ("Tester") is preserved.
+    let line = common::git(dir, &["show", "-s", "--format=%cn|%ce|%an", "main"]);
+    let fields: Vec<&str> = line.split('|').collect();
+    assert_eq!(fields[0], "Repo Config");
+    assert_eq!(fields[1], "config@example.com");
+    assert_eq!(fields[2], "Tester");
+}
+
+#[test]
 fn history_has_no_duplicate_rows_after_a_reorder() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

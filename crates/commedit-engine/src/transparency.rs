@@ -192,6 +192,22 @@ pub fn sync_worktree(workspace_root: &Path, old_rev: &str, new_rev: &str) -> Res
     Ok(())
 }
 
+/// Read a single git config value (e.g. `user.name`) as git itself would see it
+/// — honouring the system, global, and repo-local config hierarchy. `None` if
+/// the key is unset or git can't be run. Whitespace-only values count as unset.
+pub fn config_value(workspace_root: &Path, key: &str) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// The full ref name (e.g. `refs/heads/main`) HEAD symbolically points at, or
 /// `None` if HEAD is detached.
 pub fn head_branch(workspace_root: &Path) -> Option<String> {

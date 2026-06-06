@@ -40,7 +40,7 @@ impl Repo {
     /// metadata (`.jj`) if it does not exist yet, then import git refs/HEAD so
     /// jj's view matches the git repository.
     pub fn open(workspace_root: &Path) -> Result<Self> {
-        let settings = build_settings()?;
+        let settings = build_settings(workspace_root)?;
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
         let git_head_branch = crate::transparency::head_branch(workspace_root);
@@ -165,12 +165,19 @@ impl Repo {
 /// defaults of its own; the jj CLI provides them, so we mirror them here.
 const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 
-/// Build a [`UserSettings`] from the embedded defaults plus a committer identity
-/// taken from the environment (falling back to a generic commedit identity).
-fn build_settings() -> Result<UserSettings> {
-    let name = env_first(&["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME", "USER"])
+/// Build a [`UserSettings`] from the embedded defaults plus the committer
+/// identity jj should stamp on commits it rewrites. We resolve it the way git
+/// itself would: an explicit `GIT_AUTHOR_*`/`GIT_COMMITTER_*` override wins, then
+/// the repo's configured `user.name`/`user.email` (the local/global/system git
+/// config hierarchy), and only failing both do we fall back to a generic
+/// commedit identity. This keeps rebased/reordered commits attributed to the
+/// real git author rather than jj's defaults.
+fn build_settings(workspace_root: &Path) -> Result<UserSettings> {
+    let name = env_first(&["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"])
+        .or_else(|| crate::transparency::config_value(workspace_root, "user.name"))
         .unwrap_or_else(|| "commedit".to_string());
     let email = env_first(&["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"])
+        .or_else(|| crate::transparency::config_value(workspace_root, "user.email"))
         .unwrap_or_else(|| "commedit@localhost".to_string());
     let identity = format!("[user]\nname = {name:?}\nemail = {email:?}\n");
 

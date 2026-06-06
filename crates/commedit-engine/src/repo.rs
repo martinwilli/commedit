@@ -33,6 +33,9 @@ pub struct Repo {
     /// colocated layout stays invisible to plain git. `None` if HEAD was already
     /// detached.
     git_head_branch: Option<String>,
+    /// A conflicted rewrite held back from git while the user resolves it (see
+    /// [`crate::conflict`]). `None` in the normal, conflict-free state.
+    pub(crate) pending: Option<crate::conflict::PendingResolution>,
 }
 
 impl Repo {
@@ -71,6 +74,7 @@ impl Repo {
             repo,
             settings,
             git_head_branch,
+            pending: None,
         };
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;
@@ -90,7 +94,7 @@ impl Repo {
     /// The originally checked-out branch as a jj bookmark name (its
     /// `refs/heads/` prefix stripped), or `None` if HEAD was detached when the
     /// repo was opened.
-    fn current_bookmark(&self) -> Option<RefNameBuf> {
+    pub(crate) fn current_bookmark(&self) -> Option<RefNameBuf> {
         self.git_head_branch
             .as_ref()
             .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).into())

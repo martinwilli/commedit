@@ -3,13 +3,14 @@
 //! commit and rebases descendants via the engine.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{
-    apply_patch, commit_changes, parse_diff_lines, render_diff, ChangeKind, ContextExpansion,
-    DiffLineKind, FileChange, HunkInfo,
+    apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, render_diff, ChangeKind,
+    ConflictLineKind, ContextExpansion, DiffLineKind, FileChange, HunkInfo,
 };
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::patch_edit::{
@@ -44,6 +45,104 @@ type Renderer = Rc<dyn Fn()>;
 enum DragOrigin {
     History,
     Trash,
+}
+
+/// Which content the diff pane is showing. In `Diff` mode it's the usual
+/// editable unified diff guarded by the patch firewall. In `Conflict` mode a
+/// rewrite produced conflicts that git is held back from until they're resolved:
+/// the pane shows a conflicted file materialized with 2-way markers, edited
+/// free-form (the firewall is bypassed), and saving resolves rather than
+/// rewrites.
+enum PaneMode {
+    Diff,
+    Conflict(ConflictCtx),
+}
+
+impl PaneMode {
+    fn is_conflict(&self) -> bool {
+        matches!(self, PaneMode::Conflict(_))
+    }
+}
+
+/// The live state of an in-progress conflict resolution: the conflicted commits
+/// (refreshed from the engine after each resolution step, oldest first) and the
+/// marker length of the file currently shown (echoed back to the engine on
+/// save).
+struct ConflictCtx {
+    commits: Vec<ConflictedCommit>,
+    marker_len: usize,
+}
+
+impl ConflictCtx {
+    /// The change ids (hex) of commits that still have conflicts — used to badge
+    /// the matching history rows.
+    fn conflicted_changes(&self) -> HashSet<String> {
+        self.commits
+            .iter()
+            .filter(|c| !c.files.is_empty())
+            .map(|c| c.change_id_hex())
+            .collect()
+    }
+}
+
+/// Which side(s) of a conflict block a quick-resolve button keeps.
+#[derive(Clone, Copy)]
+enum Side {
+    Ours,
+    Theirs,
+    Both,
+}
+
+/// Find the conflict block (the `<<<<<<< … >>>>>>>` region) containing
+/// `caret_line` in `text`, and compute the replacement that keeps the chosen
+/// side(s) and drops the markers. Returns `(start_line, end_line, replacement)`
+/// where the block spans buffer lines `start_line..=end_line` and `replacement`
+/// is the text to substitute for those lines (newline-terminated). `None` if the
+/// caret is not inside a conflict block.
+fn resolve_conflict_block(text: &str, caret_line: usize, side: Side) -> Option<(usize, usize, String)> {
+    let kinds = classify_conflict_lines(text);
+    let lines: Vec<&str> = text.split('\n').collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    // Walk back from the caret to the opening marker; bail if we cross a closing
+    // marker first (the caret sits between blocks, not inside one).
+    let mut start = None;
+    for i in (0..=caret_line.min(kinds.len() - 1)).rev() {
+        match kinds[i] {
+            ConflictLineKind::MarkerOurs => {
+                start = Some(i);
+                break;
+            }
+            ConflictLineKind::MarkerTheirs => return None,
+            _ => {}
+        }
+    }
+    let start = start?;
+    let end = (start + 1..kinds.len()).find(|&i| kinds[i] == ConflictLineKind::MarkerTheirs)?;
+    if caret_line > end {
+        return None;
+    }
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    for i in start + 1..end {
+        match kinds[i] {
+            ConflictLineKind::Ours => ours.push(lines[i]),
+            ConflictLineKind::Theirs => theirs.push(lines[i]),
+            _ => {}
+        }
+    }
+    let chosen: Vec<&str> = match side {
+        Side::Ours => ours,
+        Side::Theirs => theirs,
+        Side::Both => ours.into_iter().chain(theirs).collect(),
+    };
+    let mut replacement = String::new();
+    for line in chosen {
+        replacement.push_str(line);
+        replacement.push('\n');
+    }
+    Some((start, end, replacement))
 }
 
 /// Run a drop's staged action, scheduled from the drag source's `drag-end`.
@@ -199,6 +298,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let trashed: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
     // Which list the in-flight drag started in, set on drag prepare.
     let drag_origin: Rc<Cell<DragOrigin>> = Rc::new(Cell::new(DragOrigin::History));
+    // Whether the diff pane is showing a normal diff or a conflict to resolve.
+    let pane_mode: Rc<RefCell<PaneMode>> = Rc::new(RefCell::new(PaneMode::Diff));
 
     // Styling for drag-and-drop reordering: the insertion gap placeholder and the
     // dimmed row being dragged. Installed once for the display.
@@ -358,6 +459,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // file/diff editing field rather than spanning the whole window.
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
+    // Conflict-mode quick actions: replace the conflict region around the caret
+    // with one side (or both). Hidden outside conflict mode.
+    let take_ours = Button::with_label("Use ours");
+    let take_theirs = Button::with_label("Use theirs");
+    let take_both = Button::with_label("Use both");
+    for b in [&take_ours, &take_theirs, &take_both] {
+        b.set_visible(false);
+        b.set_tooltip_text(Some("Resolve the conflict block at the cursor"));
+    }
     let bottom_bar = GtkBox::new(Orientation::Horizontal, 4);
     bottom_bar.set_margin_start(8);
     bottom_bar.set_margin_end(8);
@@ -367,8 +477,35 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     bottom_spacer.set_hexpand(true);
     bottom_bar.append(&status_label);
     bottom_bar.append(&bottom_spacer);
+    bottom_bar.append(&take_ours);
+    bottom_bar.append(&take_theirs);
+    bottom_bar.append(&take_both);
     bottom_bar.append(&save_button);
 
+    // A banner above the file list, shown only while a conflicted rewrite is held
+    // back from git: it states the blocking condition and offers to abort the
+    // whole rewrite. Conflicts are applied automatically once the last one is
+    // resolved, so there is no explicit "finalize" button.
+    let conflict_label = Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .build();
+    let abort_button = Button::with_label("Abort rewrite");
+    abort_button.add_css_class("destructive-action");
+    let conflict_banner = GtkBox::new(Orientation::Horizontal, 8);
+    conflict_banner.add_css_class("error");
+    conflict_banner.set_margin_start(8);
+    conflict_banner.set_margin_end(8);
+    conflict_banner.set_margin_top(4);
+    conflict_banner.set_margin_bottom(4);
+    let banner_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    conflict_banner.append(&banner_icon);
+    conflict_banner.append(&conflict_label);
+    conflict_banner.append(&abort_button);
+    conflict_banner.set_visible(false);
+
+    files_box.append(&conflict_banner);
     files_box.append(&file_dropdown);
     files_box.append(&file_scroll);
     files_box.append(&bottom_bar);
@@ -438,7 +575,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let collapse: Rc<dyn Fn()> = {
         let file_buffer = file_buffer.clone();
         let editing = editing.clone();
+        let pane_mode = pane_mode.clone();
         Rc::new(move || {
+            // Collapsing -X/+X pairs is a unified-diff notion; in conflict mode the
+            // buffer is whole-file content, so there is nothing to fold.
+            if pane_mode.borrow().is_conflict() {
+                return;
+            }
             let text = buffer_text(&file_buffer);
             let it = file_buffer.iter_at_offset(file_buffer.cursor_position());
             let cursor = Cursor {
@@ -487,9 +630,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let current_file = current_file.clone();
         let syntax_set = syntax_set.clone();
         let theme = theme.clone();
+        let pane_mode = pane_mode.clone();
         Rc::new(move || {
             let path = current_file.borrow().clone();
-            highlight_diff(&file_buffer, path.as_deref(), &syntax_set, &theme);
+            if pane_mode.borrow().is_conflict() {
+                highlight_conflict(&file_buffer, path.as_deref(), &syntax_set, &theme);
+            } else {
+                highlight_diff(&file_buffer, path.as_deref(), &syntax_set, &theme);
+            }
         })
     };
 
@@ -566,7 +714,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let expansions = expansions.clone();
         let render_cell = render_cell.clone();
         let current_file = current_file.clone();
+        let pane_mode = pane_mode.clone();
         move |gesture, _n_press, x, y| {
+            // No hunk context to expand in conflict mode (whole-file content).
+            if pane_mode.borrow().is_conflict() {
+                return;
+            }
             let (bx, by) = file_view.window_to_buffer_coords(
                 gtk::TextWindowType::Widget,
                 x as i32,
@@ -743,6 +896,110 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Show the conflicted file at dropdown index `idx` of the selected commit,
+    // materialized with 2-way markers for free-form resolution. Non-text
+    // (structural) conflicts can't be edited here, so they show a notice instead.
+    let show_conflict_file: Rc<dyn Fn(usize)> = {
+        let repo = repo.clone();
+        let pane_mode = pane_mode.clone();
+        let selected_change = selected_change.clone();
+        let current_file = current_file.clone();
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
+        let show_status = show_status.clone();
+        Rc::new(move |idx: usize| {
+            let resolved = {
+                let mode = pane_mode.borrow();
+                let PaneMode::Conflict(ctx) = &*mode else {
+                    return;
+                };
+                let Some(sel) = selected_change.borrow().clone() else {
+                    return;
+                };
+                let Some(cc) = ctx.commits.iter().find(|c| c.change_id_hex() == sel) else {
+                    return;
+                };
+                cc.files
+                    .get(idx)
+                    .map(|cp| (cc.change_id_hex(), cp.path_str(), cp.resolvable))
+            };
+            let Some((change_hex, path, resolvable)) = resolved else {
+                return;
+            };
+            *current_file.borrow_mut() = Some(path.clone());
+            if !resolvable {
+                editing.set(true);
+                file_buffer.set_text(
+                    "<structural conflict — can't be resolved as text here; \
+                     use “Abort rewrite” to discard this change>",
+                );
+                editing.set(false);
+                file_view.set_editable(false);
+                return;
+            }
+            match repo.borrow().read_conflict(&change_hex, &path) {
+                Ok(file) => {
+                    if let PaneMode::Conflict(ctx) = &mut *pane_mode.borrow_mut() {
+                        ctx.marker_len = file.marker_len;
+                    }
+                    editing.set(true);
+                    file_buffer.set_text(&file.text);
+                    editing.set(false);
+                    file_view.set_editable(true);
+                    highlight();
+                }
+                Err(err) => show_status(&format!("Can't read conflict: {err}")),
+            }
+        })
+    };
+
+    // Populate the file dropdown with the conflicted files of `commit` (the
+    // selection then cascades to `show_conflict_file`). Resolvable files are
+    // listed plainly; structural ones are flagged with a ⚠.
+    let load_conflict_files: Rc<dyn Fn(&CommitInfo)> = {
+        let pane_mode = pane_mode.clone();
+        let file_dropdown = file_dropdown.clone();
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let editing = editing.clone();
+        let current_file = current_file.clone();
+        Rc::new(move |commit: &CommitInfo| {
+            let labels: Vec<String> = {
+                let mode = pane_mode.borrow();
+                let PaneMode::Conflict(ctx) = &*mode else {
+                    return;
+                };
+                ctx.commits
+                    .iter()
+                    .find(|c| c.change_id_hex() == commit.change_id_hex())
+                    .map(|c| {
+                        c.files
+                            .iter()
+                            .map(|f| {
+                                let mark = if f.resolvable { "" } else { "⚠ " };
+                                format!("{mark}{}", f.path_str())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            file_dropdown.set_model(Some(&StringList::new(&refs)));
+            if labels.is_empty() {
+                *current_file.borrow_mut() = None;
+                editing.set(true);
+                file_buffer.set_text("(no remaining conflicts in this commit)");
+                editing.set(false);
+                file_view.set_editable(false);
+            } else {
+                // Triggers selected-notify -> show_conflict_file(0).
+                file_dropdown.set_selected(0);
+            }
+        })
+    };
+
     const READ_ONLY_HINT: &str = "Edit blocked — this change would break the patch structure.";
 
     // Firewall: every interactive mutation of the diff buffer goes through the
@@ -754,8 +1011,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let show_status = show_status.clone();
         let highlight = highlight.clone();
+        let pane_mode = pane_mode.clone();
         move |buffer, iter, text| {
             if editing.get() {
+                return;
+            }
+            // Conflict resolution is free-form whole-file editing; the unified-diff
+            // firewall does not apply.
+            if pane_mode.borrow().is_conflict() {
                 return;
             }
             let caret = Selection::caret(Cursor {
@@ -778,8 +1041,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_buffer.connect_delete_range({
         let editing = editing.clone();
         let show_status = show_status.clone();
+        let pane_mode = pane_mode.clone();
         move |buffer, start, end| {
             if editing.get() {
+                return;
+            }
+            if pane_mode.borrow().is_conflict() {
                 return;
             }
             let s = Cursor {
@@ -810,8 +1077,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let show_status = show_status.clone();
         let highlight = highlight.clone();
+        let pane_mode = pane_mode.clone();
         move |_, keyval, _, state| {
             if !file_view.is_editable() {
+                return glib::Propagation::Proceed;
+            }
+            // In conflict mode, structural diff gestures don't apply — let the view
+            // handle Enter/Backspace/Delete as ordinary text editing.
+            if pane_mode.borrow().is_conflict() {
                 return glib::Propagation::Proceed;
             }
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
@@ -839,9 +1112,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     file_dropdown.connect_selected_notify({
         let show_file = show_file.clone();
+        let show_conflict_file = show_conflict_file.clone();
+        let pane_mode = pane_mode.clone();
         move |dd| {
             let idx = dd.selected();
-            if idx != gtk::INVALID_LIST_POSITION {
+            if idx == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            if pane_mode.borrow().is_conflict() {
+                show_conflict_file(idx as usize);
+            } else {
                 show_file(idx as usize);
             }
         }
@@ -914,6 +1194,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let message_buffer = message_buffer.clone();
         let selected_change = selected_change.clone();
         let load_changes = load_changes.clone();
+        let load_conflict_files = load_conflict_files.clone();
+        let pane_mode = pane_mode.clone();
         let identity_fields = identity_fields.clone();
         let original_identity = original_identity.clone();
         move |_list, row| {
@@ -926,6 +1208,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Some(info) = info else { return };
             *selected_change.borrow_mut() = Some(info.change_id_hex());
             message_buffer.set_text(&info.description);
+            // In conflict mode the dropdown lists the commit's conflicted files,
+            // not its diff; identity editing is disabled until conflicts resolve.
+            if pane_mode.borrow().is_conflict() {
+                load_conflict_files(&info);
+                return;
+            }
             set_identity_fields(&identity_fields, &info);
             *original_identity.borrow_mut() = Some(read_identity(&identity_fields));
             load_changes(&info);
@@ -951,7 +1239,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             *commits.borrow_mut() = loaded;
             {
                 let cs = commits.borrow();
-                populate_list(&list, &cs);
+                populate_list(&list, &cs, &HashSet::new());
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
                 let mut ids: Vec<(String, String)> = Vec::new();
@@ -981,6 +1269,237 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         })
     };
+
+    // Rebuild the history list from jj's pending (not-yet-exported) head while a
+    // conflicted rewrite is being resolved, badging the still-conflicted commits
+    // and updating the banner's progress text. Selecting a row cascades through
+    // `row-selected` -> `load_conflict_files`.
+    let refresh_conflict: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let list = list.clone();
+        let pane_mode = pane_mode.clone();
+        let conflict_label = conflict_label.clone();
+        let selected_change = selected_change.clone();
+        Rc::new(move || {
+            let loaded = {
+                let r = repo.borrow();
+                match r.jj_head_commit_id() {
+                    Some(head) => history(&r.repo, &head).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
+            *commits.borrow_mut() = loaded;
+            let (badges, n_files, n_commits) = {
+                let mode = pane_mode.borrow();
+                if let PaneMode::Conflict(ctx) = &*mode {
+                    let badges = ctx.conflicted_changes();
+                    let files: usize = ctx.commits.iter().map(|c| c.files.len()).sum();
+                    (badges.clone(), files, badges.len())
+                } else {
+                    (HashSet::new(), 0, 0)
+                }
+            };
+            populate_list(&list, &commits.borrow(), &badges);
+            conflict_label.set_text(&format!(
+                "Conflicts from the rewrite must be resolved before it applies to git — \
+                 {n_files} file(s) across {n_commits} commit(s) remaining."
+            ));
+            // Re-select the previously selected commit if it's still in the chain,
+            // else the first conflicted one. Unselect first so the signal always
+            // fires (the file list may have changed even for the same row).
+            let target = selected_change
+                .borrow()
+                .clone()
+                .filter(|ch| badges.contains(ch))
+                .or_else(|| {
+                    commits
+                        .borrow()
+                        .iter()
+                        .map(|c| c.change_id_hex())
+                        .find(|ch| badges.contains(ch))
+                });
+            let idx = target.and_then(|ch| {
+                commits
+                    .borrow()
+                    .iter()
+                    .position(|c| c.change_id_hex() == ch)
+            });
+            list.unselect_all();
+            if let Some(idx) = idx {
+                if let Some(row) = list.row_at_index(idx as i32) {
+                    list.select_row(Some(&row));
+                }
+            }
+        })
+    };
+
+    // Leave conflict mode: back to the normal diff pane, banner and quick-resolve
+    // buttons hidden.
+    let exit_conflict_mode: Rc<dyn Fn()> = {
+        let pane_mode = pane_mode.clone();
+        let conflict_banner = conflict_banner.clone();
+        let take_ours = take_ours.clone();
+        let take_theirs = take_theirs.clone();
+        let take_both = take_both.clone();
+        Rc::new(move || {
+            *pane_mode.borrow_mut() = PaneMode::Diff;
+            conflict_banner.set_visible(false);
+            take_ours.set_visible(false);
+            take_theirs.set_visible(false);
+            take_both.set_visible(false);
+        })
+    };
+
+    // Enter conflict mode with the engine's reported conflicts: show the banner
+    // and quick-resolve buttons, select the oldest conflicted commit, and render
+    // the pending chain.
+    let enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)> = {
+        let pane_mode = pane_mode.clone();
+        let conflict_banner = conflict_banner.clone();
+        let take_ours = take_ours.clone();
+        let take_theirs = take_theirs.clone();
+        let take_both = take_both.clone();
+        let selected_change = selected_change.clone();
+        let refresh_conflict = refresh_conflict.clone();
+        Rc::new(move |commits: Vec<ConflictedCommit>| {
+            let first = commits
+                .iter()
+                .find(|c| !c.files.is_empty())
+                .map(|c| c.change_id_hex());
+            *pane_mode.borrow_mut() = PaneMode::Conflict(ConflictCtx {
+                commits,
+                marker_len: 7,
+            });
+            conflict_banner.set_visible(true);
+            take_ours.set_visible(true);
+            take_theirs.set_visible(true);
+            take_both.set_visible(true);
+            if let Some(ch) = first {
+                *selected_change.borrow_mut() = Some(ch);
+            }
+            refresh_conflict();
+        })
+    };
+
+    // Resolve the conflicted file currently in the buffer. The engine re-checks
+    // the whole chain: when the last conflict clears it exports the rewrite and we
+    // return to the normal view, otherwise the remaining conflicts are re-shown.
+    let resolve_current: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let pane_mode = pane_mode.clone();
+        let selected_change = selected_change.clone();
+        let current_file = current_file.clone();
+        let file_buffer = file_buffer.clone();
+        let refresh = refresh.clone();
+        let refresh_conflict = refresh_conflict.clone();
+        let exit_conflict_mode = exit_conflict_mode.clone();
+        let show_status = show_status.clone();
+        Rc::new(move || {
+            let resolved = {
+                let mode = pane_mode.borrow();
+                let PaneMode::Conflict(ctx) = &*mode else {
+                    return;
+                };
+                let Some(sel) = selected_change.borrow().clone() else {
+                    return;
+                };
+                current_file
+                    .borrow()
+                    .clone()
+                    .map(|path| (sel, path, ctx.marker_len))
+            };
+            let Some((change_hex, path, marker_len)) = resolved else {
+                show_status("Select a conflicted file to resolve");
+                return;
+            };
+            let text = buffer_text(&file_buffer);
+            if classify_conflict_lines(&text).iter().any(|k| k.is_marker()) {
+                show_status("Resolve all conflict markers before saving");
+                return;
+            }
+            let outcome = repo
+                .borrow_mut()
+                .resolve_conflict(&change_hex, &path, &text, marker_len);
+            match outcome {
+                Ok(SaveOutcome::Clean) => {
+                    exit_conflict_mode();
+                    refresh();
+                    show_status("Conflicts resolved — rewrite applied.");
+                }
+                Ok(SaveOutcome::Conflicts { commits }) => {
+                    if let PaneMode::Conflict(ctx) = &mut *pane_mode.borrow_mut() {
+                        ctx.commits = commits;
+                    }
+                    refresh_conflict();
+                    show_status("Resolved — more conflicts remain.");
+                }
+                Err(err) => show_status(&format!("Resolve failed: {err}")),
+            }
+        })
+    };
+
+    // Quick-resolve: replace the conflict block at the caret with one side / both.
+    let take_side: Rc<dyn Fn(Side)> = {
+        let file_buffer = file_buffer.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
+        let show_status = show_status.clone();
+        Rc::new(move |side: Side| {
+            let text = buffer_text(&file_buffer);
+            let caret = file_buffer.iter_at_offset(file_buffer.cursor_position());
+            let caret_line = caret.line() as usize;
+            let Some((start, end, replacement)) = resolve_conflict_block(&text, caret_line, side)
+            else {
+                show_status("Place the cursor inside a conflict block first");
+                return;
+            };
+            editing.set(true);
+            file_buffer.begin_user_action();
+            let mut s = file_buffer
+                .iter_at_line(start as i32)
+                .unwrap_or_else(|| file_buffer.start_iter());
+            let mut e = file_buffer
+                .iter_at_line(end as i32 + 1)
+                .unwrap_or_else(|| file_buffer.end_iter());
+            file_buffer.delete(&mut s, &mut e);
+            let mut at = file_buffer
+                .iter_at_line(start as i32)
+                .unwrap_or_else(|| file_buffer.end_iter());
+            file_buffer.insert(&mut at, &replacement);
+            file_buffer.end_user_action();
+            editing.set(false);
+            highlight();
+        })
+    };
+
+    take_ours.connect_clicked({
+        let take_side = take_side.clone();
+        move |_| take_side(Side::Ours)
+    });
+    take_theirs.connect_clicked({
+        let take_side = take_side.clone();
+        move |_| take_side(Side::Theirs)
+    });
+    take_both.connect_clicked({
+        let take_side = take_side.clone();
+        move |_| take_side(Side::Both)
+    });
+    abort_button.connect_clicked({
+        let repo = repo.clone();
+        let exit_conflict_mode = exit_conflict_mode.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        move |_| {
+            if let Err(err) = repo.borrow_mut().abort() {
+                show_status(&format!("Abort failed: {err}"));
+                return;
+            }
+            exit_conflict_mode();
+            refresh();
+            show_status("Rewrite aborted — history unchanged.");
+        }
+    });
 
     // Drag-and-drop to reorder commits. While dragging, a placeholder row opens a
     // gap at the hover position (the surrounding commits slide to make room) and
@@ -1178,6 +1697,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_scroll = trash_scroll.clone();
         let selected_change = selected_change.clone();
         let post_drag = post_drag.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
         move |_target, value, _x, y| {
             let Ok(from) = value.get::<i32>() else {
                 return false;
@@ -1196,6 +1716,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let commits = commits.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         // Plan against the current branch's linear chain (the view
                         // may also show other branches/tags); a no-op or off-branch
@@ -1205,16 +1726,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         let Some(mv) = plan else {
                             return;
                         };
-                        if let Err(err) = repo.borrow_mut().reorder_commit(
+                        let outcome = repo.borrow_mut().reorder_commit(
                             &mv.target,
                             mv.new_parents,
                             mv.new_children,
                             &mv.new_tip,
-                        ) {
-                            show_status(&format!("Reorder failed: {err}"));
-                            return;
+                        );
+                        match outcome {
+                            Ok(SaveOutcome::Clean) => refresh(),
+                            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                            Err(err) => show_status(&format!("Reorder failed: {err}")),
                         }
-                        refresh();
                     }));
                     true
                 }
@@ -1229,6 +1751,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let trash_list = trash_list.clone();
                     let trash_scroll = trash_scroll.clone();
                     let selected_change = selected_change.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let Some(info) = trashed.borrow().get(from as usize).cloned() else {
                             return;
@@ -1237,19 +1760,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         let Some(mv) = plan else {
                             return;
                         };
-                        if let Err(err) = repo.borrow_mut().restore_commit(
+                        let outcome = repo.borrow_mut().restore_commit(
                             &mv.target,
                             mv.new_parents,
                             mv.new_children,
                             &mv.new_tip,
-                        ) {
-                            show_status(&format!("Restore failed: {err}"));
-                            return;
+                        );
+                        match outcome {
+                            Ok(SaveOutcome::Clean) => {
+                                trashed.borrow_mut().remove(from as usize);
+                                *selected_change.borrow_mut() = Some(info.change_id_hex());
+                                refresh();
+                                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                            }
+                            Ok(SaveOutcome::Conflicts { commits }) => {
+                                trashed.borrow_mut().remove(from as usize);
+                                enter_conflict_mode(commits);
+                                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                            }
+                            Err(err) => show_status(&format!("Restore failed: {err}")),
                         }
-                        trashed.borrow_mut().remove(from as usize);
-                        *selected_change.borrow_mut() = Some(info.change_id_hex());
-                        refresh();
-                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                     }));
                     true
                 }
@@ -1318,6 +1848,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let post_drag = post_drag.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
         move |_target, value, _x, _y| {
             if drag_origin.get() != DragOrigin::History {
                 return false; // dragging within the trash: nothing to do
@@ -1335,6 +1866,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let trashed = trashed.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
+            let enter_conflict_mode = enter_conflict_mode.clone();
             *post_drag.borrow_mut() = Some(Box::new(move || {
                 let Some(info) = commits.borrow().get(from as usize).cloned() else {
                     return;
@@ -1346,13 +1878,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     show_status("Can't drop this commit");
                     return;
                 };
-                if let Err(err) = repo.borrow_mut().abandon_commit(&target) {
-                    show_status(&format!("Drop failed: {err}"));
-                    return;
+                let outcome = repo.borrow_mut().abandon_commit(&target);
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        trashed.borrow_mut().push(info);
+                        refresh();
+                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => {
+                        trashed.borrow_mut().push(info);
+                        enter_conflict_mode(commits);
+                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    }
+                    Err(err) => show_status(&format!("Drop failed: {err}")),
                 }
-                trashed.borrow_mut().push(info);
-                refresh();
-                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
             }));
             true
         }
@@ -1380,7 +1919,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let show_status = show_status.clone();
         let identity_fields = identity_fields.clone();
         let original_identity = original_identity.clone();
+        let pane_mode = pane_mode.clone();
+        let resolve_current = resolve_current.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
         Rc::new(move || {
+            // In conflict mode, "Save" means "resolve the current conflicted file".
+            if pane_mode.borrow().is_conflict() {
+                resolve_current();
+                return;
+            }
             let Some(change_id) = selected_change.borrow().clone() else {
                 return;
             };
@@ -1401,9 +1948,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // Message edit (if changed).
             let new_message = buffer_text(&message_buffer);
             if new_message != original_message {
-                if let Err(err) = repo.borrow_mut().rewrite_message(&commit_id, &new_message) {
-                    show_status(&format!("Message save failed: {err}"));
-                    return;
+                match repo.borrow_mut().rewrite_message(&commit_id, &new_message) {
+                    Ok(SaveOutcome::Clean) => {}
+                    Ok(SaveOutcome::Conflicts { commits }) => {
+                        enter_conflict_mode(commits);
+                        return;
+                    }
+                    Err(err) => {
+                        show_status(&format!("Message save failed: {err}"));
+                        return;
+                    }
                 }
                 // The commit id changed; re-resolve by change id.
                 if let Some(info) = resolve_commit(&repo, &change_id) {
@@ -1427,11 +1981,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                                     content.pop();
                                 }
                                 if content != original {
-                                    if let Err(err) =
-                                        repo.borrow_mut().rewrite_file(&commit_id, &path, &content)
+                                    match repo
+                                        .borrow_mut()
+                                        .rewrite_file(&commit_id, &path, &content)
                                     {
-                                        show_status(&format!("File save failed: {err}"));
-                                        return;
+                                        Ok(SaveOutcome::Clean) => {}
+                                        Ok(SaveOutcome::Conflicts { commits }) => {
+                                            enter_conflict_mode(commits);
+                                            return;
+                                        }
+                                        Err(err) => {
+                                            show_status(&format!("File save failed: {err}"));
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -1455,9 +2017,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 if let Some(info) = resolve_commit(&repo, &change_id) {
                     commit_id = info.id;
                 }
-                if let Err(err) = repo.borrow_mut().rewrite_identity(&commit_id, &new_identity) {
-                    show_status(&format!("Identity save failed: {err}"));
-                    return;
+                match repo.borrow_mut().rewrite_identity(&commit_id, &new_identity) {
+                    Ok(SaveOutcome::Clean) => {}
+                    Ok(SaveOutcome::Conflicts { commits }) => {
+                        enter_conflict_mode(commits);
+                        return;
+                    }
+                    Err(err) => {
+                        show_status(&format!("Identity save failed: {err}"));
+                        return;
+                    }
                 }
             }
 
@@ -1547,6 +2116,15 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
     // The clickable "expand context" cue appended to expandable @@ headers.
     add("expand-hint", &|t| {
         t.set_foreground(Some("#0969da"));
+        t.set_weight(700);
+    });
+    // Conflict-resolution pane: "our" side, "their" side, and the marker lines.
+    add("ours-line", &|t| t.set_paragraph_background(Some("#e6ffec")));
+    add("theirs-line", &|t| t.set_paragraph_background(Some("#ddf4ff")));
+    add("base-line", &|t| t.set_paragraph_background(Some("#fff8c5")));
+    add("conflict-marker", &|t| {
+        t.set_paragraph_background(Some("#ffd7d5"));
+        t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
 }
@@ -1659,6 +2237,79 @@ fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxS
                 }
             }
         }
+    }
+}
+
+/// Highlight a *conflicted* file (whole-file content with 2-way markers) in
+/// `buffer`: a colored background per region (ours/theirs/base), the marker lines
+/// emphasized, and syntect language coloring of the code, with the parser state
+/// reset at each marker so the discontiguous regions don't bleed into each other.
+fn highlight_conflict(
+    buffer: &sourceview5::Buffer,
+    path: Option<&str>,
+    ps: &SyntaxSet,
+    theme: &Theme,
+) {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    let text = buffer.text(&start, &end, false).to_string();
+    buffer.remove_all_tags(&start, &end);
+
+    let raw_lines: Vec<&str> = text.split('\n').collect();
+    let kinds = classify_conflict_lines(&text);
+
+    let syntax = path
+        .and_then(|p| std::path::Path::new(p).extension())
+        .and_then(|e| e.to_str())
+        .and_then(|ext| ps.find_syntax_by_extension(ext))
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    let mut hl = HighlightLines::new(syntax, theme);
+
+    for (li, &kind) in kinds.iter().enumerate() {
+        let raw = raw_lines.get(li).copied().unwrap_or("");
+        if let Some(name) = conflict_bg_tag(kind) {
+            apply_line_tag(buffer, li as i32, name);
+        }
+        if kind.is_marker() {
+            // A marker line is structural; reset the syntax parser so the next
+            // region starts clean, and don't language-color the marker itself.
+            hl = HighlightLines::new(syntax, theme);
+            continue;
+        }
+        // Unlike a unified diff, conflict lines carry no prefix char — column 0
+        // is real content.
+        let owned = format!("{raw}\n");
+        if let Ok(spans) = hl.highlight_line(&owned, ps) {
+            let mut byte = 0usize;
+            for (style, piece) in spans {
+                if byte >= raw.len() {
+                    break;
+                }
+                let plen = piece.len().min(raw.len() - byte);
+                if plen > 0 {
+                    let cs = raw[..byte].chars().count();
+                    let ce = raw[..byte + plen].chars().count();
+                    let fg = style.foreground;
+                    let hex = format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b);
+                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &fg_tag(buffer, &hex));
+                }
+                byte += plen;
+            }
+        }
+    }
+}
+
+/// The line-background tag name for a conflict line kind (`None` = plain content).
+fn conflict_bg_tag(kind: ConflictLineKind) -> Option<&'static str> {
+    match kind {
+        ConflictLineKind::Ours => Some("ours-line"),
+        ConflictLineKind::Theirs => Some("theirs-line"),
+        ConflictLineKind::Base => Some("base-line"),
+        ConflictLineKind::MarkerOurs
+        | ConflictLineKind::MarkerBase
+        | ConflictLineKind::MarkerSep
+        | ConflictLineKind::MarkerTheirs => Some("conflict-marker"),
+        ConflictLineKind::Plain => None,
     }
 }
 
@@ -1872,8 +2523,9 @@ fn set_identity_fields(fields: &[Entry; 4], commit: &CommitInfo) {
     fields[3].set_text(&commit.committer_time);
 }
 
-/// Build the `short-id   subject` content box shown inside a history/trash row.
-fn commit_row_box(commit: &CommitInfo) -> GtkBox {
+/// Build the `short-id   subject   ⚠` content box shown inside a history/trash
+/// row. The trailing warning icon is present but hidden unless `conflicted`.
+fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
@@ -1889,6 +2541,9 @@ fn commit_row_box(commit: &CommitInfo) -> GtkBox {
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    let badge = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    badge.set_tooltip_text(Some("This commit has unresolved conflicts"));
+    badge.set_visible(conflicted);
     let row_box = GtkBox::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -1899,13 +2554,14 @@ fn commit_row_box(commit: &CommitInfo) -> GtkBox {
         .build();
     row_box.append(&id_label);
     row_box.append(&subject_label);
+    row_box.append(&badge);
     row_box
 }
 
 /// Update the content of a row's existing labels in place, without replacing the
 /// child widget — so the labels (and the row) survive a drag-triggered rebuild.
 /// Falls back to building a fresh child if the row has none yet.
-fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo) {
+fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
@@ -1917,16 +2573,22 @@ fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo) {
         .as_ref()
         .and_then(|b| b.first_child())
         .and_downcast::<Label>();
-    let subject_label = row_box
+    let subject_label = id_label
+        .as_ref()
+        .and_then(|l| l.next_sibling())
+        .and_downcast::<Label>();
+    let badge = row_box
         .as_ref()
         .and_then(|b| b.last_child())
-        .and_downcast::<Label>();
-    match (id_label, subject_label) {
-        (Some(id_label), Some(subject_label)) => {
+        .and_downcast::<gtk::Image>();
+    match (id_label, subject_label, badge) {
+        (Some(id_label), Some(subject_label), Some(badge)) => {
             id_label.set_markup(&format!("<tt>{short}</tt>"));
             subject_label.set_text(subject);
+            badge.set_visible(conflicted);
         }
-        _ => row.set_child(Some(&commit_row_box(commit))),
+        // Older row layout (or a freshly-created empty row): build it whole.
+        _ => row.set_child(Some(&commit_row_box(commit, conflicted))),
     }
 }
 
@@ -1943,7 +2605,12 @@ fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo) {
 /// NULL parent and segfaults. Reusing rows and only *hiding* the surplus keeps
 /// every row parented, so the walk always terminates. Hidden rows are reused
 /// when the list grows again.
-fn populate_rows(list: &ListBox, commits: &[CommitInfo], selectable: bool) {
+fn populate_rows(
+    list: &ListBox,
+    commits: &[CommitInfo],
+    selectable: bool,
+    conflicts: &HashSet<String>,
+) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
             let row = ListBoxRow::new();
@@ -1954,7 +2621,7 @@ fn populate_rows(list: &ListBox, commits: &[CommitInfo], selectable: bool) {
             row
         });
         row.set_visible(true);
-        set_row_commit(&row, commit);
+        set_row_commit(&row, commit, conflicts.contains(&commit.change_id_hex()));
     }
     // Hide surplus rows rather than removing them (see the note above).
     let mut i = commits.len() as i32;
@@ -1966,8 +2633,8 @@ fn populate_rows(list: &ListBox, commits: &[CommitInfo], selectable: bool) {
 
 /// Show the history commits in `list` (newest first), reusing rows. See
 /// [`populate_rows`].
-fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
-    populate_rows(list, commits, true);
+fn populate_list(list: &ListBox, commits: &[CommitInfo], conflicts: &HashSet<String>) {
+    populate_rows(list, commits, true, conflicts);
 }
 
 /// Fill the trash list with the session's dropped commits, reusing rows. When
@@ -1975,7 +2642,7 @@ fn populate_list(list: &ListBox, commits: &[CommitInfo]) {
 /// icon (the icon still carries the drop target).
 fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
     scroll.set_visible(!commits.is_empty());
-    populate_rows(list, commits, false);
+    populate_rows(list, commits, false, &HashSet::new());
 }
 
 fn present_error(app: &Application, message: &str) {

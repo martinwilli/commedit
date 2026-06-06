@@ -11,15 +11,23 @@ use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 
+use crate::conflict::SaveOutcome;
 use crate::repo::Repo;
-use crate::transparency;
 
 impl Repo {
     /// Replace the content of `path` in commit `target` with `new_content`,
     /// rebase descendants onto the rewritten commit, and export to git — all in
     /// a single transaction. The file's executable bit is preserved.
-    pub fn rewrite_file(&mut self, target: &CommitId, path: &str, new_content: &str) -> Result<()> {
+    pub fn rewrite_file(
+        &mut self,
+        target: &CommitId,
+        path: &str,
+        new_content: &str,
+    ) -> Result<SaveOutcome> {
+        let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
         let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
         let commit = self
             .repo
@@ -53,13 +61,15 @@ impl Repo {
         )
         .context("writing rewritten commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        transparency::export_to_git(tx.repo_mut())?;
 
-        self.repo = pollster::block_on(tx.commit("commedit: edit file content"))
-            .context("committing rewrite")?;
-        self.reattach_head()?;
-        self.sync_worktree(old_head)?;
-        Ok(())
+        self.finish_mutation(
+            tx,
+            "commedit: edit file content",
+            pre_op,
+            old_head,
+            bookmarks,
+            heads,
+        )
     }
 }
 

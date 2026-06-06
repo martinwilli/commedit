@@ -453,6 +453,87 @@ pub(crate) fn classify_line(line: &str) -> DiffLineKind {
     }
 }
 
+/// The role of a single line of a *conflicted* file materialized with Git-style
+/// conflict markers, for highlighting the conflict-resolution pane. Separate from
+/// [`DiffLineKind`] (which the unified-diff patch firewall depends on): a
+/// conflicted file is whole-file content, not a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictLineKind {
+    /// Content outside any conflict region.
+    Plain,
+    /// The `<<<<<<<` line opening a conflict ("our" side).
+    MarkerOurs,
+    /// A line of the "our" side of a conflict.
+    Ours,
+    /// The `|||||||` line opening the base (only with diff3-style markers; we
+    /// strip these for display, but classify defensively in case one survives).
+    MarkerBase,
+    /// A line of the common-ancestor base of a conflict.
+    Base,
+    /// The `=======` line separating the two sides.
+    MarkerSep,
+    /// A line of the "their" side of a conflict.
+    Theirs,
+    /// The `>>>>>>>` line closing a conflict.
+    MarkerTheirs,
+}
+
+impl ConflictLineKind {
+    /// Whether this is one of the four `<<<`/`|||`/`===`/`>>>` marker lines.
+    pub fn is_marker(self) -> bool {
+        matches!(
+            self,
+            ConflictLineKind::MarkerOurs
+                | ConflictLineKind::MarkerBase
+                | ConflictLineKind::MarkerSep
+                | ConflictLineKind::MarkerTheirs
+        )
+    }
+}
+
+/// Whether `line` begins with at least seven repetitions of `ch` — a conflict
+/// marker line (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`). Seven is Git's and
+/// jj's default marker length; longer markers (chosen when content collides) also
+/// start with seven, so this stays correct.
+fn is_conflict_marker(line: &str, ch: char) -> bool {
+    line.chars().take_while(|&c| c == ch).count() >= 7
+}
+
+/// Classify each `\n`-separated line of a conflicted file by its position
+/// relative to the conflict markers, aligned 1:1 with `text.split('\n')`, so the
+/// pane can tag each line. A small state machine: `<<<<<<<` opens the "our" side,
+/// `|||||||` the base, `=======` switches to "their" side, `>>>>>>>` closes back
+/// to plain. Closing/separator markers are only recognized while inside a
+/// conflict, so ordinary content (e.g. a `=======` rule) is left as `Plain`.
+pub fn classify_conflict_lines(text: &str) -> Vec<ConflictLineKind> {
+    use ConflictLineKind::*;
+    let mut state = Plain;
+    text.split('\n')
+        .map(|line| {
+            if state == Plain {
+                if is_conflict_marker(line, '<') {
+                    state = Ours;
+                    return MarkerOurs;
+                }
+                return Plain;
+            }
+            if is_conflict_marker(line, '>') {
+                state = Plain;
+                return MarkerTheirs;
+            }
+            if is_conflict_marker(line, '=') {
+                state = Theirs;
+                return MarkerSep;
+            }
+            if is_conflict_marker(line, '|') {
+                state = Base;
+                return MarkerBase;
+            }
+            state
+        })
+        .collect()
+}
+
 /// Maximum fraction of a line that intra-line emphasis may cover before it is
 /// dropped entirely: beyond this the change is a near-rewrite and per-token
 /// highlighting is just noise — the line background already conveys it.

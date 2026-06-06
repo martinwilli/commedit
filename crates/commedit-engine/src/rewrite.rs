@@ -9,11 +9,11 @@ use jj_lib::rewrite::{
     move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
 };
 
+use crate::conflict::SaveOutcome;
 use crate::history::{
     plan_drop, plan_reorder, plan_restore, parse_timestamp, CommitInfo, ReorderMove,
 };
 use crate::repo::Repo;
-use crate::transparency;
 
 /// The author and committer identity of a commit, as edited in the UI. Names and
 /// emails are free text; the timestamps are parsed by [`parse_timestamp`].
@@ -31,7 +31,8 @@ impl Repo {
     /// Replace the description of `target` with `message`, rebase all
     /// descendants onto the rewritten commit, and export the result to git in a
     /// single transaction.
-    pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<()> {
+    pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
+        let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
@@ -51,18 +52,15 @@ impl Repo {
         .context("writing rewritten commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants())
             .context("rebasing descendants")?;
-        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
-        transparency::export_to_git(tx.repo_mut())?;
 
-        self.repo = pollster::block_on(tx.commit("commedit: edit commit message"))
-            .context("committing rewrite")?;
-        self.reattach_head()?;
-        self.protect_unrelated_heads(&heads);
-        self.sync_worktree(old_head.clone())?;
-        if let Some(old) = old_head {
-            self.prune_orphaned_keep_refs(&old);
-        }
-        Ok(())
+        self.finish_mutation(
+            tx,
+            "commedit: edit commit message",
+            pre_op,
+            old_head,
+            bookmarks,
+            heads,
+        )
     }
 
     /// Replace the author and committer identity (name, email, timestamp) of
@@ -71,7 +69,8 @@ impl Repo {
     /// Both signatures are set explicitly so this also overrides jj's habit of
     /// stamping the committer to "now" on a rewrite; run it last in a save so the
     /// edited values win over the side effects of message/content edits.
-    pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<()> {
+    pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
+        let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
@@ -102,18 +101,15 @@ impl Repo {
         )
         .context("writing rewritten commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
-        transparency::export_to_git(tx.repo_mut())?;
 
-        self.repo = pollster::block_on(tx.commit("commedit: edit commit identity"))
-            .context("committing rewrite")?;
-        self.reattach_head()?;
-        self.protect_unrelated_heads(&heads);
-        self.sync_worktree(old_head.clone())?;
-        if let Some(old) = old_head {
-            self.prune_orphaned_keep_refs(&old);
-        }
-        Ok(())
+        self.finish_mutation(
+            tx,
+            "commedit: edit commit identity",
+            pre_op,
+            old_head,
+            bookmarks,
+            heads,
+        )
     }
 
     /// Plan a drag-to-reorder of the commit at display index `from` to the
@@ -166,7 +162,7 @@ impl Repo {
         new_parent_ids: Vec<CommitId>,
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
-    ) -> Result<()> {
+    ) -> Result<SaveOutcome> {
         self.splice_commit(
             target,
             new_parent_ids,
@@ -186,7 +182,7 @@ impl Repo {
         new_parent_ids: Vec<CommitId>,
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
-    ) -> Result<()> {
+    ) -> Result<SaveOutcome> {
         self.splice_commit(
             target,
             new_parent_ids,
@@ -206,7 +202,8 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
         op_msg: &str,
-    ) -> Result<()> {
+    ) -> Result<SaveOutcome> {
+        let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
@@ -228,7 +225,9 @@ impl Repo {
         // Point the branch at the new head. A splice need not rewrite the old
         // head commit, so jj's automatic bookmark moves can leave the branch
         // behind; set it explicitly. The head keeps its change id, but its commit
-        // id changes if it was rebased onto a new parent.
+        // id changes if it was rebased onto a new parent. Setting it here (in the
+        // rewrite transaction) is also what lets `finish_mutation` read the new
+        // tip back from the bookmark to scope its conflict walk.
         let new_tip_id = match stats.rebased_commits.get(new_tip) {
             Some(RebasedCommit::Rewritten(commit)) => commit.id().clone(),
             Some(RebasedCommit::Abandoned { .. }) => bail!("the new head commit became empty"),
@@ -236,23 +235,15 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
-        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
-        transparency::export_to_git(tx.repo_mut())?;
-        self.repo = pollster::block_on(tx.commit(op_msg)).context("committing splice")?;
-        self.reattach_head()?;
-        self.protect_unrelated_heads(&heads);
-        self.sync_worktree(old_head.clone())?;
-        if let Some(old) = old_head {
-            self.prune_orphaned_keep_refs(&old);
-        }
-        Ok(())
+        self.finish_mutation(tx, op_msg, pre_op, old_head, bookmarks, heads)
     }
 
     /// Drop `target` from history entirely: its descendants are rebased onto its
     /// parent(s) and the branch bookmark follows, in one transaction exported to
     /// git. The commit object itself survives for the session (we never run
     /// `git gc`), so [`Self::restore_commit`] can graft it back.
-    pub fn abandon_commit(&mut self, target: &CommitId) -> Result<()> {
+    pub fn abandon_commit(&mut self, target: &CommitId) -> Result<SaveOutcome> {
+        let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
@@ -268,17 +259,7 @@ impl Repo {
         // abandoned bookmarks rather than deleting them).
         tx.repo_mut().record_abandoned_commit(&commit);
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        self.confine_bookmark_moves(tx.repo_mut(), &bookmarks);
-        transparency::export_to_git(tx.repo_mut())?;
 
-        self.repo = pollster::block_on(tx.commit("commedit: drop commit"))
-            .context("committing drop")?;
-        self.reattach_head()?;
-        self.protect_unrelated_heads(&heads);
-        self.sync_worktree(old_head.clone())?;
-        if let Some(old) = old_head {
-            self.prune_orphaned_keep_refs(&old);
-        }
-        Ok(())
+        self.finish_mutation(tx, "commedit: drop commit", pre_op, old_head, bookmarks, heads)
     }
 }

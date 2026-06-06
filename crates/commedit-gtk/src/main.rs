@@ -21,7 +21,8 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     gdk, Application, ApplicationWindow, Box as GtkBox, Button, Calendar, CallbackAction, DragSource,
-    DropDown, DropTarget, Entry, EventControllerKey, Grid, HeaderBar, Label, ListBox, ListBoxRow,
+    DropDown, DropTarget, Entry, EventControllerKey, EventControllerScroll,
+    EventControllerScrollFlags, Grid, HeaderBar, Label, ListBox, ListBoxRow,
     MenuButton, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
     ShortcutController, ShortcutTrigger, StringList, TextTag,
 };
@@ -700,6 +701,37 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         }
     });
+
+    // Scrolling over the (closed) drop-down steps through the files of the diff,
+    // so flipping between files doesn't require opening the popover each time.
+    let scroll_controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    scroll_controller.connect_scroll({
+        let file_dropdown = file_dropdown.clone();
+        move |_, _, dy| {
+            let n = file_dropdown.model().map_or(0, |m| m.n_items());
+            if n == 0 {
+                return glib::Propagation::Proceed;
+            }
+            let cur = file_dropdown.selected();
+            if cur == gtk::INVALID_LIST_POSITION {
+                return glib::Propagation::Proceed;
+            }
+            // Scroll down (dy > 0) advances to the next file; up goes back.
+            // Clamp at the ends rather than wrapping.
+            let next = if dy > 0.0 {
+                (cur + 1).min(n - 1)
+            } else if dy < 0.0 {
+                cur.saturating_sub(1)
+            } else {
+                cur
+            };
+            if next != cur {
+                file_dropdown.set_selected(next);
+            }
+            glib::Propagation::Stop
+        }
+    });
+    file_dropdown.add_controller(scroll_controller);
 
     // Load the changed-files list for the selected commit into the dropdown.
     let load_changes: Rc<dyn Fn(&CommitInfo)> = {

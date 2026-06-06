@@ -8,8 +8,11 @@
 //!
 //! * Only `+` (added) line content is freely editable.
 //! * Typing into a context line splits it into a `-<orig>` / `+<edited>` pair.
-//! * Backspace/Delete on a `-` line un-removes it (→ context); at the start of a
-//!   context line it marks the line removed (` ` → `-`) — a clean toggle.
+//! * Backspace/Delete on a `-` line un-removes it (→ context).
+//! * Backspace/Delete on a context line edits it like typing: dropping a
+//!   character splits it into a `-<orig>` / `+<edited>` pair. Backspace at the
+//!   content start / Delete at the content end have no character to remove there,
+//!   so they mark the whole line removed (` ` → `-`) — a clean toggle.
 //! * Enter on a context line keeps it and inserts an empty `+` line below.
 //! * Header / `@@` / meta lines are read-only.
 //!
@@ -361,13 +364,23 @@ fn plan_newline(lines: &[&str], sel: Selection) -> EditPlan {
 
 fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
     if !sel.is_empty() {
-        // Deleting a selection: only safe wholly inside one `+` line's content.
         let (lo, hi) = sel.ordered();
-        return if deletion_is_safe_lines(lines, lo, hi) {
-            EditPlan::Allow
-        } else {
-            EditPlan::Block
-        };
+        // Wholly inside one `+` line's content: the default delete is safe.
+        if deletion_is_safe_lines(lines, lo, hi) {
+            return EditPlan::Allow;
+        }
+        // A selection within one context line edits it: drop the selected span,
+        // splitting the line into a `-orig`/`+edited` pair like typing does.
+        if lo.line == hi.line {
+            if let Some(&line) = lines.get(lo.line) {
+                if !line.is_empty() && classify_line(line) == DiffLineKind::Context {
+                    let s = content_index(line, lo.col);
+                    let e = content_index(line, hi.col);
+                    return EditPlan::Edit(delete_from_context(line, lo.line, s, e));
+                }
+            }
+        }
+        return EditPlan::Block;
     }
     let caret = sel.end;
     let l = caret.line;
@@ -380,17 +393,37 @@ fn plan_delete(lines: &[&str], sel: Selection, dir: Dir) -> EditPlan {
     match classify_line(line) {
         // Un-remove: `-` → context, caret preserved.
         DiffLineKind::Removed => toggle_prefix(l, ' ', caret.col),
-        // At the line start, mark the line removed: ` ` → `-`. Elsewhere the
-        // content is immutable (type to change it), so block.
-        DiffLineKind::Context => {
-            if caret.col <= 1 {
-                toggle_prefix(l, '-', caret.col)
-            } else {
-                EditPlan::Block
-            }
-        }
+        DiffLineKind::Context => delete_in_context(line, l, caret.col, dir),
         DiffLineKind::Added => delete_in_added(lines, l, caret.col, dir),
         _ => EditPlan::Block,
+    }
+}
+
+/// Delete a character from a context line, splitting it into a `-orig`/`+edited`
+/// pair the same way typing does so the original still matches the base.
+/// Backspace at the content start / Delete at the content end have no character
+/// to remove on this line, so they fall back to marking the whole line removed.
+fn delete_in_context(line: &str, l: usize, col: usize, dir: Dir) -> EditPlan {
+    let n = char_len(content(line));
+    let ci = content_index(line, col);
+    let (s, e) = match dir {
+        Dir::Back if ci >= 1 => (ci - 1, ci),
+        Dir::Forward if ci < n => (ci, ci + 1),
+        _ => return toggle_prefix(l, '-', col),
+    };
+    EditPlan::Edit(delete_from_context(line, l, s, e))
+}
+
+/// Split a context line into a `-orig`/`+edited` pair with content chars `[s, e)`
+/// removed, leaving the caret on the `+` line at the deletion point.
+fn delete_from_context(line: &str, l: usize, s: usize, e: usize) -> PatchEdit {
+    let body = content(line);
+    let edited = splice(body, s, e, "");
+    PatchEdit {
+        start: Cursor::at(l, 0),
+        end: Cursor::at(l, char_len(line)),
+        replacement: format!("-{body}\n+{edited}"),
+        cursor: Cursor::at(l + 1, 1 + s),
     }
 }
 
@@ -638,6 +671,51 @@ mod tests {
         // Now the line is "-c"; backspace again restores context.
         let back = apply(&removed, &edit(plan_edit(&removed, caret(li, 1), EditGesture::Backspace)));
         assert!(back.contains(" c\n"), "got:\n{back}");
+    }
+
+    #[test]
+    fn backspace_in_context_splits_into_pair() {
+        let patch = unified_diff("abc\nx\n", "abc\nY\n", "f");
+        let li = line_index(&patch, |l| l == " abc");
+        // Caret after 'b' (col 3); backspace drops 'b', like editing the line.
+        let plan = plan_edit(&patch, caret(li, 3), EditGesture::Backspace);
+        let e = edit(plan);
+        let out = apply(&patch, &e);
+        assert!(out.contains("-abc\n+ac\n"), "got:\n{out}");
+        // Caret lands on the new '+' line at the deletion point.
+        assert_eq!(e.cursor, Cursor::at(li + 1, 2));
+        assert!(apply_patch("abc\nx\n", &out).is_ok());
+    }
+
+    #[test]
+    fn forward_delete_in_context_splits_into_pair() {
+        let patch = unified_diff("abc\nx\n", "abc\nY\n", "f");
+        let li = line_index(&patch, |l| l == " abc");
+        // Caret before 'b' (col 2); forward-delete drops 'b'.
+        let plan = plan_edit(&patch, caret(li, 2), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("-abc\n+ac\n"), "got:\n{out}");
+        assert!(apply_patch("abc\nx\n", &out).is_ok());
+    }
+
+    #[test]
+    fn forward_delete_at_context_end_marks_removed() {
+        // No character follows the caret, so the whole line is marked removed.
+        let patch = sample();
+        let li = line_index(&patch, |l| l == " c");
+        let out = apply(&patch, &edit(plan_edit(&patch, caret(li, 2), EditGesture::Delete)));
+        assert!(out.contains("-c\n"), "got:\n{out}");
+    }
+
+    #[test]
+    fn selection_delete_in_context_splits_into_pair() {
+        let patch = unified_diff("abc\nx\n", "abc\nY\n", "f");
+        let li = line_index(&patch, |l| l == " abc");
+        // Select "bc" (content chars 1..3 → cols 2..4) and delete it.
+        let plan = plan_edit(&patch, sel((li, 2), (li, 4)), EditGesture::Delete);
+        let out = apply(&patch, &edit(plan));
+        assert!(out.contains("-abc\n+a\n"), "got:\n{out}");
+        assert!(apply_patch("abc\nx\n", &out).is_ok());
     }
 
     #[test]

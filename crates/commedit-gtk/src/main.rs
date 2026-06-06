@@ -993,6 +993,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     placeholder.set_can_target(false);
     // The row currently being dragged, so it can be un-dimmed when the drag ends.
     let drag_row: Rc<RefCell<Option<ListBoxRow>>> = Rc::new(RefCell::new(None));
+    // The dragged row's original index (newest-first), captured at drag start so
+    // motion can tell whether a hover gap is a real move (vs. the no-op gaps just
+    // above/below the row, or an off-chain row).
+    let drag_from: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // The insertion gap (newest-first index, 0..=len) the placeholder marks.
     let drop_gap: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // A drop handler rewrites history and rebuilds both lists, which destroys the
@@ -1033,6 +1037,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let placeholder = placeholder.clone();
         let commits = commits.clone();
         let drop_gap = drop_gap.clone();
+        let repo = repo.clone();
+        let drag_from = drag_from.clone();
         Rc::new(move |y: f64| {
             let n = commits.borrow().len();
             let current = drop_gap.get();
@@ -1054,6 +1060,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 None => n,
             };
             if current == Some(new_gap) {
+                return;
+            }
+            // Only open a gap where dropping would actually move the commit. The
+            // gaps just above and below the dragged row leave it in place
+            // (plan_reorder returns None), as do off-chain rows — show no
+            // placeholder there.
+            let real_move = drag_from.get().is_some_and(|from| {
+                repo.borrow()
+                    .plan_reorder(&commits.borrow(), from, new_gap)
+                    .is_some()
+            });
+            if !real_move {
+                if placeholder.parent().is_some() {
+                    list.remove(&placeholder);
+                }
+                drop_gap.set(None);
                 return;
             }
             if placeholder.parent().is_some() {
@@ -1080,6 +1102,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     drag_source.connect_prepare({
         let list = list.clone();
         let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
         let drag_origin = drag_origin.clone();
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
@@ -1087,6 +1110,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let paintable = gtk::WidgetPaintable::new(Some(&row));
             source.set_icon(Some(&paintable), 0, 0);
             *drag_row.borrow_mut() = Some(row.clone());
+            drag_from.set(Some(row.index() as usize));
             drag_origin.set(DragOrigin::History);
             Some(gdk::ContentProvider::for_value(&row.index().to_value()))
         }
@@ -1101,12 +1125,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     });
     drag_source.connect_drag_end({
         let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
         let clear_gap = clear_gap.clone();
         let post_drag = post_drag.clone();
         move |_source, _drag, _delete| {
             if let Some(row) = drag_row.borrow_mut().take() {
                 row.remove_css_class("commit-dragging");
             }
+            drag_from.set(None);
             clear_gap();
             run_post_drag(&post_drag);
         }

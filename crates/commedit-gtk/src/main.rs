@@ -2083,7 +2083,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // Message edit (if changed).
             let new_message = buffer_text(&message_buffer);
             if new_message != original_message {
-                match repo.borrow_mut().rewrite_message(&commit_id, &new_message) {
+                // Bind in its own statement so the `RefMut` is dropped before the
+                // match arms run — `enter_conflict_mode` re-borrows `repo`.
+                let outcome = repo.borrow_mut().rewrite_message(&commit_id, &new_message);
+                match outcome {
                     Ok(SaveOutcome::Clean) => {}
                     Ok(SaveOutcome::Conflicts { commits }) => {
                         enter_conflict_mode(commits);
@@ -2116,10 +2119,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                                     content.pop();
                                 }
                                 if content != original {
-                                    match repo
+                                    let outcome = repo
                                         .borrow_mut()
-                                        .rewrite_file(&commit_id, &path, &content)
-                                    {
+                                        .rewrite_file(&commit_id, &path, &content);
+                                    match outcome {
                                         Ok(SaveOutcome::Clean) => {}
                                         Ok(SaveOutcome::Conflicts { commits }) => {
                                             enter_conflict_mode(commits);
@@ -2152,7 +2155,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 if let Some(info) = resolve_commit(&repo, &change_id) {
                     commit_id = info.id;
                 }
-                match repo.borrow_mut().rewrite_identity(&commit_id, &new_identity) {
+                let outcome = repo.borrow_mut().rewrite_identity(&commit_id, &new_identity);
+                match outcome {
                     Ok(SaveOutcome::Clean) => {}
                     Ok(SaveOutcome::Conflicts { commits }) => {
                         enter_conflict_mode(commits);

@@ -85,12 +85,51 @@ impl ConflictCtx {
     }
 }
 
-/// Which side(s) of a conflict block a quick-resolve button keeps.
+/// Which side(s) of a conflict block a quick-resolve action keeps.
 #[derive(Clone, Copy)]
 enum Side {
     Ours,
     Theirs,
     Both,
+}
+
+/// Inline, clickable quick-resolve cues appended to a conflict block's marker
+/// lines — the same idiom as the diff view's "expand context" cue. Clicking the
+/// marker line keeps the indicated side(s) and drops the markers: "use ours"
+/// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
+const CUE_OURS: &str = " ➜ use ours ";
+const CUE_BOTH: &str = " ➜ use both ";
+const CUE_THEIRS: &str = " ➜ use theirs ";
+/// The glyph that introduces every cue, used to locate it for highlighting.
+const CUE_GLYPH: char = '➜';
+
+/// The inline cue text and the side it resolves to for a marker line, or `None`
+/// for a non-marker (content) line.
+fn resolve_cue(kind: ConflictLineKind) -> Option<(&'static str, Side)> {
+    match kind {
+        ConflictLineKind::MarkerOurs => Some((CUE_OURS, Side::Ours)),
+        ConflictLineKind::MarkerSep => Some((CUE_BOTH, Side::Both)),
+        ConflictLineKind::MarkerTheirs => Some((CUE_THEIRS, Side::Theirs)),
+        _ => None,
+    }
+}
+
+/// Append the inline quick-resolve cue to each conflict-marker line of the
+/// buffer (which must already hold the materialized conflict text). Inserting at
+/// a line's end leaves line numbering unchanged, so the cached classification
+/// stays valid across the loop. The caller must hold the `editing` guard so the
+/// firewall lets these programmatic inserts through.
+fn append_resolve_cues(buffer: &sourceview5::Buffer) {
+    let text = buffer_text(buffer);
+    for (li, kind) in classify_conflict_lines(&text).into_iter().enumerate() {
+        let Some((cue, _)) = resolve_cue(kind) else {
+            continue;
+        };
+        if let Some(mut iter) = buffer.iter_at_line(li as i32) {
+            iter.forward_to_line_end();
+            buffer.insert(&mut iter, cue);
+        }
+    }
 }
 
 /// Find the conflict block (the `<<<<<<< … >>>>>>>` region) containing
@@ -105,22 +144,16 @@ fn resolve_conflict_block(text: &str, caret_line: usize, side: Side) -> Option<(
     if kinds.is_empty() {
         return None;
     }
-    // Walk back from the caret to the opening marker; bail if we cross a closing
-    // marker first (the caret sits between blocks, not inside one).
-    let mut start = None;
-    for i in (0..=caret_line.min(kinds.len() - 1)).rev() {
-        match kinds[i] {
-            ConflictLineKind::MarkerOurs => {
-                start = Some(i);
-                break;
-            }
-            ConflictLineKind::MarkerTheirs => return None,
-            _ => {}
-        }
-    }
-    let start = start?;
+    let line = caret_line.min(kinds.len() - 1);
+    // The block's opening marker is the nearest `<<<<<<<` at or before the line,
+    // its closing marker the next `>>>>>>>` after that. Anchoring on the opener
+    // (rather than walking back and bailing on a closing marker) lets a click on
+    // any line of the block resolve it — including the closing marker itself,
+    // which carries the "use theirs" cue.
+    let start = (0..=line).rev().find(|&i| kinds[i] == ConflictLineKind::MarkerOurs)?;
     let end = (start + 1..kinds.len()).find(|&i| kinds[i] == ConflictLineKind::MarkerTheirs)?;
-    if caret_line > end {
+    // Reject a line that sits past this block's close (i.e. between two blocks).
+    if line > end {
         return None;
     }
     let mut ours = Vec::new();
@@ -143,6 +176,41 @@ fn resolve_conflict_block(text: &str, caret_line: usize, side: Side) -> Option<(
         replacement.push('\n');
     }
     Some((start, end, replacement))
+}
+
+/// Resolve the conflict block containing buffer `line` by keeping `side` and
+/// dropping its markers (and the inline cues attached to them), as one undo
+/// step. Returns `false` (a no-op) if the line is not inside a conflict block.
+/// The `editing` guard marks the edit as our own so the conflict pane's free-form
+/// editing path lets it through; `highlight` recolors the now-shrunk buffer.
+fn resolve_conflict_at(
+    buffer: &sourceview5::Buffer,
+    editing: &Rc<Cell<bool>>,
+    line: usize,
+    side: Side,
+    highlight: &dyn Fn(),
+) -> bool {
+    let text = buffer_text(buffer);
+    let Some((start, end, replacement)) = resolve_conflict_block(&text, line, side) else {
+        return false;
+    };
+    editing.set(true);
+    buffer.begin_user_action();
+    let mut s = buffer
+        .iter_at_line(start as i32)
+        .unwrap_or_else(|| buffer.start_iter());
+    let mut e = buffer
+        .iter_at_line(end as i32 + 1)
+        .unwrap_or_else(|| buffer.end_iter());
+    buffer.delete(&mut s, &mut e);
+    let mut at = buffer
+        .iter_at_line(start as i32)
+        .unwrap_or_else(|| buffer.end_iter());
+    buffer.insert(&mut at, &replacement);
+    buffer.end_user_action();
+    editing.set(false);
+    highlight();
+    true
 }
 
 /// Run a drop's staged action, scheduled from the drag source's `drag-end`.
@@ -459,15 +527,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // file/diff editing field rather than spanning the whole window.
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
-    // Conflict-mode quick actions: replace the conflict region around the caret
-    // with one side (or both). Hidden outside conflict mode.
-    let take_ours = Button::with_label("Use ours");
-    let take_theirs = Button::with_label("Use theirs");
-    let take_both = Button::with_label("Use both");
-    for b in [&take_ours, &take_theirs, &take_both] {
-        b.set_visible(false);
-        b.set_tooltip_text(Some("Resolve the conflict block at the cursor"));
-    }
+    // Conflict-mode quick resolution is driven inline: clicking a block's marker
+    // line (with its "use ours/theirs/both" cue) keeps that side — see
+    // `append_resolve_cues` and the click gesture below. No toolbar buttons.
     let bottom_bar = GtkBox::new(Orientation::Horizontal, 4);
     bottom_bar.set_margin_start(8);
     bottom_bar.set_margin_end(8);
@@ -477,9 +539,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     bottom_spacer.set_hexpand(true);
     bottom_bar.append(&status_label);
     bottom_bar.append(&bottom_spacer);
-    bottom_bar.append(&take_ours);
-    bottom_bar.append(&take_theirs);
-    bottom_bar.append(&take_both);
     bottom_bar.append(&save_button);
 
     // A banner above the file list, shown only while a conflicted rewrite is held
@@ -702,8 +761,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     *render_cell.borrow_mut() = Some(render_diff_view.clone());
 
     // Clicking a @@ header line (anywhere on it, including the "expand context"
-    // cue) widens that hunk's context. The re-render is deferred to an idle so it
-    // runs outside the gesture's event handling.
+    // cue) widens that hunk's context. In conflict mode the same gesture turns a
+    // click on a block's marker line into the matching quick resolution. The
+    // mutation is deferred to an idle so it runs outside the gesture's event
+    // handling.
     let expand_click = gtk::GestureClick::new();
     expand_click.set_button(gdk::BUTTON_PRIMARY);
     expand_click.set_propagation_phase(PropagationPhase::Capture);
@@ -715,11 +776,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let render_cell = render_cell.clone();
         let current_file = current_file.clone();
         let pane_mode = pane_mode.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
         move |gesture, _n_press, x, y| {
-            // No hunk context to expand in conflict mode (whole-file content).
-            if pane_mode.borrow().is_conflict() {
-                return;
-            }
             let (bx, by) = file_view.window_to_buffer_coords(
                 gtk::TextWindowType::Widget,
                 x as i32,
@@ -729,6 +788,36 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 return;
             };
             let line = iter.line() as usize;
+            // Conflict mode: a click on a marker line's inline "➜ use …" cue
+            // resolves that block. Clicks elsewhere (the marker text, content
+            // lines) fall through so the caret places normally for free-form edits.
+            if pane_mode.borrow().is_conflict() {
+                let text = buffer_text(&file_buffer);
+                let kind = classify_conflict_lines(&text).get(line).copied();
+                let Some((_, side)) = kind.and_then(resolve_cue) else {
+                    return;
+                };
+                // Restrict the hit area to the cue's own character run: a click
+                // left of the `➜` glyph is on the marker text, not the button.
+                let line_text = text.split('\n').nth(line).unwrap_or("");
+                let Some(byte) = line_text.find(CUE_GLYPH) else {
+                    return;
+                };
+                let cue_col = line_text[..byte].chars().count();
+                if (iter.line_offset() as usize) < cue_col {
+                    return;
+                }
+                // We own this click: don't let the view also place the caret in
+                // the marker line we're about to delete.
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let file_buffer = file_buffer.clone();
+                let editing = editing.clone();
+                let highlight = highlight.clone();
+                glib::idle_add_local_once(move || {
+                    resolve_conflict_at(&file_buffer, &editing, line, side, &*highlight);
+                });
+                return;
+            }
             let hit = rendered_hunks
                 .borrow()
                 .iter()
@@ -946,6 +1035,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                     editing.set(true);
                     file_buffer.set_text(&file.text);
+                    // Attach the inline "use ours/theirs/both" cues to the marker
+                    // lines; the click gesture below turns a marker-line click into
+                    // the matching quick resolution.
+                    append_resolve_cues(&file_buffer);
                     editing.set(false);
                     file_view.set_editable(true);
                     highlight();
@@ -1334,32 +1427,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Leave conflict mode: back to the normal diff pane, banner and quick-resolve
-    // buttons hidden.
+    // Leave conflict mode: back to the normal diff pane, banner hidden.
     let exit_conflict_mode: Rc<dyn Fn()> = {
         let pane_mode = pane_mode.clone();
         let conflict_banner = conflict_banner.clone();
-        let take_ours = take_ours.clone();
-        let take_theirs = take_theirs.clone();
-        let take_both = take_both.clone();
         Rc::new(move || {
             *pane_mode.borrow_mut() = PaneMode::Diff;
             conflict_banner.set_visible(false);
-            take_ours.set_visible(false);
-            take_theirs.set_visible(false);
-            take_both.set_visible(false);
         })
     };
 
-    // Enter conflict mode with the engine's reported conflicts: show the banner
-    // and quick-resolve buttons, select the oldest conflicted commit, and render
-    // the pending chain.
+    // Enter conflict mode with the engine's reported conflicts: show the banner,
+    // select the oldest conflicted commit, and render the pending chain. The
+    // quick-resolve affordances are the inline marker-line cues (see
+    // `append_resolve_cues`).
     let enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)> = {
         let pane_mode = pane_mode.clone();
         let conflict_banner = conflict_banner.clone();
-        let take_ours = take_ours.clone();
-        let take_theirs = take_theirs.clone();
-        let take_both = take_both.clone();
         let selected_change = selected_change.clone();
         let refresh_conflict = refresh_conflict.clone();
         Rc::new(move |commits: Vec<ConflictedCommit>| {
@@ -1372,9 +1456,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 marker_len: 7,
             });
             conflict_banner.set_visible(true);
-            take_ours.set_visible(true);
-            take_theirs.set_visible(true);
-            take_both.set_visible(true);
             if let Some(ch) = first {
                 *selected_change.borrow_mut() = Some(ch);
             }
@@ -1439,52 +1520,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Quick-resolve: replace the conflict block at the caret with one side / both.
-    let take_side: Rc<dyn Fn(Side)> = {
-        let file_buffer = file_buffer.clone();
-        let editing = editing.clone();
-        let highlight = highlight.clone();
-        let show_status = show_status.clone();
-        Rc::new(move |side: Side| {
-            let text = buffer_text(&file_buffer);
-            let caret = file_buffer.iter_at_offset(file_buffer.cursor_position());
-            let caret_line = caret.line() as usize;
-            let Some((start, end, replacement)) = resolve_conflict_block(&text, caret_line, side)
-            else {
-                show_status("Place the cursor inside a conflict block first");
-                return;
-            };
-            editing.set(true);
-            file_buffer.begin_user_action();
-            let mut s = file_buffer
-                .iter_at_line(start as i32)
-                .unwrap_or_else(|| file_buffer.start_iter());
-            let mut e = file_buffer
-                .iter_at_line(end as i32 + 1)
-                .unwrap_or_else(|| file_buffer.end_iter());
-            file_buffer.delete(&mut s, &mut e);
-            let mut at = file_buffer
-                .iter_at_line(start as i32)
-                .unwrap_or_else(|| file_buffer.end_iter());
-            file_buffer.insert(&mut at, &replacement);
-            file_buffer.end_user_action();
-            editing.set(false);
-            highlight();
-        })
-    };
-
-    take_ours.connect_clicked({
-        let take_side = take_side.clone();
-        move |_| take_side(Side::Ours)
-    });
-    take_theirs.connect_clicked({
-        let take_side = take_side.clone();
-        move |_| take_side(Side::Theirs)
-    });
-    take_both.connect_clicked({
-        let take_side = take_side.clone();
-        move |_| take_side(Side::Both)
-    });
     abort_button.connect_clicked({
         let repo = repo.clone();
         let exit_conflict_mode = exit_conflict_mode.clone();
@@ -2127,6 +2162,16 @@ fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
+    // The inline conflict quick-resolve cue ("➜ use ours/theirs/both"), styled as
+    // a solid button — white on red — over just the cue's own character run.
+    // Added last so it outranks `conflict-marker` (GTK tag priority follows tag
+    // table insertion order), keeping the white text from being overridden by the
+    // marker line's red foreground.
+    add("resolve-cue", &|t| {
+        t.set_background(Some("#cf222e"));
+        t.set_foreground(Some("#ffffff"));
+        t.set_weight(700);
+    });
 }
 
 /// Look up (or lazily create and cache, via the buffer's tag table) a foreground
@@ -2274,6 +2319,16 @@ fn highlight_conflict(
             // A marker line is structural; reset the syntax parser so the next
             // region starts clean, and don't language-color the marker itself.
             hl = HighlightLines::new(syntax, theme);
+            // Paint the trailing "use ours/theirs/both" cue as a solid button so
+            // it reads as the clickable control (the click gesture restricts to
+            // this same region).
+            if let Some(byte) = raw.find(CUE_GLYPH) {
+                if let Some(tag) = buffer.tag_table().lookup("resolve-cue") {
+                    let cs = raw[..byte].chars().count() as i32;
+                    let ce = raw.chars().count() as i32;
+                    apply_cols(buffer, li as i32, cs, ce, &tag);
+                }
+            }
             continue;
         }
         // Unlike a unified diff, conflict lines carry no prefix char — column 0

@@ -224,3 +224,40 @@ fn a_jj_panic_becomes_a_recoverable_error() {
     assert!(repo.head_commit_id().is_some());
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Aborting a conflicted rewrite must not leave a dangling jj operation head.
+/// `reload_at` only moves the in-memory view; it never advances the op log, so a
+/// naive abort left the discarded (conflicted) operation as a second op head.
+/// That stale head is "the old jj state" that resurfaces — merged into divergent
+/// commits — when the repo is next loaded at head. Abort should collapse the op
+/// log back to a single head.
+#[test]
+fn abort_leaves_a_single_op_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    conflicting_repo(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+    repo.abort().expect("abort");
+
+    // The next edit forks a new operation off the rolled-back op. With a naive
+    // `reload_at` abort the discarded conflicted operation was never removed from
+    // the op-heads store, so committing this edit leaves *two* divergent heads —
+    // which the next load-at-head merges into the stale, conflicted state.
+    let head = repo.head_commit_id().expect("head");
+    let commits = history(&repo.repo, &head).expect("history");
+    let b = commits.iter().find(|c| c.subject == "B").expect("B").id.clone();
+    repo.rewrite_message(&b, "B edited").expect("edit B");
+
+    let heads = pollster::block_on(repo.repo.op_heads_store().get_op_heads())
+        .expect("op heads");
+    assert_eq!(
+        heads.len(),
+        1,
+        "edit after abort should leave one op head, found {}: the discarded \
+         conflicted operation is a dangling divergent head",
+        heads.len()
+    );
+}

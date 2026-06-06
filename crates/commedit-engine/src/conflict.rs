@@ -262,10 +262,22 @@ impl Repo {
     /// operation before it. Git was never touched while pending, so the original
     /// history is intact; the conflicted commit objects are left as unreachable
     /// garbage (like keep-ref residue).
+    ///
+    /// The rollback is *recorded* as a new operation that restores the
+    /// pre-rewrite view, rather than merely reloading the in-memory view at
+    /// `pre_op`. A bare `reload_at` never advances the op log, so the discarded
+    /// conflicted operation would linger as a second op head; the next edit then
+    /// forks off the restored op, leaving two divergent heads that a later
+    /// load-at-head merges straight back into the abandoned rewrite (the "old jj
+    /// state" resurfacing). Committing a restore op makes the clean state the
+    /// single head, mirroring jj's own `undo`/`op restore`.
     pub fn abort(&mut self) -> Result<()> {
         if let Some(p) = self.pending.take() {
-            self.repo = block_on(self.repo.reload_at(&p.pre_op))
-                .context("rolling back the conflicted rewrite")?;
+            let view = block_on(p.pre_op.view()).context("reading the pre-rewrite view")?;
+            let mut tx = self.repo.start_transaction();
+            tx.repo_mut().set_view(view.store_view().clone());
+            self.repo = block_on(tx.commit("commedit: abort rewrite"))
+                .context("recording the abort")?;
         }
         Ok(())
     }

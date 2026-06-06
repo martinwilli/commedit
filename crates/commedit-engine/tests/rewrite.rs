@@ -175,6 +175,57 @@ fn history_has_no_duplicate_rows_after_a_reorder() {
     assert_eq!(subjects, vec!["A", "B", "C", "D"]);
     let unique_ids: std::collections::HashSet<_> = after.iter().map(|c| c.id.clone()).collect();
     assert_eq!(unique_ids.len(), after.len());
+
+    // The plain-git side must be clean too: no `refs/jj/keep/*` clutter and no
+    // unreachable pre-reorder commits surfacing in `git log --all`.
+    assert_eq!(
+        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]),
+        ""
+    );
+    let mut all_subjects: Vec<_> = common::git(dir, &["log", "--all", "--format=%s"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    all_subjects.sort();
+    assert_eq!(all_subjects, vec!["A", "B", "C", "D"]);
+}
+
+#[test]
+fn keep_ref_for_a_manual_jj_anonymous_head_is_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+    );
+
+    // Simulate a manual jj user's un-bookmarked work: a commit off B with no
+    // branch pointing at it, protected only by a `refs/jj/keep/*` ref — exactly
+    // how jj guards anonymous heads from `git gc`.
+    g(&["checkout", "-q", "-b", "tmp", "main~1"]);
+    std::fs::write(dir.join("x.txt"), "x\n").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "anonymous work"]);
+    let anon = g(&["rev-parse", "HEAD"]);
+    g(&["checkout", "-q", "main"]);
+    g(&["branch", "-q", "-D", "tmp"]);
+    g(&["update-ref", &format!("refs/jj/keep/{anon}"), &anon]);
+
+    // commedit reorders its own branch.
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo).expect("history");
+    let from = commits.iter().position(|c| c.subject == "C").unwrap();
+    let mv = repo.plan_reorder(&commits, from, commits.len()).expect("plan");
+    repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder");
+
+    // The anonymous head's keep-ref (and thus the commit) must still be there:
+    // commedit only prunes its own history's keep-refs.
+    assert_eq!(
+        common::git(dir, &["rev-parse", "--verify", &format!("refs/jj/keep/{anon}")]),
+        anon
+    );
 }
 
 #[test]

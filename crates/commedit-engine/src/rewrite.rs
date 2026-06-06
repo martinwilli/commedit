@@ -52,7 +52,10 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: edit commit message"))
             .context("committing rewrite")?;
         self.reattach_head()?;
-        self.sync_worktree(old_head)?;
+        self.sync_worktree(old_head.clone())?;
+        if let Some(old) = old_head {
+            self.prune_orphaned_keep_refs(&old);
+        }
         Ok(())
     }
 
@@ -96,7 +99,10 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: edit commit identity"))
             .context("committing rewrite")?;
         self.reattach_head()?;
-        self.sync_worktree(old_head)?;
+        self.sync_worktree(old_head.clone())?;
+        if let Some(old) = old_head {
+            self.prune_orphaned_keep_refs(&old);
+        }
         Ok(())
     }
 
@@ -160,7 +166,10 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: reorder commit"))
             .context("committing reorder")?;
         self.reattach_head()?;
-        self.sync_worktree(old_head)?;
+        self.sync_worktree(old_head.clone())?;
+        if let Some(old) = old_head {
+            self.prune_orphaned_keep_refs(&old);
+        }
         Ok(())
     }
 }

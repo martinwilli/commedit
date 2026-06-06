@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
+use jj_lib::object_id::ObjectId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions};
 use jj_lib::op_store::RefTarget;
@@ -110,6 +111,27 @@ impl Repo {
     /// reordering to the current branch's linear chain.
     pub fn head_commit_id(&self) -> Option<CommitId> {
         CommitId::try_from_hex(self.head_commit()?)
+    }
+
+    /// Scrub the `refs/jj/keep/*` GC-protection refs that this rewrite orphaned
+    /// (see [`crate::transparency::prune_orphaned_keep_refs`]). `old_head` is the
+    /// branch tip from before the operation. Best-effort cleanup: it runs after a
+    /// mutation has already been committed and exported, so a failure here must not
+    /// invalidate that successful rewrite — errors are intentionally swallowed.
+    pub(crate) fn prune_orphaned_keep_refs(&self, old_head: &str) {
+        // commedit's own jj working-copy commit(s) are ours to drop too.
+        let owned: Vec<String> = self
+            .repo
+            .view()
+            .wc_commit_ids()
+            .values()
+            .map(|id| id.hex())
+            .collect();
+        let _ = crate::transparency::prune_orphaned_keep_refs(
+            self.workspace.workspace_root(),
+            old_head,
+            &owned,
+        );
     }
 
     /// Update the working tree from the pre-rewrite tip (`old_head`) to the

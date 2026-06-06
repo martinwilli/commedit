@@ -7,8 +7,9 @@
 //! tree-level edits the rewritten commit has the same working-tree content at
 //! HEAD, so the index/worktree stay consistent and `git status` reads clean.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use jj_lib::git;
@@ -20,6 +21,116 @@ use jj_lib::repo::MutableRepo;
 pub fn export_to_git(mut_repo: &mut MutableRepo) -> Result<()> {
     git::export_refs(mut_repo).context("exporting refs to git")?;
     Ok(())
+}
+
+/// Delete the jj `refs/jj/keep/*` GC-protection refs that belong to commedit's
+/// own history, so a plain-git user never sees them — neither in
+/// `git for-each-ref`/`gitk`, nor as unreachable duplicate commits in
+/// `git log --all`.
+///
+/// jj's git backend writes one such ref per commit it creates, to stop git from
+/// garbage-collecting commits jj tracks. We delete a keep-ref when its commit is
+/// either:
+///   * still reachable from a real ref (branch/tag/remote/HEAD) — then the
+///     keep-ref is redundant, the real ref already protects the commit; or
+///   * part of the pre-operation branch (an ancestor of `old_head`) — i.e. a
+///     pre-rewrite commit our own rewrite just abandoned.
+///
+/// `owned` lists extra commit ids that are likewise ours to drop — commedit's own
+/// jj working-copy commit(s), which commedit never uses (it drives the worktree
+/// through git) and which would otherwise linger as an empty, parent-less phantom
+/// in `git log --all`.
+///
+/// We keep every other keep-ref, i.e. one whose commit is *neither* reachable
+/// from a real ref, *nor* part of the branch we edited, *nor* one of `owned`.
+/// That residue is exactly a *manual* jj user's un-bookmarked work — anonymous
+/// heads, undo history — for which the keep-ref is the only thing standing between
+/// it and `git gc`. We never run `git gc` ourselves; the objects left dangling by
+/// our deletions are reclaimed by git's own maintenance.
+pub fn prune_orphaned_keep_refs(
+    workspace_root: &Path,
+    old_head: &str,
+    owned: &[String],
+) -> Result<()> {
+    // The pre-rewrite branch commits (walks the old graph via objects still
+    // present in the store). Empty/failed => nothing safe to attribute to us.
+    let old_branch = rev_list(workspace_root, &[old_head])?;
+    if old_branch.is_empty() {
+        return Ok(());
+    }
+    // Everything still reachable from a real ref after the rewrite. If this can't
+    // be computed we must not delete anything (we'd risk live commits).
+    let reachable = rev_list(workspace_root, &["--branches", "--tags", "--remotes", "HEAD"])?;
+
+    let list = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["for-each-ref", "--format=%(objectname) %(refname)", "refs/jj/keep/"])
+        .output()
+        .context("listing jj keep refs")?;
+    if !list.status.success() {
+        return Ok(());
+    }
+    let refs = String::from_utf8(list.stdout).unwrap_or_default();
+    // Batch all deletions through a single `update-ref --stdin` (keep-ref names
+    // never contain spaces, so the plain `delete <ref>` line format is safe).
+    let mut deletions = String::new();
+    for line in refs.lines() {
+        let Some((oid, name)) = line.split_once(' ') else {
+            continue;
+        };
+        if reachable.contains(oid) || old_branch.contains(oid) || owned.iter().any(|o| o == oid) {
+            deletions.push_str("delete ");
+            deletions.push_str(name);
+            deletions.push('\n');
+        }
+    }
+    if deletions.is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning git update-ref")?;
+    child
+        .stdin
+        .take()
+        .context("git update-ref stdin")?
+        .write_all(deletions.as_bytes())
+        .context("writing ref deletions")?;
+    let out = child.wait_with_output().context("running git update-ref")?;
+    if !out.status.success() {
+        bail!(
+            "failed to prune jj keep refs: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Commit ids reachable from `args` (a `git rev-list` argument list), as a set.
+/// Errors if git fails, so callers can refuse to delete on incomplete data.
+fn rev_list(workspace_root: &Path, args: &[&str]) -> Result<std::collections::HashSet<String>> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .arg("rev-list")
+        .args(args)
+        .output()
+        .context("running git rev-list")?;
+    if !out.status.success() {
+        bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect())
 }
 
 /// Ensure git ignores jj's `.jj` metadata directory via `.git/info/exclude`,

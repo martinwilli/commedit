@@ -16,6 +16,12 @@ read-only. Each hunk carries an *expand context* control to reveal more of the
 surrounding file. The intent is that you edit hunks intuitively while never
 producing a broken patch.
 
+## Keyboard shortcuts
+
+- `Ctrl+S` — save the current edits, rewriting the selected commit in place.
+- `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
+  `+` additions, restores `-` removals to context).
+
 Under the hood, comm(ed)it is built on [jujutsu](https://github.com/jj-vcs/jj)
 (`jj-lib`) for its rewrite-and-rebase engine, operating on a transparently
 colocated jj+git repository: jj does the heavy lifting, but the working copy

@@ -540,7 +540,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     wc_list.append(&wc_row);
     wc_list.set_visible(false);
     wc_list.set_tooltip_text(Some(
-        "Uncommitted working-tree changes — read-only; they are preserved across rewrites",
+        "Uncommitted working-tree changes — edit the diff here (Save writes the working \
+         tree); preserved across rewrites",
     ));
 
     let list = ListBox::new();
@@ -1126,15 +1127,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_view = file_view.clone();
         let editing = editing.clone();
         let render_diff_view = render_diff_view.clone();
-        let viewing_wc = viewing_wc.clone();
         Rc::new(move |idx: usize| {
             let change = changes.borrow().get(idx).cloned();
             let Some(change) = change else { return };
             *current_file.borrow_mut() = Some(change.path.clone());
             match (&change.new_text, change.is_binary) {
                 (Some(_), _) => {
-                    // The working-copy diff is shown read-only.
-                    file_view.set_editable(!viewing_wc.get());
+                    file_view.set_editable(true);
                     render_diff_view();
                 }
                 (None, binary) => {
@@ -1742,6 +1741,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pane_mode = pane_mode.clone();
         let conflict_label = conflict_label.clone();
         let selected_change = selected_change.clone();
+        let wc_list = wc_list.clone();
         Rc::new(move || {
             let loaded = {
                 let r = repo.borrow();
@@ -1761,6 +1761,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     (HashSet::new(), 0, 0)
                 }
             };
+            // The working copy @ resolves inline among the conflicted commits, so
+            // hide the standalone @ row and prepend @ to the chain when it's the
+            // (or a) conflicted commit.
+            wc_list.set_visible(false);
+            if let Some(wc_info) = repo.borrow().working_copy_commit_info() {
+                if badges.contains(&wc_info.change_id_hex()) {
+                    commits.borrow_mut().insert(0, wc_info);
+                }
+            }
             populate_list(&list, &commits.borrow(), &badges);
             conflict_label.set_text(&format!(
                 "Conflicts from the rewrite must be resolved before it applies to git — \
@@ -2529,15 +2538,53 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let resolve_current = resolve_current.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let viewing_wc = viewing_wc.clone();
+        let load_wc_changes = load_wc_changes.clone();
+        let refresh_wc = refresh_wc.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
                 resolve_current();
                 return;
             }
-            // The working-copy view is read-only — nothing to save.
+            // Viewing the working copy: edit @ in place (no message/identity, and
+            // the branch tip doesn't move), then reload the @ diff and row.
             if viewing_wc.get() {
-                show_status("The working copy is read-only — select a commit to edit.");
+                let saved_file = current_file.borrow().clone();
+                let saved_cursor = file_buffer.cursor_position();
+                let Some(path) = saved_file.clone() else { return };
+                let change = changes.borrow().iter().find(|c| c.path == path).cloned();
+                let Some(change) = change else { return };
+                let Some(original) = change.new_text else { return };
+                let old = change.old_text.as_deref().unwrap_or("");
+                match apply_patch(old, &buffer_text(&file_buffer)) {
+                    Ok(mut content) => {
+                        if !original.is_empty()
+                            && !original.ends_with('\n')
+                            && content.ends_with('\n')
+                        {
+                            content.pop();
+                        }
+                        if content != original {
+                            if let Err(err) =
+                                repo.borrow_mut().edit_working_copy_file(&path, &content)
+                            {
+                                show_status(&format!("Working-copy edit failed: {err}"));
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        show_status(&format!("Cannot apply edited patch: {err}"));
+                        return;
+                    }
+                }
+                refresh_wc();
+                load_wc_changes();
+                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                    file_dropdown.set_selected(idx as u32);
+                }
+                let offset = saved_cursor.min(file_buffer.char_count());
+                file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
                 return;
             }
             let Some(change_id) = selected_change.borrow().clone() else {

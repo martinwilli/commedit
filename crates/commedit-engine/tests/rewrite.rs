@@ -215,6 +215,40 @@ fn reorder_stamps_the_git_configured_committer_not_jjs_default() {
 }
 
 #[test]
+fn committer_config_overrides_user_config_like_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
+    // git resolves the committer as committer.* over user.*. A repo may set both
+    // (e.g. authoring under user.email but committing under a project address);
+    // commedit must follow the same precedence, not silently pick user.*.
+    common::git(dir, &["config", "user.name", "User Name"]);
+    common::git(dir, &["config", "user.email", "user@example.com"]);
+    common::git(dir, &["config", "committer.name", "Committer Name"]);
+    common::git(dir, &["config", "committer.email", "committer@example.com"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let first = commits.iter().find(|c| c.subject == "first").unwrap();
+
+    // Rewriting "first" re-stamps the committer and rebases "second" (the tip).
+    repo.rewrite_message(&first.id, "first (edited)")
+        .expect("rewrite message");
+
+    // The rebased tip carries the committer.* identity, not user.*, while its
+    // original author (init_repo's "Tester") is preserved.
+    let line = common::git(dir, &["show", "-s", "--format=%cn|%ce|%an|%ae", "main"]);
+    let fields: Vec<&str> = line.split('|').collect();
+    assert_eq!(fields[0], "Committer Name");
+    assert_eq!(fields[1], "committer@example.com");
+    assert_eq!(fields[2], "Tester");
+    assert_eq!(fields[3], "tester@example.com");
+}
+
+#[test]
 fn history_has_no_duplicate_rows_after_a_reorder() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

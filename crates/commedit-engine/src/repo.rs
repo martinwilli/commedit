@@ -273,20 +273,26 @@ pub(crate) fn catch_jj<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T
 /// defaults of its own; the jj CLI provides them, so we mirror them here.
 const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 
-/// Build a [`UserSettings`] from the embedded defaults plus the committer
-/// identity jj should stamp on commits it rewrites. We resolve it the way git
-/// itself would: an explicit `GIT_AUTHOR_*`/`GIT_COMMITTER_*` override wins, then
-/// the repo's configured `user.name`/`user.email` (the local/global/system git
-/// config hierarchy), and only failing both do we fall back to a generic
-/// commedit identity. This keeps rebased/reordered commits attributed to the
-/// real git author rather than jj's defaults.
+/// Build a [`UserSettings`] from the embedded defaults plus the identity jj
+/// should stamp on commits it rewrites. jj re-stamps the *committer* on every
+/// rewrite (authors are carried over from the original commit), so we resolve it
+/// with git's exact committer precedence: the `GIT_COMMITTER_*` environment
+/// override wins, then the `committer.*` config key, then the generic `user.*`
+/// key (each honouring the system/global/local git config hierarchy), and only
+/// failing all three do we fall back to a generic commedit identity. Honouring
+/// `committer.*` is what makes commedit and plain `git commit` agree on who
+/// committed — a repo that sets `committer.email` no longer needs `user.email`
+/// duplicated just for commedit's sake.
 fn build_settings(workspace_root: &Path) -> Result<UserSettings> {
-    let name = env_first(&["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"])
-        .or_else(|| crate::transparency::config_value(workspace_root, "user.name"))
+    let name = committer_field(workspace_root, "GIT_COMMITTER_NAME", "committer.name", "user.name")
         .unwrap_or_else(|| "commedit".to_string());
-    let email = env_first(&["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"])
-        .or_else(|| crate::transparency::config_value(workspace_root, "user.email"))
-        .unwrap_or_else(|| "commedit@localhost".to_string());
+    let email = committer_field(
+        workspace_root,
+        "GIT_COMMITTER_EMAIL",
+        "committer.email",
+        "user.email",
+    )
+    .unwrap_or_else(|| "commedit@localhost".to_string());
     let identity = format!("[user]\nname = {name:?}\nemail = {email:?}\n");
 
     let mut config = StackedConfig::empty();
@@ -299,7 +305,19 @@ fn build_settings(workspace_root: &Path) -> Result<UserSettings> {
     UserSettings::from_config(config).context("building user settings")
 }
 
-fn env_first(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+/// Resolve one committer identity field (name or email) the way git resolves the
+/// committer: the `GIT_COMMITTER_*` environment override first, then the
+/// `committer.*` config key, then the generic `user.*` key. Config lookups go
+/// through git so they honour its system/global/local hierarchy.
+fn committer_field(
+    workspace_root: &Path,
+    env_key: &str,
+    committer_key: &str,
+    user_key: &str,
+) -> Option<String> {
+    std::env::var(env_key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::transparency::config_value(workspace_root, committer_key))
+        .or_else(|| crate::transparency::config_value(workspace_root, user_key))
 }

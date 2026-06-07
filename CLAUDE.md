@@ -134,10 +134,10 @@ Caveats this creates:
 - The GTK UI shows `@` via `working_copy_info` as a **non-draggable row above the
   history list** — its own single-row list, deliberately *not* part of the history
   list, so the reorder/drop/squash index arithmetic and drag wiring are untouched.
-  Its diff is **editable** (Save splices the edit into `@` and writes the working
-  tree via `edit_working_copy_file`; the branch tip doesn't move). During conflict
-  resolution `@` is instead prepended into the conflict chain (the standalone row
-  hidden) so it resolves inline like any commit.
+  Its (multi-file) diff is **editable** — Save splits the combined buffer and
+  writes each changed file via `edit_working_copy_file`; the branch tip doesn't
+  move. During conflict resolution `@` is instead prepended into the conflict chain
+  (the standalone row hidden) so it resolves inline like any commit.
 
 ### Conflict resolution (`conflict.rs`)
 
@@ -152,15 +152,27 @@ clean.
 While a `PendingResolution` is held, the UI drives it by **change id** (commit
 ids churn on every resolution step): `read_conflict(change_hex, path)`
 materializes a file with Git 2-way markers (jj's diff3 base section is stripped);
-`resolve_conflict(change_hex, path, text, marker_len)` parses the edit back
+`resolve_conflicts(change_hex, &[(path, text, marker_len)])` parses each edit back
 (`update_from_content`), splices the resolved tree, re-rebases and re-settles —
-returning `Clean` (and auto-exporting) once the last conflict is gone. `abort()`
-rolls jj back to the captured pre-rewrite `Operation`; `jj_head_commit_id()`
-exposes the pending (not-yet-exported) tip so the UI can display the chain being
-resolved. Resolve **oldest-first**: fixing the earliest conflict often
-auto-clears its descendants on rebase. Non-file (structural) conflicts can't be
-resolved as text — they're flagged `resolvable: false` and the only escape is
-`abort`.
+returning `Clean` (and auto-exporting) once the last conflict is gone
+(`resolve_conflict` is the single-file wrapper). `abort()` rolls jj back to the
+captured pre-rewrite `Operation`; `jj_head_commit_id()` exposes the pending
+(not-yet-exported) tip so the UI can display the chain being resolved. Resolve
+**oldest-first**: fixing the earliest conflict often auto-clears its descendants
+on rebase. Non-file (structural) conflicts can't be resolved as text — they're
+flagged `resolvable: false` and the only escape is `abort`.
+
+The conflict pane shows **all** of the selected commit's conflicted files at once,
+as **snippets** (`render_conflict_snippets`) — each file's section is a header
+then its `<<< … >>>` blocks with context, the long unconflicted runs elided behind
+an expand cue — with the dropdown as a jump aid, mirroring the diff pane. Editing
+is free-form *within* snippets, but a guard (`is_conflict_protected_line`) blocks
+edits to the layout lines (file headers, elision cues, notices) so the
+snippet→full reconstruction keeps its anchors. On Save the whole file is rebuilt
+from the shown (edited) segments plus the recorded elided runs
+(`reconstruct_conflict_file`, after stripping the inline resolve cues) and the
+commit's files resolve together in one `resolve_conflicts` — sound because a
+commit's conflicted paths are independent.
 
 ### jj-lib is async; we block
 
@@ -186,9 +198,17 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
 
 - `diff.rs` — extract a commit's per-file changes (`commit_changes`), render a
   unified diff with per-hunk expandable context (`render_diff` + `ContextExpansion`
-  / `HunkInfo`), classify lines (`classify_line`/`DiffLineKind`), and apply an
-  edited patch back (`apply_patch`). `rewrite_file` (`tree.rs`) splices the new
-  content into the commit's tree.
+  / `HunkInfo`, both over the shared `window_groups`), classify lines
+  (`classify_line`/`DiffLineKind`), and apply an edited patch back (`apply_patch`).
+  `render_commit_diff` lays **all** of a commit's files into one buffer (separated
+  by `diff --git` lines; per-file placement in `CombinedFile`) and
+  `split_combined_patch` cuts the edited buffer back per file; `rewrite_files`
+  (`tree.rs`) splices several files' new content into the tree in one rewrite
+  (`rewrite_file` is a one-element wrapper). The conflict pane reuses the same
+  windowing: `render_conflict_snippets` shows a conflicted file's `<<< … >>>`
+  blocks with context (eliding the unconflicted runs behind a cue) and
+  `reconstruct_conflict_file` rebuilds the whole file from the edited snippets plus
+  the verbatim elided runs.
 - `patch_edit.rs` — `plan_edit(text, selection, gesture)` maps a raw edit gesture
   (Insert/Newline/Backspace/Delete) to a structurally-valid `EditPlan`. Rules:
   only `+` content is freely editable; typing on a context line splits it into a
@@ -199,7 +219,13 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
 `commedit-gtk/src/main.rs` is the whole UI: `build_ui` wires the history list,
 message/identity fields, and the SourceView diff buffer, intercepting key events
 through `plan_edit` and re-rendering via a boxed `Renderer` closure when hunks
-expand. History drag-and-drop is **zone-based** (`show_zone`): a row's top/bottom
+expand. The diff pane shows the **whole change in one buffer**; the file dropdown
+is a jump aid — selecting a file scrolls its `diff --git` header to the top
+(`scroll_to_file`), scrolling the view updates the dropdown to the file at the top
+edge (a `nav_sync` guard stops the two fighting), and `highlight_diff` switches
+syntect language per file at each `--- a/PATH`. Save splits the buffer per file
+and applies every edit in one `rewrite_files`. History drag-and-drop is
+**zone-based** (`show_zone`): a row's top/bottom
 quarter opens a reorder gap (the placeholder), its middle half marks a squash
 target (`set_squash_target`); dragging an autosquash-prefixed commit highlights
 recommended targets green and sibling fixups yellow, and dropping an unprefixed

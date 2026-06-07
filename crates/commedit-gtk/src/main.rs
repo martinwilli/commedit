@@ -27,7 +27,7 @@ use gtk::{
     DropDown, DropTarget, Entry, EventControllerKey, EventControllerScroll,
     EventControllerScrollFlags, Grid, HeaderBar, Label, ListBox, ListBoxRow,
     MenuButton, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
-    ShortcutController, ShortcutTrigger, StringList, TextTag,
+    ShortcutController, ShortcutTrigger, Stack, StringList, TextTag, ToggleButton,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -937,21 +937,55 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .position(480)
         .build();
 
-    let root = GtkBox::new(Orientation::Vertical, 0);
+    // --- Review view (full-window, read-only session diff) ---
+    // A second diff surface shown in place of the whole editor while the "Review"
+    // toggle is on: the content delta between the current tree and the one the
+    // session started with (see `Repo::session_changes`). Its own buffer so the
+    // editable diff pane is left untouched; rendered on demand by `render_review`
+    // below. Read-only — none of the diff pane's edit wiring applies here.
+    let review_buffer = sourceview5::Buffer::new(None);
+    install_diff_tags(&review_buffer);
+    let review_view = sourceview5::View::with_buffer(&review_buffer);
+    review_view.set_monospace(true);
+    review_view.set_editable(false);
+    review_view.set_left_margin(8);
+    review_view.set_top_margin(8);
+    let review_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .child(&review_view)
+        .build();
+
+    // The editor and the review are mutually exclusive full-window pages; the
+    // "Review" header toggle (wired below) flips between them.
     paned.set_vexpand(true);
-    root.append(&paned);
+    let content_stack = Stack::new();
+    content_stack.add_named(&paned, Some("edit"));
+    content_stack.add_named(&review_scroll, Some("review"));
+
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.append(&content_stack);
 
     // The header bar keeps the window title and the window controls; the Save
-    // action lives in the bottom action bar. The one custom control is the
-    // top-right "Revert all" button, which rolls the whole session back to the
-    // state the repo was opened in (wired below, once `refresh` & co. exist).
+    // action lives in the bottom action bar. The custom controls are the
+    // top-right "Revert all" button (rolls the whole session back to the state
+    // the repo was opened in) and a "Review" toggle that shows a read-only,
+    // full-window diff of every content change made this session. Both are wired
+    // below, once `refresh` & co. exist.
     let header = HeaderBar::new();
     let revert_button = Button::with_label("Revert all");
     revert_button.add_css_class("destructive-action");
     revert_button.set_tooltip_text(Some(
         "Discard all changes made this session and restore the repository to its original state",
     ));
+    let review_button = ToggleButton::with_label("Review");
+    review_button.set_tooltip_text(Some(
+        "Review all content changes made this session (current tree vs. the session start)",
+    ));
+    // pack_end fills right-to-left, so packing "Revert all" first leaves "Review"
+    // to its left: [ Review ][ Revert all ].
     header.pack_end(&revert_button);
+    header.pack_end(&review_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -2289,6 +2323,57 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
+    // Render the session "Review" into its (read-only) full-window buffer: the
+    // content delta between the current tree and the one the session started
+    // with. Recomputed each time the view is shown — and after "Revert all" — so
+    // it always reflects the live tree. A message/identity-only edit changes no
+    // tree, so it produces an empty review; after a revert it empties too.
+    let render_review: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let review_buffer = review_buffer.clone();
+        let syntax_set = syntax_set.clone();
+        let theme = theme.clone();
+        let show_status = show_status.clone();
+        Rc::new(move || {
+            let changes = match repo.borrow_mut().session_changes() {
+                Ok(changes) => changes,
+                Err(err) => {
+                    show_status(&format!("Review failed: {err}"));
+                    return;
+                }
+            };
+            if changes.is_empty() {
+                review_buffer.set_text("No content changes since the session started.");
+                return;
+            }
+            // Default context, no expand cues: the review is read-only, so the
+            // diff pane's hunk-expansion wiring deliberately doesn't apply.
+            let combined = render_commit_diff(&changes, &HashMap::new());
+            review_buffer.set_text(&combined.text);
+            let first = combined.files.first().map(|f| f.path.as_str());
+            highlight_diff(&review_buffer, first, &syntax_set, &theme);
+        })
+    };
+
+    // "Review" toggle: swap the whole window between the editor and the
+    // read-only session diff. Computing the diff snapshots the working copy
+    // (which can move `@`), so refresh the now-hidden editor to keep its
+    // history/`@`-row consistent.
+    review_button.connect_toggled({
+        let content_stack = content_stack.clone();
+        let render_review = render_review.clone();
+        let refresh = refresh.clone();
+        move |btn| {
+            if btn.is_active() {
+                render_review();
+                content_stack.set_visible_child_name("review");
+                refresh();
+            } else {
+                content_stack.set_visible_child_name("edit");
+            }
+        }
+    });
+
     // "Revert all" (top-right header button): after confirmation, roll the whole
     // session back to the state the repo was opened in — original commits *and*
     // the session-start working copy — then reload. Mirrors the abort handler's
@@ -2303,6 +2388,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trashed = trashed.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let review_button = review_button.clone();
+        let render_review = render_review.clone();
         move |_| {
             let target = repo
                 .borrow()
@@ -2329,6 +2416,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let trashed = trashed.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
+            let review_button = review_button.clone();
+            let render_review = render_review.clone();
             dialog.choose(
                 Some(&window),
                 gtk::gio::Cancellable::NONE,
@@ -2352,6 +2441,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     // as the abort handler above.
                     list.unselect_all();
                     refresh();
+                    // If we're reviewing, re-render: the revert restored the
+                    // session-start tree, so the review now shows no changes.
+                    if review_button.is_active() {
+                        render_review();
+                    }
                     show_status("Reverted to the original session state.");
                 },
             );

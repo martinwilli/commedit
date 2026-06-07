@@ -18,6 +18,7 @@ use commedit_engine::patch_edit::{
 };
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
+use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -501,7 +502,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         css.load_from_data(
             ".drop-placeholder { background-color: rgba(53, 132, 228, 0.22); \
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; margin: 1px 6px; } \
-             row.commit-dragging { opacity: 0.35; }",
+             row.commit-dragging { opacity: 0.35; } \
+             row.squash-recommended { background-color: rgba(46, 194, 126, 0.18); \
+             border: 1px dashed rgb(46, 194, 126); border-radius: 5px; } \
+             row.squash-sibling { background-color: rgba(245, 194, 17, 0.18); \
+             border: 1px dashed rgb(245, 194, 17); border-radius: 5px; } \
+             row.squash-drop-target { background-color: rgba(224, 27, 36, 0.38); \
+             border: 1px solid rgb(224, 27, 36); border-radius: 5px; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -1769,6 +1776,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let drag_from: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // The insertion gap (newest-first index, 0..=len) the placeholder marks.
     let drop_gap: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // The commit display index a squash would drop ONTO (center-zone hover over a
+    // valid target), or None. Mutually exclusive with `drop_gap`: a row's edges
+    // open a reorder gap, its middle marks a squash target.
+    let drop_onto: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // A drop handler rewrites history and rebuilds both lists, which destroys the
     // ListBoxRow widgets. Doing that while the drag is still in flight frees a row
     // GTK still holds as the drop-crossing target, crashing the next pointer event
@@ -1867,6 +1878,97 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Mark the row at commit index `ci` as the active squash target (red — a
+    // drop will rewrite it), if squashing the dragged row onto it is valid; clear
+    // any previous target first. A no-op when `ci` is already the active target
+    // (flicker guard, mirroring `show_gap`).
+    let set_squash_target: Rc<dyn Fn(usize)> = {
+        let list = list.clone();
+        let commits = commits.clone();
+        let repo = repo.clone();
+        let drag_from = drag_from.clone();
+        let drag_origin = drag_origin.clone();
+        let drop_onto = drop_onto.clone();
+        Rc::new(move |ci: usize| {
+            if drop_onto.get() == Some(ci) {
+                return;
+            }
+            if let Some(prev) = drop_onto.get() {
+                if let Some(r) = list.row_at_index(prev as i32) {
+                    r.remove_css_class("squash-drop-target");
+                }
+            }
+            let valid = drag_origin.get() == DragOrigin::History
+                && drag_from.get().is_some_and(|from| {
+                    repo.borrow().plan_squash(&commits.borrow(), from, ci).is_some()
+                });
+            if valid {
+                if let Some(r) = list.row_at_index(ci as i32) {
+                    r.add_css_class("squash-drop-target");
+                }
+                drop_onto.set(Some(ci));
+            } else {
+                drop_onto.set(None);
+            }
+        })
+    };
+    let clear_squash_target: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let drop_onto = drop_onto.clone();
+        Rc::new(move || {
+            if let Some(prev) = drop_onto.get() {
+                if let Some(r) = list.row_at_index(prev as i32) {
+                    r.remove_css_class("squash-drop-target");
+                }
+            }
+            drop_onto.set(None);
+        })
+    };
+
+    // Motion dispatcher: a row's top/bottom quarter opens a reorder gap
+    // (`show_gap`), its middle half marks a squash target (`set_squash_target`).
+    // At most one is active at a time — switching zones clears the other's
+    // visual, which also keeps the placeholder absent whenever a squash index is
+    // computed, so the list-vs-commit index math stays simple.
+    let show_zone: Rc<dyn Fn(f64)> = {
+        let list = list.clone();
+        let show_gap = show_gap.clone();
+        let clear_gap = clear_gap.clone();
+        let set_squash_target = set_squash_target.clone();
+        let clear_squash_target = clear_squash_target.clone();
+        let drop_gap = drop_gap.clone();
+        Rc::new(move |y: f64| {
+            let Some(row) = list.row_at_y(y as i32) else {
+                // Above the first / below the last row: a pure reorder gap.
+                clear_squash_target();
+                show_gap(y);
+                return;
+            };
+            let li = row.index() as usize;
+            // Hovering the placeholder itself: the gap is unchanged, leave it.
+            if drop_gap.get() == Some(li) {
+                return;
+            }
+            let alloc = row.allocation();
+            let local = (y as i32) - alloc.y();
+            let h = alloc.height().max(1);
+            if local < h / 4 || local >= h - h / 4 {
+                // Edge: reorder gap.
+                clear_squash_target();
+                show_gap(y);
+            } else {
+                // Center: squash onto this commit. Map the list index past a
+                // present placeholder (same rule as `show_gap`) before removing it.
+                let ci = match drop_gap.get() {
+                    Some(g) if li > g => li - 1,
+                    _ => li,
+                };
+                clear_gap();
+                set_squash_target(ci);
+            }
+        })
+    };
+
     let drag_source = DragSource::new();
     drag_source.set_actions(gdk::DragAction::MOVE);
     drag_source.connect_prepare({
@@ -1887,9 +1989,29 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     });
     drag_source.connect_drag_begin({
         let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let list = list.clone();
         move |_source, _drag| {
             if let Some(row) = drag_row.borrow().as_ref() {
                 row.add_css_class("commit-dragging");
+            }
+            // Highlight where this commit would squash: green for the real
+            // target(s), yellow for other autosquash commits aimed at the same
+            // target. Empty (no-op) unless the dragged commit is prefixed.
+            if let Some(from) = drag_from.get() {
+                let recs = repo.borrow().squash_recommendations(&commits.borrow(), from);
+                for i in recs.targets {
+                    if let Some(r) = list.row_at_index(i as i32) {
+                        r.add_css_class("squash-recommended");
+                    }
+                }
+                for i in recs.siblings {
+                    if let Some(r) = list.row_at_index(i as i32) {
+                        r.add_css_class("squash-sibling");
+                    }
+                }
             }
         }
     });
@@ -1897,6 +2019,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drag_row = drag_row.clone();
         let drag_from = drag_from.clone();
         let clear_gap = clear_gap.clone();
+        let clear_squash_target = clear_squash_target.clone();
+        let list = list.clone();
         let post_drag = post_drag.clone();
         move |_source, _drag, _delete| {
             if let Some(row) = drag_row.borrow_mut().take() {
@@ -1904,6 +2028,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
             drag_from.set(None);
             clear_gap();
+            // populate_rows won't touch our highlight classes, so strip them here.
+            let mut i = 0;
+            while let Some(r) = list.row_at_index(i) {
+                r.remove_css_class("squash-recommended");
+                r.remove_css_class("squash-sibling");
+                i += 1;
+            }
+            clear_squash_target();
             run_post_drag(&post_drag);
         }
     });
@@ -1911,22 +2043,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     let drop_target = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
     drop_target.connect_enter({
-        let show_gap = show_gap.clone();
+        let show_zone = show_zone.clone();
         move |_target, _x, y| {
-            show_gap(y);
+            show_zone(y);
             gdk::DragAction::MOVE
         }
     });
     drop_target.connect_motion({
-        let show_gap = show_gap.clone();
+        let show_zone = show_zone.clone();
         move |_target, _x, y| {
-            show_gap(y);
+            show_zone(y);
             gdk::DragAction::MOVE
         }
     });
     drop_target.connect_leave({
         let clear_gap = clear_gap.clone();
-        move |_target| clear_gap()
+        let clear_squash_target = clear_squash_target.clone();
+        move |_target| {
+            clear_gap();
+            clear_squash_target();
+        }
     });
     drop_target.connect_drop({
         let commits = commits.clone();
@@ -1936,6 +2072,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let gap_at = gap_at.clone();
         let clear_gap = clear_gap.clone();
         let drop_gap = drop_gap.clone();
+        let drop_onto = drop_onto.clone();
+        let list = list.clone();
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
         let trash_list = trash_list.clone();
@@ -1947,6 +2085,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Ok(from) = value.get::<i32>() else {
                 return false;
             };
+            // A center-zone hover marks a squash target; snapshot it now, since
+            // `drag-end` clears it before the staged work runs.
+            let onto = drop_onto.get();
             // Prefer the gap the placeholder marked; fall back to the drop point.
             let to = match drop_gap.get() {
                 Some(to) => to,
@@ -1956,6 +2097,56 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // Stage the work; `drag-end` runs it once the gesture is fully over
             // (rewriting history rebuilds these rows, which is unsafe mid-drag).
             match drag_origin.get() {
+                DragOrigin::History if onto.is_some() => {
+                    // Dropped ONTO a commit: squash the dragged commit into it. A
+                    // prefixed commit acts immediately; an unprefixed one opens a
+                    // popover to pick the mode.
+                    let onto = onto.unwrap();
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
+                    let list = list.clone();
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
+                        let plan = repo.borrow().plan_squash(&commits.borrow(), from as usize, onto);
+                        let Some((source, dest)) = plan else {
+                            return;
+                        };
+                        let subject = commits.borrow()[from as usize].subject.clone();
+
+                        // Run a chosen mode and report the outcome.
+                        let apply: Rc<dyn Fn(SquashMode)> = {
+                            let repo = repo.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            Rc::new(move |mode| {
+                                let outcome = repo.borrow_mut().squash_into(&source, &dest, mode);
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => refresh(),
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        enter_conflict_mode(commits)
+                                    }
+                                    Err(err) => show_status(&format!("Squash failed: {err}")),
+                                }
+                            })
+                        };
+
+                        match parse_squash_mode(&subject) {
+                            // Prefixed: the prefix picks the mode, apply at once.
+                            Some(mode) => apply(mode),
+                            // Unprefixed: ask how to merge, anchored at the target.
+                            None => {
+                                let Some(target_row) = list.row_at_index(onto as i32) else {
+                                    return;
+                                };
+                                show_squash_popover(&target_row, &apply);
+                            }
+                        }
+                    }));
+                    true
+                }
                 DragOrigin::History => {
                     let repo = repo.clone();
                     let commits = commits.clone();
@@ -2834,6 +3025,56 @@ fn set_identity_fields(fields: &[Entry; 4], commit: &CommitInfo) {
     fields[1].set_text(&commit.author_time);
     fields[2].set_text(&join_name_email(&commit.committer_name, &commit.committer_email));
     fields[3].set_text(&commit.committer_time);
+}
+
+/// A small popover anchored at `target_row` letting the user pick how to merge
+/// an unprefixed commit dropped onto another: Fixup / Squash / Amend, or Cancel.
+/// Each verb runs `apply(mode)` and dismisses; Cancel (or a click outside) just
+/// dismisses. Shown from the post-drag idle, where the row is alive and GTK's
+/// drag bookkeeping is already torn down.
+fn show_squash_popover(target_row: &ListBoxRow, apply: &Rc<dyn Fn(SquashMode)>) {
+    let popover = Popover::new();
+    let vbox = GtkBox::new(Orientation::Vertical, 0);
+    let button = |label: &str, tip: &str| {
+        let b = Button::with_label(label);
+        b.add_css_class("flat");
+        b.set_tooltip_text(Some(tip));
+        b.set_halign(gtk::Align::Fill);
+        vbox.append(&b);
+        b
+    };
+    let fixup_btn = button("Fixup", "Merge changes in; keep this commit's message.");
+    let squash_btn = button("Squash", "Merge changes in; append the dragged commit's message.");
+    let amend_btn = button(
+        "Amend",
+        "Merge changes in; replace this commit's message with the dragged commit's.",
+    );
+    vbox.append(&gtk::Separator::new(Orientation::Horizontal));
+    let cancel_btn = button("Cancel", "Don't merge — leave history unchanged.");
+
+    popover.set_child(Some(&vbox));
+    popover.set_parent(target_row);
+    popover.set_autohide(true);
+
+    let wire = |btn: &Button, mode: Option<SquashMode>| {
+        let apply = apply.clone();
+        let popover = popover.clone();
+        btn.connect_clicked(move |_| {
+            if let Some(mode) = mode {
+                apply(mode);
+            }
+            popover.popdown();
+        });
+    };
+    wire(&fixup_btn, Some(SquashMode::Fixup));
+    wire(&squash_btn, Some(SquashMode::Squash));
+    wire(&amend_btn, Some(SquashMode::Amend));
+    wire(&cancel_btn, None);
+
+    // Detach when dismissed (verb click or outside-click) so a popover doesn't
+    // leak per drop.
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
 }
 
 /// Build the `short-id   subject   ⚠` content box shown inside a history/trash

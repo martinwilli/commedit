@@ -71,3 +71,36 @@ fn rewrites_file_content_in_middle_commit() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn rewrites_several_files_in_one_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a1\n", "first")]);
+    // The "second" commit changes a.txt and adds b.txt; that's the one we re-edit.
+    std::fs::write(dir.join("a.txt"), "a2\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b2\n").unwrap();
+    common::git(dir, &["add", "-A"]);
+    common::git(dir, &["commit", "-qm", "second"]);
+    common::git(dir, &["commit", "--allow-empty", "-qm", "third"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let target = second_commit_id(&repo);
+
+    // One Save touching both files -> one rewrite, descendants rebased.
+    repo.rewrite_files(
+        &target.id,
+        &[
+            ("a.txt".to_string(), "a2-edited\n".to_string()),
+            ("b.txt".to_string(), "b2-edited\n".to_string()),
+        ],
+    )
+    .expect("rewrite files");
+
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a2-edited");
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b2-edited");
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "second", "first"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

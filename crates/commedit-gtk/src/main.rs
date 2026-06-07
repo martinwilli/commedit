@@ -494,6 +494,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let drag_origin: Rc<Cell<DragOrigin>> = Rc::new(Cell::new(DragOrigin::History));
     // Whether the diff pane is showing a normal diff or a conflict to resolve.
     let pane_mode: Rc<RefCell<PaneMode>> = Rc::new(RefCell::new(PaneMode::Diff));
+    // Whether the read-only working-copy (@) row is the current selection, in
+    // which case the diff is shown read-only and Save is inert.
+    let viewing_wc: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // Styling for drag-and-drop reordering: the insertion gap placeholder and the
     // dimmed row being dragged. Installed once for the display.
@@ -518,6 +521,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     }
 
     // --- History pane (left) ---
+    // The working-copy row: a read-only entry above the history showing the
+    // uncommitted changes (jj's `@` commit). It is its own single-row list — not
+    // part of the history `list` — so the reorder/drop/squash index arithmetic
+    // and drag wiring below are untouched, and it can never be dragged or
+    // reordered. Hidden while the tree is clean.
+    let wc_label = gtk::Label::new(None);
+    wc_label.set_halign(gtk::Align::Start);
+    wc_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    wc_label.set_margin_start(8);
+    wc_label.set_margin_end(8);
+    wc_label.set_margin_top(4);
+    wc_label.set_margin_bottom(4);
+    let wc_row = ListBoxRow::new();
+    wc_row.set_child(Some(&wc_label));
+    let wc_list = ListBox::new();
+    wc_list.append(&wc_row);
+    wc_list.set_visible(false);
+    wc_list.set_tooltip_text(Some(
+        "Uncommitted working-tree changes — read-only; they are preserved across rewrites",
+    ));
+
     let list = ListBox::new();
     let history_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -553,6 +577,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     trash_box.append(&trash_scroll);
 
     let history_box = GtkBox::new(Orientation::Vertical, 0);
+    history_box.append(&wc_list);
     history_box.append(&history_scroll);
     history_box.append(&trash_box);
 
@@ -1074,13 +1099,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_view = file_view.clone();
         let editing = editing.clone();
         let render_diff_view = render_diff_view.clone();
+        let viewing_wc = viewing_wc.clone();
         Rc::new(move |idx: usize| {
             let change = changes.borrow().get(idx).cloned();
             let Some(change) = change else { return };
             *current_file.borrow_mut() = Some(change.path.clone());
             match (&change.new_text, change.is_binary) {
                 (Some(_), _) => {
-                    file_view.set_editable(true);
+                    // The working-copy diff is shown read-only.
+                    file_view.set_editable(!viewing_wc.get());
                     render_diff_view();
                 }
                 (None, binary) => {
@@ -1425,8 +1452,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_dropdown.add_controller(scroll_controller);
 
     // Load the changed-files list for the selected commit into the dropdown.
-    let load_changes: Rc<dyn Fn(&CommitInfo)> = {
-        let repo = repo.clone();
+    // Populate the file dropdown and diff view from an already-loaded change
+    // set, shared by the commit and working-copy loaders below.
+    let apply_changes: Rc<dyn Fn(Vec<FileChange>)> = {
         let changes = changes.clone();
         let current_file = current_file.clone();
         let file_dropdown = file_dropdown.clone();
@@ -1434,8 +1462,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_view = file_view.clone();
         let editing = editing.clone();
         let expansions = expansions.clone();
-        Rc::new(move |commit: &CommitInfo| {
-            let loaded = commit_changes(&repo.borrow().repo, &commit.id).unwrap_or_default();
+        Rc::new(move |loaded: Vec<FileChange>| {
             *changes.borrow_mut() = loaded;
             *current_file.borrow_mut() = None;
             expansions.borrow_mut().clear();
@@ -1454,21 +1481,57 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    let load_changes: Rc<dyn Fn(&CommitInfo)> = {
+        let repo = repo.clone();
+        let apply_changes = apply_changes.clone();
+        Rc::new(move |commit: &CommitInfo| {
+            let loaded = commit_changes(&repo.borrow().repo, &commit.id).unwrap_or_default();
+            apply_changes(loaded);
+        })
+    };
+
+    // Load the read-only working-copy (@) diff into the file pane.
+    let load_wc_changes: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let apply_changes = apply_changes.clone();
+        Rc::new(move || {
+            let loaded = {
+                let r = repo.borrow();
+                match r.working_copy_info() {
+                    Some(info) => commit_changes(&r.repo, &info.commit_id).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
+            apply_changes(loaded);
+        })
+    };
+
     // Selecting a commit loads its message and changed files.
     list.connect_row_selected({
         let commits = commits.clone();
         let message_buffer = message_buffer.clone();
+        let message_view = message_view.clone();
         let selected_change = selected_change.clone();
         let load_changes = load_changes.clone();
         let load_conflict_files = load_conflict_files.clone();
         let pane_mode = pane_mode.clone();
         let identity_fields = identity_fields.clone();
         let original_identity = original_identity.clone();
+        let viewing_wc = viewing_wc.clone();
+        let wc_list = wc_list.clone();
         move |_list, row| {
             let Some(row) = row else { return };
             let idx = row.index();
             if idx < 0 {
                 return;
+            }
+            // Leaving the read-only working-copy view: re-enable editing and
+            // drop its (mutually exclusive) selection.
+            viewing_wc.set(false);
+            wc_list.unselect_all();
+            message_view.set_editable(true);
+            for f in identity_fields.iter() {
+                f.set_sensitive(true);
             }
             let info = commits.borrow().get(idx as usize).cloned();
             let Some(info) = info else { return };
@@ -1486,6 +1549,62 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
+    // Selecting the working-copy (@) row shows its diff read-only: there is no
+    // message or identity to edit, and Save is inert (see the `save` closure).
+    wc_list.connect_row_selected({
+        let viewing_wc = viewing_wc.clone();
+        let list = list.clone();
+        let load_wc_changes = load_wc_changes.clone();
+        let message_buffer = message_buffer.clone();
+        let message_view = message_view.clone();
+        let identity_fields = identity_fields.clone();
+        let pane_mode = pane_mode.clone();
+        move |_wc_list, row| {
+            if row.is_none() || pane_mode.borrow().is_conflict() {
+                return;
+            }
+            viewing_wc.set(true);
+            // Mutually exclusive with the history selection.
+            list.unselect_all();
+            message_buffer.set_text("");
+            message_view.set_editable(false);
+            for f in identity_fields.iter() {
+                f.set_text("");
+                f.set_sensitive(false);
+            }
+            load_wc_changes();
+        }
+    });
+
+    // Update the read-only working-copy (@) row from the engine: show it with a
+    // summary when the tree is dirty, hide it when clean or while resolving
+    // conflicts.
+    let refresh_wc: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let wc_list = wc_list.clone();
+        let wc_label = wc_label.clone();
+        let pane_mode = pane_mode.clone();
+        Rc::new(move || {
+            if pane_mode.borrow().is_conflict() {
+                wc_list.set_visible(false);
+                return;
+            }
+            match repo.borrow().working_copy_info() {
+                Some(info) => {
+                    let n = info.changed_files;
+                    let s = if n == 1 { "" } else { "s" };
+                    wc_label.set_text(&if info.has_conflict {
+                        format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {n} file{s}")
+                    } else {
+                        format!("\u{270E} Uncommitted changes \u{2014} {n} file{s}")
+                    });
+                    wc_list.set_visible(true);
+                }
+                None => wc_list.set_visible(false),
+            }
+        })
+    };
+
     // Reload history from the engine, preserving the selected commit by its
     // (rewrite-stable) change id.
     let refresh: Rc<dyn Fn()> = {
@@ -1496,6 +1615,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let identities = identities.clone();
         let history_limit = history_limit.clone();
         let history_has_more = history_has_more.clone();
+        let refresh_wc = refresh_wc.clone();
         Rc::new(move || {
             let (loaded, has_more) = {
                 let r = repo.borrow();
@@ -1537,6 +1657,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     list.select_row(Some(&row));
                 }
             }
+            refresh_wc();
         })
     };
 
@@ -2358,10 +2479,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pane_mode = pane_mode.clone();
         let resolve_current = resolve_current.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
+        let viewing_wc = viewing_wc.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
                 resolve_current();
+                return;
+            }
+            // The working-copy view is read-only — nothing to save.
+            if viewing_wc.get() {
+                show_status("The working copy is read-only — select a commit to edit.");
                 return;
             }
             let Some(change_id) = selected_change.borrow().clone() else {

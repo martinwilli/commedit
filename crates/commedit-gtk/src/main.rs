@@ -19,6 +19,7 @@ use commedit_engine::patch_edit::{
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
+use commedit_engine::workcopy::WorkingCopyAdvisory;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -733,7 +734,33 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     conflict_banner.append(&abort_button);
     conflict_banner.set_visible(false);
 
+    // A persistent, dismissable banner reporting how the user's uncommitted
+    // changes fared in the last rewrite (a conflict on reapply, and/or staged
+    // content saved to a backup ref). Unlike the transient status line it stays
+    // until dismissed, since it points at recoverable state.
+    let wc_advisory_label = Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .build();
+    let wc_advisory_dismiss = Button::with_label("Dismiss");
+    let wc_advisory_banner = GtkBox::new(Orientation::Horizontal, 8);
+    wc_advisory_banner.add_css_class("warning");
+    wc_advisory_banner.set_margin_start(8);
+    wc_advisory_banner.set_margin_end(8);
+    wc_advisory_banner.set_margin_top(4);
+    wc_advisory_banner.set_margin_bottom(4);
+    wc_advisory_banner.append(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+    wc_advisory_banner.append(&wc_advisory_label);
+    wc_advisory_banner.append(&wc_advisory_dismiss);
+    wc_advisory_banner.set_visible(false);
+    wc_advisory_dismiss.connect_clicked({
+        let wc_advisory_banner = wc_advisory_banner.clone();
+        move |_| wc_advisory_banner.set_visible(false)
+    });
+
     files_box.append(&conflict_banner);
+    files_box.append(&wc_advisory_banner);
     files_box.append(&file_dropdown);
     files_box.append(&file_scroll);
     files_box.append(&bottom_bar);
@@ -1181,6 +1208,30 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Show the persistent working-copy advisory banner from a rewrite's result.
+    let show_advisory: Rc<dyn Fn(WorkingCopyAdvisory)> = {
+        let wc_advisory_label = wc_advisory_label.clone();
+        let wc_advisory_banner = wc_advisory_banner.clone();
+        Rc::new(move |adv: WorkingCopyAdvisory| {
+            let mut parts: Vec<String> = Vec::new();
+            if !adv.conflicted_paths.is_empty() {
+                parts.push(format!(
+                    "Your uncommitted changes to {} overlapped the rewrite and now have \
+                     conflict markers in the working tree.",
+                    adv.conflicted_paths.join(", ")
+                ));
+            }
+            if let Some(r) = &adv.index_backup_ref {
+                parts.push(format!(
+                    "Staged content not on disk was preserved at {r} \
+                     (recover with `git read-tree {r}`)."
+                ));
+            }
+            wc_advisory_label.set_text(&parts.join(" "));
+            wc_advisory_banner.set_visible(true);
+        })
+    };
+
     // Show the conflicted file at dropdown index `idx` of the selected commit,
     // materialized with 2-way markers for free-form resolution. Non-text
     // (structural) conflicts can't be edited here, so they show a notice instead.
@@ -1616,7 +1667,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let history_limit = history_limit.clone();
         let history_has_more = history_has_more.clone();
         let refresh_wc = refresh_wc.clone();
+        let show_advisory = show_advisory.clone();
+        let wc_advisory_banner = wc_advisory_banner.clone();
         Rc::new(move || {
+            // Reset the per-rewrite advisory; re-shown below if the rewrite that
+            // triggered this refresh produced one.
+            wc_advisory_banner.set_visible(false);
             let (loaded, has_more) = {
                 let r = repo.borrow();
                 match r.head_commit_id() {
@@ -1658,6 +1714,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
             refresh_wc();
+            if let Some(adv) = repo.borrow_mut().take_working_copy_advisory() {
+                show_advisory(adv);
+            }
         })
     };
 

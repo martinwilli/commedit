@@ -1,0 +1,71 @@
+# Builds release binaries for Linux and macOS.
+#
+# The app links dynamically against system GTK4 + GtkSourceView5, so these
+# artifacts are NOT self-contained. The end user must have a compatible runtime
+# (and `git` on PATH) installed — see the "Installing a binary release" section
+# of README.md:
+#   - Linux:   apt install git libgtk-4-1 libgtksourceview-5-0  (or distro equivalent)
+#   - macOS:   brew install git gtk4 gtksourceview5
+#
+# Push a tag like `v0.1.0` to cut a GitHub Release; or run manually via the
+# Actions tab to just produce downloadable build artifacts.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: commedit-linux-x86_64.tar.gz
+          - os: macos-latest
+            asset: commedit-macos-aarch64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Linux: GTK from apt, Rust from rustup --------------------------
+      - name: Install GTK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgtksourceview-5-dev
+
+      # --- macOS: GTK from Homebrew, Rust from rustup ---------------------
+      - name: Install GTK (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gtk4 gtksourceview5 pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked -p commedit-gtk
+
+      - name: Package
+        run: tar -C target/release -czf "${{ matrix.asset }}" commedit
+
+      # --- Publish --------------------------------------------------------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true

@@ -36,11 +36,6 @@ pub struct Repo {
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
-    /// Advisory produced by the most recent successful rewrite about how the
-    /// user's uncommitted changes were preserved — conflicted working-copy paths
-    /// and/or an index backup ref. Consumed (and cleared) by
-    /// [`Self::take_working_copy_advisory`].
-    pub(crate) wc_advisory: Option<crate::workcopy::WorkingCopyAdvisory>,
 }
 
 impl Repo {
@@ -80,7 +75,6 @@ impl Repo {
             settings,
             git_head_branch,
             pending: None,
-            wc_advisory: None,
         };
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;

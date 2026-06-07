@@ -344,6 +344,38 @@ pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
     ok.then_some(refname)
 }
 
+/// Keep only the most recently-created `refs/commedit/backup/index-*` ref,
+/// deleting any older ones. Each rewrite that finds index-only content writes a
+/// full snapshot of the index as its own ref; without pruning they accumulate
+/// one per distinct staged state across sessions. The newest is the freshest
+/// recovery point, so it is retained and the rest dropped. Best-effort: git
+/// failures are ignored (a stale ref is harmless clutter, never a loss).
+pub fn prune_backup_refs(workspace_root: &Path) {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let refs = String::from_utf8(out.stdout).unwrap_or_default();
+    // The first line is the newest; delete everything after it.
+    for refname in refs.lines().skip(1) {
+        let _ = Command::new("git")
+            .current_dir(workspace_root)
+            .args(["update-ref", "-d", refname])
+            .status();
+    }
+}
+
 /// Whether `git status` reports any path that is staged *and* differs again in
 /// the working tree (codes like `MM`, `AD`, `MD`) — i.e. the staged version is
 /// not the on-disk version, so it lives only in the index.

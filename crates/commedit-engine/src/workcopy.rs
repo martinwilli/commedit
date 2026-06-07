@@ -43,18 +43,6 @@ pub struct WorkingCopyInfo {
     pub has_conflict: bool,
 }
 
-/// How the user's uncommitted changes fared across the most recent rewrite, for
-/// the UI to surface once. An overlap between a local edit and the rewrite is
-/// handled by the deferred conflict-resolution flow (the working copy `@` shows
-/// up as a conflicted commit), so the only thing left to report here is staged
-/// content that only lived in the git index and was pinned to a backup ref.
-#[derive(Debug, Clone)]
-pub struct WorkingCopyAdvisory {
-    /// A `refs/commedit/backup/index-*` ref pinning staged content that only
-    /// lived in the index (see [`crate::transparency::backup_index_only_content`]).
-    pub index_backup_ref: String,
-}
-
 impl Repo {
     /// Snapshot the on-disk working directory into the working-copy commit `@`,
     /// so uncommitted changes (tracked edits **and** untracked, non-ignored
@@ -182,20 +170,16 @@ impl Repo {
                 self.materialize_working_copy(&wc_id)?;
                 // Resetting the index below would drop any staged content that
                 // only lives in the index (not on disk, hence not in @). Pin it
-                // to a recoverable backup ref first so it is never lost.
-                let index_backup = crate::transparency::backup_index_only_content(&root);
-                if let Some(backup) = &index_backup {
-                    eprintln!(
-                        "commedit: staged changes not present on disk were preserved at {backup}; \
-                         recover with `git read-tree {backup}` or `git checkout {backup} -- .`"
-                    );
-                }
+                // to a recoverable backup ref first so it is never lost — a
+                // silent safety net documented in the README, not surfaced in
+                // the UI.
+                let _ = crate::transparency::backup_index_only_content(&root);
                 if let Some(new_head) = crate::transparency::head_commit(&root) {
                     crate::transparency::reset_index_to(&root, &new_head)?;
                 }
-                // A conflicted @ never reaches here — it defers via the conflict
-                // flow — so the only advisory left is the index backup, if any.
-                self.wc_advisory = index_backup.map(|r| WorkingCopyAdvisory { index_backup_ref: r });
+                // Backup refs are transient; keep only the most recent so they
+                // don't pile up one per session.
+                crate::transparency::prune_backup_refs(&root);
                 Ok(())
             }
             None => self.sync_worktree(old_head),
@@ -226,12 +210,6 @@ impl Repo {
             changed_files,
             has_conflict: commit.has_conflict(),
         })
-    }
-
-    /// Take (and clear) the advisory describing how uncommitted changes fared in
-    /// the last rewrite, for the UI to surface once.
-    pub fn take_working_copy_advisory(&mut self) -> Option<WorkingCopyAdvisory> {
-        self.wc_advisory.take()
     }
 
     /// The working-copy commit `@` as a history row, labelled "Uncommitted

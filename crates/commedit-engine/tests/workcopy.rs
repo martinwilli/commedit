@@ -206,6 +206,35 @@ fn identical_index_only_content_dedups_to_one_backup_ref() {
 }
 
 #[test]
+fn stale_backup_refs_are_pruned_to_one_on_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    // Seed several backup refs, as if left behind by earlier sessions.
+    let tree = common::git(dir, &["rev-parse", "HEAD^{tree}"]);
+    for tag in ["aaa", "bbb", "ccc"] {
+        let commit = common::git(dir, &["commit-tree", &tree, "-m", &format!("stale backup {tag}")]);
+        common::git(dir, &["update-ref", &format!("refs/commedit/backup/index-{tag}"), &commit]);
+    }
+
+    let mut repo = Repo::open(dir).expect("open");
+    let target = subject_id(&repo, "B").id;
+    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+
+    // The rewrite prunes the pile-up down to a single most-recent backup ref.
+    let backups = common::git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+    );
+    assert_eq!(
+        backups.lines().count(),
+        1,
+        "stale backups should prune to one, got: {backups}"
+    );
+}
+
+#[test]
 fn a_plain_unstaged_edit_creates_no_backup_ref() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

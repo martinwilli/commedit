@@ -9,9 +9,9 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{
-    apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, render_commit_diff,
-    split_combined_patch, ChangeKind, CombinedFile, ConflictLineKind, ContextExpansion, DiffLineKind,
-    FileChange, HunkInfo,
+    apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, reconstruct_conflict_file,
+    render_commit_diff, render_conflict_snippets, split_combined_patch, ChangeKind, CombinedFile,
+    ConflictLineKind, ConflictPiece, ContextExpansion, DiffLineKind, FileChange, HunkInfo,
 };
 use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
@@ -71,13 +71,34 @@ impl PaneMode {
     }
 }
 
-/// The live state of an in-progress conflict resolution: the conflicted commits
-/// (refreshed from the engine after each resolution step, oldest first) and the
-/// marker length of the file currently shown (echoed back to the engine on
-/// save).
+/// The live state of an in-progress conflict resolution: the conflicted commits,
+/// refreshed from the engine after each resolution step, oldest first.
 struct ConflictCtx {
     commits: Vec<ConflictedCommit>,
+}
+
+/// Per-file state of the combined conflict-snippet buffer currently shown (one
+/// per conflicted file of the selected commit). The buffer shows only each file's
+/// conflict snippets — its `<<< … >>>` blocks plus context, with the long
+/// unconflicted runs elided behind a cue — so on save we reconstruct each whole
+/// file from the (edited) shown segments interleaved with the verbatim elided
+/// runs recorded in `pieces`.
+struct ConflictFileView {
+    path: String,
+    /// False for structural (non-text) conflicts, shown as a read-only notice.
+    resolvable: bool,
+    /// Marker length jj used, echoed back on resolve so the edit re-parses.
     marker_len: usize,
+    /// The file's current full conflict text (source of truth): re-windowed on
+    /// render, refreshed from the buffer (capturing edits) on expand/save.
+    full_text: String,
+    /// Per-file snippet context expansion (the elision cues widen it).
+    exp: ContextExpansion,
+    /// Pieces recorded at the last render, for reconstructing the full file.
+    pieces: Vec<ConflictPiece>,
+    /// The elision gaps recorded at the last render, in document order, as
+    /// `(above_block, below_block)` — which blocks' context a cue click widens.
+    gaps: Vec<(Option<usize>, Option<usize>)>,
 }
 
 impl ConflictCtx {
@@ -132,6 +153,52 @@ const ABORT_HINT: &str =
 /// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
 fn pill(label: &str) -> String {
     format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
+}
+
+/// Label of the conflict pane's elision cue — the pill standing in for a hidden
+/// run of unconflicted lines between snippets. Clicking it reveals more context.
+const CONFLICT_CUE_LABEL: &str = "↕ expand hidden lines";
+
+/// The standalone notice shown for a structural (non-text-resolvable) conflicted
+/// file in the combined conflict view.
+const CONFLICT_STRUCTURAL_NOTICE: &str =
+    "⚠ structural conflict — can't be resolved as text here; use “Abort rewrite”";
+
+/// The header line introducing one file's section in the combined conflict view,
+/// e.g. `─── src/main.rs ───`.
+fn conflict_header_line(path: &str) -> String {
+    format!("\u{2500}\u{2500}\u{2500} {path} \u{2500}\u{2500}\u{2500}")
+}
+
+/// The path of a conflict-view file header line, or `None` if `line` isn't one.
+fn conflict_header_path(line: &str) -> Option<&str> {
+    line.strip_prefix("\u{2500}\u{2500}\u{2500} ")
+        .and_then(|r| r.strip_suffix(" \u{2500}\u{2500}\u{2500}"))
+}
+
+/// Whether `line` is a structural line of the combined conflict view's layout
+/// (a file header, the elision cue, or the structural-conflict notice) that the
+/// user must not edit, lest the snippet→full-file reconstruction lose its anchors.
+fn is_conflict_protected_line(line: &str) -> bool {
+    conflict_header_path(line).is_some()
+        || line == pill(CONFLICT_CUE_LABEL)
+        || line == CONFLICT_STRUCTURAL_NOTICE
+}
+
+/// Strip the inline "➜ use ours/theirs/both" cue that [`append_resolve_cues`]
+/// appends to a conflict-marker line, restoring the bare marker. Applied only to
+/// marker lines (so real content containing `◀` is untouched) when reconstructing
+/// the full file, otherwise re-rendering would append a second cue each time.
+fn strip_marker_cue(line: &str) -> String {
+    let is_marker = ['<', '=', '>']
+        .iter()
+        .any(|&c| line.chars().take_while(|&x| x == c).count() >= 7);
+    if is_marker {
+        if let Some(pos) = line.find(CUE_CAP_L) {
+            return line[..pos].trim_end().to_string();
+        }
+    }
+    line.to_string()
 }
 
 /// Paint the inline banner button on `raw` (buffer line `line`): the two end-caps
@@ -218,6 +285,84 @@ fn diff_file_index_at_line(buffer: &sourceview5::Buffer, line: usize) -> usize {
         }
     }
     idx
+}
+
+/// Index (in file order) of the conflict-view section containing buffer `line` —
+/// the count of file headers at or before it, minus one. Scans the live buffer so
+/// it survives edits. The conflict analogue of [`diff_file_index_at_line`].
+fn conflict_file_index_at_line(buffer: &sourceview5::Buffer, line: usize) -> usize {
+    let text = buffer_text(buffer);
+    let mut idx = 0;
+    let mut seen = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        if i > line {
+            break;
+        }
+        if conflict_header_path(l).is_some() {
+            idx = seen;
+            seen += 1;
+        }
+    }
+    idx
+}
+
+/// Buffer line of the `idx`-th file header in the combined conflict view.
+fn conflict_file_header_line(buffer: &sourceview5::Buffer, idx: usize) -> Option<usize> {
+    let text = buffer_text(buffer);
+    text.split('\n')
+        .enumerate()
+        .filter(|(_, l)| conflict_header_path(l).is_some())
+        .nth(idx)
+        .map(|(i, _)| i)
+}
+
+/// For a click on the elision cue at buffer `line`, the `(file index, gap index)`
+/// it addresses: which file section it falls in, and which cue within that
+/// section it is (0-based, document order, matching the recorded gaps). `None` if
+/// `line` is not an elision cue.
+fn conflict_cue_gap_at(buffer: &sourceview5::Buffer, line: usize) -> Option<(usize, usize)> {
+    let cue = pill(CONFLICT_CUE_LABEL);
+    let text = buffer_text(buffer);
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.get(line).copied() != Some(cue.as_str()) {
+        return None;
+    }
+    let mut file_idx = 0usize;
+    let mut seen_files = 0usize;
+    let mut k = 0usize;
+    for l in &lines[..line] {
+        if conflict_header_path(l).is_some() {
+            file_idx = seen_files;
+            seen_files += 1;
+            k = 0;
+        } else if *l == cue {
+            k += 1;
+        }
+    }
+    Some((file_idx, k))
+}
+
+/// Buffer line of the `k`-th elision cue within file section `fi`, after a
+/// re-render — used to re-pin the viewport on the cue the user just expanded.
+fn conflict_section_cue_line(buffer: &sourceview5::Buffer, fi: usize, k: usize) -> Option<usize> {
+    let cue = pill(CONFLICT_CUE_LABEL);
+    let text = buffer_text(buffer);
+    let mut cur_file: Option<usize> = None;
+    let mut header_count = 0usize;
+    let mut seen = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        if conflict_header_path(l).is_some() {
+            cur_file = Some(header_count);
+            header_count += 1;
+            seen = 0;
+        } else if l == cue && cur_file == Some(fi) {
+            if seen == k {
+                return Some(i);
+            }
+            seen += 1;
+        }
+    }
+    None
 }
 
 /// The text of buffer `line` (without its trailing newline).
@@ -525,6 +670,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let drag_origin: Rc<Cell<DragOrigin>> = Rc::new(Cell::new(DragOrigin::History));
     // Whether the diff pane is showing a normal diff or a conflict to resolve.
     let pane_mode: Rc<RefCell<PaneMode>> = Rc::new(RefCell::new(PaneMode::Diff));
+    // Per-file state of the combined conflict-snippet buffer for the selected
+    // commit (rebuilt by `load_conflict_files`, in dropdown/file order).
+    let conflict_view: Rc<RefCell<Vec<ConflictFileView>>> = Rc::new(RefCell::new(Vec::new()));
     // Whether the read-only working-copy (@) row is the current selection, in
     // which case the diff is shown read-only and Save is inert.
     let viewing_wc: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -909,6 +1057,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Hunks of the diff currently in the buffer, so an expand click can scroll
     // its (now re-rendered) hunk back into view instead of jumping to the top.
     let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // The conflict pane's "expand hidden lines" action, late-bound (it needs the
+    // conflict renderer defined below). The expand-click gesture invokes it by
+    // buffer line, mirroring `render_cell` for the diff pane.
+    let conflict_expand_cell: Rc<RefCell<Option<Rc<dyn Fn(usize)>>>> =
+        Rc::new(RefCell::new(None));
     let render_diff_view: Renderer = {
         let changes = changes.clone();
         let combined_files = combined_files.clone();
@@ -981,6 +1134,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let highlight = highlight.clone();
         let nav_sync = nav_sync.clone();
+        let conflict_expand_cell = conflict_expand_cell.clone();
         move |gesture, _n_press, x, y| {
             let (bx, by) = file_view.window_to_buffer_coords(
                 gtk::TextWindowType::Widget,
@@ -991,10 +1145,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 return;
             };
             let line = iter.line() as usize;
-            // Conflict mode: a click on a marker line's inline "➜ use …" cue
-            // resolves that block. Clicks elsewhere (the marker text, content
-            // lines) fall through so the caret places normally for free-form edits.
+            // Conflict mode: a click on an elision cue expands that gap; a click on
+            // a marker line's inline "➜ use …" cue resolves that block. Clicks
+            // elsewhere fall through so the caret places for free-form edits.
             if pane_mode.borrow().is_conflict() {
+                let line_text = buffer_line_text(&file_buffer, line);
+                if line_text == pill(CONFLICT_CUE_LABEL) {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    if let Some(expand) = conflict_expand_cell.borrow().clone() {
+                        glib::idle_add_local_once(move || expand(line));
+                    }
+                    return;
+                }
                 let text = buffer_text(&file_buffer);
                 let col = iter.line_offset() as usize;
                 let Some(side) = conflict_cue_side_at(&text, line, col) else {
@@ -1128,8 +1290,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let line = iter.line() as usize;
                 let col = iter.line_offset() as usize;
                 if pane_mode.borrow().is_conflict() {
-                    let text = buffer_text(&file_buffer);
-                    conflict_cue_side_at(&text, line, col).is_some()
+                    let line_text = buffer_line_text(&file_buffer, line);
+                    line_text == pill(CONFLICT_CUE_LABEL)
+                        || conflict_cue_side_at(&buffer_text(&file_buffer), line, col).is_some()
                 } else {
                     let line_text = buffer_line_text(&file_buffer, line);
                     expand_cue_at(&rendered_hunks.borrow(), &line_text, line, col).is_some()
@@ -1225,85 +1388,172 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Show the conflicted file at dropdown index `idx` of the selected commit,
-    // materialized with 2-way markers for free-form resolution. Non-text
-    // (structural) conflicts can't be edited here, so they show a notice instead.
-    let show_conflict_file: Rc<dyn Fn(usize)> = {
-        let repo = repo.clone();
-        let pane_mode = pane_mode.clone();
-        let selected_change = selected_change.clone();
-        let current_file = current_file.clone();
+    // Render every conflicted file of the selected commit into the one buffer:
+    // each file's section is a header line then its conflict *snippets* (the
+    // `<<< … >>>` blocks with context, the unconflicted runs elided behind a cue),
+    // or a notice for a structural conflict. Records per file the pieces and gaps
+    // for reconstruction / expansion. The whole change is rendered once; the
+    // dropdown is a jump aid, just like the diff pane.
+    let render_conflict_view: Rc<dyn Fn()> = {
+        let conflict_view = conflict_view.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
         let highlight = highlight.clone();
-        let show_status = show_status.clone();
-        Rc::new(move |idx: usize| {
-            let resolved = {
-                let mode = pane_mode.borrow();
-                let PaneMode::Conflict(ctx) = &*mode else {
-                    return;
-                };
-                let Some(sel) = selected_change.borrow().clone() else {
-                    return;
-                };
-                let Some(cc) = ctx.commits.iter().find(|c| c.change_id_hex() == sel) else {
-                    return;
-                };
-                cc.files
-                    .get(idx)
-                    .map(|cp| (cc.change_id_hex(), cp.path_str(), cp.resolvable))
-            };
-            let Some((change_hex, path, resolvable)) = resolved else {
-                return;
-            };
-            *current_file.borrow_mut() = Some(path.clone());
-            if !resolvable {
-                editing.set(true);
-                file_buffer.set_text(
-                    "<structural conflict — can't be resolved as text here; \
-                     use “Abort rewrite” to discard this change>",
-                );
-                editing.set(false);
-                file_view.set_editable(false);
-                return;
-            }
-            match repo.borrow().read_conflict(&change_hex, &path) {
-                Ok(file) => {
-                    if let PaneMode::Conflict(ctx) = &mut *pane_mode.borrow_mut() {
-                        ctx.marker_len = file.marker_len;
+        Rc::new(move || {
+            let cue = pill(CONFLICT_CUE_LABEL);
+            let mut out: Vec<String> = Vec::new();
+            {
+                let mut view = conflict_view.borrow_mut();
+                for fv in view.iter_mut() {
+                    out.push(conflict_header_line(&fv.path));
+                    if !fv.resolvable {
+                        out.push(CONFLICT_STRUCTURAL_NOTICE.to_string());
+                        fv.pieces.clear();
+                        fv.gaps.clear();
+                        continue;
                     }
-                    editing.set(true);
-                    file_buffer.set_text(&file.text);
-                    // Attach the inline "use ours/theirs/both" cues to the marker
-                    // lines; the click gesture below turns a marker-line click into
-                    // the matching quick resolution.
-                    append_resolve_cues(&file_buffer);
-                    editing.set(false);
-                    file_view.set_editable(true);
-                    highlight();
-                    // Land on the first conflict rather than the file's top.
-                    if let Some(&first) = conflict_block_lines(&file_buffer).first() {
-                        scroll_to_line(&file_view, &file_buffer, first);
+                    let snip = render_conflict_snippets(&fv.full_text, &fv.exp, &cue);
+                    for l in snip.text.split('\n') {
+                        out.push(l.to_string());
                     }
+                    fv.gaps = snip.gaps.iter().map(|g| (g.above, g.below)).collect();
+                    fv.pieces = snip.pieces;
                 }
-                Err(err) => show_status(&format!("Can't read conflict: {err}")),
+            }
+            editing.set(true);
+            file_buffer.set_text(&out.join("\n"));
+            // Inline "use ours/theirs/both" cues on each conflict block's markers.
+            append_resolve_cues(&file_buffer);
+            editing.set(false);
+            file_view.set_editable(conflict_view.borrow().iter().any(|fv| fv.resolvable));
+            highlight();
+        })
+    };
+
+    // Refresh each resolvable file's full conflict text from the (edited) buffer,
+    // so a re-render or save reflects edits made since the last render. Splits the
+    // buffer into per-file sections by header line, then reconstructs each from its
+    // shown snippets + the verbatim elided runs recorded in `pieces`.
+    let sync_conflict_from_buffer: Rc<dyn Fn()> = {
+        let conflict_view = conflict_view.clone();
+        let file_buffer = file_buffer.clone();
+        Rc::new(move || {
+            let cue = pill(CONFLICT_CUE_LABEL);
+            let combined = buffer_text(&file_buffer);
+            let buf_lines: Vec<&str> = combined.split('\n').collect();
+            let mut sections: Vec<Vec<&str>> = Vec::new();
+            for &l in &buf_lines {
+                if conflict_header_path(l).is_some() {
+                    sections.push(Vec::new());
+                } else if let Some(cur) = sections.last_mut() {
+                    cur.push(l);
+                }
+            }
+            let mut view = conflict_view.borrow_mut();
+            for (fv, section) in view.iter_mut().zip(sections.iter()) {
+                if fv.resolvable {
+                    // Drop the inline resolve cues we appended to marker lines, so
+                    // they don't accrete into the reconstructed text on re-render.
+                    let cleaned: Vec<String> = section.iter().map(|l| strip_marker_cue(l)).collect();
+                    let refs: Vec<&str> = cleaned.iter().map(String::as_str).collect();
+                    fv.full_text = reconstruct_conflict_file(&refs, &fv.pieces, &cue);
+                }
             }
         })
     };
 
-    // Populate the file dropdown with the conflicted files of `commit` (the
-    // selection then cascades to `show_conflict_file`). Resolvable files are
-    // listed plainly; structural ones are flagged with a ⚠.
+    // Jump the (already-rendered) combined conflict buffer to the file at dropdown
+    // `idx`, pinning its header to the top. The conflict analogue of
+    // `scroll_to_file`; skips the scroll under `nav_sync` (scroll→dropdown sync).
+    let scroll_to_conflict_file: Rc<dyn Fn(usize)> = {
+        let conflict_view = conflict_view.clone();
+        let current_file = current_file.clone();
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let nav_sync = nav_sync.clone();
+        Rc::new(move |idx: usize| {
+            let path = conflict_view.borrow().get(idx).map(|fv| fv.path.clone());
+            let Some(path) = path else { return };
+            *current_file.borrow_mut() = Some(path);
+            if nav_sync.get() {
+                return;
+            }
+            if let Some(line) = conflict_file_header_line(&file_buffer, idx) {
+                if let Some(mut iter) = file_buffer.iter_at_line(line as i32) {
+                    file_view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
+                }
+            }
+        })
+    };
+
+    // Expand the elided gap at the clicked cue `line`: capture any buffer edits,
+    // widen that gap's context, re-render, and re-pin the cue (or the file header)
+    // to where it sat — the conflict-pane analogue of the diff expand handler.
+    let conflict_expand: Rc<dyn Fn(usize)> = {
+        let conflict_view = conflict_view.clone();
+        let sync_conflict_from_buffer = sync_conflict_from_buffer.clone();
+        let render_conflict_view = render_conflict_view.clone();
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let nav_sync = nav_sync.clone();
+        Rc::new(move |line: usize| {
+            let Some((fi, k)) = conflict_cue_gap_at(&file_buffer, line) else {
+                return;
+            };
+            // Record the clicked cue's viewport position to re-pin it afterwards.
+            let frac = vertical_fraction_of_line(&file_view, &file_buffer, line);
+            let line_height = file_view.iter_location(&file_buffer.start_iter()).height() as f64;
+            nav_sync.set(true);
+            sync_conflict_from_buffer();
+            {
+                let mut view = conflict_view.borrow_mut();
+                if let Some(fv) = view.get_mut(fi) {
+                    if let Some(&(above, below)) = fv.gaps.get(k) {
+                        fv.exp.expand_gap(above, below);
+                    }
+                }
+            }
+            render_conflict_view();
+            // Re-pin to the gap's new cue line (or the file header if it merged).
+            let new_line = conflict_section_cue_line(&file_buffer, fi, k)
+                .or_else(|| conflict_file_header_line(&file_buffer, fi));
+            if let (Some(nl), Some(vadj)) = (new_line, file_view.vadjustment()) {
+                let page = vadj.page_size();
+                if line_height > 0.0 && page > 0.0 {
+                    let top = file_view.top_margin() as f64;
+                    let bottom = file_view.bottom_margin() as f64;
+                    let height = file_buffer.line_count() as f64 * line_height + top + bottom;
+                    let upper = height.max(page);
+                    let target = (nl as f64 * line_height + top - frac * page)
+                        .clamp(0.0, (upper - page).max(0.0));
+                    vadj.set_upper(upper);
+                    vadj.set_value(target);
+                    if let Some(iter) = file_buffer.iter_at_line(nl as i32) {
+                        file_buffer.place_cursor(&iter);
+                    }
+                }
+            }
+            nav_sync.set(false);
+        })
+    };
+    *conflict_expand_cell.borrow_mut() = Some(conflict_expand);
+
+    // Build the conflict-view state for `commit`'s conflicted files, fill the
+    // dropdown, render the combined snippet buffer, and land on the first conflict.
     let load_conflict_files: Rc<dyn Fn(&CommitInfo)> = {
+        let repo = repo.clone();
         let pane_mode = pane_mode.clone();
+        let conflict_view = conflict_view.clone();
         let file_dropdown = file_dropdown.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
         let current_file = current_file.clone();
+        let render_conflict_view = render_conflict_view.clone();
+        let scroll_to_conflict_file = scroll_to_conflict_file.clone();
         Rc::new(move |commit: &CommitInfo| {
-            let labels: Vec<String> = {
+            let files: Vec<(String, String, bool)> = {
                 let mode = pane_mode.borrow();
                 let PaneMode::Conflict(ctx) = &*mode else {
                     return;
@@ -1314,14 +1564,41 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     .map(|c| {
                         c.files
                             .iter()
-                            .map(|f| {
-                                let mark = if f.resolvable { "" } else { "⚠ " };
-                                format!("{mark}{}", f.path_str())
-                            })
+                            .map(|f| (c.change_id_hex(), f.path_str(), f.resolvable))
                             .collect()
                     })
                     .unwrap_or_default()
             };
+            // Materialize each resolvable file's full conflict text up front.
+            let mut view = Vec::new();
+            for (change_hex, path, resolvable) in &files {
+                let (full_text, marker_len) = if *resolvable {
+                    match repo.borrow().read_conflict(change_hex, path) {
+                        Ok(cf) => (cf.text, cf.marker_len),
+                        Err(_) => (String::new(), 7),
+                    }
+                } else {
+                    (String::new(), 7)
+                };
+                view.push(ConflictFileView {
+                    path: path.clone(),
+                    resolvable: *resolvable,
+                    marker_len,
+                    full_text,
+                    exp: ContextExpansion::default(),
+                    pieces: Vec::new(),
+                    gaps: Vec::new(),
+                });
+            }
+            let labels: Vec<String> = view
+                .iter()
+                .map(|fv| {
+                    let mark = if fv.resolvable { "" } else { "⚠ " };
+                    format!("{mark}{}", fv.path)
+                })
+                .collect();
+            *conflict_view.borrow_mut() = view;
+
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             file_dropdown.set_model(Some(&StringList::new(&refs)));
             if labels.is_empty() {
@@ -1330,14 +1607,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 file_buffer.set_text("(no remaining conflicts in this commit)");
                 editing.set(false);
                 file_view.set_editable(false);
-            } else {
-                // Triggers selected-notify -> show_conflict_file(0).
-                file_dropdown.set_selected(0);
+                return;
+            }
+            // Render all files' snippets at once, then land on the first conflict.
+            render_conflict_view();
+            file_dropdown.set_selected(0);
+            scroll_to_conflict_file(0);
+            if let Some(&first) = conflict_block_lines(&file_buffer).first() {
+                scroll_to_line(&file_view, &file_buffer, first);
             }
         })
     };
 
     const READ_ONLY_HINT: &str = "Edit blocked — this change would break the patch structure.";
+    const CONFLICT_LAYOUT_HINT: &str =
+        "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
 
     // Firewall: every interactive mutation of the diff buffer goes through the
     // structured-edit planner so it can never produce a patch that fails to
@@ -1353,9 +1637,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if editing.get() {
                 return;
             }
-            // Conflict resolution is free-form whole-file editing; the unified-diff
-            // firewall does not apply.
+            // Conflict resolution is free-form *within* snippets — the unified-diff
+            // firewall doesn't apply — but the view's structural lines (file
+            // headers, elision cues, notices) must stay intact so the snippet→full
+            // reconstruction keeps its anchors.
             if pane_mode.borrow().is_conflict() {
+                if is_conflict_protected_line(&buffer_line_text(buffer, iter.line() as usize)) {
+                    buffer.stop_signal_emission_by_name("insert-text");
+                    show_status(CONFLICT_LAYOUT_HINT);
+                }
                 return;
             }
             let caret = Selection::caret(Cursor {
@@ -1383,7 +1673,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if editing.get() {
                 return;
             }
+            // Free-form within snippets, but block deletes that touch a structural
+            // layout line (header / elision cue / notice).
             if pane_mode.borrow().is_conflict() {
+                let touches_layout = (start.line()..=end.line())
+                    .any(|li| is_conflict_protected_line(&buffer_line_text(buffer, li as usize)));
+                if touches_layout {
+                    buffer.stop_signal_emission_by_name("delete-range");
+                    show_status(CONFLICT_LAYOUT_HINT);
+                }
                 return;
             }
             let s = Cursor {
@@ -1449,7 +1747,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     file_dropdown.connect_selected_notify({
         let scroll_to_file = scroll_to_file.clone();
-        let show_conflict_file = show_conflict_file.clone();
+        let scroll_to_conflict_file = scroll_to_conflict_file.clone();
         let pane_mode = pane_mode.clone();
         move |dd| {
             let idx = dd.selected();
@@ -1457,7 +1755,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 return;
             }
             if pane_mode.borrow().is_conflict() {
-                show_conflict_file(idx as usize);
+                scroll_to_conflict_file(idx as usize);
             } else {
                 scroll_to_file(idx as usize);
             }
@@ -1478,12 +1776,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let editing = editing.clone();
             let pane_mode = pane_mode.clone();
             move |vadj| {
-                if editing.get() || nav_sync.get() || pane_mode.borrow().is_conflict() {
+                if editing.get() || nav_sync.get() {
                     return;
                 }
                 let (iter, _) = file_view.line_at_y(vadj.value() as i32);
                 let top_line = iter.line() as usize;
-                let idx = diff_file_index_at_line(&file_buffer, top_line) as u32;
+                let idx = if pane_mode.borrow().is_conflict() {
+                    conflict_file_index_at_line(&file_buffer, top_line)
+                } else {
+                    diff_file_index_at_line(&file_buffer, top_line)
+                } as u32;
                 if file_dropdown.selected() != idx {
                     nav_sync.set(true);
                     file_dropdown.set_selected(idx);
@@ -1871,10 +2173,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 .iter()
                 .find(|c| !c.files.is_empty())
                 .map(|c| c.change_id_hex());
-            *pane_mode.borrow_mut() = PaneMode::Conflict(ConflictCtx {
-                commits,
-                marker_len: 7,
-            });
+            *pane_mode.borrow_mut() = PaneMode::Conflict(ConflictCtx { commits });
             conflict_banner.set_visible(true);
             prev_conflict_button.set_visible(true);
             next_conflict_button.set_visible(true);
@@ -1893,38 +2192,49 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let repo = repo.clone();
         let pane_mode = pane_mode.clone();
         let selected_change = selected_change.clone();
-        let current_file = current_file.clone();
-        let file_buffer = file_buffer.clone();
+        let conflict_view = conflict_view.clone();
+        let sync_conflict_from_buffer = sync_conflict_from_buffer.clone();
         let refresh = refresh.clone();
         let refresh_conflict = refresh_conflict.clone();
         let exit_conflict_mode = exit_conflict_mode.clone();
         let show_status = show_status.clone();
         Rc::new(move || {
-            let resolved = {
-                let mode = pane_mode.borrow();
-                let PaneMode::Conflict(ctx) = &*mode else {
-                    return;
-                };
-                let Some(sel) = selected_change.borrow().clone() else {
-                    return;
-                };
-                current_file
-                    .borrow()
-                    .clone()
-                    .map(|path| (sel, path, ctx.marker_len))
-            };
-            let Some((change_hex, path, marker_len)) = resolved else {
-                show_status("Select a conflicted file to resolve");
-                return;
-            };
-            let text = buffer_text(&file_buffer);
-            if classify_conflict_lines(&text).iter().any(|k| k.is_marker()) {
-                show_status("Resolve all conflict markers before saving");
+            if !pane_mode.borrow().is_conflict() {
                 return;
             }
-            let outcome = repo
-                .borrow_mut()
-                .resolve_conflict(&change_hex, &path, &text, marker_len);
+            let Some(change_hex) = selected_change.borrow().clone() else {
+                show_status("Select a conflicted commit to resolve");
+                return;
+            };
+            // Capture buffer edits into each file's full text, then reconstruct the
+            // (path, full_text, marker_len) list for this commit's resolvable files.
+            sync_conflict_from_buffer();
+            let files: Option<Vec<(String, String, usize)>> = {
+                let view = conflict_view.borrow();
+                let mut out = Vec::new();
+                let mut unresolved = false;
+                for fv in view.iter().filter(|fv| fv.resolvable) {
+                    if classify_conflict_lines(&fv.full_text).iter().any(|k| k.is_marker()) {
+                        unresolved = true;
+                        break;
+                    }
+                    out.push((fv.path.clone(), fv.full_text.clone(), fv.marker_len));
+                }
+                if unresolved {
+                    None
+                } else {
+                    Some(out)
+                }
+            };
+            let Some(files) = files else {
+                show_status("Resolve all conflict markers before saving");
+                return;
+            };
+            if files.is_empty() {
+                show_status("No text-resolvable conflicts here — use “Abort rewrite” to discard");
+                return;
+            }
+            let outcome = repo.borrow_mut().resolve_conflicts(&change_hex, &files);
             match outcome {
                 Ok(SaveOutcome::Clean) => {
                     exit_conflict_mode();
@@ -3166,16 +3476,40 @@ fn highlight_conflict(
 
     let raw_lines: Vec<&str> = text.split('\n').collect();
     let kinds = classify_conflict_lines(&text);
+    let cue = pill(CONFLICT_CUE_LABEL);
 
-    let syntax = path
-        .and_then(|p| std::path::Path::new(p).extension())
-        .and_then(|e| e.to_str())
-        .and_then(|ext| ps.find_syntax_by_extension(ext))
-        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    let pick = |p: &str| {
+        std::path::Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| ps.find_syntax_by_extension(ext))
+            .unwrap_or_else(|| ps.find_syntax_plain_text())
+    };
+    // `path` is only the fallback; the combined buffer holds several files and the
+    // per-section language is re-derived from each `─── PATH ───` header.
+    let mut syntax = path.map(pick).unwrap_or_else(|| ps.find_syntax_plain_text());
     let mut hl = HighlightLines::new(syntax, theme);
 
     for (li, &kind) in kinds.iter().enumerate() {
         let raw = raw_lines.get(li).copied().unwrap_or("");
+        // A file header starts a new section: switch language, reset state, paint
+        // it as a header, and skip the content coloring.
+        if let Some(p) = conflict_header_path(raw) {
+            syntax = pick(p);
+            hl = HighlightLines::new(syntax, theme);
+            apply_line_tag(buffer, li as i32, "hunk");
+            continue;
+        }
+        // The elision cue is a pill button standing in for a hidden run.
+        if raw == cue {
+            apply_line_tag(buffer, li as i32, "hunk");
+            paint_pill(buffer, li as i32, raw, "expand-cue-cap", "expand-cue");
+            continue;
+        }
+        if raw == CONFLICT_STRUCTURAL_NOTICE {
+            apply_line_tag(buffer, li as i32, "meta");
+            continue;
+        }
         if let Some(name) = conflict_bg_tag(kind) {
             apply_line_tag(buffer, li as i32, name);
         }

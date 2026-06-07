@@ -94,6 +94,20 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   `squash_target_subject`, `squash_recommendations`, `compose_squash_message`)
   read git's `fixup!`/`squash!`/`amend!` subject prefixes so the UI can recommend
   drop targets and compose the merged message.
+- `split_commit` (`split.rs`) — the diff view's "Split" button (left of Save,
+  enabled only with pending diff edits). Takes the same `(path, content)` edits as
+  `rewrite_files`: rewrites the target `C` → `C'` to the **edited** tree (keeping
+  its change id / message / author), then `new_commit`s `N` holding `C`'s
+  **original** tree as `C'`'s child (message `Split of <subject>`, original author),
+  so `C'` + `N` reproduce the original commit's diff and descendants are untouched.
+  The trick is `set_rewritten_commit(C, N)`, which **overwrites** the `C → C'`
+  rewrite `rewrite_commit` recorded so `rebase_descendants` (and the bookmark and
+  `@`) follow `C → N` — `N` restores the original tree, the exact base descendants
+  were built on, so the rebase is clean. No explicit head-bookmark set is needed
+  (unlike reorder): `C` is genuinely rewritten, so jj carries the bookmark. The
+  file-blob/tree-splicing step is shared with `rewrite_files` via
+  `tree::splice_files_into_tree`; `split_message` (pure, inline-tested) builds the
+  message.
 
 ### Working-copy preservation (`workcopy.rs`)
 

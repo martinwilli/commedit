@@ -186,6 +186,51 @@ impl Repo {
         self.session_head.clone()
     }
 
+    /// The content delta of the whole session: the file changes between the tree
+    /// the repo was opened with and the current tree. Identity/message-only
+    /// edits don't touch any tree, so they don't appear here. Snapshots the
+    /// working copy first so on-disk edits are included, then compares the
+    /// working-copy commit `@` (the current tree, including uncommitted changes)
+    /// against its session-start counterpart — falling back to the HEAD trees on
+    /// a detached HEAD (no `@`). Powers the read-only "Review" view; empty right
+    /// after [`Repo::revert_all`] restores the session-start state.
+    pub fn session_changes(&mut self) -> Result<Vec<crate::diff::FileChange>> {
+        let Some(session_op) = self.session_op.clone() else {
+            return Ok(Vec::new());
+        };
+        // Fold any on-disk edits into @ so the review reflects the real tree.
+        self.snapshot_working_copy()?;
+        let store = self.repo.store().clone();
+
+        // Current tree: prefer @ (includes uncommitted changes), else HEAD.
+        let Some(new_id) = self
+            .working_copy_commit_id()
+            .or_else(|| self.head_commit_id())
+        else {
+            return Ok(Vec::new());
+        };
+        // Session-start tree: the @ recorded in the session-start view, or its
+        // HEAD where there was none (detached HEAD).
+        let view = pollster::block_on(session_op.view()).context("reading the session-start view")?;
+        let old_id = view
+            .get_wc_commit_id(self.workspace.workspace_name())
+            .cloned()
+            .or_else(|| self.session_head.as_deref().and_then(CommitId::try_from_hex));
+        let Some(old_id) = old_id else {
+            return Ok(Vec::new());
+        };
+
+        let new_tree = store
+            .get_commit(&new_id)
+            .context("loading the current commit")?
+            .tree();
+        let old_tree = store
+            .get_commit(&old_id)
+            .context("loading the session-start commit")?
+            .tree();
+        crate::diff::tree_changes(&store, &old_tree, &new_tree)
+    }
+
     /// Snapshot every local branch (`refs/heads/*`) as git sees it now, to pair
     /// with [`Self::protect_unrelated_heads`] across a rewrite.
     pub(crate) fn snapshot_heads(&self) -> BTreeMap<String, String> {

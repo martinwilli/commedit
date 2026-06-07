@@ -1,6 +1,7 @@
 //! Extract the per-file changes a commit introduces (vs. its parent), with text
 //! content for the history/hunk view.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -274,50 +275,14 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
         return RenderedDiff::default();
     }
 
-    let cb = |g: usize| DEFAULT_CONTEXT + exp.before_of(g);
-    let ca = |g: usize| DEFAULT_CONTEXT + exp.after_of(g);
-
-    // Join consecutive groups into hunks while the gap between them is fully
-    // covered by the two groups' context (then there is no point in a split).
-    let mut hunk_groups: Vec<(usize, usize)> = Vec::new();
-    let mut a = 0;
-    while a < group_count {
-        let mut b = a;
-        while b + 1 < group_count {
-            let gap = groups[b + 1].0 - groups[b].1;
-            if ca(b) + cb(b + 1) >= gap {
-                b += 1;
-            } else {
-                break;
-            }
-        }
-        hunk_groups.push((a, b));
-        a = b + 1;
-    }
-
-    // Each hunk is the contiguous segment slice [top_start, bottom_end): the
-    // groups it spans, their (fully shown) interior gaps, plus clamped context.
-    let slices: Vec<(usize, usize, usize, usize)> = hunk_groups
-        .iter()
-        .map(|&(a, b)| {
-            let top_avail = if a == 0 { groups[0].0 } else { groups[a].0 - groups[a - 1].1 };
-            let bot_avail = if b + 1 == group_count {
-                segs.len() - groups[b].1
-            } else {
-                groups[b + 1].0 - groups[b].1
-            };
-            let top_start = groups[a].0 - cb(a).min(top_avail);
-            let bottom_end = groups[b].1 + ca(b).min(bot_avail);
-            (top_start, bottom_end, a, b)
-        })
-        .collect();
+    let windows = window_groups(segs.len(), &groups, exp);
 
     let mut lines: Vec<String> = vec![format!("--- a/{path}"), format!("+++ b/{path}")];
-    let mut hunks = Vec::with_capacity(slices.len());
-    for (idx, &(ts, be, a, b)) in slices.iter().enumerate() {
-        let first = &segs[ts];
+    let mut hunks = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let first = &segs[w.top];
         let (mut old_count, mut new_count) = (0usize, 0usize);
-        for s in &segs[ts..be] {
+        for s in &segs[w.top..w.bottom] {
             match s.tag {
                 Tag::Ctx => {
                     old_count += 1;
@@ -335,7 +300,7 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
             first.new + 1,
             new_count
         ));
-        for s in &segs[ts..be] {
+        for s in &segs[w.top..w.bottom] {
             let prefix = match s.tag {
                 Tag::Ctx => ' ',
                 Tag::Del => '-',
@@ -343,18 +308,12 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
             };
             lines.push(format!("{prefix}{}", s.text));
         }
-        // Separate hunks always have hidden lines between them (otherwise they
-        // would have merged), so only the outermost edges can hit a file bound.
         hunks.push(HunkInfo {
             header_line,
-            first_group: a,
-            last_group: b,
-            can_expand_up: if idx == 0 { ts > 0 } else { true },
-            can_expand_down: if idx + 1 == slices.len() {
-                be < segs.len()
-            } else {
-                true
-            },
+            first_group: w.first_group,
+            last_group: w.last_group,
+            can_expand_up: w.can_expand_up,
+            can_expand_down: w.can_expand_down,
         });
     }
 
@@ -363,6 +322,200 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
         hunks,
         group_count,
     }
+}
+
+/// A windowed hunk produced by [`window_groups`]: the half-open span
+/// `[top, bottom)` of the underlying sequence it shows, the inclusive
+/// change-group index range it covers, and whether hidden items remain just
+/// above/below it (i.e. whether expanding in that direction reveals anything).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    pub top: usize,
+    pub bottom: usize,
+    pub first_group: usize,
+    pub last_group: usize,
+    pub can_expand_up: bool,
+    pub can_expand_down: bool,
+}
+
+/// Window `total` items around `groups` (each a half-open `[start, end)` index
+/// range into the same sequence, ordered and non-overlapping) with per-group
+/// context controlled by `exp`. Consecutive groups merge into one window while
+/// the gap between them is fully covered by their combined context (then a split
+/// is pointless). Shared by the unified-diff renderer (items = diff segments) and
+/// the conflict-snippet renderer (items = file lines, groups = conflict blocks).
+pub(crate) fn window_groups(
+    total: usize,
+    groups: &[(usize, usize)],
+    exp: &ContextExpansion,
+) -> Vec<Window> {
+    let group_count = groups.len();
+    if group_count == 0 {
+        return Vec::new();
+    }
+    let cb = |g: usize| DEFAULT_CONTEXT + exp.before_of(g);
+    let ca = |g: usize| DEFAULT_CONTEXT + exp.after_of(g);
+
+    let mut hunk_groups: Vec<(usize, usize)> = Vec::new();
+    let mut a = 0;
+    while a < group_count {
+        let mut b = a;
+        while b + 1 < group_count {
+            let gap = groups[b + 1].0 - groups[b].1;
+            if ca(b) + cb(b + 1) >= gap {
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        hunk_groups.push((a, b));
+        a = b + 1;
+    }
+
+    let n = hunk_groups.len();
+    hunk_groups
+        .iter()
+        .enumerate()
+        .map(|(idx, &(a, b))| {
+            let top_avail = if a == 0 { groups[0].0 } else { groups[a].0 - groups[a - 1].1 };
+            let bot_avail = if b + 1 == group_count {
+                total - groups[b].1
+            } else {
+                groups[b + 1].0 - groups[b].1
+            };
+            let top = groups[a].0 - cb(a).min(top_avail);
+            let bottom = groups[b].1 + ca(b).min(bot_avail);
+            // Separate windows always have hidden items between them (otherwise
+            // they would have merged), so only the outermost edges can hit a bound.
+            Window {
+                top,
+                bottom,
+                first_group: a,
+                last_group: b,
+                can_expand_up: if idx == 0 { top > 0 } else { true },
+                can_expand_down: if idx + 1 == n { bottom < total } else { true },
+            }
+        })
+        .collect()
+}
+
+/// One file's placement within a combined commit diff (see [`render_commit_diff`]).
+#[derive(Debug, Clone)]
+pub struct CombinedFile {
+    pub path: String,
+    /// Line of this file's `diff --git` separator within the combined text.
+    pub start_line: usize,
+    /// False for removed/binary files, shown as a read-only notice.
+    pub editable: bool,
+    /// This file's hunks, with `header_line` mapped to the *combined* text;
+    /// `first_group`/`last_group` stay file-relative (for context expansion).
+    pub hunks: Vec<HunkInfo>,
+}
+
+/// All of a commit's file changes rendered into one editable unified-diff buffer,
+/// each file separated by a `diff --git` line, plus per-file placement so the UI
+/// can jump to / expand / save individual files within the one view.
+#[derive(Debug, Clone, Default)]
+pub struct CombinedDiff {
+    pub text: String,
+    pub files: Vec<CombinedFile>,
+}
+
+/// Render every change in `changes` (in order) into one combined unified-diff
+/// buffer. Each file is introduced by a `diff --git a/PATH b/PATH` separator —
+/// unambiguous because a diff content line always carries a leading prefix char,
+/// so it never starts with bare `diff `. Editable files (text content present)
+/// use [`render_diff`] with their per-path [`ContextExpansion`] from `expansions`;
+/// removed/binary files (and ones with no textual change) get a read-only
+/// `\`-prefixed notice. The result reverse-applies per file via
+/// [`split_combined_patch`] + [`apply_patch`].
+pub fn render_commit_diff(
+    changes: &[FileChange],
+    expansions: &HashMap<String, ContextExpansion>,
+) -> CombinedDiff {
+    let default_exp = ContextExpansion::default();
+    let mut text = String::new();
+    let mut files = Vec::new();
+    // Line index in `text` of the next line to be appended.
+    let mut line = 0usize;
+
+    for change in changes {
+        let start_line = line;
+        text.push_str(&format!("diff --git a/{p} b/{p}\n", p = change.path));
+        line += 1;
+
+        let mut editable = change.new_text.is_some() && !change.is_binary;
+        let mut hunks = Vec::new();
+        let body = if editable {
+            let new = change.new_text.as_deref().unwrap_or("");
+            let old = change.old_text.as_deref().unwrap_or("");
+            let exp = expansions.get(&change.path).unwrap_or(&default_exp);
+            let rendered = render_diff(old, new, &change.path, exp);
+            if rendered.text.is_empty() {
+                // No textual change (e.g. mode-only) — show a notice instead.
+                editable = false;
+                format!(
+                    "--- a/{p}\n+++ b/{p}\n\\ (no textual changes)\n",
+                    p = change.path
+                )
+            } else {
+                // Offset each hunk's `@@` header into the combined text. The
+                // file's `--- a/` header sits at `line` (just past the separator),
+                // which is render_diff's line 0.
+                for h in &rendered.hunks {
+                    hunks.push(HunkInfo {
+                        header_line: line + h.header_line,
+                        ..h.clone()
+                    });
+                }
+                rendered.text
+            }
+        } else {
+            let notice = if change.is_binary {
+                "\\ Binary file (not editable)"
+            } else {
+                "\\ File removed by this commit"
+            };
+            format!("--- a/{p}\n+++ b/{p}\n{notice}\n", p = change.path)
+        };
+        line += body.matches('\n').count();
+        text.push_str(&body);
+        files.push(CombinedFile {
+            path: change.path.clone(),
+            start_line,
+            editable,
+            hunks,
+        });
+    }
+
+    CombinedDiff { text, files }
+}
+
+/// Split a combined diff (as produced by [`render_commit_diff`], possibly edited)
+/// into per-file `(path, patch)` chunks. A `diff --git ` line opens each section;
+/// the path is read from its `--- a/PATH` header. Robust under edits because the
+/// firewall keeps the `diff --git`/`--- `/`+++ ` lines read-only, and content
+/// lines always carry a prefix char so they can't masquerade as those headers.
+pub fn split_combined_patch(text: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    for line in text.split('\n') {
+        if line.starts_with("diff --git ") {
+            sections.push(Vec::new());
+        }
+        if let Some(cur) = sections.last_mut() {
+            cur.push(line);
+        }
+    }
+    sections
+        .into_iter()
+        .filter_map(|lines| {
+            let path = lines
+                .iter()
+                .find_map(|l| l.strip_prefix("--- a/"))
+                .map(str::to_string)?;
+            Some((path, lines.join("\n")))
+        })
+        .collect()
 }
 
 /// The role of a single line within a unified diff, for display/highlighting.
@@ -532,6 +685,170 @@ pub fn classify_conflict_lines(text: &str) -> Vec<ConflictLineKind> {
             state
         })
         .collect()
+}
+
+/// A piece of a conflicted file in snippet view, for reconstructing the whole
+/// file from the (edited) shown segments interleaved with the verbatim hidden
+/// runs (see [`reconstruct_conflict_file`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictPiece {
+    /// A run of `lines` consecutive lines shown (and editable) in the view.
+    Shown { lines: usize },
+    /// A run of lines hidden behind an elision cue, kept verbatim.
+    Elided { lines: Vec<String> },
+}
+
+/// An elided gap in a [`ConflictSnippets`] view: the cue line standing in for the
+/// hidden run, and the conflict blocks adjacent to it whose context expands when
+/// the cue is clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictGap {
+    /// Line of this gap's elision cue within [`ConflictSnippets::text`].
+    pub cue_line: usize,
+    /// Block just above the gap whose trailing context widens, if any.
+    pub above: Option<usize>,
+    /// Block just below the gap whose leading context widens, if any.
+    pub below: Option<usize>,
+}
+
+/// A conflicted file rendered as snippets: only the conflict blocks plus
+/// surrounding context, with the long unconflicted runs between them elided
+/// behind an expandable cue line — the conflict-pane analogue of [`render_diff`].
+#[derive(Debug, Clone, Default)]
+pub struct ConflictSnippets {
+    /// The snippet text: shown content lines, with a single elision-`cue` line
+    /// standing in for each hidden run. Carries no file header.
+    pub text: String,
+    /// The elided gaps, one per cue line, for click-to-expand.
+    pub gaps: Vec<ConflictGap>,
+    /// Ordered pieces to reconstruct the full file (see [`reconstruct_conflict_file`]).
+    pub pieces: Vec<ConflictPiece>,
+    /// Number of conflict blocks (bounds valid block indices for expansion).
+    pub block_count: usize,
+}
+
+/// Render a conflicted file (whole-file text materialized with Git 2-way markers)
+/// as snippets: each `<<<<<<< … >>>>>>>` block is the "change group", shown in
+/// full with surrounding context; the unconflicted runs between/around blocks are
+/// elided behind a `cue` line (exactly as [`render_diff`] windows a diff). A block
+/// is *never* elided, so inline marker-line resolution still sees every marker.
+/// Reuses [`window_groups`] for identical windowing/merging behavior. `cue` is the
+/// caller's elision-cue line text (echoed back to [`reconstruct_conflict_file`]).
+pub fn render_conflict_snippets(
+    full_text: &str,
+    exp: &ContextExpansion,
+    cue: &str,
+) -> ConflictSnippets {
+    let kinds = classify_conflict_lines(full_text);
+    let lines: Vec<&str> = full_text.split('\n').collect();
+    let total = lines.len();
+
+    // Conflict blocks as half-open `[start, end)` line ranges (opener through its
+    // closing marker, inclusive). An unterminated block runs to end of file.
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < kinds.len() {
+        if kinds[i] == ConflictLineKind::MarkerOurs {
+            let mut j = i + 1;
+            while j < kinds.len() && kinds[j] != ConflictLineKind::MarkerTheirs {
+                j += 1;
+            }
+            let end = (j + 1).min(kinds.len());
+            blocks.push((i, end));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    let block_count = blocks.len();
+    if block_count == 0 {
+        // Nothing to resolve: the whole file is one elided run (the caller
+        // generally won't render such a file).
+        return ConflictSnippets {
+            text: String::new(),
+            gaps: Vec::new(),
+            pieces: vec![ConflictPiece::Elided {
+                lines: lines.iter().map(|s| s.to_string()).collect(),
+            }],
+            block_count: 0,
+        };
+    }
+
+    let windows = window_groups(total, &blocks, exp);
+    let mut text_lines: Vec<String> = Vec::new();
+    let mut pieces: Vec<ConflictPiece> = Vec::new();
+    let mut gaps: Vec<ConflictGap> = Vec::new();
+    let mut cursor = 0usize;
+    for (wi, w) in windows.iter().enumerate() {
+        // Hidden run between the previous window (or the file start) and this one.
+        if w.top > cursor {
+            pieces.push(ConflictPiece::Elided {
+                lines: lines[cursor..w.top].iter().map(|s| s.to_string()).collect(),
+            });
+            let cue_line = text_lines.len();
+            text_lines.push(cue.to_string());
+            gaps.push(ConflictGap {
+                cue_line,
+                above: (wi > 0).then(|| windows[wi - 1].last_group),
+                below: Some(w.first_group),
+            });
+        }
+        // The shown window (its interior gaps, if any, are fully shown).
+        for k in w.top..w.bottom {
+            text_lines.push(lines[k].to_string());
+        }
+        pieces.push(ConflictPiece::Shown {
+            lines: w.bottom - w.top,
+        });
+        cursor = w.bottom;
+    }
+    // Trailing hidden run after the last window.
+    if cursor < total {
+        pieces.push(ConflictPiece::Elided {
+            lines: lines[cursor..total].iter().map(|s| s.to_string()).collect(),
+        });
+        let cue_line = text_lines.len();
+        text_lines.push(cue.to_string());
+        gaps.push(ConflictGap {
+            cue_line,
+            above: Some(windows[windows.len() - 1].last_group),
+            below: None,
+        });
+    }
+
+    ConflictSnippets {
+        text: text_lines.join("\n"),
+        gaps,
+        pieces,
+        block_count,
+    }
+}
+
+/// Reconstruct a conflicted file's full text from `shown` (the lines of its
+/// snippet section in the buffer, possibly edited) and the `pieces` recorded at
+/// render time. Each line equal to `cue` is replaced by the next [`ConflictPiece::Elided`]
+/// run's verbatim lines (in document order); every other line is shown content
+/// kept as-is. The inverse of [`render_conflict_snippets`]: rendering then
+/// reconstructing (without edits) yields the original text.
+pub fn reconstruct_conflict_file(shown: &[&str], pieces: &[ConflictPiece], cue: &str) -> String {
+    let mut elided = pieces.iter().filter_map(|p| match p {
+        ConflictPiece::Elided { lines } => Some(lines),
+        ConflictPiece::Shown { .. } => None,
+    });
+    let mut out: Vec<String> = Vec::new();
+    for &line in shown {
+        if line == cue {
+            if let Some(run) = elided.next() {
+                out.extend(run.iter().cloned());
+            }
+            // A cue with no matching run (shouldn't happen with the edit guard)
+            // is simply dropped.
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n")
 }
 
 /// Maximum fraction of a line that intra-line emphasis may cover before it is
@@ -755,8 +1072,11 @@ fn read_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_patch, parse_diff_lines, render_diff, unified_diff, ContextExpansion, DiffLineKind,
+        apply_patch, parse_diff_lines, reconstruct_conflict_file, render_commit_diff,
+        render_conflict_snippets, render_diff, split_combined_patch, unified_diff, ChangeKind,
+        ContextExpansion, DiffLineKind, FileChange,
     };
+    use std::collections::HashMap;
 
     /// Build a 20-line file and a copy with two far-apart single-line edits.
     fn two_change_file() -> (String, String) {
@@ -944,5 +1264,155 @@ mod tests {
         // Corrupt a context line so it no longer matches the base.
         let patch = unified_diff("a\nb\nc\n", "a\nB\nc\n", "f").replace(" a\n", " WRONG\n");
         assert!(apply_patch("a\nb\nc\n", &patch).is_err());
+    }
+
+    fn modified(path: &str, old: &str, new: &str) -> FileChange {
+        FileChange {
+            path: path.to_string(),
+            kind: ChangeKind::Modified,
+            old_text: Some(old.to_string()),
+            new_text: Some(new.to_string()),
+            is_binary: false,
+        }
+    }
+
+    #[test]
+    fn combined_diff_has_one_section_per_file_with_global_hunk_lines() {
+        let changes = vec![
+            modified("a.txt", "a1\na2\n", "a1\nA2\n"),
+            modified("b.txt", "b1\nb2\n", "B1\nb2\n"),
+        ];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        let lines: Vec<&str> = combined.text.split('\n').collect();
+
+        // One `diff --git` separator per file, recorded as `start_line`.
+        let seps: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("diff --git "))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(seps.len(), 2);
+        assert_eq!(combined.files.len(), 2);
+        assert_eq!(combined.files[0].start_line, seps[0]);
+        assert_eq!(combined.files[1].start_line, seps[1]);
+
+        // Every recorded hunk header line is, in the combined text, an `@@` line.
+        for f in &combined.files {
+            assert!(f.editable);
+            for h in &f.hunks {
+                assert!(lines[h.header_line].starts_with("@@"), "hunk not at @@");
+            }
+        }
+    }
+
+    #[test]
+    fn combined_diff_splits_then_applies_per_file() {
+        let changes = vec![
+            modified("a.txt", "a1\na2\n", "a1\nA2\n"),
+            modified("b.txt", "b1\nb2\n", "B1\nb2\n"),
+        ];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        let chunks = split_combined_patch(&combined.text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, "a.txt");
+        assert_eq!(chunks[1].0, "b.txt");
+        assert_eq!(apply_patch("a1\na2\n", &chunks[0].1).unwrap(), "a1\nA2\n");
+        assert_eq!(apply_patch("b1\nb2\n", &chunks[1].1).unwrap(), "B1\nb2\n");
+    }
+
+    #[test]
+    fn editing_one_file_in_combined_diff_changes_only_that_file() {
+        let changes = vec![
+            modified("a.txt", "a1\na2\n", "a1\nA2\n"),
+            modified("b.txt", "b1\nb2\n", "B1\nb2\n"),
+        ];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        // Edit the second file's added line `+B1` -> `+B1X`.
+        let edited = combined.text.replace("+B1\n", "+B1X\n");
+        let chunks = split_combined_patch(&edited);
+        assert_eq!(apply_patch("a1\na2\n", &chunks[0].1).unwrap(), "a1\nA2\n");
+        assert_eq!(apply_patch("b1\nb2\n", &chunks[1].1).unwrap(), "B1X\nb2\n");
+    }
+
+    #[test]
+    fn removed_file_renders_a_read_only_notice() {
+        let changes = vec![FileChange {
+            path: "gone.txt".to_string(),
+            kind: ChangeKind::Removed,
+            old_text: Some("x\n".to_string()),
+            new_text: None,
+            is_binary: false,
+        }];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        assert!(!combined.files[0].editable);
+        assert!(combined.files[0].hunks.is_empty());
+        assert!(combined.text.contains("File removed by this commit"));
+        // Its split chunk has no @@, so apply is a no-op against the old content.
+        let chunks = split_combined_patch(&combined.text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(apply_patch("x\n", &chunks[0].1).unwrap(), "x\n");
+    }
+
+    /// A 14-line file with a conflict block buried in the middle.
+    fn conflict_file() -> String {
+        let mut s = String::new();
+        for n in 1..=5 {
+            s.push_str(&format!("ctx{n}\n"));
+        }
+        s.push_str("<<<<<<< ours\n");
+        s.push_str("mine\n");
+        s.push_str("=======\n");
+        s.push_str("yours\n");
+        s.push_str(">>>>>>> theirs\n");
+        for n in 6..=10 {
+            s.push_str(&format!("ctx{n}\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn conflict_snippets_elide_far_context_and_keep_the_block() {
+        let full = conflict_file();
+        let snip = render_conflict_snippets(&full, &ContextExpansion::default(), "<CUE>");
+        assert_eq!(snip.block_count, 1);
+        // The whole conflict block is shown.
+        assert!(snip.text.contains("<<<<<<< ours"));
+        assert!(snip.text.contains("mine"));
+        assert!(snip.text.contains("yours"));
+        assert!(snip.text.contains(">>>>>>> theirs"));
+        // Distant context (ctx1/ctx10) is elided behind a cue on each side.
+        assert!(!snip.text.contains("ctx1\n") || snip.text.matches("<CUE>").count() >= 1);
+        assert_eq!(snip.text.matches("<CUE>").count(), snip.gaps.len());
+        assert!(snip.gaps.iter().any(|g| g.below == Some(0)));
+        assert!(snip.gaps.iter().any(|g| g.above == Some(0)));
+    }
+
+    #[test]
+    fn conflict_snippets_reconstruct_to_the_original() {
+        let full = conflict_file();
+        let snip = render_conflict_snippets(&full, &ContextExpansion::default(), "<CUE>");
+        let shown: Vec<&str> = snip.text.split('\n').collect();
+        let rebuilt = reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>");
+        assert_eq!(rebuilt, full);
+    }
+
+    #[test]
+    fn conflict_snippets_reconstruct_after_editing_a_shown_line() {
+        let full = conflict_file();
+        let snip = render_conflict_snippets(&full, &ContextExpansion::default(), "<CUE>");
+        // Resolve the block by hand: drop the markers, keep "mine".
+        let resolved_text = snip
+            .text
+            .replace("<<<<<<< ours\n", "")
+            .replace("=======\nyours\n>>>>>>> theirs\n", "");
+        let shown: Vec<&str> = resolved_text.split('\n').collect();
+        let rebuilt = reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>");
+        // The elided context is restored verbatim; the resolved block has no markers.
+        assert!(rebuilt.contains("ctx1\n"));
+        assert!(rebuilt.contains("ctx10\n"));
+        assert!(rebuilt.contains("mine\n"));
+        assert!(!rebuilt.contains("<<<<<<<"));
+        assert!(!rebuilt.contains("yours"));
     }
 }

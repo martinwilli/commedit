@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 comm(ed)it is a GTK4 desktop app for visually editing the *history* of a git
 repo — any commit in the graph, not just the latest. Pick a commit, edit its
-message, identity, or file content (as an editable unified diff), or reorder it
-by drag-and-drop; saving rewrites that commit in place and auto-rebases its
-descendants. See `README.md` for the user-facing pitch.
+message, identity, or file content (as an editable unified diff), or reorder /
+squash it by drag-and-drop; saving rewrites that commit in place and auto-rebases
+its descendants. See `README.md` for the user-facing pitch.
 
 ## Commands
 
@@ -79,6 +79,20 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   object lingers in the ODB (kept reachable so a later restore can graft it
   back). Restore reuses the `reorder_commit` body. Both share the same
   plan-then-rebase shape as reorder.
+- `squash_into` (`squash.rs`) + `plan_squash` / `squash_recommendations` —
+  drag one commit *onto* another to merge it in. Built on jj-lib's native
+  `squash_commits` (full-commit selection): the source's changes are applied to
+  the target's tree, the source is abandoned, descendants rebase. Preserves the
+  target's **author** but lets jj re-stamp the committer (git `--autosquash`
+  style); the new message is `compose_squash_message`'d per `SquashMode` (Fixup
+  keeps the target's, Squash appends the source's body, Amend replaces with it).
+  Unlike reorder it does **not** set the head bookmark — the post-squash tip is
+  always a rewrite-descendant of the old head (or, when the source *was* the tip,
+  the abandoned tip's parent), which jj's automatic bookmark moves follow. The
+  pure, GTK-free, inline-tested helpers (`parse_squash_mode`,
+  `squash_target_subject`, `squash_recommendations`, `compose_squash_message`)
+  read git's `fixup!`/`squash!`/`amend!` subject prefixes so the UI can recommend
+  drop targets and compose the merged message.
 
 ### Conflict resolution (`conflict.rs`)
 
@@ -140,7 +154,14 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
 `commedit-gtk/src/main.rs` is the whole UI: `build_ui` wires the history list,
 message/identity fields, and the SourceView diff buffer, intercepting key events
 through `plan_edit` and re-rendering via a boxed `Renderer` closure when hunks
-expand.
+expand. History drag-and-drop is **zone-based** (`show_zone`): a row's top/bottom
+quarter opens a reorder gap (the placeholder), its middle half marks a squash
+target (`set_squash_target`); dragging an autosquash-prefixed commit highlights
+recommended targets green and sibling fixups yellow, and dropping an unprefixed
+commit onto another opens the fixup/squash/amend popover (`show_squash_popover`).
+A drop only *stages* its rewrite into `post_drag`, run at idle from `drag-end` —
+rewriting history mid-gesture frees a row GTK still tracks as the drop target and
+segfaults, so `populate_rows` also only hides (never unparents) surplus rows.
 
 ## Conventions
 

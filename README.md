@@ -37,6 +37,18 @@ abort it and leave history exactly as it was. Some conflicts are structural
 (a directory, symlink, or submodule rather than text) and can't be resolved in
 the diff pane — for those, aborting the rewrite is the only way out.
 
+And you can **squash** one commit into another by dragging it *onto* a commit —
+drop on the middle of a row (its top and bottom edges still open a gap to
+reorder). A commit marked with git's autosquash prefix — `fixup! <subject>`,
+`squash! <subject>` or `amend! <subject>` — lights up its matching target
+**green** while you drag (and any sibling autosquash commits aimed at the same
+target **yellow**), and folds in immediately when dropped: `fixup!` keeps the
+target's message, `squash!` appends the dragged commit's message to it, and
+`amend!` replaces it. Dropping an ordinary commit onto another instead opens a
+small popup to pick fixup / squash / amend (or cancel — handy if the drop was an
+accident). A squash is a rebase too, so it can conflict, and is then held back
+and resolved exactly like a reorder.
+
 ## Installing a binary release
 
 Pre-built binaries for Linux (x86-64) and macOS (Apple Silicon) are attached to

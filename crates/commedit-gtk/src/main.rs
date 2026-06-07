@@ -923,11 +923,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     files_box.append(&file_scroll);
     files_box.append(&bottom_bar);
 
+    // The file pane carries the Save action bar at its bottom. A Paned lets
+    // either child be shrunk below its minimum by default, so dragging this
+    // divider down (or shrinking the window) would squeeze `files_box` until its
+    // bottom bar overflowed off the window edge — the Save button ending up
+    // partly or wholly off-screen and unclickable. Pin the end child to its
+    // minimum so the action bar always stays visible; the message pane (the
+    // start child, still shrinkable) absorbs the slack instead.
     let right_paned = Paned::builder()
         .orientation(Orientation::Vertical)
         .start_child(&message_box)
         .end_child(&files_box)
         .position(200)
+        .shrink_end_child(false)
         .build();
 
     let paned = Paned::builder()

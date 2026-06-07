@@ -1950,6 +1950,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drop_gap = drop_gap.clone();
         let repo = repo.clone();
         let drag_from = drag_from.clone();
+        let drag_origin = drag_origin.clone();
+        let trashed = trashed.clone();
         Rc::new(move |y: f64| {
             let n = commits.borrow().len();
             let current = drop_gap.get();
@@ -1973,14 +1975,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if current == Some(new_gap) {
                 return;
             }
-            // Only open a gap where dropping would actually move the commit. The
-            // gaps just above and below the dragged row leave it in place
-            // (plan_reorder returns None), as do off-chain rows — show no
-            // placeholder there.
-            let real_move = drag_from.get().is_some_and(|from| {
-                repo.borrow()
+            // Only open a gap where dropping would actually move/graft the
+            // commit. For a history drag the no-op gaps just above/below the
+            // dragged row (and off-chain rows) yield None; for a trash drag the
+            // same gate runs through plan_restore on the trashed commit.
+            let real_move = drag_from.get().is_some_and(|from| match drag_origin.get() {
+                DragOrigin::History => repo
+                    .borrow()
                     .plan_reorder(&commits.borrow(), from, new_gap)
-                    .is_some()
+                    .is_some(),
+                DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
+                    repo.borrow()
+                        .plan_restore(&commits.borrow(), info, new_gap)
+                        .is_some()
+                }),
             });
             if !real_move {
                 if placeholder.parent().is_some() {
@@ -2019,6 +2027,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drag_from = drag_from.clone();
         let drag_origin = drag_origin.clone();
         let drop_onto = drop_onto.clone();
+        let trashed = trashed.clone();
         Rc::new(move |ci: usize| {
             if drop_onto.get() == Some(ci) {
                 return;
@@ -2028,10 +2037,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     r.remove_css_class("squash-drop-target");
                 }
             }
-            let valid = drag_origin.get() == DragOrigin::History
-                && drag_from.get().is_some_and(|from| {
+            // A history drag squashes one chain commit onto another; a trash drag
+            // squashes the trashed commit onto the chain commit at `ci`.
+            let valid = drag_from.get().is_some_and(|from| match drag_origin.get() {
+                DragOrigin::History => {
                     repo.borrow().plan_squash(&commits.borrow(), from, ci).is_some()
-                });
+                }
+                DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
+                    repo.borrow()
+                        .plan_squash_restore(&commits.borrow(), info, ci)
+                        .is_some()
+                }),
+            });
             if valid {
                 if let Some(r) = list.row_at_index(ci as i32) {
                     r.add_css_class("squash-drop-target");
@@ -2306,6 +2323,83 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }));
                     true
                 }
+                DragOrigin::Trash if onto.is_some() => {
+                    // Dropped a trashed commit ONTO a chain commit: squash its
+                    // changes into that commit and forget it from the trash. A
+                    // prefixed trashed subject acts at once; otherwise a popover
+                    // picks the mode — mirroring the history squash arm above.
+                    let onto = onto.unwrap();
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
+                    let trashed = trashed.clone();
+                    let trash_list = trash_list.clone();
+                    let trash_scroll = trash_scroll.clone();
+                    let list = list.clone();
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
+                        let Some(info) = trashed.borrow().get(from as usize).cloned() else {
+                            return;
+                        };
+                        let plan =
+                            repo.borrow().plan_squash_restore(&commits.borrow(), &info, onto);
+                        let Some((source, dest)) = plan else {
+                            return;
+                        };
+                        let subject = info.subject.clone();
+                        let change_hex = info.change_id_hex();
+
+                        // Run a chosen mode and report the outcome.
+                        let apply: Rc<dyn Fn(SquashMode)> = {
+                            let repo = repo.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            let trashed = trashed.clone();
+                            let trash_list = trash_list.clone();
+                            let trash_scroll = trash_scroll.clone();
+                            Rc::new(move |mode| {
+                                let outcome =
+                                    repo.borrow_mut().squash_restore_into(&source, &dest, mode);
+                                // On success (Clean or pending Conflicts) the
+                                // changes now live in the target, so forget the
+                                // trashed commit — match by change id, since the
+                                // popover may have let the trash drift.
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => {
+                                        trashed
+                                            .borrow_mut()
+                                            .retain(|c| c.change_id_hex() != change_hex);
+                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        refresh();
+                                    }
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        trashed
+                                            .borrow_mut()
+                                            .retain(|c| c.change_id_hex() != change_hex);
+                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        enter_conflict_mode(commits);
+                                    }
+                                    Err(err) => show_status(&format!("Squash failed: {err}")),
+                                }
+                            })
+                        };
+
+                        match parse_squash_mode(&subject) {
+                            // Prefixed: the prefix picks the mode, apply at once.
+                            Some(mode) => apply(mode),
+                            // Unprefixed: ask how to merge, anchored at the target.
+                            None => {
+                                let Some(target_row) = list.row_at_index(onto as i32) else {
+                                    return;
+                                };
+                                show_squash_popover(&target_row, &apply);
+                            }
+                        }
+                    }));
+                    true
+                }
                 DragOrigin::Trash => {
                     // Restoring a trashed commit: graft it back into the chain at
                     // the drop gap, drop it from the trash, and select it.
@@ -2365,6 +2459,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trashed = trashed.clone();
         let drag_row = drag_row.clone();
         let drag_origin = drag_origin.clone();
+        let drag_from = drag_from.clone();
         move |source, _x, y| {
             if trashed.borrow().is_empty() {
                 return None; // only the hint row is present
@@ -2374,26 +2469,62 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             source.set_icon(Some(&paintable), 0, 0);
             *drag_row.borrow_mut() = Some(row.clone());
             drag_origin.set(DragOrigin::Trash);
+            // The motion handlers (show_gap / set_squash_target) read drag_from to
+            // validate the restore/squash; it's the trash row index here.
+            drag_from.set(Some(row.index() as usize));
             Some(gdk::ContentProvider::for_value(&row.index().to_value()))
         }
     });
     trash_drag.connect_drag_begin({
         let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
+        let trashed = trashed.clone();
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let list = list.clone();
         move |_source, _drag| {
             if let Some(row) = drag_row.borrow().as_ref() {
                 row.add_css_class("commit-dragging");
+            }
+            // Same green/yellow squash hints as a history drag, for a trashed
+            // commit whose subject carries an autosquash prefix. Empty otherwise.
+            if let Some(info) = drag_from.get().and_then(|f| trashed.borrow().get(f).cloned()) {
+                let recs = repo.borrow().squash_recommendations_for(&commits.borrow(), &info);
+                for i in recs.targets {
+                    if let Some(r) = list.row_at_index(i as i32) {
+                        r.add_css_class("squash-recommended");
+                    }
+                }
+                for i in recs.siblings {
+                    if let Some(r) = list.row_at_index(i as i32) {
+                        r.add_css_class("squash-sibling");
+                    }
+                }
             }
         }
     });
     trash_drag.connect_drag_end({
         let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
         let clear_gap = clear_gap.clone();
+        let clear_squash_target = clear_squash_target.clone();
+        let list = list.clone();
         let post_drag = post_drag.clone();
         move |_source, _drag, _delete| {
             if let Some(row) = drag_row.borrow_mut().take() {
                 row.remove_css_class("commit-dragging");
             }
+            drag_from.set(None);
             clear_gap();
+            // The trash drag highlights history rows too (green/yellow recs, red
+            // target); strip them here, as populate_rows leaves them alone.
+            let mut i = 0;
+            while let Some(r) = list.row_at_index(i) {
+                r.remove_css_class("squash-recommended");
+                r.remove_css_class("squash-sibling");
+                i += 1;
+            }
+            clear_squash_target();
             run_post_drag(&post_drag);
         }
     });

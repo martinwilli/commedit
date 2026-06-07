@@ -3358,7 +3358,18 @@ fn show_squash_popover(target_row: &ListBoxRow, apply: &Rc<dyn Fn(SquashMode)>) 
     let cancel_btn = button("Cancel", "Don't merge — leave history unchanged.");
 
     popover.set_child(Some(&vbox));
-    popover.set_parent(target_row);
+    // Parent to the list (the row's container), NOT the row itself: a *selected*
+    // target row carries the selected-state foreground (white), which the
+    // popover's button labels would inherit through the widget tree — leaving
+    // white-on-grey, unreadable text. The list carries the normal theme colors.
+    // Point the popover at the row's allocation (in list coordinates) so it
+    // still anchors at the drop target.
+    if let Some(parent) = target_row.parent() {
+        popover.set_parent(&parent);
+        popover.set_pointing_to(Some(&target_row.allocation()));
+    } else {
+        popover.set_parent(target_row);
+    }
     popover.set_autohide(true);
 
     let wire = |btn: &Button, mode: Option<SquashMode>| {

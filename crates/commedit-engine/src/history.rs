@@ -43,7 +43,7 @@ impl CommitInfo {
         self.change_id.hex()
     }
 
-    fn from_commit(commit: &Commit) -> Self {
+    pub(crate) fn from_commit(commit: &Commit) -> Self {
         let description = commit.description().to_string();
         let subject = description.lines().next().unwrap_or("").to_string();
         let author = commit.author();

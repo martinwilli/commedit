@@ -212,7 +212,7 @@ fn working_copy_info_is_some_only_when_dirty() {
 }
 
 #[test]
-fn overlapping_edit_leaves_a_conflict_advisory_and_markers() {
+fn overlapping_edit_defers_as_a_conflict_then_resolves() {
     use commedit_engine::conflict::SaveOutcome;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -232,13 +232,35 @@ fn overlapping_edit_leaves_a_conflict_advisory_and_markers() {
         .rewrite_file(&base, "f.txt", "1\n2-rewritten\n3\n")
         .expect("rewrite");
 
-    // The committed history is clean, so the rewrite exported...
+    // The overlap surfaces @ ("Uncommitted changes") as a conflicted commit and
+    // the whole rewrite defers — git is left completely untouched.
+    let SaveOutcome::Conflicts { commits } = outcome else {
+        panic!("expected the overlap to defer as a conflict");
+    };
+    let wc = commits
+        .iter()
+        .find(|c| c.subject == "Uncommitted changes")
+        .expect("@ is among the conflicts");
+    assert_eq!(common::git_log_subjects(dir), vec!["top", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\n2\n3");
+    assert!(
+        !std::fs::read_to_string(dir.join("f.txt")).unwrap().contains("<<<<<<<"),
+        "git/worktree must be untouched while the conflict is pending"
+    );
+
+    // Resolve @ in the pane, exactly like a commit conflict: read the markers,
+    // write back a resolution.
+    let cf = repo.read_conflict(&wc.change_id_hex(), "f.txt").expect("read conflict");
+    let outcome = repo
+        .resolve_conflict(&wc.change_id_hex(), "f.txt", "1\n2-resolved\n3\n", cf.marker_len)
+        .expect("resolve");
+
+    // Now the rewrite applies to git, and the resolved working copy lands on disk.
     assert!(matches!(outcome, SaveOutcome::Clean));
-    // ...but reapplying the local edit conflicted: advisory names the file and
-    // the working tree holds conflict markers.
-    let adv = repo.take_working_copy_advisory().expect("advisory");
-    assert!(adv.conflicted_paths.iter().any(|p| p == "f.txt"));
-    let disk = std::fs::read_to_string(dir.join("f.txt")).unwrap();
-    assert!(disk.contains("<<<<<<<"), "expected conflict markers, got: {disk}");
-    assert!(repo.working_copy_info().expect("dirty").has_conflict);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\n2-rewritten\n3");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "1\n2-resolved\n3\n"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
 }

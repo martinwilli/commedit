@@ -1213,21 +1213,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let wc_advisory_label = wc_advisory_label.clone();
         let wc_advisory_banner = wc_advisory_banner.clone();
         Rc::new(move |adv: WorkingCopyAdvisory| {
-            let mut parts: Vec<String> = Vec::new();
-            if !adv.conflicted_paths.is_empty() {
-                parts.push(format!(
-                    "Your uncommitted changes to {} overlapped the rewrite and now have \
-                     conflict markers in the working tree.",
-                    adv.conflicted_paths.join(", ")
-                ));
-            }
-            if let Some(r) = &adv.index_backup_ref {
-                parts.push(format!(
-                    "Staged content not on disk was preserved at {r} \
-                     (recover with `git read-tree {r}`)."
-                ));
-            }
-            wc_advisory_label.set_text(&parts.join(" "));
+            let r = &adv.index_backup_ref;
+            wc_advisory_label.set_text(&format!(
+                "Staged content not present on disk was preserved at {r} \
+                 (recover with `git read-tree {r}`)."
+            ));
             wc_advisory_banner.set_visible(true);
         })
     };

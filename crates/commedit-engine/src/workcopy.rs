@@ -42,16 +42,15 @@ pub struct WorkingCopyInfo {
 }
 
 /// How the user's uncommitted changes fared across the most recent rewrite, for
-/// the UI to surface. Only produced when there is something worth telling the
-/// user about (a conflict or an index backup).
+/// the UI to surface once. An overlap between a local edit and the rewrite is
+/// handled by the deferred conflict-resolution flow (the working copy `@` shows
+/// up as a conflicted commit), so the only thing left to report here is staged
+/// content that only lived in the git index and was pinned to a backup ref.
 #[derive(Debug, Clone)]
 pub struct WorkingCopyAdvisory {
-    /// Working-tree paths left with conflict markers because the local edit
-    /// overlapped the rewrite. Empty when the reapply merged cleanly.
-    pub conflicted_paths: Vec<String>,
     /// A `refs/commedit/backup/index-*` ref pinning staged content that only
     /// lived in the index (see [`crate::transparency::backup_index_only_content`]).
-    pub index_backup_ref: Option<String>,
+    pub index_backup_ref: String,
 }
 
 impl Repo {
@@ -144,15 +143,9 @@ impl Repo {
                 if let Some(new_head) = crate::transparency::head_commit(&root) {
                     crate::transparency::reset_index_to(&root, &new_head)?;
                 }
-                // If reapplying the local edits onto the rewrite left @ conflicted,
-                // the working tree now holds conflict markers; record an advisory
-                // (with any index backup) for the UI to surface.
-                let conflicted_paths = self.working_copy_conflicted_paths();
-                self.wc_advisory = (!conflicted_paths.is_empty() || index_backup.is_some())
-                    .then_some(WorkingCopyAdvisory {
-                        conflicted_paths,
-                        index_backup_ref: index_backup,
-                    });
+                // A conflicted @ never reaches here — it defers via the conflict
+                // flow — so the only advisory left is the index backup, if any.
+                self.wc_advisory = index_backup.map(|r| WorkingCopyAdvisory { index_backup_ref: r });
                 Ok(())
             }
             None => self.sync_worktree(old_head),
@@ -191,23 +184,15 @@ impl Repo {
         self.wc_advisory.take()
     }
 
-    /// The working-tree paths where `@` is currently conflicted (markers on
-    /// disk), empty when it merged cleanly.
-    fn working_copy_conflicted_paths(&self) -> Vec<String> {
-        let Some(id) = self.working_copy_commit_id() else {
-            return Vec::new();
-        };
-        let Ok(commit) = self.repo.store().get_commit(&id) else {
-            return Vec::new();
-        };
-        if !commit.has_conflict() {
-            return Vec::new();
-        }
-        commit
-            .tree()
-            .conflicts()
-            .map(|(path, _value)| path.as_internal_file_string().to_string())
-            .collect()
+    /// The working-copy commit `@` as a history row, labelled "Uncommitted
+    /// changes". The UI prepends this to the conflict chain so a conflicted `@`
+    /// is selectable and resolvable like any other commit.
+    pub fn working_copy_commit_info(&self) -> Option<crate::history::CommitInfo> {
+        let id = self.working_copy_commit_id()?;
+        let commit = self.repo.store().get_commit(&id).ok()?;
+        let mut info = crate::history::CommitInfo::from_commit(&commit);
+        info.subject = "Uncommitted changes".to_string();
+        Some(info)
     }
 
     /// Re-parent `@` onto the current git HEAD when it isn't already there (e.g.

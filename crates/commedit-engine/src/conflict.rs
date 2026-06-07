@@ -306,6 +306,67 @@ impl Repo {
         Ok(())
     }
 
+    /// Roll the entire session back to its starting point: restore jj's view to
+    /// the operation captured at [`Repo::open`] (the original commits *and* the
+    /// session-start working copy) and re-export it to git, so plain `git` sees
+    /// the original history and the working tree is reset to its session-start
+    /// content. Discards every rewrite/reorder/squash/drop and every
+    /// working-copy edit made this session — the in-app equivalent of
+    /// `git reset --hard <session head>`.
+    ///
+    /// Like [`Self::abort`], the restore is *recorded* as a new operation rather
+    /// than a bare reload (see that method's note on why a divergent op head
+    /// would otherwise resurface the old state). Unlike `abort`, clean saves
+    /// during the session already moved git refs / HEAD / the worktree, so the
+    /// restored state must be exported and materialized back to disk — hence the
+    /// `export_and_sync` tail. Reverting drops any pending conflicted rewrite
+    /// first (git was never touched for it).
+    pub fn revert_all(&mut self) -> Result<()> {
+        crate::repo::catch_jj("reverting the session", || self.revert_all_inner())
+    }
+
+    fn revert_all_inner(&mut self) -> Result<()> {
+        let Some(session_op) = self.session_op.clone() else {
+            return Ok(());
+        };
+        // Drop any held-back conflicted rewrite; git was never touched for it.
+        self.pending = None;
+        // The export tail needs the *current* (rewritten) on-disk state to sync
+        // away from and the unrelated branches to hold in place.
+        let old_head = self.head_commit();
+        let bookmarks = self.local_bookmark_targets();
+        let heads = self.snapshot_heads();
+        // jj's recorded git-ref state tracks what it last wrote to git's
+        // refs/*; the session's clean saves left it at the rewritten tips. Keep
+        // a copy: `set_view` below rewinds this record to the session-start
+        // values, but git's actual on-disk refs are still at the rewritten tips,
+        // so the export would see no bookmark/ref diff and push nothing. We
+        // re-stamp these afterwards so the export reconciles git with reality.
+        let on_disk_git_refs: Vec<_> = self
+            .repo
+            .view()
+            .git_refs()
+            .iter()
+            .map(|(name, target)| (name.clone(), target.clone()))
+            .collect();
+        // Restore the session-start view and record it as a new operation.
+        let view = block_on(session_op.view()).context("reading the session-start view")?;
+        let mut tx = self.repo.start_transaction();
+        tx.repo_mut().set_view(view.store_view().clone());
+        // Re-point the recorded git refs at what git actually holds on disk, so
+        // the deferred export detects bookmark(session-start) != git-ref(current)
+        // and pushes the restored tips back to git.
+        for (name, target) in &on_disk_git_refs {
+            tx.repo_mut().set_git_ref_target(name, target.clone());
+        }
+        self.repo = block_on(tx.commit("commedit: revert all to session start"))
+            .context("recording the revert")?;
+        // Push the restored state back to git and check the original working
+        // copy back out to disk. The session-start state was a clean exported
+        // git history, so the restored chain is always conflict-free.
+        self.export_and_sync(old_head, &bookmarks, &heads)
+    }
+
     /// Materialize one conflicted file of the commit with change id `change_id`
     /// to Git-style 2-way conflict-marker text, for display in the editor.
     pub fn read_conflict(&self, change_hex: &str, path: &str) -> Result<ConflictedFile> {

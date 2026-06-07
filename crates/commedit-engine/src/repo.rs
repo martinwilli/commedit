@@ -14,6 +14,7 @@ use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions};
 use jj_lib::op_store::RefTarget;
+use jj_lib::operation::Operation;
 use jj_lib::ref_name::RefNameBuf;
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, StoreFactories};
 use jj_lib::settings::UserSettings;
@@ -36,6 +37,14 @@ pub struct Repo {
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
+    /// The jj operation captured at the end of [`Repo::open`] — the
+    /// fully-initialized, pre-session state (working copy included).
+    /// [`Repo::revert_all`] rolls the whole session back to it. `None` only in
+    /// the (unreachable) window before `open` finishes capturing it.
+    pub(crate) session_op: Option<Operation>,
+    /// The git HEAD commit (hex) as of session start, shown in the UI's
+    /// "Revert all" confirmation so the user sees what they revert to.
+    session_head: Option<String>,
 }
 
 impl Repo {
@@ -75,6 +84,8 @@ impl Repo {
             settings,
             git_head_branch,
             pending: None,
+            session_op: None,
+            session_head: None,
         };
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;
@@ -82,6 +93,11 @@ impl Repo {
         // Record any uncommitted changes into @ so they show in the history and
         // ride through rewrites from the start.
         this.snapshot_working_copy()?;
+        // Remember the fully-initialized session-start state (after the working
+        // copy snapshot, so it includes the original uncommitted changes) so
+        // `revert_all` can roll the whole session back to it.
+        this.session_op = Some(this.repo.operation().clone());
+        this.session_head = this.head_commit();
         Ok(this)
     }
 
@@ -162,6 +178,12 @@ impl Repo {
     /// goes wrong.
     pub fn head_commit_hex(&self) -> Option<String> {
         self.head_commit()
+    }
+
+    /// The git HEAD commit (hex) captured at session start — the state
+    /// [`Repo::revert_all`] restores. Shown in the UI's revert confirmation.
+    pub fn session_start_head_hex(&self) -> Option<String> {
+        self.session_head.clone()
     }
 
     /// Snapshot every local branch (`refs/heads/*`) as git sees it now, to pair

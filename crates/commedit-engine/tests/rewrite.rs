@@ -495,3 +495,97 @@ fn drops_branch_tip_moving_the_branch_to_its_parent() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn revert_all_restores_the_original_session_state_to_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    // The state to revert back to: the original subjects and the exact HEAD.
+    let original_subjects = common::git_log_subjects(dir);
+    let original_head = common::git(dir, &["rev-parse", "HEAD"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Stack two distinct mutations on top of the session-start state: edit a
+    // middle message, then drop the tip.
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let second = commits
+        .iter()
+        .find(|c| c.subject == "second")
+        .expect("second commit present")
+        .id
+        .clone();
+    repo.rewrite_message(&second, "second (edited)").expect("rewrite");
+
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second (edited), first]
+    let tip = repo.plan_drop(&commits, 0).expect("droppable"); // "third"
+    repo.abandon_commit(&tip).expect("drop");
+
+    // Sanity: git now sees the rewritten, shortened history.
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["second (edited)", "first"]
+    );
+
+    // Revert the whole session.
+    repo.revert_all().expect("revert all");
+
+    // git sees exactly the original history again — same subjects AND the same
+    // commit object at HEAD, proving a true revert rather than a fresh rewrite.
+    assert_eq!(common::git_log_subjects(dir), original_subjects);
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), original_head);
+
+    // Transparency invariants hold after the revert.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn revert_all_discards_session_working_copy_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
+
+    // Session starts with a clean working tree.
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Make an uncommitted on-disk edit, then a history rewrite that snapshots it
+    // into the working-copy commit and carries it through the rewrite.
+    std::fs::write(dir.join("a.txt"), "a changed this session\n").unwrap();
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let first = commits
+        .iter()
+        .find(|c| c.subject == "first")
+        .expect("first commit present")
+        .id
+        .clone();
+    repo.rewrite_message(&first, "first (edited)").expect("rewrite");
+
+    // The edit survived the rewrite (working-copy preservation).
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a changed this session\n"
+    );
+
+    // Reverting to the session-start state discards the working-copy edit too:
+    // the original content is checked back out and the tree is clean again.
+    repo.revert_all().expect("revert all");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

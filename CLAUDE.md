@@ -43,9 +43,10 @@ time. This invariant drives much of the code:
   replaces `self.repo` with the result.
 - `transparency.rs` — the glue that hides jj from git: re-attach HEAD to its
   original branch (jj uses detached HEAD by design), export jj bookmarks to git
-  refs, exclude `.jj/` via `.git/info/exclude`, and `git read-tree -m -u` the
-  working tree to the rewritten tip. The post-rewrite invariant verified by
-  tests is: HEAD symbolic + `git status` clean + `git fsck` passes.
+  refs, exclude `.jj/` via `.git/info/exclude`, and reset the git index to the
+  rewritten tip. The post-rewrite invariant verified by tests is: HEAD symbolic +
+  `git fsck` passes + `git status` shows exactly the user's uncommitted changes
+  (clean when there were none — see "Working-copy preservation").
 
 ### Mutation pipeline (every edit follows the same shape)
 
@@ -59,8 +60,8 @@ inline.
 `finish_mutation` (`conflict.rs`) is the shared tail: it commits the jj
 transaction, then walks the branch tip's ancestors for `commit.has_conflict()`.
 If clean it runs the deferred export (`export_to_git` → `reattach_head` →
-`sync_worktree(old_head)` → `prune_orphaned_keep_refs`) in a second transaction
-and returns `SaveOutcome::Clean`. If conflicted it stores a `PendingResolution`
+`materialize_after_rewrite(old_head)` → `prune_orphaned_keep_refs`) in a second
+transaction and returns `SaveOutcome::Clean`. If conflicted it stores a `PendingResolution`
 and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — see
 "Conflict resolution" below.
 
@@ -93,6 +94,38 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   `squash_target_subject`, `squash_recommendations`, `compose_squash_message`)
   read git's `fixup!`/`squash!`/`amend!` subject prefixes so the UI can recommend
   drop targets and compose the merged message.
+
+### Working-copy preservation (`workcopy.rs`)
+
+Uncommitted changes are first-class: they live in jj's **working-copy commit
+`@`**, so a rewrite never loses them. `snapshot_working_copy` (run at `Repo::open`
+and at the start of every mutation) re-parents `@` onto the current tip and
+snapshots the on-disk tree into it — tracked edits **and** untracked, non-ignored
+files; jj skips `.git`/`.jj` and honours `.gitignore` + `.git/info/exclude`. So
+`@`-vs-parent *is* the uncommitted delta, which `rebase_descendants` carries
+forward (`@`→`@'`) through the rewrite like any other descendant.
+`materialize_after_rewrite` (in the deferred export, replacing the old
+`sync_worktree`) checks `@'` out to disk via jj and resets the git index to the
+new tip. Non-overlapping local edits merge cleanly onto the rewritten content; an
+overlap leaves `@'` conflicted with markers on disk — reported by
+`take_working_copy_advisory`, **not** blocking the export (`@'` is a descendant of
+the tip, outside `finish_mutation`'s ancestor conflict walk).
+
+Caveats this creates:
+- jj has no index concept (it snapshots the disk, never `.git/index`), so staging
+  collapses to unstaged after a rewrite. Staged content that lives *only* in the
+  index (staged then reverted/deleted on disk) is invisible to `@`, so
+  `backup_index_only_content` pins it to a `refs/commedit/backup/index-*` ref
+  before the index reset — never lost, recoverable with `git read-tree`.
+- `prune_orphaned_keep_refs` now drops *our own* working-copy keep-refs (the
+  current `@`, its superseded snapshots sharing its change id, and jj's empty
+  scaffolding) so they don't surface as phantom commits in `git log --all`, while
+  still preserving a manual jj user's anonymous head (real content + description,
+  unrelated change id).
+- The GTK UI shows `@` via `working_copy_info` as a **read-only, non-draggable
+  row above the history list** — its own single-row list, deliberately *not* part
+  of the history list, so the reorder/drop/squash index arithmetic and drag wiring
+  are untouched.
 
 ### Conflict resolution (`conflict.rs`)
 

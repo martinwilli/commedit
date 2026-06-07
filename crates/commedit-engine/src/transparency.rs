@@ -315,6 +315,74 @@ pub fn reset_index_to(workspace_root: &Path, rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// If the git index holds staged content that is **not** reflected in the
+/// working tree — a file staged then reverted or deleted on disk — jj's
+/// worktree snapshot can't see it (jj reads the disk, never `.git/index`), so a
+/// rewrite that resets the index would lose it. Capture the whole index as a
+/// durable `refs/commedit/backup/index-*` commit so it stays recoverable
+/// (`git read-tree`/`git checkout` the ref), and return that ref. Returns `None`
+/// when there is no such index-only content. Best-effort: any git failure yields
+/// `None` rather than blocking the rewrite.
+pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
+    if !has_index_only_content(workspace_root) {
+        return None;
+    }
+    let tree = git_line(workspace_root, &["write-tree"])?;
+    let commit = git_line(
+        workspace_root,
+        &["commit-tree", &tree, "-m", "commedit: index backup (staged content not on disk)"],
+    )?;
+    let refname = format!("refs/commedit/backup/index-{}", &commit[..commit.len().min(12)]);
+    let ok = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["update-ref", &refname, &commit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(refname)
+}
+
+/// Whether `git status` reports any path that is staged *and* differs again in
+/// the working tree (codes like `MM`, `AD`, `MD`) — i.e. the staged version is
+/// not the on-disk version, so it lives only in the index.
+fn has_index_only_content(workspace_root: &Path) -> bool {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            let b = line.as_bytes();
+            // X = index column, Y = worktree column. Index-only content ⟺ a
+            // staged change (X not space, not the `?` of untracked) that the
+            // worktree changed again (Y not space).
+            b.len() >= 2 && b[0] != b' ' && b[0] != b'?' && b[1] != b' '
+        })
+}
+
+/// Run a git command expected to print a single line (e.g. an object id),
+/// returning the trimmed stdout, or `None` on failure/empty output.
+fn git_line(workspace_root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
 /// Read a single git config value (e.g. `user.name`) as git itself would see it
 /// — honouring the system, global, and repo-local config hierarchy. `None` if
 /// the key is unset or git can't be run. Whitespace-only values count as unset.

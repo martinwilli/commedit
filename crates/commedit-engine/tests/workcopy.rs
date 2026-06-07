@@ -144,3 +144,52 @@ fn non_overlapping_edit_to_a_rewritten_file_is_merged_on_disk() {
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1-rewritten\n2\n3\n4\n5");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn index_only_staged_content_is_backed_up_across_a_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Stage content into a.txt, then revert the working tree to HEAD: the staged
+    // version now lives ONLY in the git index, invisible to jj's disk snapshot.
+    std::fs::write(dir.join("a.txt"), "staged-only\n").unwrap();
+    common::git(dir, &["add", "a.txt"]);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+
+    let target = subject_id(&repo, "B").id;
+    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+
+    // The index-only content was pinned to a recoverable backup ref.
+    let backups = common::git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+    );
+    let backup = backups.lines().next().expect("an index backup ref exists");
+    assert!(backup.starts_with("refs/commedit/backup/index-"));
+    assert_eq!(
+        common::git(dir, &["show", &format!("{backup}:a.txt")]),
+        "staged-only"
+    );
+}
+
+#[test]
+fn a_plain_unstaged_edit_creates_no_backup_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    // Unstaged edit only: it lives on disk, so it needs no index backup.
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+
+    let target = subject_id(&repo, "B").id;
+    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+
+    assert_eq!(
+        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"]),
+        ""
+    );
+}

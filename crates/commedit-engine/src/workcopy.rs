@@ -104,6 +104,15 @@ impl Repo {
         match self.working_copy_commit_id() {
             Some(wc_id) => {
                 self.materialize_working_copy(&wc_id)?;
+                // Resetting the index below would drop any staged content that
+                // only lives in the index (not on disk, hence not in @). Pin it
+                // to a recoverable backup ref first so it is never lost.
+                if let Some(backup) = crate::transparency::backup_index_only_content(&root) {
+                    eprintln!(
+                        "commedit: staged changes not present on disk were preserved at {backup}; \
+                         recover with `git read-tree {backup}` or `git checkout {backup} -- .`"
+                    );
+                }
                 if let Some(new_head) = crate::transparency::head_commit(&root) {
                     crate::transparency::reset_index_to(&root, &new_head)?;
                 }

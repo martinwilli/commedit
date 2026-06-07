@@ -92,6 +92,61 @@ fn conflicting_reorder_is_held_back_then_resolved() {
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
+/// A reorder that conflicts in *two* files of the same commit is resolved by a
+/// single `resolve_conflicts` call per commit (all of that commit's files at
+/// once), and only then does git see the conflict-free history.
+#[test]
+fn multi_file_conflict_resolves_per_commit_in_one_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // base carries f.txt and g.txt; A and B each change the middle line of both.
+    common::init_repo(dir, &[("f.txt", "1\n2\n3\n", "base")]);
+    std::fs::write(dir.join("g.txt"), "x\ny\nz\n").unwrap();
+    common::git(dir, &["add", "g.txt"]);
+    common::git(dir, &["commit", "--amend", "-qm", "base"]);
+    std::fs::write(dir.join("f.txt"), "1\nA\n3\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "x\nA\nz\n").unwrap();
+    common::git(dir, &["commit", "-aqm", "A"]);
+    std::fs::write(dir.join("f.txt"), "1\nB\n3\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "x\nB\nz\n").unwrap();
+    common::git(dir, &["commit", "-aqm", "B"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+
+    let mut steps = 0;
+    let mut max_files = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let change_hex = oldest.change_id_hex();
+        // Resolve ALL of this commit's resolvable files together, in one call.
+        let files: Vec<(String, String, usize)> = oldest
+            .files
+            .iter()
+            .filter(|f| f.resolvable)
+            .map(|f| {
+                let path = f.path_str();
+                let cf = repo.read_conflict(&change_hex, &path).expect("read conflict");
+                let resolved = if path == "f.txt" { "1\nR\n3\n" } else { "x\nR\nz\n" };
+                (path, resolved.to_string(), cf.marker_len)
+            })
+            .collect();
+        max_files = max_files.max(files.len());
+        outcome = repo.resolve_conflicts(&change_hex, &files).expect("resolve");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending());
+    assert!(max_files >= 2, "a commit with two conflicted files was resolved at once");
+
+    assert_eq!(common::git_log_subjects(dir), vec!["A", "B", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
+    assert_eq!(common::git(dir, &["show", "HEAD:g.txt"]), "x\nR\nz");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
 #[test]
 fn aborting_a_conflicted_reorder_restores_the_original_history() {
     let tmp = tempfile::tempdir().unwrap();

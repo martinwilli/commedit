@@ -842,7 +842,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .build();
     let files_box = GtkBox::new(Orientation::Vertical, 0);
     file_dropdown.set_margin_start(8);
-    file_dropdown.set_margin_top(0);
+    // The vertical Paned overlays its ~9px resize handle on top of the bottom
+    // pane's top edge, and the handle's drag gesture (capture phase, on the Paned
+    // ancestor) claims presses over that band before they reach this dropdown's
+    // toggle button. Flush against the handle, the dropdown's top was swallowed —
+    // clicks there never opened it. Push the dropdown clear of the handle band.
+    file_dropdown.set_margin_top(14);
     file_dropdown.set_margin_end(8);
     file_dropdown.set_margin_bottom(4);
     // Transient feedback line for blocked edits and save errors. It lives at the

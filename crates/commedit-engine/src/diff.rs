@@ -9,6 +9,7 @@ use futures::StreamExt;
 use similar::{ChangeTag, DiffOp, TextDiff};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::RepoPath;
 use jj_lib::store::Store;
@@ -42,10 +43,21 @@ pub fn commit_changes(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Vec<F
     let commit = store.get_commit(commit_id).context("loading commit")?;
     let new_tree = commit.tree();
     let parent_tree = pollster::block_on(commit.parent_tree(repo)).context("parent tree")?;
+    tree_changes(&store, &parent_tree, &new_tree)
+}
 
+/// List the file changes between two arbitrary trees (`old` → `new`), as the
+/// content delta with text on both sides. The core of [`commit_changes`], also
+/// used to diff non-parent-related trees (e.g. the session "Review" comparing
+/// the current tree against the one the session started with).
+pub fn tree_changes(
+    store: &Arc<Store>,
+    old_tree: &MergedTree,
+    new_tree: &MergedTree,
+) -> Result<Vec<FileChange>> {
     let entries = pollster::block_on(
-        parent_tree
-            .diff_stream(&new_tree, &EverythingMatcher)
+        old_tree
+            .diff_stream(new_tree, &EverythingMatcher)
             .collect::<Vec<_>>(),
     );
 
@@ -55,8 +67,8 @@ pub fn commit_changes(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Vec<F
         let before = diff.before.into_resolved().ok().flatten();
         let after = diff.after.into_resolved().ok().flatten();
 
-        let (old_text, old_binary) = read_text(&store, &entry.path, before.as_ref())?;
-        let (new_text, new_binary) = read_text(&store, &entry.path, after.as_ref())?;
+        let (old_text, old_binary) = read_text(store, &entry.path, before.as_ref())?;
+        let (new_text, new_binary) = read_text(store, &entry.path, after.as_ref())?;
         let kind = match (before.is_some(), after.is_some()) {
             (false, true) => ChangeKind::Added,
             (true, false) => ChangeKind::Removed,

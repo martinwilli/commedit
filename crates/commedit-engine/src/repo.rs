@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
-use jj_lib::object_id::ObjectId;
+use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions};
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::RefNameBuf;
-use jj_lib::repo::{MutableRepo, ReadonlyRepo, StoreFactories};
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, StoreFactories};
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace::{default_working_copy_factories, Workspace};
 
@@ -79,6 +79,9 @@ impl Repo {
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;
         this.reattach_head()?;
+        // Record any uncommitted changes into @ so they show in the history and
+        // ride through rewrites from the start.
+        this.snapshot_working_copy()?;
         Ok(this)
     }
 
@@ -199,19 +202,53 @@ impl Repo {
     /// mutation has already been committed and exported, so a failure here must not
     /// invalidate that successful rewrite — errors are intentionally swallowed.
     pub(crate) fn prune_orphaned_keep_refs(&self, old_head: &str) {
-        // commedit's own jj working-copy commit(s) are ours to drop too.
-        let owned: Vec<String> = self
-            .repo
-            .view()
-            .wc_commit_ids()
-            .values()
-            .map(|id| id.hex())
-            .collect();
+        // commedit's own jj working-copy commits are ours to drop: the user's
+        // uncommitted changes are preserved by materializing @ to the working
+        // tree, so neither @ nor its superseded snapshots need linger as keep-refs
+        // (which would surface phantom working-copy commits in `git log --all`).
+        let owned = self.owned_workingcopy_keep_refs();
         let _ = crate::transparency::prune_orphaned_keep_refs(
             self.workspace.workspace_root(),
             old_head,
             &owned,
         );
+    }
+
+    /// The `refs/jj/keep/*` oids that protect commedit's own working-copy
+    /// commits — the current `@`, its superseded snapshots (sharing its change
+    /// id), and jj's empty, description-less scaffolding commits. A manual jj
+    /// user's anonymous head (real content and description, an unrelated change
+    /// id) is deliberately excluded so its keep-ref survives.
+    fn owned_workingcopy_keep_refs(&self) -> Vec<String> {
+        let root = self.workspace.workspace_root();
+        let wc_change = self
+            .working_copy_commit_id()
+            .and_then(|id| self.repo.store().get_commit(&id).ok())
+            .map(|c| c.change_id().clone());
+        crate::transparency::keep_ref_oids(root)
+            .into_iter()
+            .filter(|oid| {
+                let Some(cid) = CommitId::try_from_hex(oid) else {
+                    return false;
+                };
+                let Ok(commit) = self.repo.store().get_commit(&cid) else {
+                    return false;
+                };
+                Some(commit.change_id()) == wc_change.as_ref()
+                    || (commit.description().is_empty() && self.is_empty_commit(&commit))
+            })
+            .collect()
+    }
+
+    /// Whether `commit` carries no changes over its parent(s) — true for jj's
+    /// empty working-copy scaffolding and a clean `@`.
+    fn is_empty_commit(&self, commit: &Commit) -> bool {
+        match pollster::block_on(commit.parent_tree(self.repo.as_ref())) {
+            Ok(parent_tree) => {
+                commit.tree().tree_ids_and_labels() == parent_tree.tree_ids_and_labels()
+            }
+            Err(_) => false,
+        }
     }
 
     /// Update the working tree from the pre-rewrite tip (`old_head`) to the

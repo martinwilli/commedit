@@ -418,7 +418,10 @@ impl Repo {
             .context("committing export")?;
         self.reattach_head()?;
         self.protect_unrelated_heads(heads);
-        self.sync_worktree(old_head.clone())?;
+        // Write the rebased working-copy commit @' back to disk (preserving the
+        // user's uncommitted changes through the rewrite), in place of the old
+        // git read-tree sync.
+        self.materialize_after_rewrite(old_head.clone())?;
         if let Some(old) = old_head {
             self.prune_orphaned_keep_refs(&old);
         }

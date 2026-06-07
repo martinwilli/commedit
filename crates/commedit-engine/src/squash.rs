@@ -227,6 +227,8 @@ impl Repo {
         dest: &CommitId,
         mode: SquashMode,
     ) -> Result<SaveOutcome> {
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();

@@ -36,6 +36,8 @@ impl Repo {
     }
 
     fn rewrite_message_inner(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -78,6 +80,8 @@ impl Repo {
     }
 
     fn rewrite_identity_inner(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -224,6 +228,8 @@ impl Repo {
         new_tip: &CommitId,
         op_msg: &str,
     ) -> Result<SaveOutcome> {
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();
@@ -268,6 +274,8 @@ impl Repo {
     }
 
     fn abandon_commit_inner(&mut self, target: &CommitId) -> Result<SaveOutcome> {
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let bookmarks = self.local_bookmark_targets();

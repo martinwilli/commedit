@@ -93,6 +93,26 @@ impl Repo {
             .context("checking out the working copy")
     }
 
+    /// Materialize the rebased working-copy commit `@'` to disk after a rewrite,
+    /// then reset the git index to the new tip so `git status` shows the
+    /// preserved uncommitted changes. The jj-native replacement for the old
+    /// `git read-tree` worktree sync (which is kept as a fallback when there is
+    /// no working-copy commit, e.g. a detached HEAD). `old_head` is the
+    /// pre-rewrite git tip, used only by that fallback.
+    pub(crate) fn materialize_after_rewrite(&mut self, old_head: Option<String>) -> Result<()> {
+        let root = self.workspace.workspace_root().to_owned();
+        match self.working_copy_commit_id() {
+            Some(wc_id) => {
+                self.materialize_working_copy(&wc_id)?;
+                if let Some(new_head) = crate::transparency::head_commit(&root) {
+                    crate::transparency::reset_index_to(&root, &new_head)?;
+                }
+                Ok(())
+            }
+            None => self.sync_worktree(old_head),
+        }
+    }
+
     /// The working-copy commit `@` of this workspace, if one is set.
     pub fn working_copy_commit_id(&self) -> Option<CommitId> {
         let name = self.workspace.workspace_name();

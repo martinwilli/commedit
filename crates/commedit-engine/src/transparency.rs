@@ -48,6 +48,27 @@ pub fn export_to_git(mut_repo: &mut MutableRepo) -> Result<()> {
 /// heads, undo history — for which the keep-ref is the only thing standing between
 /// it and `git gc`. We never run `git gc` ourselves; the objects left dangling by
 /// our deletions are reclaimed by git's own maintenance.
+/// The commit oids currently protected by `refs/jj/keep/*`. Lets the engine
+/// inspect each (via jj) to decide which are its own working-copy commits.
+pub fn keep_ref_oids(workspace_root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["for-each-ref", "--format=%(objectname)", "refs/jj/keep/"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub fn prune_orphaned_keep_refs(
     workspace_root: &Path,
     old_head: &str,
@@ -269,6 +290,25 @@ pub fn sync_worktree(workspace_root: &Path, old_rev: &str, new_rev: &str) -> Res
     if !output.status.success() {
         bail!(
             "failed to update working tree to rewritten tip: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Reset the git index to `rev`'s tree **without** touching the working tree, so
+/// `git status` reports the working-copy changes against the rewritten tip. Used
+/// after materializing the rebased `@` to disk, where the worktree is already in
+/// place and only the index needs to catch up to the new HEAD.
+pub fn reset_index_to(workspace_root: &Path, rev: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["read-tree", rev])
+        .output()
+        .context("running git read-tree")?;
+    if !output.status.success() {
+        bail!(
+            "failed to reset the index to the rewritten tip: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

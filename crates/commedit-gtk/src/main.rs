@@ -149,6 +149,11 @@ const SAVE_HINT_CONFLICT: &str =
 const ABORT_HINT: &str =
     "Discard the entire rewrite and roll the repository back to the state it had \
      before you saved, leaving git untouched.";
+/// Hover hint for the diff view's Split button (enabled only with pending diff edits).
+const SPLIT_HINT: &str =
+    "Split this commit in two: rewrite it to your edited diff, and add a new commit \
+     after it holding the changes you took out — so the two together reproduce the \
+     original commit and its descendants stay unchanged.";
 
 /// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
 fn pill(label: &str) -> String {
@@ -870,6 +875,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
     save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
+    // Sits left of Save. Splits the selected commit into the edited diff plus a
+    // follow-up "Split of …" commit; enabled only while the diff has pending edits
+    // (wired by `update_split_sensitivity`), never in the conflict/working-copy views.
+    let split_button = Button::with_label("Split");
+    split_button.set_tooltip_text(Some(SPLIT_HINT));
+    split_button.set_sensitive(false);
     // Conflict-mode quick resolution is driven inline: clicking a block's marker
     // line (with its "use ours/theirs/both" cue) keeps that side — see
     // `append_resolve_cues` and the click gesture below. No toolbar buttons.
@@ -892,6 +903,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     bottom_bar.append(&bottom_spacer);
     bottom_bar.append(&prev_conflict_button);
     bottom_bar.append(&next_conflict_button);
+    bottom_bar.append(&split_button);
     bottom_bar.append(&save_button);
 
     // A banner above the file list, shown only while a conflicted rewrite is held
@@ -1389,12 +1401,37 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Re-highlight after edits, debounced/coalesced so typing stays responsive.
     // (Applying tags does not emit `changed`, so this can't loop.)
     let highlight_gen = Rc::new(RefCell::new(0u64));
+    // Light the Split button only when the diff carries pending file-content edits
+    // (the same edits Save would apply, via `collect_file_edits`) — and never in
+    // the conflict or working-copy views. Runs on every buffer change below, so it
+    // also resets to insensitive after a (re)load renders a fresh, unedited diff.
+    let update_split_sensitivity: Rc<dyn Fn()> = {
+        let split_button = split_button.clone();
+        let file_buffer = file_buffer.clone();
+        let changes = changes.clone();
+        let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        Rc::new(move || {
+            let has_edits = !pane_mode.borrow().is_conflict()
+                && !viewing_wc.get()
+                && matches!(
+                    collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()),
+                    Ok(edits) if !edits.is_empty()
+                );
+            split_button.set_sensitive(has_edits);
+        })
+    };
+
     file_buffer.connect_changed({
         let collapse = collapse.clone();
         let highlight = highlight.clone();
         let highlight_gen = highlight_gen.clone();
         let editing = editing.clone();
+        let update_split_sensitivity = update_split_sensitivity.clone();
         move |_| {
+            // Track Split-button sensitivity on every change, including programmatic
+            // renders (a load leaves an unedited diff -> insensitive).
+            update_split_sensitivity();
             // A full programmatic render highlights itself synchronously; don't
             // also schedule a redundant (and flash-inducing) debounced pass.
             if editing.get() {
@@ -3343,6 +3380,89 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     save_button.connect_clicked({
         let save = save.clone();
         move |_| save()
+    });
+
+    // Split: rewrite the selected commit to the edited diff, and insert a new
+    // "Split of …" commit holding its original tree right after it. Mirrors the
+    // save closure's commit-content path (and its place-restoring reload), but is
+    // diff-only — message/identity edits are left for Save. The button is
+    // insensitive unless the diff has pending edits, but guard the modes anyway.
+    split_button.connect_clicked({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let changes = changes.clone();
+        let current_file = current_file.clone();
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let file_dropdown = file_dropdown.clone();
+        let selected_change = selected_change.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
+        move |_| {
+            if pane_mode.borrow().is_conflict() || viewing_wc.get() {
+                return;
+            }
+            let Some(change_id) = selected_change.borrow().clone() else {
+                return;
+            };
+            let target = commits
+                .borrow()
+                .iter()
+                .find(|c| c.change_id_hex() == change_id)
+                .map(|c| c.id.clone());
+            let Some(commit_id) = target else {
+                return;
+            };
+            let edits = match collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()) {
+                Ok(edits) => edits,
+                Err(msg) => {
+                    show_status(&msg);
+                    return;
+                }
+            };
+            if edits.is_empty() {
+                return;
+            }
+
+            // Remember where the user is so the reload is invisible.
+            let saved_file = current_file.borrow().clone();
+            let saved_cursor = file_buffer.cursor_position();
+            let file_had_focus = file_view.has_focus();
+
+            // Own statement so the `RefMut` drops before the match arms run
+            // (`enter_conflict_mode`/`refresh` re-borrow `repo`).
+            let outcome = repo.borrow_mut().split_commit(&commit_id, &edits);
+            match outcome {
+                Ok(SaveOutcome::Clean) => {}
+                Ok(SaveOutcome::Conflicts { commits }) => {
+                    enter_conflict_mode(commits);
+                    return;
+                }
+                Err(err) => {
+                    show_status(&format!("Split failed: {err}"));
+                    return;
+                }
+            }
+
+            refresh();
+
+            // Restore the selected file and cursor (refresh reset both). The
+            // selected change id resolves to the edited commit, which kept it.
+            if let Some(path) = saved_file {
+                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                    file_dropdown.set_selected(idx as u32);
+                }
+            }
+            let offset = saved_cursor.min(file_buffer.char_count());
+            file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
+            file_view.scroll_to_mark(&file_buffer.get_insert(), 0.0, false, 0.0, 0.0);
+            if file_had_focus {
+                file_view.grab_focus();
+            }
+        }
     });
 
     // ◀ / ▶ jump the view to the previous/next conflict block, anchored on the

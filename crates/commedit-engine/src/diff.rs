@@ -123,6 +123,22 @@ impl ContextExpansion {
         self.before[first_group] += CONTEXT_STEP;
         self.after[last_group] += CONTEXT_STEP;
     }
+
+    /// Widen the context revealed *into an elided gap* by [`CONTEXT_STEP`]: more
+    /// trailing context below the block `above` the gap, more leading context
+    /// above the block `below` it. Either end may be absent (the gap is at the
+    /// file's start/end). Drives the conflict-snippet "expand" cue, whose gaps sit
+    /// between conflict blocks rather than on a hunk header.
+    pub fn expand_gap(&mut self, above: Option<usize>, below: Option<usize>) {
+        if let Some(g) = above {
+            grow(&mut self.after, g);
+            self.after[g] += CONTEXT_STEP;
+        }
+        if let Some(g) = below {
+            grow(&mut self.before, g);
+            self.before[g] += CONTEXT_STEP;
+        }
+    }
 }
 
 fn grow(v: &mut Vec<usize>, idx: usize) {
@@ -1395,6 +1411,24 @@ mod tests {
         let shown: Vec<&str> = snip.text.split('\n').collect();
         let rebuilt = reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>");
         assert_eq!(rebuilt, full);
+    }
+
+    #[test]
+    fn conflict_snippet_gap_expands_then_still_reconstructs() {
+        let full = conflict_file();
+        let mut exp = ContextExpansion::default();
+        let base = render_conflict_snippets(&full, &exp, "<CUE>");
+        // Widen the gap above the block (the leading elided run).
+        let leading = base.gaps.iter().find(|g| g.below == Some(0)).expect("leading gap");
+        exp.expand_gap(leading.above, leading.below);
+        let wider = render_conflict_snippets(&full, &exp, "<CUE>");
+        assert!(
+            wider.text.lines().count() > base.text.lines().count(),
+            "expanding the gap reveals more context"
+        );
+        // It still reconstructs to the original.
+        let shown: Vec<&str> = wider.text.split('\n').collect();
+        assert_eq!(reconstruct_conflict_file(&shown, &wider.pieces, "<CUE>"), full);
     }
 
     #[test]

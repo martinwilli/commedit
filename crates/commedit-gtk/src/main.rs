@@ -9,8 +9,9 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{
-    apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, render_diff, ChangeKind,
-    ConflictLineKind, ContextExpansion, DiffLineKind, FileChange, HunkInfo,
+    apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, render_commit_diff,
+    split_combined_patch, ChangeKind, CombinedFile, ConflictLineKind, ContextExpansion, DiffLineKind,
+    FileChange, HunkInfo,
 };
 use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
@@ -196,6 +197,27 @@ fn expand_cue_at(
         .iter()
         .find(|h| h.header_line == line && (h.can_expand_up || h.can_expand_down))
         .map(|h| (h.first_group, h.last_group))
+}
+
+/// The index (in `changes`/dropdown order) of the file whose `diff --git`
+/// separator is the last one at or before buffer `line` — i.e. the file the
+/// combined-diff viewport is currently showing at its top. Scans the *live*
+/// buffer rather than cached line numbers so it stays correct after edits shift
+/// lines. Defaults to 0 when `line` precedes the first separator.
+fn diff_file_index_at_line(buffer: &sourceview5::Buffer, line: usize) -> usize {
+    let text = buffer_text(buffer);
+    let mut idx = 0;
+    let mut seen = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        if i > line {
+            break;
+        }
+        if l.starts_with("diff --git ") {
+            idx = seen;
+            seen += 1;
+        }
+    }
+    idx
 }
 
 /// The text of buffer `line` (without its trailing newline).
@@ -481,7 +503,16 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let history_has_more: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let selected_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let changes: Rc<RefCell<Vec<FileChange>>> = Rc::new(RefCell::new(Vec::new()));
+    // The file the dropdown points at / the diff is scrolled to. Used for the
+    // post-save cursor restore and as the scroll-jump target.
     let current_file: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Placement of each file within the combined diff buffer (from the last
+    // render): drives dropdown↔scroll navigation, expand-click file mapping, and
+    // per-file editability.
+    let combined_files: Rc<RefCell<Vec<CombinedFile>>> = Rc::new(RefCell::new(Vec::new()));
+    // Guards the dropdown↔scroll feedback loop: set while one side programmatically
+    // drives the other so the reaction doesn't bounce back.
+    let nav_sync: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // Per-file hunk context expansion, keyed by path. Reset when the selected
     // commit changes (see `load_changes`).
     let expansions: Rc<RefCell<HashMap<String, ContextExpansion>>> =
@@ -880,46 +911,47 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
     let render_diff_view: Renderer = {
         let changes = changes.clone();
-        let current_file = current_file.clone();
+        let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
         let editing = editing.clone();
         let expansions = expansions.clone();
         let rendered_hunks = rendered_hunks.clone();
         let highlight = highlight.clone();
         Rc::new(move || {
-            let Some(path) = current_file.borrow().clone() else {
-                return;
-            };
-            let change = changes.borrow().iter().find(|c| c.path == path).cloned();
-            let Some(change) = change else { return };
-            let Some(new) = change.new_text.as_deref() else {
-                return;
-            };
-            let old = change.old_text.as_deref().unwrap_or("");
-            let rendered = {
-                let mut map = expansions.borrow_mut();
-                let exp = map.entry(path.clone()).or_default();
-                render_diff(old, new, &path, exp)
-            };
+            // Render the whole change — every file's diff in one buffer, files
+            // separated by `diff --git` lines — rather than one file at a time.
+            let combined = render_commit_diff(&changes.borrow(), &expansions.borrow());
             editing.set(true);
-            file_buffer.set_text(&rendered.text);
-            // Append a click-to-expand cue to each expandable @@ header. The
-            // click is handled by a GestureClick on the view (see below); we must
-            // not embed a real widget in the buffer, because removing it during
-            // the next `set_text` crashes GTK.
-            for hunk in &rendered.hunks {
-                let label = match (hunk.can_expand_up, hunk.can_expand_down) {
-                    (true, true) => "↕ expand context",
-                    (true, false) => "↑ expand context",
-                    (false, true) => "↓ expand context",
-                    (false, false) => continue,
-                };
-                if let Some(mut iter) = file_buffer.iter_at_line(hunk.header_line as i32) {
-                    iter.forward_to_line_end();
-                    file_buffer.insert(&mut iter, &format!("  {}", pill(label)));
+            file_buffer.set_text(&combined.text);
+            // Append a click-to-expand cue to each expandable @@ header, across all
+            // files (header lines are already mapped to the combined text). Inserts
+            // at a line's end so line numbering — and the cached `header_line`s —
+            // stay valid. The click is handled by a GestureClick on the view; we
+            // must not embed a real widget, since removing it on the next set_text
+            // crashes GTK.
+            let mut all_hunks: Vec<HunkInfo> = Vec::new();
+            for file in &combined.files {
+                for hunk in &file.hunks {
+                    let label = match (hunk.can_expand_up, hunk.can_expand_down) {
+                        (true, true) => "↕ expand context",
+                        (true, false) => "↑ expand context",
+                        (false, true) => "↓ expand context",
+                        (false, false) => {
+                            all_hunks.push(hunk.clone());
+                            continue;
+                        }
+                    };
+                    if let Some(mut iter) = file_buffer.iter_at_line(hunk.header_line as i32) {
+                        iter.forward_to_line_end();
+                        file_buffer.insert(&mut iter, &format!("  {}", pill(label)));
+                    }
+                    all_hunks.push(hunk.clone());
                 }
             }
-            *rendered_hunks.borrow_mut() = rendered.hunks.clone();
+            file_view.set_editable(combined.files.iter().any(|f| f.editable));
+            *rendered_hunks.borrow_mut() = all_hunks;
+            *combined_files.borrow_mut() = combined.files;
             // Highlight in this same main-loop turn, before GTK paints, so the
             // diff appears once fully colored instead of flashing plain first and
             // then re-highlighting via the debounced `changed` handler (which is
@@ -944,10 +976,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let rendered_hunks = rendered_hunks.clone();
         let expansions = expansions.clone();
         let render_cell = render_cell.clone();
-        let current_file = current_file.clone();
+        let combined_files = combined_files.clone();
         let pane_mode = pane_mode.clone();
         let editing = editing.clone();
         let highlight = highlight.clone();
+        let nav_sync = nav_sync.clone();
         move |gesture, _n_press, x, y| {
             let (bx, by) = file_view.window_to_buffer_coords(
                 gtk::TextWindowType::Widget,
@@ -983,9 +1016,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let line_text = buffer_line_text(&file_buffer, line);
             let hit = expand_cue_at(&rendered_hunks.borrow(), &line_text, line, col);
             let Some((first, last)) = hit else { return };
-            let Some(path) = current_file.borrow().clone() else {
-                return;
-            };
+            // The combined diff holds several files; find which one owns the
+            // clicked hunk so we widen *its* per-path expansion (group indices are
+            // file-relative).
+            let path = combined_files
+                .borrow()
+                .iter()
+                .find(|f| f.hunks.iter().any(|h| h.header_line == line))
+                .map(|f| f.path.clone());
+            let Some(path) = path else { return };
             // We own this click: don't let the view also place the caret.
             gesture.set_state(gtk::EventSequenceState::Claimed);
 
@@ -1003,13 +1042,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
             let expansions = expansions.clone();
             let render_cell = render_cell.clone();
-            let rendered_hunks = rendered_hunks.clone();
+            let combined_files = combined_files.clone();
             let file_buffer = file_buffer.clone();
             let file_view = file_view.clone();
+            let nav_sync = nav_sync.clone();
             glib::idle_add_local_once(move || {
+                // The re-render's set_text resets the scroll to the top and we then
+                // re-pin it; guard so the transient doesn't flip the dropdown.
+                nav_sync.set(true);
                 expansions
                     .borrow_mut()
-                    .entry(path)
+                    .entry(path.clone())
                     .or_default()
                     .expand(first, last);
                 if let Some(render) = render_cell.borrow().clone() {
@@ -1026,12 +1069,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 // the document height is `lines * line_height + margins`. We set
                 // the adjustment's upper too, so set_value isn't clamped against
                 // the stale (pre-render) range; GTK's own validation later sets the
-                // same values, leaving the position unchanged.
-                let header = rendered_hunks
+                // same values, leaving the position unchanged. The hunk is found
+                // scoped to this file, since group indices repeat across files in
+                // the combined buffer.
+                let header = combined_files
                     .borrow()
                     .iter()
-                    .find(|h| h.first_group <= first && last <= h.last_group)
-                    .map(|h| h.header_line);
+                    .find(|f| f.path == path)
+                    .and_then(|f| {
+                        f.hunks
+                            .iter()
+                            .find(|h| h.first_group <= first && last <= h.last_group)
+                            .map(|h| h.header_line)
+                    });
                 if let (Some(line), Some(vadj)) = (header, file_view.vadjustment()) {
                     let page = vadj.page_size();
                     if line_height > 0.0 && page > 0.0 {
@@ -1051,6 +1101,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         }
                     }
                 }
+                nav_sync.set(false);
             });
         }
     });
@@ -1092,33 +1143,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     });
     file_view.add_controller(hover_motion);
 
-    // Show the file at `idx` of the current changes in the editor.
-    let show_file: Rc<dyn Fn(usize)> = {
-        let changes = changes.clone();
+    // Jump the (already-rendered) combined diff to the file at dropdown `idx`,
+    // pinning its `diff --git` header to the top of the viewport. The whole change
+    // is rendered once by `render_diff_view`; the dropdown is just a navigation
+    // aid. Skips the scroll when `nav_sync` is set — i.e. when this selection was
+    // itself driven by the scroll→dropdown sync, so the two don't fight.
+    let scroll_to_file: Rc<dyn Fn(usize)> = {
+        let combined_files = combined_files.clone();
         let current_file = current_file.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
-        let editing = editing.clone();
-        let render_diff_view = render_diff_view.clone();
+        let nav_sync = nav_sync.clone();
         Rc::new(move |idx: usize| {
-            let change = changes.borrow().get(idx).cloned();
-            let Some(change) = change else { return };
-            *current_file.borrow_mut() = Some(change.path.clone());
-            match (&change.new_text, change.is_binary) {
-                (Some(_), _) => {
-                    file_view.set_editable(true);
-                    render_diff_view();
-                }
-                (None, binary) => {
-                    editing.set(true);
-                    file_buffer.set_text(if binary {
-                        "<binary file — not editable>"
-                    } else {
-                        "<file removed by this commit>"
-                    });
-                    editing.set(false);
-                    file_view.set_editable(false);
-                }
+            let file = combined_files.borrow().get(idx).cloned();
+            let Some(file) = file else { return };
+            *current_file.borrow_mut() = Some(file.path.clone());
+            if nav_sync.get() {
+                return;
+            }
+            if let Some(mut iter) = file_buffer.iter_at_line(file.start_line as i32) {
+                // yalign 0.0 pins the header to the top edge without moving the caret.
+                file_view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
             }
         })
     };
@@ -1403,7 +1448,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_view.add_controller(key_controller);
 
     file_dropdown.connect_selected_notify({
-        let show_file = show_file.clone();
+        let scroll_to_file = scroll_to_file.clone();
         let show_conflict_file = show_conflict_file.clone();
         let pane_mode = pane_mode.clone();
         move |dd| {
@@ -1414,10 +1459,39 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if pane_mode.borrow().is_conflict() {
                 show_conflict_file(idx as usize);
             } else {
-                show_file(idx as usize);
+                scroll_to_file(idx as usize);
             }
         }
     });
+
+    // Scrolling the diff view updates the dropdown to the file now at the top of
+    // the viewport — the reverse of selecting a file to jump to it. Ignored while
+    // we're mid-render (`editing`), already driving navigation (`nav_sync`), or in
+    // conflict mode (handled separately). Sets `nav_sync` around the dropdown
+    // change so the resulting `selected_notify` doesn't scroll back.
+    if let Some(vadj) = file_view.vadjustment() {
+        vadj.connect_value_changed({
+            let file_view = file_view.clone();
+            let file_buffer = file_buffer.clone();
+            let file_dropdown = file_dropdown.clone();
+            let nav_sync = nav_sync.clone();
+            let editing = editing.clone();
+            let pane_mode = pane_mode.clone();
+            move |vadj| {
+                if editing.get() || nav_sync.get() || pane_mode.borrow().is_conflict() {
+                    return;
+                }
+                let (iter, _) = file_view.line_at_y(vadj.value() as i32);
+                let top_line = iter.line() as usize;
+                let idx = diff_file_index_at_line(&file_buffer, top_line) as u32;
+                if file_dropdown.selected() != idx {
+                    nav_sync.set(true);
+                    file_dropdown.set_selected(idx);
+                    nav_sync.set(false);
+                }
+            }
+        });
+    }
 
     // Scrolling over the (closed) drop-down steps through the files of the diff,
     // so flipping between files doesn't require opening the popover each time.
@@ -1456,27 +1530,36 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let apply_changes: Rc<dyn Fn(Vec<FileChange>)> = {
         let changes = changes.clone();
         let current_file = current_file.clone();
+        let combined_files = combined_files.clone();
         let file_dropdown = file_dropdown.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
         let expansions = expansions.clone();
+        let render_diff_view = render_diff_view.clone();
+        let scroll_to_file = scroll_to_file.clone();
         Rc::new(move |loaded: Vec<FileChange>| {
             *changes.borrow_mut() = loaded;
             *current_file.borrow_mut() = None;
             expansions.borrow_mut().clear();
-            let labels: Vec<String> = changes.borrow().iter().map(change_label).collect();
-            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-            file_dropdown.set_model(Some(&StringList::new(&refs)));
-            if labels.is_empty() {
+            if changes.borrow().is_empty() {
+                *combined_files.borrow_mut() = Vec::new();
                 editing.set(true);
                 file_buffer.set_text("");
                 editing.set(false);
                 file_view.set_editable(false);
-            } else {
-                // Triggers selected-notify -> show_file(0).
-                file_dropdown.set_selected(0);
+                file_dropdown.set_model(Some(&StringList::new(&[])));
+                return;
             }
+            // Render the whole change once; the dropdown is now a jump aid.
+            render_diff_view();
+            let labels: Vec<String> = changes.borrow().iter().map(change_label).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            file_dropdown.set_model(Some(&StringList::new(&refs)));
+            file_dropdown.set_selected(0);
+            // Land at the first file's top (and set current_file) even if
+            // set_selected(0) didn't fire a change notification.
+            scroll_to_file(0);
         })
     };
 
@@ -2633,37 +2716,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if viewing_wc.get() {
                 let saved_file = current_file.borrow().clone();
                 let saved_cursor = file_buffer.cursor_position();
-                let Some(path) = saved_file.clone() else { return };
-                let change = changes.borrow().iter().find(|c| c.path == path).cloned();
-                let Some(change) = change else { return };
-                let Some(original) = change.new_text else { return };
-                let old = change.old_text.as_deref().unwrap_or("");
-                match apply_patch(old, &buffer_text(&file_buffer)) {
-                    Ok(mut content) => {
-                        if !original.is_empty()
-                            && !original.ends_with('\n')
-                            && content.ends_with('\n')
-                        {
-                            content.pop();
-                        }
-                        if content != original {
-                            if let Err(err) =
-                                repo.borrow_mut().edit_working_copy_file(&path, &content)
-                            {
-                                show_status(&format!("Working-copy edit failed: {err}"));
-                                return;
-                            }
-                        }
+                // Edit each changed file of @ in place (no rebase, so a loop is
+                // fine); the branch tip doesn't move.
+                let edits = match collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()) {
+                    Ok(edits) => edits,
+                    Err(msg) => {
+                        show_status(&msg);
+                        return;
                     }
-                    Err(err) => {
-                        show_status(&format!("Cannot apply edited patch: {err}"));
+                };
+                for (path, content) in &edits {
+                    if let Err(err) = repo.borrow_mut().edit_working_copy_file(path, content) {
+                        show_status(&format!("Working-copy edit failed: {err}"));
                         return;
                     }
                 }
                 refresh_wc();
                 load_wc_changes();
-                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
-                    file_dropdown.set_selected(idx as u32);
+                if let Some(path) = saved_file {
+                    if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                        file_dropdown.set_selected(idx as u32);
+                    }
                 }
                 let offset = saved_cursor.min(file_buffer.char_count());
                 file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
@@ -2709,46 +2782,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
 
-            // File content edit (if an editable file is selected and changed).
-            if let Some(path) = saved_file.clone() {
-                let change = changes.borrow().iter().find(|c| c.path == path).cloned();
-                if let Some(change) = change {
-                    if let Some(original) = change.new_text {
-                        let old = change.old_text.as_deref().unwrap_or("");
-                        match apply_patch(old, &buffer_text(&file_buffer)) {
-                            Ok(mut content) => {
-                                // Preserve the original file's trailing-newline style.
-                                if !original.is_empty()
-                                    && !original.ends_with('\n')
-                                    && content.ends_with('\n')
-                                {
-                                    content.pop();
-                                }
-                                if content != original {
-                                    let outcome = repo
-                                        .borrow_mut()
-                                        .rewrite_file(&commit_id, &path, &content);
-                                    match outcome {
-                                        Ok(SaveOutcome::Clean) => {}
-                                        Ok(SaveOutcome::Conflicts { commits }) => {
-                                            enter_conflict_mode(commits);
-                                            return;
-                                        }
-                                        Err(err) => {
-                                            show_status(&format!("File save failed: {err}"));
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                // The firewall should make this unreachable; if
-                                // it ever fires, surface it instead of silently
-                                // dropping the save.
-                                show_status(&format!("Cannot apply edited patch: {err}"));
-                                return;
-                            }
-                        }
+            // File content edits across every file of the combined diff, applied
+            // in one rewrite so a multi-file Save is a single transaction.
+            let edits = match collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()) {
+                Ok(edits) => edits,
+                Err(msg) => {
+                    show_status(&msg);
+                    return;
+                }
+            };
+            if !edits.is_empty() {
+                let outcome = repo.borrow_mut().rewrite_files(&commit_id, &edits);
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {}
+                    Ok(SaveOutcome::Conflicts { commits }) => {
+                        enter_conflict_mode(commits);
+                        return;
+                    }
+                    Err(err) => {
+                        show_status(&format!("File save failed: {err}"));
+                        return;
                     }
                 }
             }
@@ -2876,6 +2929,39 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     window.present();
 }
 
+/// Split the combined diff buffer into the per-file edits whose reconstructed
+/// content differs from the commit's current version. Removed/binary files (no
+/// `new_text`) are skipped; the original trailing-newline style is preserved.
+/// `Err` carries an apply-failure message (the patch firewall should make that
+/// unreachable, but a save surfaces it rather than dropping silently).
+fn collect_file_edits(
+    combined: &str,
+    changes: &[FileChange],
+) -> Result<Vec<(String, String)>, String> {
+    let mut edits = Vec::new();
+    for (path, patch) in split_combined_patch(combined) {
+        let Some(change) = changes.iter().find(|c| c.path == path) else {
+            continue;
+        };
+        let Some(original) = change.new_text.as_deref() else {
+            continue;
+        };
+        let old = change.old_text.as_deref().unwrap_or("");
+        match apply_patch(old, &patch) {
+            Ok(mut content) => {
+                if !original.is_empty() && !original.ends_with('\n') && content.ends_with('\n') {
+                    content.pop();
+                }
+                if content != original {
+                    edits.push((path, content));
+                }
+            }
+            Err(err) => return Err(format!("Cannot apply edited patch for {path}: {err}")),
+        }
+    }
+    Ok(edits)
+}
+
 /// Re-resolve a commit's current id from its rewrite-stable change id.
 fn resolve_commit(
     repo: &Rc<RefCell<Repo>>,
@@ -2972,11 +3058,17 @@ fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxS
     let raw_lines: Vec<&str> = text.split('\n').collect();
     let parsed = parse_diff_lines(&text);
 
-    let syntax = path
-        .and_then(|p| std::path::Path::new(p).extension())
-        .and_then(|e| e.to_str())
-        .and_then(|ext| ps.find_syntax_by_extension(ext))
-        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    // Pick a syntect syntax from a file extension, falling back to plain text.
+    let pick = |p: &str| {
+        std::path::Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| ps.find_syntax_by_extension(ext))
+            .unwrap_or_else(|| ps.find_syntax_plain_text())
+    };
+    // The combined buffer holds several files; `path` is only the fallback. The
+    // per-section language is re-derived from each `--- a/PATH` header below.
+    let mut syntax = path.map(pick).unwrap_or_else(|| ps.find_syntax_plain_text());
     let mut old_hl = HighlightLines::new(syntax, theme);
     let mut new_hl = HighlightLines::new(syntax, theme);
 
@@ -2995,7 +3087,17 @@ fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxS
                 paint_pill(buffer, li as i32, raw, "expand-cue-cap", "expand-cue");
                 continue;
             }
-            DiffLineKind::Header | DiffLineKind::Meta => continue,
+            DiffLineKind::Header => {
+                // A new file section starts at `--- a/PATH`: switch language and
+                // reset the parser state so the previous file doesn't bleed in.
+                if let Some(p) = raw.strip_prefix("--- a/") {
+                    syntax = pick(p);
+                    old_hl = HighlightLines::new(syntax, theme);
+                    new_hl = HighlightLines::new(syntax, theme);
+                }
+                continue;
+            }
+            DiffLineKind::Meta => continue,
             _ => {}
         }
 

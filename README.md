@@ -37,11 +37,49 @@ abort it and leave history exactly as it was. Some conflicts are structural
 (a directory, symlink, or submodule rather than text) and can't be resolved in
 the diff pane — for those, aborting the rewrite is the only way out.
 
+## Installing a binary release
+
+Pre-built binaries for Linux (x86-64) and macOS (Apple Silicon) are attached to
+each [GitHub release](../../releases). They are **dynamically linked** against
+your system GTK, so they are not self-contained — you need a few runtime
+dependencies installed first:
+
+- **`git`** on your `PATH` — comm(ed)it drives the git CLI for working-copy and
+  `HEAD` bookkeeping.
+- **GTK 4** (≥ 4.10) and **GtkSourceView 5** (≥ 5.4) shared libraries.
+
+Install the dependencies, then unpack the tarball and run it:
+
+```sh
+# macOS (Apple Silicon)
+brew install git gtk4 gtksourceview5
+tar -xzf commedit-macos-aarch64.tar.gz
+xattr -dr com.apple.quarantine commedit   # the binary is unsigned; clear Gatekeeper
+./commedit /path/to/repo
+
+# Debian / Ubuntu (24.04+; 22.04 ships GTK 4.6, too old)
+sudo apt install git libgtk-4-1 libgtksourceview-5-0
+tar -xzf commedit-linux-x86_64.tar.gz
+./commedit /path/to/repo
+```
+
+The runtime library packages on other common distributions:
+
+| Distribution    | Install command                                                      |
+| --------------- | -------------------------------------------------------------------- |
+| Fedora          | `sudo dnf install git gtk4 gtksourceview5`                            |
+| Arch Linux      | `sudo pacman -S git gtk4 gtksourceview5`                             |
+| openSUSE        | `sudo zypper install git libgtk-4-1 libgtksourceview-5-0`            |
+
+Drop the `commedit` binary somewhere on your `PATH` (e.g. `~/.local/bin` or
+`/usr/local/bin`) to launch it from anywhere. There is no Windows release.
+
 ## Building and running
 
-comm(ed)it is a Rust workspace; you need a Rust toolchain and the system
-GTK4 and libsourceview5 development libraries (e.g. `libgtk-4-dev` and
-`libgtksourceview-5-dev` on Debian/Ubuntu).
+comm(ed)it is a Rust workspace; you need a Rust toolchain, `git` on your `PATH`,
+and the system GTK4 and libsourceview5 **development** libraries (e.g.
+`libgtk-4-dev` and `libgtksourceview-5-dev` on Debian/Ubuntu, or `gtk4-devel`
+and `gtksourceview5-devel` on Fedora).
 
 ```sh
 cargo build                 # build the workspace

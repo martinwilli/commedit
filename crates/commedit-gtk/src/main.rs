@@ -936,9 +936,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     paned.set_vexpand(true);
     root.append(&paned);
 
-    // An (otherwise empty) header bar keeps the window title and the window
-    // controls; the Save action now lives in the bottom action bar.
+    // The header bar keeps the window title and the window controls; the Save
+    // action lives in the bottom action bar. The one custom control is the
+    // top-right "Revert all" button, which rolls the whole session back to the
+    // state the repo was opened in (wired below, once `refresh` & co. exist).
     let header = HeaderBar::new();
+    let revert_button = Button::with_label("Revert all");
+    revert_button.add_css_class("destructive-action");
+    revert_button.set_tooltip_text(Some(
+        "Discard all changes made this session and restore the repository to its original state",
+    ));
+    header.pack_end(&revert_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -2273,6 +2281,75 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             list.unselect_all();
             refresh();
             show_status("Rewrite aborted — history unchanged.");
+        }
+    });
+
+    // "Revert all" (top-right header button): after confirmation, roll the whole
+    // session back to the state the repo was opened in — original commits *and*
+    // the session-start working copy — then reload. Mirrors the abort handler's
+    // reload, and additionally empties the trash (its drops are undone).
+    revert_button.connect_clicked({
+        let repo = repo.clone();
+        let window = window.clone();
+        let exit_conflict_mode = exit_conflict_mode.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        let list = list.clone();
+        let trashed = trashed.clone();
+        let trash_list = trash_list.clone();
+        let trash_scroll = trash_scroll.clone();
+        move |_| {
+            let target = repo
+                .borrow()
+                .session_start_head_hex()
+                .map(|h| h[..h.len().min(12)].to_string())
+                .unwrap_or_else(|| "its original state".to_string());
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message("Revert all changes?")
+                .detail(format!(
+                    "Discard everything done this session and restore the repository to \
+                     {target}. Uncommitted changes made this session are lost. This cannot \
+                     be undone."
+                ))
+                .buttons(["Cancel", "Revert all"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+            let repo = repo.clone();
+            let exit_conflict_mode = exit_conflict_mode.clone();
+            let refresh = refresh.clone();
+            let show_status = show_status.clone();
+            let list = list.clone();
+            let trashed = trashed.clone();
+            let trash_list = trash_list.clone();
+            let trash_scroll = trash_scroll.clone();
+            dialog.choose(
+                Some(&window),
+                gtk::gio::Cancellable::NONE,
+                move |result| {
+                    // Index 1 is "Revert all"; anything else (Cancel / dismissed)
+                    // leaves the session untouched.
+                    if result != Ok(1) {
+                        return;
+                    }
+                    if let Err(err) = repo.borrow_mut().revert_all() {
+                        show_status(&format!("Revert failed: {err}"));
+                        return;
+                    }
+                    // Drop conflict mode if we were resolving (idempotent otherwise).
+                    exit_conflict_mode();
+                    // The session's drops are undone, so empty the trash bin.
+                    trashed.borrow_mut().clear();
+                    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    // Force the reselect to re-fire `row-selected` (rows are reused),
+                    // so the diff pane reloads the reverted content — same reasoning
+                    // as the abort handler above.
+                    list.unselect_all();
+                    refresh();
+                    show_status("Reverted to the original session state.");
+                },
+            );
         }
     });
 

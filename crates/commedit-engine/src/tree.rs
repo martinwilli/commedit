@@ -2,6 +2,8 @@
 //! primitive behind hunk editing. Reuses the same rewrite/rebase/transparency
 //! pipeline as message editing.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use jj_lib::backend::{CommitId, CopyId, TreeValue};
 use jj_lib::matchers::FilesMatcher;
@@ -10,6 +12,7 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::store::Store;
 
 use crate::conflict::SaveOutcome;
 use crate::repo::Repo;
@@ -59,31 +62,8 @@ impl Repo {
             .store()
             .get_commit(target)
             .context("loading target commit")?;
-        let base_tree = commit.tree();
         let store = self.repo.store().clone();
-
-        // Write each new blob and gather the spliced (path, value) pairs up front,
-        // while `base_tree` is still borrowable for the metadata lookups; then move
-        // it into the builder.
-        let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(files.len());
-        for (path, content) in files {
-            let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
-            let (executable, copy_id) = existing_file_meta(&base_tree, &repo_path);
-            let mut reader: &[u8] = content.as_bytes();
-            let file_id = pollster::block_on(store.write_file(&repo_path, &mut reader))
-                .context("writing file blob")?;
-            let value = TreeValue::File {
-                id: file_id,
-                executable,
-                copy_id,
-            };
-            entries.push((repo_path, Merge::normal(value)));
-        }
-        let mut builder = MergedTreeBuilder::new(base_tree);
-        for (repo_path, value) in entries {
-            builder.set_or_remove(repo_path, value);
-        }
-        let new_tree = pollster::block_on(builder.write_tree()).context("writing tree")?;
+        let new_tree = splice_files_into_tree(commit.tree(), &store, files)?;
 
         let mut tx = self.repo.start_transaction();
         pollster::block_on(
@@ -104,6 +84,39 @@ impl Repo {
             heads,
         )
     }
+}
+
+/// Splice new content for several files into `base_tree`, returning the written
+/// tree. Each file's blob is written to `store` and set into a single
+/// [`MergedTreeBuilder`] pass; each file's executable bit and copy id are preserved
+/// from `base_tree`. Shared by [`Repo::rewrite_files`] and [`Repo::split_commit`].
+pub(crate) fn splice_files_into_tree(
+    base_tree: MergedTree,
+    store: &Arc<Store>,
+    files: &[(String, String)],
+) -> Result<MergedTree> {
+    // Write each new blob and gather the spliced (path, value) pairs up front,
+    // while `base_tree` is still borrowable for the metadata lookups; then move
+    // it into the builder.
+    let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(files.len());
+    for (path, content) in files {
+        let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
+        let (executable, copy_id) = existing_file_meta(&base_tree, &repo_path);
+        let mut reader: &[u8] = content.as_bytes();
+        let file_id = pollster::block_on(store.write_file(&repo_path, &mut reader))
+            .context("writing file blob")?;
+        let value = TreeValue::File {
+            id: file_id,
+            executable,
+            copy_id,
+        };
+        entries.push((repo_path, Merge::normal(value)));
+    }
+    let mut builder = MergedTreeBuilder::new(base_tree);
+    for (repo_path, value) in entries {
+        builder.set_or_remove(repo_path, value);
+    }
+    pollster::block_on(builder.write_tree()).context("writing tree")
 }
 
 /// Look up the executable bit and copy id of an existing file at `repo_path`,

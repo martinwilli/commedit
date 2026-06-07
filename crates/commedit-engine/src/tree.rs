@@ -89,7 +89,7 @@ impl Repo {
 /// Look up the executable bit and copy id of an existing file at `repo_path`,
 /// so a content edit preserves them. Defaults for a path that isn't a resolved
 /// file (e.g. newly added).
-fn existing_file_meta(base_tree: &MergedTree, repo_path: &RepoPath) -> (bool, CopyId) {
+pub(crate) fn existing_file_meta(base_tree: &MergedTree, repo_path: &RepoPath) -> (bool, CopyId) {
     let matcher = FilesMatcher::new([repo_path]);
     for (_path, value) in base_tree.entries_matching(&matcher) {
         if let Ok(merged) = value {

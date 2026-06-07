@@ -294,3 +294,28 @@ fn overlapping_edit_defers_as_a_conflict_then_resolves() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn editing_the_working_copy_file_updates_the_worktree_not_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    // An uncommitted edit, then refine it through the diff pane.
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+    repo.edit_working_copy_file("a.txt", "a\npane edit\n")
+        .expect("edit working copy");
+
+    // The working tree reflects the pane edit...
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\npane edit\n"
+    );
+    // ...while committed history is untouched, and @ is still dirty.
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a");
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert!(repo.working_copy_info().is_some());
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

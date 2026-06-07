@@ -14,11 +14,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use jj_lib::backend::CommitId;
+use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
-use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::working_copy::{CheckoutStats, SnapshotOptions};
 
 use crate::repo::Repo;
@@ -117,6 +119,54 @@ impl Repo {
         let op_id = self.repo.operation().id().clone();
         block_on(self.workspace.check_out(op_id, None, &commit))
             .context("checking out the working copy")
+    }
+
+    /// Edit a file of the working copy through the diff pane: splice `new_content`
+    /// into `@`'s tree and write the result to disk — like editing any commit,
+    /// but the branch tip doesn't move (no history export). Snapshots the disk
+    /// first so a concurrent external edit to another file isn't clobbered.
+    pub fn edit_working_copy_file(&mut self, path: &str, new_content: &str) -> Result<()> {
+        crate::repo::catch_jj("editing the working copy", || {
+            self.edit_working_copy_file_inner(path, new_content)
+        })
+    }
+
+    fn edit_working_copy_file_inner(&mut self, path: &str, new_content: &str) -> Result<()> {
+        self.snapshot_working_copy()?;
+        let wc_id = self
+            .working_copy_commit_id()
+            .context("no working copy to edit")?;
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&wc_id)
+            .context("loading the working-copy commit")?;
+        let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
+        let base_tree = commit.tree();
+        let (executable, copy_id) = crate::tree::existing_file_meta(&base_tree, &repo_path);
+
+        let store = self.repo.store().clone();
+        let mut reader: &[u8] = new_content.as_bytes();
+        let file_id = block_on(store.write_file(&repo_path, &mut reader))
+            .context("writing file blob")?;
+        let value: MergedTreeValue = Merge::normal(TreeValue::File {
+            id: file_id,
+            executable,
+            copy_id,
+        });
+        let mut builder = MergedTreeBuilder::new(base_tree);
+        builder.set_or_remove(repo_path, value);
+        let new_tree = block_on(builder.write_tree()).context("writing tree")?;
+
+        let mut tx = self.repo.start_transaction();
+        block_on(tx.repo_mut().rewrite_commit(&commit).set_tree(new_tree).write())
+            .context("rewriting the working-copy commit")?;
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing after edit")?;
+        self.repo = block_on(tx.commit("commedit: edit working copy"))
+            .context("committing the working-copy edit")?;
+
+        // Write the edited @ to disk (the branch tip is unchanged).
+        self.materialize_after_rewrite(self.head_commit())
     }
 
     /// Materialize the rebased working-copy commit `@'` to disk after a rewrite,

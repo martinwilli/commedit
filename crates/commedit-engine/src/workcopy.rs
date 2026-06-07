@@ -27,6 +27,33 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
 }
 
+/// A summary of the working-copy commit `@`, shown as a read-only top row in the
+/// history. `None` (from [`Repo::working_copy_info`]) when the tree is clean.
+#[derive(Debug, Clone)]
+pub struct WorkingCopyInfo {
+    /// The `@` commit, whose diff against its parent is the uncommitted change
+    /// set — load it with [`crate::diff::commit_changes`].
+    pub commit_id: CommitId,
+    /// Number of files that differ from the checked-out tip.
+    pub changed_files: usize,
+    /// Whether reapplying the changes onto a rewrite left `@` conflicted (the
+    /// working tree then holds conflict markers in [`Self::commit_id`]'s files).
+    pub has_conflict: bool,
+}
+
+/// How the user's uncommitted changes fared across the most recent rewrite, for
+/// the UI to surface. Only produced when there is something worth telling the
+/// user about (a conflict or an index backup).
+#[derive(Debug, Clone)]
+pub struct WorkingCopyAdvisory {
+    /// Working-tree paths left with conflict markers because the local edit
+    /// overlapped the rewrite. Empty when the reapply merged cleanly.
+    pub conflicted_paths: Vec<String>,
+    /// A `refs/commedit/backup/index-*` ref pinning staged content that only
+    /// lived in the index (see [`crate::transparency::backup_index_only_content`]).
+    pub index_backup_ref: Option<String>,
+}
+
 impl Repo {
     /// Snapshot the on-disk working directory into the working-copy commit `@`,
     /// so uncommitted changes (tracked edits **and** untracked, non-ignored
@@ -107,7 +134,8 @@ impl Repo {
                 // Resetting the index below would drop any staged content that
                 // only lives in the index (not on disk, hence not in @). Pin it
                 // to a recoverable backup ref first so it is never lost.
-                if let Some(backup) = crate::transparency::backup_index_only_content(&root) {
+                let index_backup = crate::transparency::backup_index_only_content(&root);
+                if let Some(backup) = &index_backup {
                     eprintln!(
                         "commedit: staged changes not present on disk were preserved at {backup}; \
                          recover with `git read-tree {backup}` or `git checkout {backup} -- .`"
@@ -116,6 +144,15 @@ impl Repo {
                 if let Some(new_head) = crate::transparency::head_commit(&root) {
                     crate::transparency::reset_index_to(&root, &new_head)?;
                 }
+                // If reapplying the local edits onto the rewrite left @ conflicted,
+                // the working tree now holds conflict markers; record an advisory
+                // (with any index backup) for the UI to surface.
+                let conflicted_paths = self.working_copy_conflicted_paths();
+                self.wc_advisory = (!conflicted_paths.is_empty() || index_backup.is_some())
+                    .then_some(WorkingCopyAdvisory {
+                        conflicted_paths,
+                        index_backup_ref: index_backup,
+                    });
                 Ok(())
             }
             None => self.sync_worktree(old_head),
@@ -126,6 +163,51 @@ impl Repo {
     pub fn working_copy_commit_id(&self) -> Option<CommitId> {
         let name = self.workspace.workspace_name();
         self.repo.view().get_wc_commit_id(name).cloned()
+    }
+
+    /// A summary of the uncommitted changes to show as a read-only top row in the
+    /// history, or `None` when the working tree is clean. Kept out of
+    /// [`crate::history::history`] so the reorder/drop/squash index arithmetic is
+    /// unaffected.
+    pub fn working_copy_info(&self) -> Option<WorkingCopyInfo> {
+        let commit_id = self.working_copy_commit_id()?;
+        let commit = self.repo.store().get_commit(&commit_id).ok()?;
+        let changed_files = crate::diff::commit_changes(&self.repo, &commit_id)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if changed_files == 0 {
+            return None;
+        }
+        Some(WorkingCopyInfo {
+            commit_id,
+            changed_files,
+            has_conflict: commit.has_conflict(),
+        })
+    }
+
+    /// Take (and clear) the advisory describing how uncommitted changes fared in
+    /// the last rewrite, for the UI to surface once.
+    pub fn take_working_copy_advisory(&mut self) -> Option<WorkingCopyAdvisory> {
+        self.wc_advisory.take()
+    }
+
+    /// The working-tree paths where `@` is currently conflicted (markers on
+    /// disk), empty when it merged cleanly.
+    fn working_copy_conflicted_paths(&self) -> Vec<String> {
+        let Some(id) = self.working_copy_commit_id() else {
+            return Vec::new();
+        };
+        let Ok(commit) = self.repo.store().get_commit(&id) else {
+            return Vec::new();
+        };
+        if !commit.has_conflict() {
+            return Vec::new();
+        }
+        commit
+            .tree()
+            .conflicts()
+            .map(|(path, _value)| path.as_internal_file_string().to_string())
+            .collect()
     }
 
     /// Re-parent `@` onto the current git HEAD when it isn't already there (e.g.

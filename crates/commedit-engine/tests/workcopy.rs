@@ -193,3 +193,52 @@ fn a_plain_unstaged_edit_creates_no_backup_ref() {
         ""
     );
 }
+
+#[test]
+fn working_copy_info_is_some_only_when_dirty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    // Clean tree right after open: no working-copy row.
+    assert!(repo.working_copy_info().is_none());
+
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+    repo.snapshot_working_copy().expect("snapshot");
+    let info = repo.working_copy_info().expect("dirty");
+    assert_eq!(info.changed_files, 1);
+    assert!(!info.has_conflict);
+}
+
+#[test]
+fn overlapping_edit_leaves_a_conflict_advisory_and_markers() {
+    use commedit_engine::conflict::SaveOutcome;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[("f.txt", "1\n2\n3\n", "base"), ("g.txt", "g\n", "top")],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    // Local edit to line 2...
+    std::fs::write(dir.join("f.txt"), "1\n2-local\n3\n").unwrap();
+
+    // ...and the rewrite changes the very same line 2 of the base commit.
+    let base = subject_id(&repo, "base").id;
+    let outcome = repo
+        .rewrite_file(&base, "f.txt", "1\n2-rewritten\n3\n")
+        .expect("rewrite");
+
+    // The committed history is clean, so the rewrite exported...
+    assert!(matches!(outcome, SaveOutcome::Clean));
+    // ...but reapplying the local edit conflicted: advisory names the file and
+    // the working tree holds conflict markers.
+    let adv = repo.take_working_copy_advisory().expect("advisory");
+    assert!(adv.conflicted_paths.iter().any(|p| p == "f.txt"));
+    let disk = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+    assert!(disk.contains("<<<<<<<"), "expected conflict markers, got: {disk}");
+    assert!(repo.working_copy_info().expect("dirty").has_conflict);
+}

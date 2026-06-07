@@ -122,7 +122,10 @@ Caveats this creates:
   collapses to unstaged after a rewrite. Staged content that lives *only* in the
   index (staged then reverted/deleted on disk) is invisible to `@`, so
   `backup_index_only_content` pins it to a `refs/commedit/backup/index-*` ref
-  before the index reset — never lost, recoverable with `git read-tree`.
+  before the index reset — never lost, recoverable with `git read-tree`. This is a
+  **silent** safety net (no stderr, no UI surface — documented in the README); a
+  rewrite then `prune_backup_refs` keeps only the most-recent backup so they don't
+  accumulate one per session.
 - `prune_orphaned_keep_refs` now drops *our own* working-copy keep-refs (the
   current `@`, its superseded snapshots sharing its change id, and jj's empty
   scaffolding) so they don't surface as phantom commits in `git log --all`, while

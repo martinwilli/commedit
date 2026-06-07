@@ -124,6 +124,17 @@ pointed at when you opened it — `commedit: use git reset --hard <id> to undo
 this session` — so you can roll the whole session back from the command line if
 a rewrite goes wrong.
 
+Your uncommitted changes (edits on disk and untracked files) ride through every
+rewrite and are restored to the working tree as-is. The one thing the underlying
+jj model can't see is content that lives *only* in the git index — a file you
+`git add`ed and then changed or removed on disk — so before each rewrite resets
+the index, comm(ed)it pins the whole index to a `refs/commedit/backup/index-*`
+ref. These are silent, transient safety nets: only the most recent one is kept
+(older ones are pruned automatically on the next rewrite), and you almost never
+need them. If you do, recover with `git read-tree <ref>` (restage) or
+`git checkout <ref> -- .` (write to disk); `git for-each-ref refs/commedit/backup/`
+lists any that exist.
+
 ## License
 
 comm(ed)it is licensed under the [MIT License](LICENSE).

@@ -328,11 +328,13 @@ pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
         return None;
     }
     let tree = git_line(workspace_root, &["write-tree"])?;
+    // Name the ref after the index *tree*, so identical staged content reuses
+    // (overwrites) one ref instead of piling up a new ref on every rewrite.
+    let refname = format!("refs/commedit/backup/index-{}", &tree[..tree.len().min(12)]);
     let commit = git_line(
         workspace_root,
         &["commit-tree", &tree, "-m", "commedit: index backup (staged content not on disk)"],
     )?;
-    let refname = format!("refs/commedit/backup/index-{}", &commit[..commit.len().min(12)]);
     let ok = Command::new("git")
         .current_dir(workspace_root)
         .args(["update-ref", &refname, &commit])

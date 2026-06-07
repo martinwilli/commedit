@@ -176,6 +176,36 @@ fn index_only_staged_content_is_backed_up_across_a_rewrite() {
 }
 
 #[test]
+fn identical_index_only_content_dedups_to_one_backup_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let stage_only = |dir: &std::path::Path| {
+        std::fs::write(dir.join("a.txt"), "staged-only\n").unwrap();
+        common::git(dir, &["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    };
+
+    // Two rewrites, each preceded by the *same* index-only staged content.
+    stage_only(dir);
+    let b = subject_id(&repo, "B").id;
+    repo.rewrite_message(&b, "B v2").expect("rewrite 1");
+    stage_only(dir);
+    let b = subject_id(&repo, "B v2").id;
+    repo.rewrite_message(&b, "B v3").expect("rewrite 2");
+
+    // The backup ref is named after the index tree, so identical content reuses
+    // one ref rather than piling up.
+    let backups = common::git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+    );
+    assert_eq!(backups.lines().count(), 1, "expected a single deduped backup ref, got: {backups}");
+}
+
+#[test]
 fn a_plain_unstaged_edit_creates_no_backup_ref() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

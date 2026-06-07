@@ -9,5 +9,6 @@ pub mod history;
 pub mod patch_edit;
 pub mod repo;
 pub mod rewrite;
+pub mod squash;
 pub mod transparency;
 pub mod tree;

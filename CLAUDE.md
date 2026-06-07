@@ -106,10 +106,16 @@ files; jj skips `.git`/`.jj` and honours `.gitignore` + `.git/info/exclude`. So
 forward (`@`→`@'`) through the rewrite like any other descendant.
 `materialize_after_rewrite` (in the deferred export, replacing the old
 `sync_worktree`) checks `@'` out to disk via jj and resets the git index to the
-new tip. Non-overlapping local edits merge cleanly onto the rewritten content; an
-overlap leaves `@'` conflicted with markers on disk — reported by
-`take_working_copy_advisory`, **not** blocking the export (`@'` is a descendant of
-the tip, outside `finish_mutation`'s ancestor conflict walk).
+new tip. Non-overlapping local edits merge cleanly onto the rewritten content.
+
+An **overlap** (a local edit clashing with the rewrite) makes `@'` a *conflicted*
+commit. `collect_conflicts` appends `@'` to the conflict set (it's a child of the
+tip, so the ancestor walk misses it; `resolve_change_on_chain` likewise matches
+`@`'s change id), so it goes through the **same deferred flow as a commit
+conflict**: the whole rewrite is held back (git untouched), `@'` shows up as a
+"Uncommitted changes" conflicted commit, and the user resolves it in the diff pane
+(or `abort`s the lot). Only when `@'` and the chain are all clean does the
+deferred export + materialize run.
 
 Caveats this creates:
 - jj has no index concept (it snapshots the disk, never `.git/index`), so staging
@@ -122,10 +128,13 @@ Caveats this creates:
   scaffolding) so they don't surface as phantom commits in `git log --all`, while
   still preserving a manual jj user's anonymous head (real content + description,
   unrelated change id).
-- The GTK UI shows `@` via `working_copy_info` as a **read-only, non-draggable
-  row above the history list** — its own single-row list, deliberately *not* part
-  of the history list, so the reorder/drop/squash index arithmetic and drag wiring
-  are untouched.
+- The GTK UI shows `@` via `working_copy_info` as a **non-draggable row above the
+  history list** — its own single-row list, deliberately *not* part of the history
+  list, so the reorder/drop/squash index arithmetic and drag wiring are untouched.
+  Its diff is **editable** (Save splices the edit into `@` and writes the working
+  tree via `edit_working_copy_file`; the branch tip doesn't move). During conflict
+  resolution `@` is instead prepended into the conflict chain (the standalone row
+  hidden) so it resolves inline like any commit.
 
 ### Conflict resolution (`conflict.rs`)
 

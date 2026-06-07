@@ -779,14 +779,14 @@ pub fn render_conflict_snippets(
 
     let block_count = blocks.len();
     if block_count == 0 {
-        // Nothing to resolve: the whole file is one elided run (the caller
-        // generally won't render such a file).
+        // No conflict left (e.g. every block was resolved inline): there is
+        // nothing to focus on, so show the whole file as content. Shown — not
+        // elided — so it round-trips through `reconstruct_conflict_file` (an
+        // Elided run with no cue line to anchor it could not be recovered).
         return ConflictSnippets {
-            text: String::new(),
+            text: full_text.to_string(),
             gaps: Vec::new(),
-            pieces: vec![ConflictPiece::Elided {
-                lines: lines.iter().map(|s| s.to_string()).collect(),
-            }],
+            pieces: vec![ConflictPiece::Shown { lines: total }],
             block_count: 0,
         };
     }
@@ -1411,6 +1411,19 @@ mod tests {
         let shown: Vec<&str> = snip.text.split('\n').collect();
         let rebuilt = reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>");
         assert_eq!(rebuilt, full);
+    }
+
+    #[test]
+    fn conflict_snippets_with_no_conflict_show_and_reconstruct_whole_file() {
+        // A file with every conflict already resolved (no markers) shows in full
+        // and round-trips — no content is hidden behind an unrecoverable elision.
+        let full = "a\nb\nc\nd\n";
+        let snip = render_conflict_snippets(full, &ContextExpansion::default(), "<CUE>");
+        assert_eq!(snip.block_count, 0);
+        assert!(!snip.text.contains("<CUE>"));
+        assert!(snip.text.contains("a") && snip.text.contains("d"));
+        let shown: Vec<&str> = snip.text.split('\n').collect();
+        assert_eq!(reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>"), full);
     }
 
     #[test]

@@ -12,3 +12,4 @@ pub mod rewrite;
 pub mod squash;
 pub mod transparency;
 pub mod tree;
+pub mod workcopy;

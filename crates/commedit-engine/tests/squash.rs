@@ -57,6 +57,46 @@ fn fixup_merges_content_keeps_target_message_drops_source() {
 }
 
 #[test]
+fn squashes_a_trashed_commit_into_a_chain_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    three_commits(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Drop "second" to the trash: it becomes an orphan, and "third" rebases onto
+    // "first". Capture its CommitInfo first — its id stays resolvable afterwards.
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "second").unwrap();
+    let second = commits[from].clone();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    repo.abandon_commit(&target).expect("drop");
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
+
+    // Squash the trashed "second" (an orphan, unrelated to "first") into "first".
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let onto = commits.iter().position(|c| c.subject == "first").unwrap();
+    let (source, dest) = repo
+        .plan_squash_restore(&commits, &second, onto)
+        .expect("plan");
+    let outcome = repo
+        .squash_restore_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash from trash");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // "second"'s content (b.txt) is merged into "first"; the trashed commit is
+    // gone from the graph and "first" keeps its own message (Fixup).
+    assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
+    common::git(dir, &["cat-file", "-e", "HEAD:b.txt"]);
+    common::git(dir, &["cat-file", "-e", "HEAD:c.txt"]);
+
+    // Transparency.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn squash_extends_the_target_message() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

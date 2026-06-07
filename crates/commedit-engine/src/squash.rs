@@ -96,9 +96,38 @@ pub fn squash_recommendations(
         return SquashHighlights::default();
     }
     let candidates: Vec<usize> = chain.into_iter().filter(|&i| i != from).collect();
+    recommendations_in_chain(commits, &candidates, &target)
+}
 
-    // Green: the real destination. Prefer an exact subject match; fall back to a
-    // prefix (starts-with) match only when no exact match exists.
+/// Like [`squash_recommendations`], but for dragging a *trashed* commit
+/// (`restored`, a [`CommitInfo`] no longer in `commits`) back over the history:
+/// highlight the chain rows its `fixup!`/`squash!`/`amend!` subject points at.
+/// Empty when the trashed commit is unprefixed or nothing matches.
+pub fn squash_recommendations_for(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    restored: &CommitInfo,
+) -> SquashHighlights {
+    let Some(target) = squash_target_subject(&restored.subject) else {
+        return SquashHighlights::default();
+    };
+    let chain = branch_chain(commits, head);
+    let candidates: Vec<usize> = chain
+        .into_iter()
+        .filter(|&i| commits[i].id != restored.id)
+        .collect();
+    recommendations_in_chain(commits, &candidates, &target)
+}
+
+/// From the chain `candidates`, pick the highlights for a drag whose bare target
+/// subject is `target`: green `targets` (an exact subject match, falling back to
+/// a starts-with match when none match exactly) and yellow `siblings` (other
+/// prefixed commits aimed at the same `target`, disjoint from the targets).
+fn recommendations_in_chain(
+    commits: &[CommitInfo],
+    candidates: &[usize],
+    target: &str,
+) -> SquashHighlights {
     let mut targets: Vec<usize> = candidates
         .iter()
         .copied()
@@ -108,19 +137,15 @@ pub fn squash_recommendations(
         targets = candidates
             .iter()
             .copied()
-            .filter(|&i| commits[i].subject.starts_with(&target))
+            .filter(|&i| commits[i].subject.starts_with(target))
             .collect();
     }
-
-    // Yellow: other autosquash commits with the same bare target (disjoint from
-    // the green targets, which carry no prefix of their own).
     let siblings: Vec<usize> = candidates
         .iter()
         .copied()
         .filter(|&i| !targets.contains(&i))
-        .filter(|&i| squash_target_subject(&commits[i].subject).as_deref() == Some(target.as_str()))
+        .filter(|&i| squash_target_subject(&commits[i].subject).as_deref() == Some(target))
         .collect();
-
     SquashHighlights { targets, siblings }
 }
 
@@ -142,6 +167,23 @@ pub fn plan_squash(
         return None;
     }
     Some((commits[from].id.clone(), commits[onto].id.clone()))
+}
+
+/// Validate squashing a *trashed* commit (`restored`, a [`CommitInfo`] no longer
+/// in `commits`) onto the commit at display row `onto`: `onto` must sit on the
+/// current branch chain and not be the trashed commit itself. Returns
+/// `(source_id, dest_id)` or `None`.
+pub fn plan_squash_restore(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    restored: &CommitInfo,
+    onto: usize,
+) -> Option<(CommitId, CommitId)> {
+    let chain = branch_chain(commits, head);
+    if !chain.contains(&onto) || commits[onto].id == restored.id {
+        return None;
+    }
+    Some((restored.id.clone(), commits[onto].id.clone()))
 }
 
 /// The source commit's message contribution: the description with a leading
@@ -194,6 +236,19 @@ impl Repo {
         plan_squash(commits, &head, from, onto)
     }
 
+    /// Plan a drag-squash of a *trashed* commit `restored` onto the commit at
+    /// display row `onto`, against the current branch chain. See
+    /// [`plan_squash_restore`].
+    pub fn plan_squash_restore(
+        &self,
+        commits: &[CommitInfo],
+        restored: &CommitInfo,
+        onto: usize,
+    ) -> Option<(CommitId, CommitId)> {
+        let head = self.head_commit_id()?;
+        plan_squash_restore(commits, &head, restored, onto)
+    }
+
     /// Recommended green/yellow drop-target highlights for the prefixed commit
     /// at display row `from`. See [`squash_recommendations`].
     pub fn squash_recommendations(&self, commits: &[CommitInfo], from: usize) -> SquashHighlights {
@@ -201,6 +256,19 @@ impl Repo {
             return SquashHighlights::default();
         };
         squash_recommendations(commits, &head, from)
+    }
+
+    /// Recommended highlights for dragging a *trashed* commit `restored` back
+    /// over the history. See [`squash_recommendations_for`].
+    pub fn squash_recommendations_for(
+        &self,
+        commits: &[CommitInfo],
+        restored: &CommitInfo,
+    ) -> SquashHighlights {
+        let Some(head) = self.head_commit_id() else {
+            return SquashHighlights::default();
+        };
+        squash_recommendations_for(commits, &head, restored)
     }
 
     /// Merge `source`'s changes into `dest`, recompose `dest`'s message per
@@ -217,7 +285,23 @@ impl Repo {
         mode: SquashMode,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(source, dest, mode)
+            self.squash_into_inner(source, dest, mode, false)
+        })
+    }
+
+    /// Like [`Self::squash_into`], but `source` is a *trashed* commit — an orphan
+    /// no longer reachable from any visible head. It is briefly re-added as a
+    /// head inside the transaction so jj-lib's `squash_commits` can index it (its
+    /// `is_ancestor` check panics on an un-indexed commit); the squash then
+    /// abandons it again, so it leaves no trace as a head.
+    pub fn squash_restore_into(
+        &mut self,
+        source: &CommitId,
+        dest: &CommitId,
+        mode: SquashMode,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("squashing the commit from trash", || {
+            self.squash_into_inner(source, dest, mode, true)
         })
     }
 
@@ -226,6 +310,7 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        source_is_orphan: bool,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -262,6 +347,15 @@ impl Repo {
         let dest_author = dest_commit.author().clone();
 
         let mut tx = self.repo.start_transaction();
+        if source_is_orphan {
+            // The trashed source isn't reachable from any visible head, so it's
+            // absent from the index — make it visible so squash_commits'
+            // is_ancestor check finds it instead of panicking on the lookup. The
+            // squash abandons it (full selection), so rebase_descendants drops it
+            // from the heads again and it leaves no trace.
+            pollster::block_on(tx.repo_mut().add_head(&source_commit))
+                .context("making the trashed commit visible")?;
+        }
         let squashed = pollster::block_on(squash_commits(
             tx.repo_mut(),
             std::slice::from_ref(&sel),
@@ -299,8 +393,9 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_squash_message, parse_squash_mode, plan_squash, squash_recommendations,
-        squash_target_subject, SquashHighlights, SquashMode,
+        compose_squash_message, parse_squash_mode, plan_squash, plan_squash_restore,
+        squash_recommendations, squash_recommendations_for, squash_target_subject,
+        SquashHighlights, SquashMode,
     };
     use crate::history::CommitInfo;
     use jj_lib::backend::{ChangeId, CommitId};
@@ -397,6 +492,39 @@ mod tests {
         assert_eq!(plan_squash(&h, &cid(3), 0, 1), Some((cid(3), cid(2))));
         assert_eq!(plan_squash(&h, &cid(3), 1, 1), None); // onto itself
         assert_eq!(plan_squash(&h, &cid(3), 0, 9), None); // out of range
+    }
+
+    #[test]
+    fn plans_a_squash_from_trash_onto_a_chain_commit() {
+        // Chain 3 <- 2 <- 1; `dropped` (id 9) is a trashed commit not in it.
+        let h = vec![ci(3, 2, "third"), ci(2, 1, "second"), ci(1, 0, "first")];
+        let dropped = ci(9, 1, "dropped");
+        // Squashing the trashed commit onto "second" (row 1) is valid.
+        assert_eq!(
+            plan_squash_restore(&h, &cid(3), &dropped, 1),
+            Some((cid(9), cid(2)))
+        );
+        // Out of range, and onto the trashed commit itself, are rejected.
+        assert_eq!(plan_squash_restore(&h, &cid(3), &dropped, 9), None);
+        let self_drop = ci(2, 1, "second");
+        assert_eq!(plan_squash_restore(&h, &cid(3), &self_drop, 1), None);
+    }
+
+    #[test]
+    fn recommends_a_target_for_a_trashed_prefixed_commit() {
+        let h = fixup_history(); // 3=fixup! second, 2=second, 1=first
+        // A trashed `fixup! second` (id 9, not in the chain) points at "second".
+        let dropped = ci(9, 1, "fixup! second");
+        let r = squash_recommendations_for(&h, &cid(3), &dropped);
+        // Row 1 is "second"; row 0 is the (in-chain) other fixup, a sibling.
+        assert_eq!(r.targets, vec![1]);
+        assert_eq!(r.siblings, vec![0]);
+        // An unprefixed trashed commit recommends nothing.
+        let plain = ci(9, 1, "whatever");
+        assert_eq!(
+            squash_recommendations_for(&h, &cid(3), &plain),
+            SquashHighlights::default()
+        );
     }
 
     #[test]

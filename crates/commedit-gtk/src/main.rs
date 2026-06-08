@@ -898,7 +898,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     save_button.add_css_class("suggested-action");
     save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
     // Sits left of Save. Splits the selected commit into the edited diff plus a
-    // follow-up "Split of …" commit; enabled only while the diff has pending edits
+    // follow-up "fixup! …" commit; enabled only while the diff has pending edits
     // (wired by `update_split_sensitivity`), never in the conflict/working-copy views.
     let split_button = Button::with_label("Split");
     split_button.set_tooltip_text(Some(SPLIT_HINT));

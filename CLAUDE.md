@@ -98,7 +98,7 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   enabled only with pending diff edits). Takes the same `(path, content)` edits as
   `rewrite_files`: rewrites the target `C` → `C'` to the **edited** tree (keeping
   its change id / message / author), then `new_commit`s `N` holding `C`'s
-  **original** tree as `C'`'s child (message `Split of <subject>`, original author),
+  **original** tree as `C'`'s child (message `fixup! <subject>`, original author),
   so `C'` + `N` reproduce the original commit's diff and descendants are untouched.
   The trick is `set_rewritten_commit(C, N)`, which **overwrites** the `C → C'`
   rewrite `rewrite_commit` recorded so `rebase_descendants` (and the bookmark and

@@ -23,7 +23,7 @@ use crate::repo::Repo;
 impl Repo {
     /// Split commit `target`: rewrite it to the edited diff given by `files`
     /// (`(path, content)` pairs, as produced for [`Repo::rewrite_files`]), and
-    /// insert a new "Split of …" commit holding the original tree as its child so
+    /// insert a new "fixup! …" commit holding the original tree as its child so
     /// the two combined reproduce the original commit. Descendants rebase onto the
     /// inserted commit through the shared export pipeline.
     pub fn split_commit(
@@ -175,15 +175,17 @@ impl Repo {
 }
 
 /// Compose the inserted commit's message from the original commit's description:
-/// `Split of <subject>`, where the subject is the first non-empty line. An empty
-/// description yields just `Split of`.
+/// `fixup! <subject>` — git's autosquash prefix pointing back at the original, so
+/// the split-out commit reads (and re-folds, via `--autosquash`) as a fixup of the
+/// edited remainder — where the subject is the first non-empty line. An empty
+/// description yields just `fixup!`.
 fn split_message(original: &str) -> String {
     let subject = original
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim();
-    format!("Split of {subject}").trim_end().to_string()
+    format!("fixup! {subject}").trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -192,13 +194,13 @@ mod tests {
 
     #[test]
     fn split_message_uses_first_nonempty_line() {
-        assert_eq!(split_message("Add feature\n\nbody text"), "Split of Add feature");
-        assert_eq!(split_message("  \n  Real subject\nmore"), "Split of Real subject");
+        assert_eq!(split_message("Add feature\n\nbody text"), "fixup! Add feature");
+        assert_eq!(split_message("  \n  Real subject\nmore"), "fixup! Real subject");
     }
 
     #[test]
     fn split_message_handles_empty_description() {
-        assert_eq!(split_message(""), "Split of");
-        assert_eq!(split_message("\n\n"), "Split of");
+        assert_eq!(split_message(""), "fixup!");
+        assert_eq!(split_message("\n\n"), "fixup!");
     }
 }

@@ -1,5 +1,5 @@
 //! End-to-end: split a historical commit into the edited diff plus an inserted
-//! "Split of …" commit holding the original tree, confirming plain git sees both
+//! "fixup! …" commit holding the original tree, confirming plain git sees both
 //! commits and that the branch tip / descendants are left unchanged.
 
 mod common;
@@ -38,16 +38,16 @@ fn split_middle_commit_inserts_followup_and_preserves_descendants() {
         .expect("split");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
-    // History gains a "Split of second" commit right after the edited one.
+    // History gains a "fixup! second" commit right after the edited one.
     assert_eq!(
         common::git_log_subjects(dir),
-        vec!["third", "Split of second", "second", "first"]
+        vec!["third", "fixup! second", "second", "first"]
     );
 
     // The edited commit leaves f.txt edited; the split commit restores the
     // original; the tip is byte-for-byte what it was before the split.
     assert_eq!(common::git(dir, &["show", "HEAD~2:f.txt"]), "v2-edited"); // second (C')
-    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "v2"); //        Split of second (N)
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "v2"); //        fixup! second (N)
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "v2"); //          third, unchanged
     assert_eq!(common::git(dir, &["show", "HEAD:g.txt"]), "g");
 
@@ -171,9 +171,9 @@ fn split_tip_commit_moves_branch_to_followup() {
     // The branch tip is now the inserted commit, restoring the original tip tree.
     assert_eq!(
         common::git_log_subjects(dir),
-        vec!["Split of second", "second", "first"]
+        vec!["fixup! second", "second", "first"]
     );
-    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "a\nb"); //   Split of second (N)
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "a\nb"); //   fixup! second (N)
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "a\nb\nc"); // second (C')
 
     assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");

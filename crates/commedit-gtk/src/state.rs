@@ -5,11 +5,16 @@
 //! `build_ui` all reach for. Keeping them in one place lets each module depend on
 //! the vocabulary without depending on each other.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use commedit_engine::conflict::ConflictedCommit;
 use commedit_engine::diff::{ConflictPiece, ContextExpansion};
+use commedit_engine::history::CommitInfo;
+use commedit_engine::repo::Repo;
+use commedit_engine::workcopy::WorkingCopyEntry;
+use gtk::{Box as GtkBox, ListBox, ListBoxRow, ScrolledWindow};
 
 pub(crate) const APP_ID: &str = "net.willi.commedit";
 
@@ -173,3 +178,50 @@ pub(crate) const READ_ONLY_HINT: &str = "Edit blocked — this change would brea
 /// layout lines (file headers, elision cues, notices).
 pub(crate) const CONFLICT_LAYOUT_HINT: &str =
     "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
+
+/// Grouped bundles of the `build_ui` state handed to the peeled modules
+/// (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself
+/// refcounted), so the derived `Clone` is cheap. The bundles are assembled in
+/// `build_ui` by cloning its existing locals — no state is duplicated, both point
+/// at the same `Rc` — and handed to the modules as borrowed bundles, which clone
+/// out the individual handles their closures capture.
+
+/// The GTK widget handles a peeled module captures.
+#[derive(Clone)]
+pub(crate) struct Widgets {
+    pub(crate) list: ListBox,
+    pub(crate) placeholder: ListBoxRow,
+    pub(crate) trash_list: ListBox,
+    pub(crate) trash_scroll: ScrolledWindow,
+    pub(crate) trash_box: GtkBox,
+    pub(crate) wc_list: ListBox,
+}
+
+/// The model cells a peeled module reads/writes.
+#[derive(Clone)]
+pub(crate) struct Data {
+    pub(crate) repo: Rc<RefCell<Repo>>,
+    pub(crate) commits: Rc<RefCell<Vec<CommitInfo>>>,
+    pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
+    pub(crate) wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>>,
+    pub(crate) selected_change: Rc<RefCell<Option<String>>>,
+}
+
+/// The transient drag-only cells.
+#[derive(Clone)]
+pub(crate) struct DragState {
+    pub(crate) drag_origin: Rc<Cell<DragOrigin>>,
+    pub(crate) drag_row: Rc<RefCell<Option<ListBoxRow>>>,
+    pub(crate) drag_from: Rc<Cell<Option<usize>>>,
+    pub(crate) drop_gap: Rc<Cell<Option<usize>>>,
+    pub(crate) drop_onto: Rc<Cell<Option<usize>>>,
+    pub(crate) post_drag: Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
+}
+
+/// The late-bound cross-module callbacks.
+#[derive(Clone)]
+pub(crate) struct Callbacks {
+    pub(crate) refresh: Rc<dyn Fn()>,
+    pub(crate) show_status: Rc<dyn Fn(&str)>,
+    pub(crate) enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)>,
+}

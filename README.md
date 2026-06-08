@@ -31,6 +31,15 @@ or **Split** to peel them into a separate commit. (Reverting re-renders from the
 unedited diff, so it discards any in-progress manual edits, just like *expand
 context*; to undo reverts, reselect the commit.)
 
+Whenever the diff has pending edits, a **Split** button appears beside **Save**.
+Where *Save* rewrites the commit to your edited diff, *Split* keeps that edited
+version *and* inserts a new follow-up commit holding everything you changed away
+from the original — so the two together still reproduce the commit's original
+result and its descendants are untouched, but one commit has become two. Paired
+with *revert*, that's how you carve a commit apart: revert the hunks you want to
+separate out, then *Split*, and exactly those changes move into a commit of
+their own.
+
 You can also **reorder** commits by dragging them in the history, or **drop**
 one into the trash (and drag it back to restore it). A reorder or drop is a
 real rebase, so it can conflict. When it does, comm(ed)it never writes the
@@ -55,6 +64,21 @@ target's message, `squash!` appends the dragged commit's message to it, and
 small popup to pick fixup / squash / amend (or cancel — handy if the drop was an
 accident). A squash is a rebase too, so it can conflict, and is then held back
 and resolved exactly like a reorder.
+
+Your **uncommitted changes** aren't left out of all this. Whatever you've edited
+or added on disk but not yet committed appears as its own row (or rows) *above*
+the history list — selectable like a commit, with the same editable diff, where
+**Save** writes back to the working tree rather than rewriting history. You can
+drag such a row **onto a commit** to fold those changes into it (as a fixup),
+**Split** it to peel off a piece, or drop it onto the **trash** to discard it.
+And because the working copy rides through every rewrite untouched, your changes
+are still there — and still uncommitted — once any reorder, squash or edit
+finishes.
+
+Finally, the toolbar's **Review** toggle flips the whole window into a
+read-only, full-window diff of every content change you've made this session —
+the repository as it stands now versus how it was when you opened it — so you
+can sanity-check the cumulative result before you call it done.
 
 ## Installing a binary release
 

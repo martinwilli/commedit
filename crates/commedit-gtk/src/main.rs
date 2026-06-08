@@ -629,6 +629,73 @@ fn change_label(change: &FileChange) -> String {
     format!("{sigil} {}", change.path)
 }
 
+/// Build the diff pane's full buffer text — the combined unified diff for
+/// `changes` with each expandable `@@` header's inline "expand context" cue
+/// appended — together with the hunks (for hit-testing the cues) and the per-
+/// file placement. Appending the cue at a line's *end* keeps every `header_line`
+/// valid, so the returned hunks/files match the text exactly. Shared by the full
+/// (`set_text`) render and the in-place spliced re-render.
+fn build_diff_buffer_text(
+    changes: &[FileChange],
+    expansions: &HashMap<String, ContextExpansion>,
+) -> (String, Vec<HunkInfo>, Vec<CombinedFile>) {
+    let combined = render_commit_diff(changes, expansions);
+    let mut lines: Vec<String> = combined.text.split('\n').map(str::to_string).collect();
+    let mut all_hunks: Vec<HunkInfo> = Vec::new();
+    for file in &combined.files {
+        for hunk in &file.hunks {
+            let label = match (hunk.can_expand_up, hunk.can_expand_down) {
+                (true, true) => "↕ expand context",
+                (true, false) => "↑ expand context",
+                (false, true) => "↓ expand context",
+                (false, false) => {
+                    all_hunks.push(hunk.clone());
+                    continue;
+                }
+            };
+            if let Some(l) = lines.get_mut(hunk.header_line) {
+                l.push_str(&format!("  {}", pill(label)));
+            }
+            all_hunks.push(hunk.clone());
+        }
+    }
+    (lines.join("\n"), all_hunks, combined.files)
+}
+
+/// Replace the buffer's contents with `new_text` by editing only the span that
+/// actually differs — the common leading/trailing runs are left untouched — so
+/// GTK keeps the scroll position instead of resetting it to the top as
+/// `set_text` would (and then fighting GTK's deferred validation; see the diff
+/// expand handler). Mirrors the localized splice in `collapse`. The caller must
+/// hold the `editing` guard so the firewall treats it as our own edit.
+fn splice_buffer_text(buffer: &sourceview5::Buffer, new_text: &str) {
+    let old = buffer_text(buffer);
+    if old == new_text {
+        return;
+    }
+    let old_chars: Vec<char> = old.chars().collect();
+    let new_chars: Vec<char> = new_text.chars().collect();
+    let mut head = 0;
+    while head < old_chars.len() && head < new_chars.len() && old_chars[head] == new_chars[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < old_chars.len() - head
+        && tail < new_chars.len() - head
+        && old_chars[old_chars.len() - 1 - tail] == new_chars[new_chars.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let middle: String = new_chars[head..new_chars.len() - tail].iter().collect();
+    buffer.begin_user_action();
+    let mut start = buffer.iter_at_offset(head as i32);
+    let mut end = buffer.iter_at_offset((old_chars.len() - tail) as i32);
+    buffer.delete(&mut start, &mut end);
+    let mut at = buffer.iter_at_offset(head as i32);
+    buffer.insert(&mut at, &middle);
+    buffer.end_user_action();
+}
+
 fn build_ui(app: &Application, repo_path: PathBuf) {
     let repo = match Repo::open(&repo_path) {
         Ok(repo) => Rc::new(RefCell::new(repo)),
@@ -1116,71 +1183,72 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Render the current file's diff into the buffer with its per-hunk context
-    // expansion, appending a click-to-expand cue to each expandable `@@` header.
-    // Self-referential (via `render_cell`) so a click can request a re-render
-    // after widening a hunk.
-    let render_cell: Rc<RefCell<Option<Renderer>>> = Rc::new(RefCell::new(None));
-    // Hunks of the diff currently in the buffer, so an expand click can scroll
-    // its (now re-rendered) hunk back into view instead of jumping to the top.
+    // Hunks of the diff currently in the buffer, so an expand click can hit-test
+    // the cue it lands on and re-render that hunk's widened context.
     let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
     // The conflict pane's "expand hidden lines" action, late-bound (it needs the
     // conflict renderer defined below). The expand-click gesture invokes it by
-    // buffer line, mirroring `render_cell` for the diff pane.
+    // buffer line, mirroring the diff renderer.
     let conflict_expand_cell: Rc<RefCell<Option<Rc<dyn Fn(usize)>>>> =
         Rc::new(RefCell::new(None));
-    let render_diff_view: Renderer = {
-        let changes = changes.clone();
+    // Push `new_text` (built by `build_diff_buffer_text`) into the buffer and
+    // refresh the derived state + highlighting. `replace` chooses how the text
+    // lands: a full `set_text` (used for a fresh load, where resetting the scroll
+    // to the top is wanted) or an in-place `splice` (used when widening context,
+    // where the scroll must stay put). The cue is handled by a GestureClick on
+    // the view, not an embedded widget — removing a real widget on the next
+    // render crashes GTK.
+    let apply_diff_text: Rc<dyn Fn(String, Vec<HunkInfo>, Vec<CombinedFile>, bool)> = {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
-        let expansions = expansions.clone();
         let rendered_hunks = rendered_hunks.clone();
         let highlight = highlight.clone();
-        Rc::new(move || {
-            // Render the whole change — every file's diff in one buffer, files
-            // separated by `diff --git` lines — rather than one file at a time.
-            let combined = render_commit_diff(&changes.borrow(), &expansions.borrow());
+        Rc::new(move |text: String, all_hunks, files: Vec<CombinedFile>, splice: bool| {
             editing.set(true);
-            file_buffer.set_text(&combined.text);
-            // Append a click-to-expand cue to each expandable @@ header, across all
-            // files (header lines are already mapped to the combined text). Inserts
-            // at a line's end so line numbering — and the cached `header_line`s —
-            // stay valid. The click is handled by a GestureClick on the view; we
-            // must not embed a real widget, since removing it on the next set_text
-            // crashes GTK.
-            let mut all_hunks: Vec<HunkInfo> = Vec::new();
-            for file in &combined.files {
-                for hunk in &file.hunks {
-                    let label = match (hunk.can_expand_up, hunk.can_expand_down) {
-                        (true, true) => "↕ expand context",
-                        (true, false) => "↑ expand context",
-                        (false, true) => "↓ expand context",
-                        (false, false) => {
-                            all_hunks.push(hunk.clone());
-                            continue;
-                        }
-                    };
-                    if let Some(mut iter) = file_buffer.iter_at_line(hunk.header_line as i32) {
-                        iter.forward_to_line_end();
-                        file_buffer.insert(&mut iter, &format!("  {}", pill(label)));
-                    }
-                    all_hunks.push(hunk.clone());
-                }
+            if splice {
+                splice_buffer_text(&file_buffer, &text);
+            } else {
+                file_buffer.set_text(&text);
             }
-            file_view.set_editable(combined.files.iter().any(|f| f.editable));
+            file_view.set_editable(files.iter().any(|f| f.editable));
             *rendered_hunks.borrow_mut() = all_hunks;
-            *combined_files.borrow_mut() = combined.files;
+            *combined_files.borrow_mut() = files;
             // Highlight in this same main-loop turn, before GTK paints, so the
             // diff appears once fully colored instead of flashing plain first and
             // then re-highlighting via the debounced `changed` handler (which is
-            // suppressed below while `editing` is set).
+            // suppressed while `editing` is set).
             highlight();
             editing.set(false);
         })
     };
-    *render_cell.borrow_mut() = Some(render_diff_view.clone());
+    // Full render: every file's diff in one buffer, files separated by
+    // `diff --git` lines. `set_text`s the buffer (scroll resets to the top).
+    let render_diff_view: Renderer = {
+        let changes = changes.clone();
+        let expansions = expansions.clone();
+        let apply_diff_text = apply_diff_text.clone();
+        Rc::new(move || {
+            let (text, hunks, files) =
+                build_diff_buffer_text(&changes.borrow(), &expansions.borrow());
+            apply_diff_text(text, hunks, files, false);
+        })
+    };
+    // In-place re-render after widening a hunk's context: splices only the
+    // changed span so GTK keeps the scroll exactly where it is. Expansion only
+    // adds/changes lines at or below the clicked header — everything above is a
+    // common prefix — so the header stays put and the new context grows below it.
+    let rerender_diff_spliced: Renderer = {
+        let changes = changes.clone();
+        let expansions = expansions.clone();
+        let apply_diff_text = apply_diff_text.clone();
+        Rc::new(move || {
+            let (text, hunks, files) =
+                build_diff_buffer_text(&changes.borrow(), &expansions.borrow());
+            apply_diff_text(text, hunks, files, true);
+        })
+    };
 
     // Clicking a @@ header line (anywhere on it, including the "expand context"
     // cue) widens that hunk's context. In conflict mode the same gesture turns a
@@ -1195,7 +1263,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let rendered_hunks = rendered_hunks.clone();
         let expansions = expansions.clone();
-        let render_cell = render_cell.clone();
+        let rerender_diff_spliced = rerender_diff_spliced.clone();
         let combined_files = combined_files.clone();
         let pane_mode = pane_mode.clone();
         let editing = editing.clone();
@@ -1257,79 +1325,24 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // We own this click: don't let the view also place the caret.
             gesture.set_state(gtk::EventSequenceState::Claimed);
 
-            // Record where the clicked header sits in the viewport now, so that
-            // after re-rendering (which resets the scroll and shifts lines down
-            // as context appears above) we can pin that same header back to the
-            // same spot — expansion then grows around it instead of jumping.
-            let frac = vertical_fraction_of_line(&file_view, &file_buffer, line);
-            // The view is monospace and never wraps, so every line is the same
-            // height. Measure it now (layout is valid) to compute the post-render
-            // scroll offset arithmetically — see the idle below.
-            let line_height = file_view
-                .iter_location(&file_buffer.start_iter())
-                .height() as f64;
-
             let expansions = expansions.clone();
-            let render_cell = render_cell.clone();
-            let combined_files = combined_files.clone();
-            let file_buffer = file_buffer.clone();
-            let file_view = file_view.clone();
+            let rerender_diff_spliced = rerender_diff_spliced.clone();
             let nav_sync = nav_sync.clone();
             glib::idle_add_local_once(move || {
-                // The re-render's set_text resets the scroll to the top and we then
-                // re-pin it; guard so the transient doesn't flip the dropdown.
+                // Widen the clicked hunk's context and re-render in place. The
+                // spliced re-render edits only the changed span, so GTK keeps the
+                // scroll untouched: the clicked header stays exactly where it sat
+                // and the new context grows below it — no scroll math, and none of
+                // the jump-to-top flash a `set_text` re-render would cause (see
+                // `splice_buffer_text`). Guard with `nav_sync` so any adjustment
+                // settle from the edit doesn't flip the file dropdown.
                 nav_sync.set(true);
                 expansions
                     .borrow_mut()
                     .entry(path.clone())
                     .or_default()
                     .expand(first, last);
-                if let Some(render) = render_cell.borrow().clone() {
-                    render();
-                }
-                // Pin the (possibly moved or merged) hunk header to its prior
-                // viewport position. set_text reset the scroll to the top; the
-                // deferred scrollers (scroll_to_mark / scroll_to_iter) only run on
-                // a later frame, so the top is painted first and *then* corrected —
-                // the visible jump-to-top flash. Instead, set the scroll offset
-                // synchronously here, before GTK paints, so the next paint already
-                // shows the final position. Line height is uniform (monospace, no
-                // wrap), so the header's offset is just `line * line_height`, and
-                // the document height is `lines * line_height + margins`. We set
-                // the adjustment's upper too, so set_value isn't clamped against
-                // the stale (pre-render) range; GTK's own validation later sets the
-                // same values, leaving the position unchanged. The hunk is found
-                // scoped to this file, since group indices repeat across files in
-                // the combined buffer.
-                let header = combined_files
-                    .borrow()
-                    .iter()
-                    .find(|f| f.path == path)
-                    .and_then(|f| {
-                        f.hunks
-                            .iter()
-                            .find(|h| h.first_group <= first && last <= h.last_group)
-                            .map(|h| h.header_line)
-                    });
-                if let (Some(line), Some(vadj)) = (header, file_view.vadjustment()) {
-                    let page = vadj.page_size();
-                    if line_height > 0.0 && page > 0.0 {
-                        let top = file_view.top_margin() as f64;
-                        let bottom = file_view.bottom_margin() as f64;
-                        let height = file_buffer.line_count() as f64 * line_height + top + bottom;
-                        let upper = height.max(page);
-                        let target = (line as f64 * line_height + top - frac * page)
-                            .clamp(0.0, (upper - page).max(0.0));
-                        vadj.set_upper(upper);
-                        vadj.set_value(target);
-                        // Keep the cursor on the now-visible header so GTK's
-                        // validation doesn't scroll the (offset-0) caret back into
-                        // view and undo the offset we just set.
-                        if let Some(iter) = file_buffer.iter_at_line(line as i32) {
-                            file_buffer.place_cursor(&iter);
-                        }
-                    }
-                }
+                rerender_diff_spliced();
                 nav_sync.set(false);
             });
         }

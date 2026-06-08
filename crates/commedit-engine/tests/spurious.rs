@@ -9,6 +9,7 @@ mod common;
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
+use commedit_engine::squash::SquashMode;
 
 /// Plan and perform "drag display row `from` to the top gap".
 fn reorder_row_to_top(repo: &mut Repo, from: usize) -> SaveOutcome {
@@ -134,6 +135,55 @@ fn spurious_reorder_auto_resolves_and_preserves_uncommitted_changes() {
     let status = common::git(dir, &["status", "--porcelain"]);
     assert!(status.contains("f.txt") && status.contains("other.txt"), "status: {status:?}");
     common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn spurious_squash_across_an_interior_commit_is_auto_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // foo / +bar / +baz / +qux: each commit appends one adjacent line. Squashing
+    // C (+qux) into A (+bar), *skipping* B (+baz), re-applies qux's change where
+    // baz is absent — so A' conflicts spuriously. But B re-adds baz on top,
+    // cancelling the conflict, so the tip is clean and equals the original; the
+    // interior conflict is auto-resolved without bothering the user.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "A"),
+            ("f.txt", "foo\nbar\nbaz\n", "B"),
+            ("f.txt", "foo\nbar\nbaz\nqux\n", "C"),
+        ],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "C").unwrap();
+    let onto = commits.iter().position(|c| c.subject == "A").unwrap();
+    let (source, dest) = repo.plan_squash(&commits, from, onto).expect("plan");
+    let outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "expected the spurious squash to auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing should be left pending");
+
+    // C folded into A (Fixup keeps A's message); the tip is the original combined
+    // file, and A' now carries `qux` (re-attributed) but not `baz`.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz\nqux");
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbar\nqux");
+
+    // Transparency invariants.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+    assert!(!std::fs::read_to_string(dir.join("f.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
 }
 
 #[test]

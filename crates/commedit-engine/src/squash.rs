@@ -401,7 +401,10 @@ impl Repo {
         pollster::block_on(tx.repo_mut().rebase_descendants())
             .context("rebasing descendants")?;
 
-        self.finish_mutation(
+        // A squash preserves the net change set, so the post-squash tip is clean
+        // and identical to the original even when an interior commit conflicts
+        // spuriously — opt into the same CleanTip auto-resolution as a reorder.
+        self.finish_mutation_auto_resolve(
             tx,
             "commedit: squash commit",
             pre_op,

@@ -108,13 +108,25 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   file-blob/tree-splicing step is shared with `rewrite_files` via
   `tree::splice_files_into_tree`; `split_message` (pure, inline-tested) builds the
   message.
+- `split_working_copy` (`split.rs`) + `squash_working_copy_into` (`squash.rs`) —
+  the same Split button and drag-to-squash, but acting on an *uncommitted* entry
+  (see "Working-copy preservation"). `split_working_copy(change_hex, files)` runs
+  the identical `rewrite C→C'` / `new_commit N` / `set_rewritten_commit(C, N)`
+  recipe on a working-copy entry (resolved by its stable change id *after*
+  snapshotting, since the leaf `@`'s commit id churns), but commits the tx
+  **directly** — like `edit_working_copy_file`, no `finish_mutation`/export — so
+  HEAD/refs/index/worktree are untouched and disk stays byte-identical; the result
+  is a *chain* of uncommitted entries. `squash_working_copy_into(change_hex, dest)`
+  snapshots, resolves the entry, and delegates to `squash_into(.., Fixup)`; folding
+  the whole leaf `@` leaves jj's recreated empty `@` as a clean tree.
 
 ### Working-copy preservation (`workcopy.rs`)
 
 Uncommitted changes are first-class: they live in jj's **working-copy commit
 `@`**, so a rewrite never loses them. `snapshot_working_copy` (run at `Repo::open`
-and at the start of every mutation) re-parents `@` onto the current tip and
-snapshots the on-disk tree into it — tracked edits **and** untracked, non-ignored
+and at the start of every mutation) keeps `@` attached above the current tip (see
+"the working-copy chain" below) and snapshots the on-disk tree into the leaf `@` —
+tracked edits **and** untracked, non-ignored
 files; jj skips `.git`/`.jj` and honours `.gitignore` + `.git/info/exclude`. So
 `@`-vs-parent *is* the uncommitted delta, which `rebase_descendants` carries
 forward (`@`→`@'`) through the rewrite like any other descendant.
@@ -122,14 +134,31 @@ forward (`@`→`@'`) through the rewrite like any other descendant.
 `sync_worktree`) checks `@'` out to disk via jj and resets the git index to the
 new tip. Non-overlapping local edits merge cleanly onto the rewritten content.
 
-An **overlap** (a local edit clashing with the rewrite) makes `@'` a *conflicted*
-commit. `collect_conflicts` appends `@'` to the conflict set (it's a child of the
-tip, so the ancestor walk misses it; `resolve_change_on_chain` likewise matches
-`@`'s change id), so it goes through the **same deferred flow as a commit
-conflict**: the whole rewrite is held back (git untouched), `@'` shows up as a
-"Uncommitted changes" conflicted commit, and the user resolves it in the diff pane
-(or `abort`s the lot). Only when `@'` and the chain are all clean does the
-deferred export + materialize run.
+**The working-copy *chain*.** `@` need not sit directly on HEAD: the Split button
+(`split_working_copy`) peels `@` into a short linear stack of jj commits between
+HEAD and the leaf `@` — `HEAD → @' (edited subset) → @ (leaf, full disk tree)` —
+none exported to git. `working_copy_chain` enumerates these entries (newest first,
+empty ones filtered); `working_copy_chain_ids` is the id-only walk reused below.
+`ensure_working_copy_on_head` keeps the chain intact (it re-attaches only when the
+single-parent walk from `@` *doesn't* reach the tip, e.g. plain `git` moved HEAD).
+The walk stops at the git tip **or** jj's bookmark tip, since git HEAD lags while a
+conflicted rewrite is pending. Dragging an entry onto a commit folds it in as a
+Fixup (`squash_working_copy_into`); folding the leaf leaves jj's recreated empty
+`@`. The chain is **session-local**: it persists in jj's op log, but git only sees
+the leaf as one unstaged pile, so `Repo::open` calls `collapse_working_copy_chain`
+(re-attach `@` directly onto HEAD, abandoning intermediates) *before* its snapshot
+— a fresh session reconciles to git's single-pile view rather than resurrecting a
+split git can't represent.
+
+An **overlap** (a local edit clashing with the rewrite) makes a chain entry a
+*conflicted* commit. `collect_conflicts` appends every conflicted chain entry
+(they're descendants of the tip, so the ancestor walk misses them — appended
+oldest-first via `working_copy_chain_ids`; `resolve_change_on_chain` likewise
+matches any chain entry's change id), so it goes through the **same deferred flow
+as a commit conflict**: the whole rewrite is held back (git untouched), the entry
+shows up as a "Uncommitted changes" conflicted commit, and the user resolves it in
+the diff pane (or `abort`s the lot). Only when the chain and the branch are all
+clean does the deferred export + materialize run.
 
 Caveats this creates:
 - jj has no index concept (it snapshots the disk, never `.git/index`), so staging
@@ -145,13 +174,18 @@ Caveats this creates:
   scaffolding) so they don't surface as phantom commits in `git log --all`, while
   still preserving a manual jj user's anonymous head (real content + description,
   unrelated change id).
-- The GTK UI shows `@` via `working_copy_info` as a **non-draggable row above the
-  history list** — its own single-row list, deliberately *not* part of the history
-  list, so the reorder/drop/squash index arithmetic and drag wiring are untouched.
-  Its (multi-file) diff is **editable** — Save splits the combined buffer and
-  writes each changed file via `edit_working_copy_file`; the branch tip doesn't
-  move. During conflict resolution `@` is instead prepended into the conflict chain
-  (the standalone row hidden) so it resolves inline like any commit.
+- The GTK UI shows the working-copy chain via `working_copy_chain` as **rows above
+  the history list** (`populate_wc`) — their own list (`wc_entries` mirrors them),
+  deliberately *not* part of the history list, so the reorder/drop/squash index
+  arithmetic is untouched. Selecting a row shows that entry's diff; it's
+  **editable** (Save writes each changed file via `edit_working_copy_file(change_hex,
+  …)`, the tip doesn't move) and **splittable** (Split → `split_working_copy`). Each
+  row is a drag *source* whose drop onto a commit folds it in as a fixup
+  (`DragOrigin::WorkingCopy`): the history list is the drop target, but for these
+  drags `show_zone` offers only the red onto-a-commit squash target — never the blue
+  reorder gap (uncommitted entries can't be reordered into history). During conflict
+  resolution the rows are hidden and each conflicted entry is prepended into the
+  conflict chain so it resolves inline like any commit.
 
 ### Conflict resolution (`conflict.rs`)
 
@@ -244,9 +278,12 @@ quarter opens a reorder gap (the placeholder), its middle half marks a squash
 target (`set_squash_target`); dragging an autosquash-prefixed commit highlights
 recommended targets green and sibling fixups yellow, and dropping an unprefixed
 commit onto another opens the fixup/squash/amend popover (`show_squash_popover`).
-A drop only *stages* its rewrite into `post_drag`, run at idle from `drag-end` —
-rewriting history mid-gesture frees a row GTK still tracks as the drop target and
-segfaults, so `populate_rows` also only hides (never unparents) surplus rows.
+A working-copy row dragged onto a commit (`DragOrigin::WorkingCopy`) instead folds
+in silently as a fixup — `show_zone` offers it only the red onto-a-commit target,
+never the blue reorder gap. A drop only *stages* its rewrite into `post_drag`, run
+at idle from `drag-end` — rewriting history mid-gesture frees a row GTK still tracks
+as the drop target and segfaults, so `populate_rows` also only hides (never
+unparents) surplus rows.
 
 ## Conventions
 

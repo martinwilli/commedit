@@ -20,6 +20,7 @@ use commedit_engine::patch_edit::{
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
+use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -46,12 +47,15 @@ const HISTORY_PAGE: usize = 64;
 type Renderer = Rc<dyn Fn()>;
 
 /// Which list a drag started in, so the shared drop handlers can tell a reorder
-/// (history → history), a drop (history → trash) and a restore (trash → history)
-/// apart. The carried value is just the source row index; this says where from.
+/// (history → history), a drop (history → trash), a restore (trash → history) and
+/// a working-copy fold (working copy → commit) apart. The carried value is just
+/// the source row index; this says where from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragOrigin {
     History,
     Trash,
+    /// A working-copy entry being dragged onto a commit to fold it in (fixup).
+    WorkingCopy,
 }
 
 /// Which content the diff pane is showing. In `Diff` mode it's the usual
@@ -729,26 +733,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     }
 
     // --- History pane (left) ---
-    // The working-copy row: a read-only entry above the history showing the
-    // uncommitted changes (jj's `@` commit). It is its own single-row list — not
-    // part of the history `list` — so the reorder/drop/squash index arithmetic
-    // and drag wiring below are untouched, and it can never be dragged or
-    // reordered. Hidden while the tree is clean.
-    let wc_label = gtk::Label::new(None);
-    wc_label.set_halign(gtk::Align::Start);
-    wc_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    wc_label.set_margin_start(8);
-    wc_label.set_margin_end(8);
-    wc_label.set_margin_top(4);
-    wc_label.set_margin_bottom(4);
-    let wc_row = ListBoxRow::new();
-    wc_row.set_child(Some(&wc_label));
+    // The working-copy rows: read-only entries above the history showing the
+    // uncommitted changes (jj's `@` commit and any pieces split off it). They are
+    // their own list — not part of the history `list` — so the reorder/drop/squash
+    // index arithmetic below is untouched. Each row can be *dragged onto* a commit
+    // to fold its changes in as a fixup, but never reordered into history. Hidden
+    // while the tree is clean. `wc_entries` mirrors the rows (newest first, the
+    // leaf `@` first); `selected_wc_change` is the entry the diff pane shows.
+    let wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected_wc_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let wc_list = ListBox::new();
-    wc_list.append(&wc_row);
     wc_list.set_visible(false);
     wc_list.set_tooltip_text(Some(
         "Uncommitted working-tree changes — edit the diff here (Save writes the working \
-         tree); preserved across rewrites",
+         tree), Split to peel off a piece, or drag a row onto a commit to fold it in",
     ));
 
     let list = ListBox::new();
@@ -1372,18 +1370,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // (Applying tags does not emit `changed`, so this can't loop.)
     let highlight_gen = Rc::new(RefCell::new(0u64));
     // Light the Split button only when the diff carries pending file-content edits
-    // (the same edits Save would apply, via `collect_file_edits`) — and never in
-    // the conflict or working-copy views. Runs on every buffer change below, so it
-    // also resets to insensitive after a (re)load renders a fresh, unedited diff.
+    // (the same edits Save would apply, via `collect_file_edits`) — never in the
+    // conflict view, but now also for a working-copy entry (Split peels it). Runs
+    // on every buffer change below, so it also resets to insensitive after a
+    // (re)load renders a fresh, unedited diff.
     let update_split_sensitivity: Rc<dyn Fn()> = {
         let split_button = split_button.clone();
         let file_buffer = file_buffer.clone();
         let changes = changes.clone();
         let pane_mode = pane_mode.clone();
-        let viewing_wc = viewing_wc.clone();
         Rc::new(move || {
             let has_edits = !pane_mode.borrow().is_conflict()
-                && !viewing_wc.get()
                 && matches!(
                     collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()),
                     Ok(edits) if !edits.is_empty()
@@ -1926,15 +1923,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Load the read-only working-copy (@) diff into the file pane.
+    // Load the selected working-copy entry's diff into the file pane (read-only).
+    // The entry is named by its stable change id; falls back to the leaf `@` (the
+    // first chain entry) when nothing is selected.
     let load_wc_changes: Rc<dyn Fn()> = {
         let repo = repo.clone();
         let apply_changes = apply_changes.clone();
+        let selected_wc_change = selected_wc_change.clone();
         Rc::new(move || {
             let loaded = {
                 let r = repo.borrow();
-                match r.working_copy_info() {
-                    Some(info) => commit_changes(&r.repo, &info.commit_id).unwrap_or_default(),
+                let chain = r.working_copy_chain();
+                let want = selected_wc_change.borrow().clone();
+                let entry = want
+                    .and_then(|ch| chain.iter().find(|e| e.info.change_id_hex() == ch))
+                    .or_else(|| chain.first());
+                match entry {
+                    Some(e) => commit_changes(&r.repo, &e.info.id).unwrap_or_default(),
                     None => Vec::new(),
                 }
             };
@@ -1985,8 +1990,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
-    // Selecting the working-copy (@) row shows its diff read-only: there is no
-    // message or identity to edit, and Save is inert (see the `save` closure).
+    // Selecting a working-copy entry shows its diff read-only: there is no
+    // message or identity to edit, and Save edits that entry in place (see the
+    // `save` closure). The selected entry is tracked by its stable change id.
     wc_list.connect_row_selected({
         let viewing_wc = viewing_wc.clone();
         let list = list.clone();
@@ -1995,10 +2001,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let message_view = message_view.clone();
         let identity_fields = identity_fields.clone();
         let pane_mode = pane_mode.clone();
+        let wc_entries = wc_entries.clone();
+        let selected_wc_change = selected_wc_change.clone();
         move |_wc_list, row| {
-            if row.is_none() || pane_mode.borrow().is_conflict() {
+            let Some(row) = row else { return };
+            if pane_mode.borrow().is_conflict() {
                 return;
             }
+            let idx = row.index();
+            if idx < 0 {
+                return;
+            }
+            let change = wc_entries
+                .borrow()
+                .get(idx as usize)
+                .map(|e| e.info.change_id_hex());
+            let Some(change) = change else { return };
+            *selected_wc_change.borrow_mut() = Some(change);
             viewing_wc.set(true);
             // Mutually exclusive with the history selection.
             list.unselect_all();
@@ -2012,31 +2031,38 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
-    // Update the read-only working-copy (@) row from the engine: show it with a
-    // summary when the tree is dirty, hide it when clean or while resolving
-    // conflicts.
+    // Update the working-copy rows from the engine: one per uncommitted entry when
+    // the tree is dirty, hidden when clean or while resolving conflicts. Drops a
+    // stale selection that no longer names a live entry.
     let refresh_wc: Rc<dyn Fn()> = {
         let repo = repo.clone();
         let wc_list = wc_list.clone();
-        let wc_label = wc_label.clone();
+        let wc_entries = wc_entries.clone();
+        let selected_wc_change = selected_wc_change.clone();
+        let viewing_wc = viewing_wc.clone();
         let pane_mode = pane_mode.clone();
         Rc::new(move || {
             if pane_mode.borrow().is_conflict() {
                 wc_list.set_visible(false);
                 return;
             }
-            match repo.borrow().working_copy_info() {
-                Some(info) => {
-                    let n = info.changed_files;
-                    let s = if n == 1 { "" } else { "s" };
-                    wc_label.set_text(&if info.has_conflict {
-                        format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {n} file{s}")
-                    } else {
-                        format!("\u{270E} Uncommitted changes \u{2014} {n} file{s}")
-                    });
-                    wc_list.set_visible(true);
+            let chain = repo.borrow().working_copy_chain();
+            let visible = !chain.is_empty();
+            populate_wc(&wc_list, &chain);
+            let still_present = selected_wc_change
+                .borrow()
+                .as_ref()
+                .map(|ch| chain.iter().any(|e| e.info.change_id_hex() == *ch))
+                .unwrap_or(false);
+            *wc_entries.borrow_mut() = chain;
+            wc_list.set_visible(visible);
+            // If the viewed entry is gone (folded away, or the tree went clean),
+            // forget it so a later edit/split doesn't target the wrong entry.
+            if !still_present {
+                selected_wc_change.borrow_mut().take();
+                if !visible {
+                    viewing_wc.set(false);
                 }
-                None => wc_list.set_visible(false),
             }
         })
     };
@@ -2149,13 +2175,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     (HashSet::new(), 0, 0)
                 }
             };
-            // The working copy @ resolves inline among the conflicted commits, so
-            // hide the standalone @ row and prepend @ to the chain when it's the
-            // (or a) conflicted commit.
+            // The working-copy chain resolves inline among the conflicted
+            // commits, so hide the standalone rows and prepend each conflicted
+            // entry to the chain. Insert oldest-first (the chain is newest-first)
+            // so the newest entry lands at the top, above the branch tip.
             wc_list.set_visible(false);
-            if let Some(wc_info) = repo.borrow().working_copy_commit_info() {
-                if badges.contains(&wc_info.change_id_hex()) {
-                    commits.borrow_mut().insert(0, wc_info);
+            for entry in repo.borrow().working_copy_chain().into_iter().rev() {
+                if badges.contains(&entry.info.change_id_hex()) {
+                    commits.borrow_mut().insert(0, entry.info);
                 }
             }
             populate_list(&list, &commits.borrow(), &badges);
@@ -2563,6 +2590,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         .plan_restore(&commits.borrow(), info, new_gap)
                         .is_some()
                 }),
+                // A working-copy entry only folds *onto* a commit — never between.
+                DragOrigin::WorkingCopy => false,
             });
             if !real_move {
                 if placeholder.parent().is_some() {
@@ -2602,6 +2631,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let drag_origin = drag_origin.clone();
         let drop_onto = drop_onto.clone();
         let trashed = trashed.clone();
+        let wc_entries = wc_entries.clone();
         Rc::new(move |ci: usize| {
             if drop_onto.get() == Some(ci) {
                 return;
@@ -2612,7 +2642,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
             // A history drag squashes one chain commit onto another; a trash drag
-            // squashes the trashed commit onto the chain commit at `ci`.
+            // squashes the trashed commit onto the chain commit at `ci`; a
+            // working-copy drag folds that uncommitted entry into it (a fixup).
             let valid = drag_from.get().is_some_and(|from| match drag_origin.get() {
                 DragOrigin::History => {
                     repo.borrow().plan_squash(&commits.borrow(), from, ci).is_some()
@@ -2620,6 +2651,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
                     repo.borrow()
                         .plan_squash_restore(&commits.borrow(), info, ci)
+                        .is_some()
+                }),
+                DragOrigin::WorkingCopy => wc_entries.borrow().get(from).is_some_and(|e| {
+                    repo.borrow()
+                        .plan_squash_restore(&commits.borrow(), &e.info, ci)
                         .is_some()
                 }),
             });
@@ -2658,16 +2694,32 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let set_squash_target = set_squash_target.clone();
         let clear_squash_target = clear_squash_target.clone();
         let drop_gap = drop_gap.clone();
+        let drag_origin = drag_origin.clone();
         Rc::new(move |y: f64| {
+            // A working-copy entry can only be folded *onto* a commit (fixup), so
+            // the whole row is a squash target and no reorder gap ever opens.
+            let wc_drag = drag_origin.get() == DragOrigin::WorkingCopy;
             let Some(row) = list.row_at_y(y as i32) else {
-                // Above the first / below the last row: a pure reorder gap.
+                // Above the first / below the last row: a pure reorder gap (none
+                // for a working-copy drag).
                 clear_squash_target();
-                show_gap(y);
+                if wc_drag {
+                    clear_gap();
+                } else {
+                    show_gap(y);
+                }
                 return;
             };
             let li = row.index() as usize;
             // Hovering the placeholder itself: the gap is unchanged, leave it.
             if drop_gap.get() == Some(li) {
+                return;
+            }
+            if wc_drag {
+                // No placeholder is ever inserted for a working-copy drag, so the
+                // list index is the commit index.
+                clear_gap();
+                set_squash_target(li);
                 return;
             }
             let alloc = row.allocation();
@@ -2800,6 +2852,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let selected_change = selected_change.clone();
+        let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         move |_target, value, _x, y| {
@@ -3017,6 +3070,50 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }));
                     true
                 }
+                DragOrigin::WorkingCopy if onto.is_some() => {
+                    // Dropped a working-copy entry ONTO a commit: fold its changes
+                    // in as a Fixup — no popover, no message change.
+                    let onto = onto.unwrap();
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let wc_entries = wc_entries.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
+                        let entry = wc_entries.borrow().get(from as usize).map(|e| e.info.clone());
+                        let Some(entry) = entry else {
+                            return;
+                        };
+                        // Validate the target sits on the branch chain (reuse the
+                        // trash-squash planner). Fold by the entry's *stable change
+                        // id* so the leaf's churning commit id can't go stale across
+                        // the internal snapshot.
+                        if repo
+                            .borrow()
+                            .plan_squash_restore(&commits.borrow(), &entry, onto)
+                            .is_none()
+                        {
+                            return;
+                        }
+                        let dest = commits.borrow()[onto].id.clone();
+                        let change_hex = entry.change_id_hex();
+                        let outcome = repo
+                            .borrow_mut()
+                            .squash_working_copy_into(Some(&change_hex), &dest);
+                        match outcome {
+                            Ok(SaveOutcome::Clean) => refresh(),
+                            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                            Err(err) => show_status(&format!("Fixup failed: {err}")),
+                        }
+                    }));
+                    true
+                }
+                DragOrigin::WorkingCopy => {
+                    // Dropped between commits (or off a commit): uncommitted entries
+                    // can't be reordered, so there is nothing to do.
+                    false
+                }
             }
         }
     });
@@ -3103,6 +3200,55 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
     trash_list.add_controller(trash_drag);
+
+    // The working-copy list is a drag *source* only (its rows can be folded onto a
+    // commit), never a drop target. It shares the history list's drop target and
+    // the deferred `post_drag` machinery; the drop handler's `WorkingCopy` arm
+    // folds the dragged entry in as a fixup.
+    let wc_drag = DragSource::new();
+    wc_drag.set_actions(gdk::DragAction::MOVE);
+    wc_drag.connect_prepare({
+        let wc_list = wc_list.clone();
+        let drag_row = drag_row.clone();
+        let drag_origin = drag_origin.clone();
+        let drag_from = drag_from.clone();
+        move |source, _x, y| {
+            let row = wc_list.row_at_y(y as i32)?;
+            let paintable = gtk::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&paintable), 0, 0);
+            *drag_row.borrow_mut() = Some(row.clone());
+            drag_origin.set(DragOrigin::WorkingCopy);
+            // Index into `wc_entries`, read by the motion/drop handlers.
+            drag_from.set(Some(row.index() as usize));
+            Some(gdk::ContentProvider::for_value(&row.index().to_value()))
+        }
+    });
+    wc_drag.connect_drag_begin({
+        let drag_row = drag_row.clone();
+        move |_source, _drag| {
+            if let Some(row) = drag_row.borrow().as_ref() {
+                row.add_css_class("commit-dragging");
+            }
+            // No autosquash recommendations: uncommitted entries carry no subject.
+        }
+    });
+    wc_drag.connect_drag_end({
+        let drag_row = drag_row.clone();
+        let drag_from = drag_from.clone();
+        let clear_gap = clear_gap.clone();
+        let clear_squash_target = clear_squash_target.clone();
+        let post_drag = post_drag.clone();
+        move |_source, _drag, _delete| {
+            if let Some(row) = drag_row.borrow_mut().take() {
+                row.remove_css_class("commit-dragging");
+            }
+            drag_from.set(None);
+            clear_gap();
+            clear_squash_target();
+            run_post_drag(&post_drag);
+        }
+    });
+    wc_list.add_controller(wc_drag);
 
     let trash_drop = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
     // Deliberately no widget mutation in enter/leave (no hover highlight): those
@@ -3197,19 +3343,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let viewing_wc = viewing_wc.clone();
         let load_wc_changes = load_wc_changes.clone();
         let refresh_wc = refresh_wc.clone();
+        let selected_wc_change = selected_wc_change.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
                 resolve_current();
                 return;
             }
-            // Viewing the working copy: edit @ in place (no message/identity, and
-            // the branch tip doesn't move), then reload the @ diff and row.
+            // Viewing a working-copy entry: edit it in place (no message/identity,
+            // and the branch tip doesn't move), then reload the diff and rows.
             if viewing_wc.get() {
                 let saved_file = current_file.borrow().clone();
                 let saved_cursor = file_buffer.cursor_position();
-                // Edit each changed file of @ in place (no rebase, so a loop is
-                // fine); the branch tip doesn't move.
+                // Edit each changed file of the selected entry in place (no rebase
+                // that moves the tip, so a loop is fine).
                 let edits = match collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()) {
                     Ok(edits) => edits,
                     Err(msg) => {
@@ -3217,8 +3364,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         return;
                     }
                 };
+                let change = selected_wc_change.borrow().clone();
                 for (path, content) in &edits {
-                    if let Err(err) = repo.borrow_mut().edit_working_copy_file(path, content) {
+                    if let Err(err) =
+                        repo.borrow_mut().edit_working_copy_file(change.as_deref(), path, content)
+                    {
                         show_status(&format!("Working-copy edit failed: {err}"));
                         return;
                     }
@@ -3376,11 +3526,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         move |_| save()
     });
 
-    // Split: rewrite the selected commit to the edited diff, and insert a new
-    // "Split of …" commit holding its original tree right after it. Mirrors the
-    // save closure's commit-content path (and its place-restoring reload), but is
-    // diff-only — message/identity edits are left for Save. The button is
-    // insensitive unless the diff has pending edits, but guard the modes anyway.
+    // Split: rewrite the selected commit (or working-copy entry) to the edited
+    // diff and insert a new commit holding its original tree right after it.
+    // Mirrors the save closure's commit-content path (and its place-restoring
+    // reload), but is diff-only — message/identity edits are left for Save. The
+    // button is insensitive unless the diff has pending edits; guard conflict mode.
     split_button.connect_clicked({
         let repo = repo.clone();
         let commits = commits.clone();
@@ -3395,21 +3545,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pane_mode = pane_mode.clone();
         let viewing_wc = viewing_wc.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
+        let selected_wc_change = selected_wc_change.clone();
+        let refresh_wc = refresh_wc.clone();
+        let wc_list = wc_list.clone();
+        let wc_entries = wc_entries.clone();
         move |_| {
-            if pane_mode.borrow().is_conflict() || viewing_wc.get() {
+            if pane_mode.borrow().is_conflict() {
                 return;
             }
-            let Some(change_id) = selected_change.borrow().clone() else {
-                return;
-            };
-            let target = commits
-                .borrow()
-                .iter()
-                .find(|c| c.change_id_hex() == change_id)
-                .map(|c| c.id.clone());
-            let Some(commit_id) = target else {
-                return;
-            };
             let edits = match collect_file_edits(&buffer_text(&file_buffer), &changes.borrow()) {
                 Ok(edits) => edits,
                 Err(msg) => {
@@ -3425,7 +3568,64 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let saved_file = current_file.borrow().clone();
             let saved_cursor = file_buffer.cursor_position();
             let file_had_focus = file_view.has_focus();
+            // Restore the diff place after a reload; shared by both paths.
+            let restore_place = {
+                let changes = changes.clone();
+                let file_buffer = file_buffer.clone();
+                let file_view = file_view.clone();
+                let file_dropdown = file_dropdown.clone();
+                move || {
+                    if let Some(path) = saved_file {
+                        if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                            file_dropdown.set_selected(idx as u32);
+                        }
+                    }
+                    let offset = saved_cursor.min(file_buffer.char_count());
+                    file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
+                    file_view.scroll_to_mark(&file_buffer.get_insert(), 0.0, false, 0.0, 0.0);
+                    if file_had_focus {
+                        file_view.grab_focus();
+                    }
+                }
+            };
 
+            // Splitting a working-copy entry: a pure jj-side peel — no history
+            // change, so only the working-copy rows and this diff reload. The
+            // edited entry keeps its change id; re-select it so the highlight and
+            // the reloaded diff stay in sync.
+            if viewing_wc.get() {
+                let change = selected_wc_change.borrow().clone();
+                if let Err(err) = repo.borrow_mut().split_working_copy(change.as_deref(), &edits) {
+                    show_status(&format!("Split failed: {err}"));
+                    return;
+                }
+                refresh_wc();
+                wc_list.unselect_all();
+                if let Some(ch) = &change {
+                    let idx = wc_entries
+                        .borrow()
+                        .iter()
+                        .position(|e| e.info.change_id_hex() == *ch);
+                    if let Some(row) = idx.and_then(|i| wc_list.row_at_index(i as i32)) {
+                        wc_list.select_row(Some(&row)); // fires row-selected -> reload
+                    }
+                }
+                restore_place();
+                return;
+            }
+
+            // Splitting a history commit.
+            let Some(change_id) = selected_change.borrow().clone() else {
+                return;
+            };
+            let target = commits
+                .borrow()
+                .iter()
+                .find(|c| c.change_id_hex() == change_id)
+                .map(|c| c.id.clone());
+            let Some(commit_id) = target else {
+                return;
+            };
             // Own statement so the `RefMut` drops before the match arms run
             // (`enter_conflict_mode`/`refresh` re-borrow `repo`).
             let outcome = repo.borrow_mut().split_commit(&commit_id, &edits);
@@ -3440,22 +3640,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     return;
                 }
             }
-
             refresh();
-
-            // Restore the selected file and cursor (refresh reset both). The
-            // selected change id resolves to the edited commit, which kept it.
-            if let Some(path) = saved_file {
-                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
-                    file_dropdown.set_selected(idx as u32);
-                }
-            }
-            let offset = saved_cursor.min(file_buffer.char_count());
-            file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
-            file_view.scroll_to_mark(&file_buffer.get_insert(), 0.0, false, 0.0, 0.0);
-            if file_had_focus {
-                file_view.grab_focus();
-            }
+            restore_place();
         }
     });
 
@@ -4252,6 +4438,44 @@ fn populate_list(list: &ListBox, commits: &[CommitInfo], conflicts: &HashSet<Str
 fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
     scroll.set_visible(!commits.is_empty());
     populate_rows(list, commits, false, &HashSet::new());
+}
+
+/// Fill the working-copy list with one summary row per uncommitted entry (newest
+/// first, the leaf `@` first), reusing rows and hiding the surplus — the same
+/// drag-safe pattern as [`populate_rows`]. Each row is a single label, e.g.
+/// "✏ Uncommitted changes — 2 files" (or "⚠ … conflicts in N files").
+fn populate_wc(list: &ListBox, entries: &[WorkingCopyEntry]) {
+    for (i, entry) in entries.iter().enumerate() {
+        let row = list.row_at_index(i as i32).unwrap_or_else(|| {
+            let label = Label::new(None);
+            label.set_halign(gtk::Align::Start);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_margin_start(8);
+            label.set_margin_end(8);
+            label.set_margin_top(4);
+            label.set_margin_bottom(4);
+            let row = ListBoxRow::new();
+            row.set_child(Some(&label));
+            list.append(&row);
+            row
+        });
+        row.set_visible(true);
+        let n = entry.changed_files;
+        let s = if n == 1 { "" } else { "s" };
+        let text = if entry.has_conflict {
+            format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {n} file{s}")
+        } else {
+            format!("\u{270E} Uncommitted changes \u{2014} {n} file{s}")
+        };
+        if let Some(label) = row.child().and_downcast::<Label>() {
+            label.set_text(&text);
+        }
+    }
+    let mut i = entries.len() as i32;
+    while let Some(extra) = list.row_at_index(i) {
+        extra.set_visible(false);
+        i += 1;
+    }
 }
 
 fn present_error(app: &Application, message: &str) {

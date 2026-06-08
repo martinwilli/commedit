@@ -127,20 +127,32 @@ impl Repo {
             .context("checking out the working copy")
     }
 
-    /// Edit a file of the working copy through the diff pane: splice `new_content`
-    /// into `@`'s tree and write the result to disk — like editing any commit,
-    /// but the branch tip doesn't move (no history export). Snapshots the disk
-    /// first so a concurrent external edit to another file isn't clobbered.
-    pub fn edit_working_copy_file(&mut self, path: &str, new_content: &str) -> Result<()> {
+    /// Edit a file of a working-copy entry through the diff pane: splice
+    /// `new_content` into the entry's tree and write the result to disk — like
+    /// editing any commit, but the branch tip doesn't move (no history export).
+    /// `change_hex` selects which uncommitted entry to edit (its stable change id,
+    /// resolved after snapshotting); `None` targets the leaf `@`. Snapshots the
+    /// disk first so a concurrent external edit to another file isn't clobbered.
+    pub fn edit_working_copy_file(
+        &mut self,
+        change_hex: Option<&str>,
+        path: &str,
+        new_content: &str,
+    ) -> Result<()> {
         crate::repo::catch_jj("editing the working copy", || {
-            self.edit_working_copy_file_inner(path, new_content)
+            self.edit_working_copy_file_inner(change_hex, path, new_content)
         })
     }
 
-    fn edit_working_copy_file_inner(&mut self, path: &str, new_content: &str) -> Result<()> {
+    fn edit_working_copy_file_inner(
+        &mut self,
+        change_hex: Option<&str>,
+        path: &str,
+        new_content: &str,
+    ) -> Result<()> {
         self.snapshot_working_copy()?;
         let wc_id = self
-            .working_copy_commit_id()
+            .resolve_working_copy_change(change_hex)
             .context("no working copy to edit")?;
         let commit = self
             .repo

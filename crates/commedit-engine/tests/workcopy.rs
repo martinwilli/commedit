@@ -333,7 +333,7 @@ fn editing_the_working_copy_file_updates_the_worktree_not_history() {
     let mut repo = Repo::open(dir).expect("open");
     // An uncommitted edit, then refine it through the diff pane.
     std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
-    repo.edit_working_copy_file("a.txt", "a\npane edit\n")
+    repo.edit_working_copy_file(None, "a.txt", "a\npane edit\n")
         .expect("edit working copy");
 
     // The working tree reflects the pane edit...

@@ -11,7 +11,7 @@ use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{
     apply_patch, classify_conflict_lines, commit_changes, parse_diff_lines, reconstruct_conflict_file,
     render_commit_diff, render_conflict_snippets, revert_groups, split_combined_patch, ChangeKind,
-    CombinedFile, ConflictLineKind, ConflictPiece, ContextExpansion, DiffLineKind, FileChange,
+    CombinedFile, ConflictLineKind, ContextExpansion, DiffLineKind, FileChange,
     HunkInfo,
 };
 use commedit_engine::history::{history, history_limited, CommitInfo};
@@ -35,165 +35,13 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-const APP_ID: &str = "net.willi.commedit";
-
-/// How many history rows to load per page. The list starts with one page and
-/// grows by another whenever the user scrolls near the bottom (see the
-/// `history_scroll` edge handler), so opening a deep repo stays cheap.
-const HISTORY_PAGE: usize = 64;
-
-/// A reference-counted, re-entrant "render the current diff" callback. Boxed so
-/// the embedded expand-context buttons can hold and invoke it after they widen a
-/// hunk (the renderer rebuilds the buffer and the buttons themselves).
-type Renderer = Rc<dyn Fn()>;
-
-/// Which list a drag started in, so the shared drop handlers can tell a reorder
-/// (history → history), a drop (history → trash), a restore (trash → history) and
-/// a working-copy fold (working copy → commit) apart. The carried value is just
-/// the source row index; this says where from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DragOrigin {
-    History,
-    Trash,
-    /// A working-copy entry being dragged onto a commit to fold it in (fixup).
-    WorkingCopy,
-}
-
-/// Which content the diff pane is showing. In `Diff` mode it's the usual
-/// editable unified diff guarded by the patch firewall. In `Conflict` mode a
-/// rewrite produced conflicts that git is held back from until they're resolved:
-/// the pane shows a conflicted file materialized with 2-way markers, edited
-/// free-form (the firewall is bypassed), and saving resolves rather than
-/// rewrites.
-enum PaneMode {
-    Diff,
-    Conflict(ConflictCtx),
-}
-
-impl PaneMode {
-    fn is_conflict(&self) -> bool {
-        matches!(self, PaneMode::Conflict(_))
-    }
-}
-
-/// The live state of an in-progress conflict resolution: the conflicted commits,
-/// refreshed from the engine after each resolution step, oldest first.
-struct ConflictCtx {
-    commits: Vec<ConflictedCommit>,
-}
-
-/// Per-file state of the combined conflict-snippet buffer currently shown (one
-/// per conflicted file of the selected commit). The buffer shows only each file's
-/// conflict snippets — its `<<< … >>>` blocks plus context, with the long
-/// unconflicted runs elided behind a cue — so on save we reconstruct each whole
-/// file from the (edited) shown segments interleaved with the verbatim elided
-/// runs recorded in `pieces`.
-struct ConflictFileView {
-    path: String,
-    /// False for structural (non-text) conflicts, shown as a read-only notice.
-    resolvable: bool,
-    /// Marker length jj used, echoed back on resolve so the edit re-parses.
-    marker_len: usize,
-    /// The file's current full conflict text (source of truth): re-windowed on
-    /// render, refreshed from the buffer (capturing edits) on expand/save.
-    full_text: String,
-    /// Per-file snippet context expansion (the elision cues widen it).
-    exp: ContextExpansion,
-    /// Pieces recorded at the last render, for reconstructing the full file.
-    pieces: Vec<ConflictPiece>,
-    /// The elision gaps recorded at the last render, in document order, as
-    /// `(above_block, below_block)` — which blocks' context a cue click widens.
-    gaps: Vec<(Option<usize>, Option<usize>)>,
-}
-
-impl ConflictCtx {
-    /// The change ids (hex) of commits that still have conflicts — used to badge
-    /// the matching history rows.
-    fn conflicted_changes(&self) -> HashSet<String> {
-        self.commits
-            .iter()
-            .filter(|c| !c.files.is_empty())
-            .map(|c| c.change_id_hex())
-            .collect()
-    }
-}
-
-/// Which side(s) of a conflict block a quick-resolve action keeps.
-#[derive(Clone, Copy)]
-enum Side {
-    Ours,
-    Theirs,
-    Both,
-}
-
-/// Inline, clickable quick-resolve cues appended to a conflict block's marker
-/// lines — the same idiom as the diff view's "expand context" cue. Clicking the
-/// marker line keeps the indicated side(s) and drops the markers: "use ours"
-/// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
-const CUE_OURS: &str = " ◀ ➜ use ours ▶";
-const CUE_BOTH: &str = " ◀ ➜ use both ▶";
-const CUE_THEIRS: &str = " ◀ ➜ use theirs ▶";
-/// The end-caps that make a cue read as a banner/tag-shaped button. Painted as a
-/// full-height triangle in the button colour against the line background, their
-/// flat (vertical) side sits flush against the solid-fill body between them, so
-/// they align in height and touch the block, giving pointed ends. The left cap
-/// also marks where the clickable button begins.
-const CUE_CAP_L: char = '◀';
-const CUE_CAP_R: char = '▶';
-
-/// Tooltips for the action-bar buttons. The Save button means different things
-/// per pane mode — committing an edit in the diff view, resolving a file in the
-/// conflict view — so its tooltip is swapped when entering/leaving conflict mode.
-const SAVE_HINT_DIFF: &str =
-    "Save your edits to this commit — message, identity, or file content — \
-     rewriting it in place and rebasing its descendants onto the result.";
-const SAVE_HINT_CONFLICT: &str =
-    "Resolve the conflicted file shown above. When a rewrite conflicts across \
-     several files you resolve them one at a time — save each in turn; the \
-     rewrite is applied to git only once the last conflict is cleared.";
-const ABORT_HINT: &str =
-    "Discard the entire rewrite and roll the repository back to the state it had \
-     before you saved, leaving git untouched.";
-/// Hover hint for the diff view's Split button (enabled only with pending diff edits).
-const SPLIT_HINT: &str =
-    "Split this commit in two: rewrite it to your edited diff, and add a new commit \
-     after it holding the changes you took out — so the two together reproduce the \
-     original commit and its descendants stay unchanged.";
+mod state;
+use crate::state::*;
 
 /// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
 fn pill(label: &str) -> String {
     format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
 }
-
-/// Inline cues that *drop* changes from the diff — the mirror of "expand
-/// context". `revert hunk` sits on each `@@` header (next to the expand cue),
-/// `revert file` on each `diff --git` separator. Clicking one rewrites the diff
-/// so those changes vanish, leaving a pending edit; the user then Saves (drops
-/// them) or Splits (peels them into a separate commit). Shown only for modified
-/// text files (see `build_diff_buffer_text`).
-const REVERT_HUNK_LABEL: &str = "⤺ revert hunk";
-const REVERT_FILE_LABEL: &str = "⤺ revert file";
-
-/// Which inline cue a click/hover landed on in the (non-conflict) diff view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffCue {
-    /// The "expand context" pill on an expandable `@@` header — widen this hunk's
-    /// context (group range to grow on each side).
-    Expand(usize, usize),
-    /// The "revert hunk" pill — drop this hunk's changes (its group range).
-    RevertHunk(usize, usize),
-    /// The "revert file" pill on a `diff --git` line — drop the whole file's changes.
-    RevertFile,
-}
-
-/// Label of the conflict pane's elision cue — the pill standing in for a hidden
-/// run of unconflicted lines between snippets. Clicking it reveals more context.
-const CONFLICT_CUE_LABEL: &str = "↕ expand hidden lines";
-
-/// The standalone notice shown for a structural (non-text-resolvable) conflicted
-/// file in the combined conflict view.
-const CONFLICT_STRUCTURAL_NOTICE: &str =
-    "⚠ structural conflict — can't be resolved as text here; use “Abort rewrite”";
 
 /// The header line introducing one file's section in the combined conflict view,
 /// e.g. `─── src/main.rs ───`.
@@ -1786,9 +1634,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    const READ_ONLY_HINT: &str = "Edit blocked — this change would break the patch structure.";
-    const CONFLICT_LAYOUT_HINT: &str =
-        "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
 
     // Firewall: every interactive mutation of the diff buffer goes through the
     // structured-edit planner so it can never produce a patch that fails to

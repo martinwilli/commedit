@@ -3544,10 +3544,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 }
 
 /// Split the combined diff buffer into the per-file edits whose reconstructed
-/// content differs from the commit's current version. Removed/binary files (no
-/// `new_text`) are skipped; the original trailing-newline style is preserved.
-/// `Err` carries an apply-failure message (the patch firewall should make that
-/// unreachable, but a save surfaces it rather than dropping silently).
+/// content differs from the commit's current version. Files rendered read-only
+/// are skipped: removed/binary ones (no `new_text`) and a conflicted merge base
+/// (its notice has no hunks, so applying it would reconstruct empty content and
+/// spuriously "edit" the file to nothing). The original trailing-newline style is
+/// preserved. `Err` carries an apply-failure message (the patch firewall should
+/// make that unreachable, but a save surfaces it rather than dropping silently).
 fn collect_file_edits(
     combined: &str,
     changes: &[FileChange],
@@ -3557,6 +3559,9 @@ fn collect_file_edits(
         let Some(change) = changes.iter().find(|c| c.path == path) else {
             continue;
         };
+        if change.conflicted_base {
+            continue;
+        }
         let Some(original) = change.new_text.as_deref() else {
             continue;
         };

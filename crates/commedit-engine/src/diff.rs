@@ -35,6 +35,11 @@ pub struct FileChange {
     pub new_text: Option<String>,
     /// True if either side is non-UTF-8 (not editable as text).
     pub is_binary: bool,
+    /// True if the `old` (parent) side is a *conflicted* tree value: for a merge
+    /// commit the parents disagree at this path and don't auto-resolve, so the
+    /// auto-merged `parent_tree()` has no single resolved base to reverse an
+    /// edited patch against. Shown read-only, the same as [`Self::is_binary`].
+    pub conflicted_base: bool,
 }
 
 /// List the file changes a commit introduces relative to its parent tree.
@@ -64,12 +69,19 @@ pub fn tree_changes(
     let mut changes = Vec::new();
     for entry in entries {
         let diff = entry.values.context("computing file diff")?;
+        // Capture before the `into_resolved()` move below collapses a conflicted
+        // base to `None`: a conflicted parent tree (merge parents disagree) has no
+        // single old side, so the file can't be edited as a reversible patch.
+        let before_conflicted = !diff.before.is_resolved();
         let before = diff.before.into_resolved().ok().flatten();
         let after = diff.after.into_resolved().ok().flatten();
 
         let (old_text, old_binary) = read_text(store, &entry.path, before.as_ref())?;
         let (new_text, new_binary) = read_text(store, &entry.path, after.as_ref())?;
-        let kind = match (before.is_some(), after.is_some()) {
+        // A conflicted base resolves to `None`, but the file does exist on the
+        // (disagreeing) parents — so treat it as present for classification, so a
+        // path the merge keeps reads as Modified rather than spuriously Added.
+        let kind = match (before.is_some() || before_conflicted, after.is_some()) {
             (false, true) => ChangeKind::Added,
             (true, false) => ChangeKind::Removed,
             _ => ChangeKind::Modified,
@@ -80,6 +92,7 @@ pub fn tree_changes(
             old_text,
             new_text,
             is_binary: old_binary || new_binary,
+            conflicted_base: before_conflicted,
         });
     }
     Ok(changes)
@@ -472,7 +485,8 @@ pub fn render_commit_diff(
         text.push_str(&format!("diff --git a/{p} b/{p}\n", p = change.path));
         line += 1;
 
-        let mut editable = change.new_text.is_some() && !change.is_binary;
+        let mut editable =
+            change.new_text.is_some() && !change.is_binary && !change.conflicted_base;
         let mut hunks = Vec::new();
         let body = if editable {
             let new = change.new_text.as_deref().unwrap_or("");
@@ -501,6 +515,8 @@ pub fn render_commit_diff(
         } else {
             let notice = if change.is_binary {
                 "\\ Binary file (not editable)"
+            } else if change.conflicted_base {
+                "\\ Conflicted merge base (not editable)"
             } else {
                 "\\ File removed by this commit"
             };
@@ -1301,6 +1317,7 @@ mod tests {
             old_text: Some(old.to_string()),
             new_text: Some(new.to_string()),
             is_binary: false,
+            conflicted_base: false,
         }
     }
 
@@ -1371,6 +1388,7 @@ mod tests {
             old_text: Some("x\n".to_string()),
             new_text: None,
             is_binary: false,
+            conflicted_base: false,
         }];
         let combined = render_commit_diff(&changes, &HashMap::new());
         assert!(!combined.files[0].editable);
@@ -1380,6 +1398,26 @@ mod tests {
         let chunks = split_combined_patch(&combined.text);
         assert_eq!(chunks.len(), 1);
         assert_eq!(apply_patch("x\n", &chunks[0].1).unwrap(), "x\n");
+    }
+
+    #[test]
+    fn conflicted_merge_base_renders_a_read_only_notice() {
+        // A merge whose parents disagree at a path leaves the auto-merged base
+        // conflicted: there is no single old side to reverse a patch against, so
+        // the file is shown read-only (like a binary file), never as an editable
+        // diff that could not round-trip.
+        let changes = vec![FileChange {
+            path: "m.txt".to_string(),
+            kind: ChangeKind::Modified,
+            old_text: None,
+            new_text: Some("resolved\n".to_string()),
+            is_binary: false,
+            conflicted_base: true,
+        }];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        assert!(!combined.files[0].editable);
+        assert!(combined.files[0].hunks.is_empty());
+        assert!(combined.text.contains("Conflicted merge base (not editable)"));
     }
 
     /// A 14-line file with a conflict block buried in the middle.

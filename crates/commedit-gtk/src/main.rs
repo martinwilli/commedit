@@ -190,7 +190,7 @@ fn is_conflict_protected_line(line: &str) -> bool {
         || line == CONFLICT_STRUCTURAL_NOTICE
 }
 
-/// Strip the inline "➜ use ours/theirs/both" cue that [`append_resolve_cues`]
+/// Strip the inline "➜ use ours/theirs/both" cue that [`with_resolve_cues`]
 /// appends to a conflict-marker line, restoring the bare marker. Applied only to
 /// marker lines (so real content containing `◀` is untouched) when reconstructing
 /// the full file, otherwise re-rendering would append a second cue each time.
@@ -347,29 +347,6 @@ fn conflict_cue_gap_at(buffer: &sourceview5::Buffer, line: usize) -> Option<(usi
     Some((file_idx, k))
 }
 
-/// Buffer line of the `k`-th elision cue within file section `fi`, after a
-/// re-render — used to re-pin the viewport on the cue the user just expanded.
-fn conflict_section_cue_line(buffer: &sourceview5::Buffer, fi: usize, k: usize) -> Option<usize> {
-    let cue = pill(CONFLICT_CUE_LABEL);
-    let text = buffer_text(buffer);
-    let mut cur_file: Option<usize> = None;
-    let mut header_count = 0usize;
-    let mut seen = 0usize;
-    for (i, l) in text.split('\n').enumerate() {
-        if conflict_header_path(l).is_some() {
-            cur_file = Some(header_count);
-            header_count += 1;
-            seen = 0;
-        } else if l == cue && cur_file == Some(fi) {
-            if seen == k {
-                return Some(i);
-            }
-            seen += 1;
-        }
-    }
-    None
-}
-
 /// The text of buffer `line` (without its trailing newline).
 fn buffer_line_text(buffer: &sourceview5::Buffer, line: usize) -> String {
     let Some(start) = buffer.iter_at_line(line as i32) else {
@@ -382,22 +359,24 @@ fn buffer_line_text(buffer: &sourceview5::Buffer, line: usize) -> String {
     buffer.text(&start, &end, false).to_string()
 }
 
-/// Append the inline quick-resolve cue to each conflict-marker line of the
-/// buffer (which must already hold the materialized conflict text). Inserting at
-/// a line's end leaves line numbering unchanged, so the cached classification
-/// stays valid across the loop. The caller must hold the `editing` guard so the
-/// firewall lets these programmatic inserts through.
-fn append_resolve_cues(buffer: &sourceview5::Buffer) {
-    let text = buffer_text(buffer);
-    for (li, kind) in classify_conflict_lines(&text).into_iter().enumerate() {
-        let Some((cue, _)) = resolve_cue(kind) else {
-            continue;
-        };
-        if let Some(mut iter) = buffer.iter_at_line(li as i32) {
-            iter.forward_to_line_end();
-            buffer.insert(&mut iter, cue);
+/// Return `text` with the inline quick-resolve cue appended to each of its
+/// conflict-marker lines (the buffer must hold materialized conflict text).
+/// Appending at a line's end leaves line numbering unchanged, so the cached
+/// classification stays valid; building the full string up front lets the
+/// caller land it with either `set_text` or an in-place splice.
+fn with_resolve_cues(text: &str) -> String {
+    let kinds = classify_conflict_lines(text);
+    let mut out = String::new();
+    for (li, line) in text.split('\n').enumerate() {
+        if li > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if let Some((cue, _)) = kinds.get(li).and_then(|k| resolve_cue(*k)) {
+            out.push_str(cue);
         }
     }
+    out
 }
 
 /// Buffer line indices of the conflict-block openers (`<<<<<<<`) in the
@@ -596,28 +575,6 @@ fn apply_patch_edit(
     let cursor = iter_at(buffer, &edit.cursor);
     buffer.place_cursor(&cursor);
     highlight();
-}
-
-/// The fraction of the visible height at which buffer `line`'s top currently
-/// sits in `view` (0.0 = top edge, 1.0 = bottom). Used to keep a clicked hunk
-/// header at the same place across a re-render. Falls back to a third down.
-fn vertical_fraction_of_line(
-    view: &sourceview5::View,
-    buffer: &sourceview5::Buffer,
-    line: usize,
-) -> f64 {
-    let Some(vadjustment) = view.vadjustment() else {
-        return 0.3;
-    };
-    let page = vadjustment.page_size();
-    if page <= 0.0 {
-        return 0.3;
-    }
-    let Some(iter) = buffer.iter_at_line(line as i32) else {
-        return 0.3;
-    };
-    let line_top = view.iter_location(&iter).y() as f64;
-    ((line_top - vadjustment.value()) / page).clamp(0.0, 1.0)
 }
 
 fn change_label(change: &FileChange) -> String {
@@ -950,7 +907,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     split_button.set_sensitive(false);
     // Conflict-mode quick resolution is driven inline: clicking a block's marker
     // line (with its "use ours/theirs/both" cue) keeps that side — see
-    // `append_resolve_cues` and the click gesture below. No toolbar buttons.
+    // `with_resolve_cues` and the click gesture below. No toolbar buttons.
     // Previous/next-conflict navigation jumps the view between blocks; only
     // shown while resolving conflicts.
     let prev_conflict_button = Button::with_label("◀");
@@ -1499,13 +1456,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // or a notice for a structural conflict. Records per file the pieces and gaps
     // for reconstruction / expansion. The whole change is rendered once; the
     // dropdown is a jump aid, just like the diff pane.
-    let render_conflict_view: Rc<dyn Fn()> = {
+    // `splice` chooses how the rebuilt text lands: a full `set_text` (fresh
+    // load, where resetting the scroll to the top is wanted) or an in-place
+    // splice (expanding a gap, where the scroll must stay put) — mirroring the
+    // diff pane's `apply_diff_text`.
+    let render_conflict_view: Rc<dyn Fn(bool)> = {
         let conflict_view = conflict_view.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
         let highlight = highlight.clone();
-        Rc::new(move || {
+        Rc::new(move |splice: bool| {
             let cue = pill(CONFLICT_CUE_LABEL);
             let mut out: Vec<String> = Vec::new();
             {
@@ -1526,10 +1487,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     fv.pieces = snip.pieces;
                 }
             }
+            // Build the full text including the inline "use ours/theirs/both" cues
+            // up front, so a splice diffs against the same content set_text yields.
+            let text = with_resolve_cues(&out.join("\n"));
             editing.set(true);
-            file_buffer.set_text(&out.join("\n"));
-            // Inline "use ours/theirs/both" cues on each conflict block's markers.
-            append_resolve_cues(&file_buffer);
+            if splice {
+                splice_buffer_text(&file_buffer, &text);
+            } else {
+                file_buffer.set_text(&text);
+            }
             editing.set(false);
             file_view.set_editable(conflict_view.borrow().iter().any(|fv| fv.resolvable));
             highlight();
@@ -1593,22 +1559,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     };
 
     // Expand the elided gap at the clicked cue `line`: capture any buffer edits,
-    // widen that gap's context, re-render, and re-pin the cue (or the file header)
-    // to where it sat — the conflict-pane analogue of the diff expand handler.
+    // widen that gap's context, and re-render in place — the conflict-pane
+    // analogue of the diff expand handler. The spliced re-render edits only the
+    // changed span, so GTK keeps the scroll where it is: the clicked cue stays
+    // put and the revealed lines grow around it, with no re-pin math and no
+    // jump-to-top flash (see `splice_buffer_text`). `nav_sync` guards the rebuild
+    // so it doesn't flip the file dropdown.
     let conflict_expand: Rc<dyn Fn(usize)> = {
         let conflict_view = conflict_view.clone();
         let sync_conflict_from_buffer = sync_conflict_from_buffer.clone();
         let render_conflict_view = render_conflict_view.clone();
         let file_buffer = file_buffer.clone();
-        let file_view = file_view.clone();
         let nav_sync = nav_sync.clone();
         Rc::new(move |line: usize| {
             let Some((fi, k)) = conflict_cue_gap_at(&file_buffer, line) else {
                 return;
             };
-            // Record the clicked cue's viewport position to re-pin it afterwards.
-            let frac = vertical_fraction_of_line(&file_view, &file_buffer, line);
-            let line_height = file_view.iter_location(&file_buffer.start_iter()).height() as f64;
             nav_sync.set(true);
             sync_conflict_from_buffer();
             {
@@ -1619,26 +1585,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                 }
             }
-            render_conflict_view();
-            // Re-pin to the gap's new cue line (or the file header if it merged).
-            let new_line = conflict_section_cue_line(&file_buffer, fi, k)
-                .or_else(|| conflict_file_header_line(&file_buffer, fi));
-            if let (Some(nl), Some(vadj)) = (new_line, file_view.vadjustment()) {
-                let page = vadj.page_size();
-                if line_height > 0.0 && page > 0.0 {
-                    let top = file_view.top_margin() as f64;
-                    let bottom = file_view.bottom_margin() as f64;
-                    let height = file_buffer.line_count() as f64 * line_height + top + bottom;
-                    let upper = height.max(page);
-                    let target = (nl as f64 * line_height + top - frac * page)
-                        .clamp(0.0, (upper - page).max(0.0));
-                    vadj.set_upper(upper);
-                    vadj.set_value(target);
-                    if let Some(iter) = file_buffer.iter_at_line(nl as i32) {
-                        file_buffer.place_cursor(&iter);
-                    }
-                }
-            }
+            render_conflict_view(true);
             nav_sync.set(false);
         })
     };
@@ -1715,7 +1662,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 return;
             }
             // Render all files' snippets at once, then land on the first conflict.
-            render_conflict_view();
+            render_conflict_view(false);
             file_dropdown.set_selected(0);
             scroll_to_conflict_file(0);
             if let Some(&first) = conflict_block_lines(&file_buffer).first() {
@@ -2264,7 +2211,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Enter conflict mode with the engine's reported conflicts: show the banner,
     // select the oldest conflicted commit, and render the pending chain. The
     // quick-resolve affordances are the inline marker-line cues (see
-    // `append_resolve_cues`).
+    // `with_resolve_cues`).
     let enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)> = {
         let pane_mode = pane_mode.clone();
         let conflict_banner = conflict_banner.clone();

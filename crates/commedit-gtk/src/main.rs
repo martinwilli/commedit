@@ -1903,6 +1903,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     // as the abort handler above.
                     list.unselect_all();
                     refresh();
+                    // If the selection no longer names a live commit (it was a
+                    // conflict the revert undid), fall back to the branch tip so the
+                    // pane reloads instead of keeping stale content.
+                    if list.selected_row().is_none() {
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                    }
                     // If we're reviewing, re-render: the revert restored the
                     // session-start tree, so the review now shows no changes.
                     if review_button.is_active() {

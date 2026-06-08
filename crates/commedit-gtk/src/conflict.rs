@@ -527,6 +527,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
             // reselect fires and reloads the now-conflict-free diff.
             list.unselect_all();
             refresh();
+            // The conflict may have been on a commit that abort removed from
+            // history — a commit restored from trash that abort sends back to the
+            // trash, say — so the reselect matched no row and the pane would keep
+            // the conflict markers. Fall back to the branch tip so the diff
+            // reloads onto a live commit.
+            if list.selected_row().is_none() {
+                if let Some(row) = list.row_at_index(0) {
+                    list.select_row(Some(&row));
+                }
+            }
             show_status("Rewrite aborted — history unchanged.");
         }
     });

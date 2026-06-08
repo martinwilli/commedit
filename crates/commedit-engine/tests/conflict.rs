@@ -147,6 +147,75 @@ fn multi_file_conflict_resolves_per_commit_in_one_call() {
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
+/// A merge-derived conflict: an evil merge changes `base.txt`'s middle line, so
+/// rewriting a parent to change that same line means the merge's recorded delta
+/// can no longer apply cleanly — the rebased merge becomes conflicted. The merge
+/// goes through the *same* held-back / oldest-first resolution flow as a linear
+/// conflict (git untouched until clean, no `.jjconflict-*` residue), and the
+/// merge stays a 2-parent merge once resolved.
+#[test]
+fn merge_rebase_conflict_is_held_back_then_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_evil_merge_repo(dir);
+    let head_before = common::git(dir, &["rev-parse", "HEAD"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let side = history(&repo.repo, &repo.head_commit_id().expect("head"))
+        .expect("history")
+        .into_iter()
+        .find(|c| c.subject == "side-1")
+        .expect("side-1 commit")
+        .id;
+
+    // side-1 now also touches base.txt's middle line, which the merge's evil
+    // delta also rewrote — the two can't both apply, so the rebased merge conflicts.
+    let mut outcome = repo
+        .rewrite_file(&side, "base.txt", "1\nSIDE\n3\n")
+        .expect("rewrite");
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "the merge's delta can no longer apply over the edited parent"
+    );
+    assert!(repo.is_pending());
+
+    // Transparency while pending: git still sees the original merge history.
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+
+    // Resolve oldest-first through the existing loop.
+    let mut steps = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        assert_eq!(path, "base.txt");
+        let change_hex = oldest.change_id_hex();
+        let file = repo.read_conflict(&change_hex, &path).expect("read conflict");
+        assert!(file.text.contains("<<<<<<<"), "opening marker: {}", file.text);
+        assert!(!file.text.contains("|||||||"), "2-way markers omit the base");
+        outcome = repo
+            .resolve_conflict(&change_hex, &path, "1\nMERGED\n3\n", file.marker_len)
+            .expect("resolve");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending(), "no pending resolution after finalize");
+
+    // git now sees the conflict-free rewritten history; the tip is still a merge.
+    assert!(common::is_merge(dir, "HEAD"), "tip stays a 2-parent merge");
+    assert_eq!(common::git(dir, &["show", "HEAD:base.txt"]), "1\nMERGED\n3");
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.contains(".jjconflict"), "no .jjconflict-* in the tree: {tree}");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
 #[test]
 fn aborting_a_conflicted_reorder_restores_the_original_history() {
     let tmp = tempfile::tempdir().unwrap();

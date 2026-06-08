@@ -758,12 +758,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     };
 
-    // Print the starting HEAD so the user has a recovery anchor: if a rewrite
-    // ever messes up their working branch, `git reset --hard <id>` restores it.
-    if let Some(head) = repo.borrow().head_commit_hex() {
-        println!("commedit: use `git reset --hard {head}` to undo this session");
-    }
-
     // Shared UI state.
     let commits: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
     // How many history rows the normal (non-conflict) view currently loads, and

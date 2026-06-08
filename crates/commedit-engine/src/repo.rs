@@ -179,13 +179,6 @@ impl Repo {
         crate::transparency::head_commit(self.workspace.workspace_root())
     }
 
-    /// The current git HEAD commit id (hex), for display and recovery — e.g.
-    /// printed on startup so the user can `git reset --hard <id>` if a rewrite
-    /// goes wrong.
-    pub fn head_commit_hex(&self) -> Option<String> {
-        self.head_commit()
-    }
-
     /// The git HEAD commit (hex) captured at session start — the state
     /// [`Repo::revert_all`] restores. Shown in the UI's revert confirmation.
     pub fn session_start_head_hex(&self) -> Option<String> {

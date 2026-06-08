@@ -126,10 +126,12 @@ This project has been completely vibe-coded. It rewrites git history, and it may
 eat your commits and your git repository. Use it only on repositories you can
 afford to lose, and keep a backup.
 
-As a recovery anchor, on startup comm(ed)it prints the commit your branch
-pointed at when you opened it — `commedit: use git reset --hard <id> to undo
-this session` — so you can roll the whole session back from the command line if
-a rewrite goes wrong.
+As a recovery anchor, the toolbar's **Revert all** button rolls the whole
+session back to the state your repository was in when you opened it — one click
+undoes every rewrite, reorder, squash and working-copy edit made since. If a
+session goes wrong beyond that (the app crashes, say), `git reflog` still holds
+the commit your branch pointed at when you opened it, so a `git reset --hard`
+gets you back.
 
 Your uncommitted changes (edits on disk and untracked files) ride through every
 rewrite and are restored to the working tree as-is. The one thing the underlying

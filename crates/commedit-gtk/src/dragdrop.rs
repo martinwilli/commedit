@@ -823,6 +823,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
+        let list = list.clone();
+        let selected_change = selected_change.clone();
         move |_target, value, _x, _y| {
             // The trash accepts a history commit (abandoned, but kept so it can be
             // dragged back to restore) or an uncommitted-changes entry (discarded
@@ -847,6 +849,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
+            let list = list.clone();
+            let selected_change = selected_change.clone();
             *post_drag.borrow_mut() = Some(Box::new(move || {
                 if origin == DragOrigin::WorkingCopy {
                     // Discard an uncommitted-changes entry. It has no git object to
@@ -884,6 +888,25 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 let outcome = repo.borrow_mut().abandon_commit(&target);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
+                        // If the dropped commit was the selected one it's gone now,
+                        // so the detail pane would keep showing it: move the
+                        // selection to a surviving neighbour (the commit that takes
+                        // its slot, else its child) and force the reselect to
+                        // re-fire `row-selected` so the diff reloads — the same idiom
+                        // as the abort handler.
+                        let fi = from as usize;
+                        if selected_change.borrow().as_deref()
+                            == Some(info.change_id_hex().as_str())
+                        {
+                            let neighbour = {
+                                let cs = commits.borrow();
+                                cs.get(fi + 1)
+                                    .or_else(|| fi.checked_sub(1).and_then(|i| cs.get(i)))
+                                    .map(|c| c.change_id_hex())
+                            };
+                            *selected_change.borrow_mut() = neighbour;
+                            list.unselect_all();
+                        }
                         trashed.borrow_mut().push(info);
                         refresh();
                         populate_trash(&trash_list, &trash_scroll, &trashed.borrow());

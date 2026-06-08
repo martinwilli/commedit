@@ -321,8 +321,10 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
              {n_files} file(s) across {n_commits} commit(s) remaining."
         ));
         // Re-select the previously selected commit if it's still in the chain,
-        // else the first conflicted one. Unselect first so the signal always
-        // fires (the file list may have changed even for the same row).
+        // else the oldest remaining conflicted one — the lowest in the
+        // newest-first list, the next to resolve in bottom-up order. Unselect
+        // first so the signal always fires (the file list may have changed even
+        // for the same row).
         let target = selected_change
             .borrow()
             .clone()
@@ -331,6 +333,7 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                 commits
                     .borrow()
                     .iter()
+                    .rev()
                     .map(|c| c.change_id_hex())
                     .find(|ch| badges.contains(ch))
             });

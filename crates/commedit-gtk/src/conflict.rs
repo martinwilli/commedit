@@ -1,19 +1,26 @@
-//! Conflict-resolution support. For now this holds the pure conflict-text
-//! helpers — the combined conflict view's header/layout lines, the inline
-//! "use ours/theirs/both" quick-resolve cues, block-finding and resolution, and
-//! the buffer scanners that map a buffer line to a file section / elision gap.
-//! The conflict-mode UI wiring is added here in a later step.
+//! Conflict-resolution support. Two layers: the pure conflict-text helpers — the
+//! combined conflict view's header/layout lines, the inline "use ours/theirs/both"
+//! quick-resolve cues, block-finding and resolution, and the buffer scanners that
+//! map a buffer line to a file section / elision gap — and the conflict-mode UI
+//! wiring: the callback builders (`build_*`, called by `build_ui` in dependency
+//! order) and `wire`, which installs the abort/navigation events.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
+use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind};
+use commedit_engine::history::history;
 use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
 use crate::highlight::pill;
+use crate::rows::populate_list;
 use crate::state::{
-    Side, CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS,
+    Callbacks, ConflictCtx, Data, PaneMode, Side, Widgets, CONFLICT_CUE_LABEL,
+    CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS, SAVE_HINT_CONFLICT,
+    SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -257,4 +264,297 @@ pub(crate) fn conflict_cue_gap_at(buffer: &sourceview5::Buffer, line: usize) -> 
         }
     }
     Some((file_idx, k))
+}
+
+// --- Conflict-mode UI wiring -------------------------------------------------
+//
+// The conflict-mode callbacks are built in `build_ui` in strict dependency order
+// (`refresh_conflict` -> `exit_conflict_mode` -> `enter_conflict_mode` ->
+// `resolve_current`) and bundled into `Callbacks`; `wire` then installs the
+// conflict-mode events. Each builder re-binds the handles it needs out of the
+// borrowed bundles, so the moved closures are otherwise verbatim.
+
+/// Build the `refresh_conflict` callback: rebuild the history list from jj's
+/// pending (not-yet-exported) head while a conflicted rewrite is being resolved,
+/// badging the still-conflicted commits and updating the banner's progress text.
+/// Selecting a row cascades through `row-selected` -> `load_conflict_files`.
+pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
+    let repo = d.repo.clone();
+    let commits = d.commits.clone();
+    let list = w.list.clone();
+    let pane_mode = d.pane_mode.clone();
+    let conflict_label = w.conflict_label.clone();
+    let selected_change = d.selected_change.clone();
+    let wc_list = w.wc_list.clone();
+    Rc::new(move || {
+        let loaded = {
+            let r = repo.borrow();
+            match r.jj_head_commit_id() {
+                Some(head) => history(&r.repo, &head).unwrap_or_default(),
+                None => Vec::new(),
+            }
+        };
+        *commits.borrow_mut() = loaded;
+        let (badges, n_files, n_commits) = {
+            let mode = pane_mode.borrow();
+            if let PaneMode::Conflict(ctx) = &*mode {
+                let badges = ctx.conflicted_changes();
+                let files: usize = ctx.commits.iter().map(|c| c.files.len()).sum();
+                (badges.clone(), files, badges.len())
+            } else {
+                (HashSet::new(), 0, 0)
+            }
+        };
+        // The working-copy chain resolves inline among the conflicted
+        // commits, so hide the standalone rows and prepend each conflicted
+        // entry to the chain. Insert oldest-first (the chain is newest-first)
+        // so the newest entry lands at the top, above the branch tip.
+        wc_list.set_visible(false);
+        for entry in repo.borrow().working_copy_chain().into_iter().rev() {
+            if badges.contains(&entry.info.change_id_hex()) {
+                commits.borrow_mut().insert(0, entry.info);
+            }
+        }
+        populate_list(&list, &commits.borrow(), &badges);
+        conflict_label.set_text(&format!(
+            "Conflicts from the rewrite must be resolved before it applies to git — \
+             {n_files} file(s) across {n_commits} commit(s) remaining."
+        ));
+        // Re-select the previously selected commit if it's still in the chain,
+        // else the first conflicted one. Unselect first so the signal always
+        // fires (the file list may have changed even for the same row).
+        let target = selected_change
+            .borrow()
+            .clone()
+            .filter(|ch| badges.contains(ch))
+            .or_else(|| {
+                commits
+                    .borrow()
+                    .iter()
+                    .map(|c| c.change_id_hex())
+                    .find(|ch| badges.contains(ch))
+            });
+        let idx = target.and_then(|ch| {
+            commits
+                .borrow()
+                .iter()
+                .position(|c| c.change_id_hex() == ch)
+        });
+        list.unselect_all();
+        if let Some(idx) = idx {
+            if let Some(row) = list.row_at_index(idx as i32) {
+                list.select_row(Some(&row));
+            }
+        }
+    })
+}
+
+/// Build the `exit_conflict_mode` callback: back to the normal diff pane, banner
+/// hidden.
+pub(crate) fn build_exit_conflict_mode(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
+    let pane_mode = d.pane_mode.clone();
+    let conflict_banner = w.conflict_banner.clone();
+    let prev_conflict_button = w.prev_conflict_button.clone();
+    let next_conflict_button = w.next_conflict_button.clone();
+    let save_button = w.save_button.clone();
+    Rc::new(move || {
+        *pane_mode.borrow_mut() = PaneMode::Diff;
+        conflict_banner.set_visible(false);
+        prev_conflict_button.set_visible(false);
+        next_conflict_button.set_visible(false);
+        save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
+    })
+}
+
+/// Build the `enter_conflict_mode` callback: show the banner, select the oldest
+/// conflicted commit, and render the pending chain. The quick-resolve affordances
+/// are the inline marker-line cues (see `with_resolve_cues`).
+pub(crate) fn build_enter_conflict_mode(
+    w: &Widgets,
+    d: &Data,
+    refresh_conflict: Rc<dyn Fn()>,
+) -> Rc<dyn Fn(Vec<ConflictedCommit>)> {
+    let pane_mode = d.pane_mode.clone();
+    let conflict_banner = w.conflict_banner.clone();
+    let selected_change = d.selected_change.clone();
+    let prev_conflict_button = w.prev_conflict_button.clone();
+    let next_conflict_button = w.next_conflict_button.clone();
+    let save_button = w.save_button.clone();
+    Rc::new(move |commits: Vec<ConflictedCommit>| {
+        let first = commits
+            .iter()
+            .find(|c| !c.files.is_empty())
+            .map(|c| c.change_id_hex());
+        *pane_mode.borrow_mut() = PaneMode::Conflict(ConflictCtx { commits });
+        conflict_banner.set_visible(true);
+        prev_conflict_button.set_visible(true);
+        next_conflict_button.set_visible(true);
+        save_button.set_tooltip_text(Some(SAVE_HINT_CONFLICT));
+        if let Some(ch) = first {
+            *selected_change.borrow_mut() = Some(ch);
+        }
+        refresh_conflict();
+    })
+}
+
+/// Build the `resolve_current` callback: resolve the conflicted file currently in
+/// the buffer. The engine re-checks the whole chain: when the last conflict clears
+/// it exports the rewrite and we return to the normal view, otherwise the
+/// remaining conflicts are re-shown.
+pub(crate) fn build_resolve_current(
+    d: &Data,
+    refresh: Rc<dyn Fn()>,
+    refresh_conflict: Rc<dyn Fn()>,
+    exit_conflict_mode: Rc<dyn Fn()>,
+    show_status: Rc<dyn Fn(&str)>,
+    sync_conflict_from_buffer: Rc<dyn Fn()>,
+) -> Rc<dyn Fn()> {
+    let repo = d.repo.clone();
+    let pane_mode = d.pane_mode.clone();
+    let selected_change = d.selected_change.clone();
+    let conflict_view = d.conflict_view.clone();
+    Rc::new(move || {
+        if !pane_mode.borrow().is_conflict() {
+            return;
+        }
+        let Some(change_hex) = selected_change.borrow().clone() else {
+            show_status("Select a conflicted commit to resolve");
+            return;
+        };
+        // Capture buffer edits into each file's full text, then reconstruct the
+        // (path, full_text, marker_len) list for this commit's resolvable files.
+        sync_conflict_from_buffer();
+        let files: Option<Vec<(String, String, usize)>> = {
+            let view = conflict_view.borrow();
+            let mut out = Vec::new();
+            let mut unresolved = false;
+            for fv in view.iter().filter(|fv| fv.resolvable) {
+                if classify_conflict_lines(&fv.full_text).iter().any(|k| k.is_marker()) {
+                    unresolved = true;
+                    break;
+                }
+                out.push((fv.path.clone(), fv.full_text.clone(), fv.marker_len));
+            }
+            if unresolved {
+                None
+            } else {
+                Some(out)
+            }
+        };
+        let Some(files) = files else {
+            show_status("Resolve all conflict markers before saving");
+            return;
+        };
+        if files.is_empty() {
+            show_status("No text-resolvable conflicts here — use “Abort rewrite” to discard");
+            return;
+        }
+        let outcome = repo.borrow_mut().resolve_conflicts(&change_hex, &files);
+        match outcome {
+            Ok(SaveOutcome::Clean) => {
+                exit_conflict_mode();
+                refresh();
+                show_status("Conflicts resolved — rewrite applied.");
+            }
+            Ok(SaveOutcome::Conflicts { commits }) => {
+                if let PaneMode::Conflict(ctx) = &mut *pane_mode.borrow_mut() {
+                    ctx.commits = commits;
+                }
+                refresh_conflict();
+                show_status("Resolved — more conflicts remain.");
+            }
+            Err(err) => show_status(&format!("Resolve failed: {err}")),
+        }
+    })
+}
+
+/// Install the conflict-mode events: the Abort button, the previous/next-conflict
+/// navigation buttons, and the cursor-driven nav-button enabler.
+pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
+    let repo = d.repo.clone();
+    let pane_mode = d.pane_mode.clone();
+    let list = w.list.clone();
+    let abort_button = w.abort_button.clone();
+    let file_buffer = w.file_buffer.clone();
+    let file_view = w.file_view.clone();
+    let prev_conflict_button = w.prev_conflict_button.clone();
+    let next_conflict_button = w.next_conflict_button.clone();
+    let refresh = cb.refresh.clone();
+    let show_status = cb.show_status.clone();
+    let exit_conflict_mode = cb.exit_conflict_mode.clone();
+
+    abort_button.connect_clicked({
+        let repo = repo.clone();
+        let exit_conflict_mode = exit_conflict_mode.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        let list = list.clone();
+        move |_| {
+            if let Err(err) = repo.borrow_mut().abort() {
+                show_status(&format!("Abort failed: {err}"));
+                return;
+            }
+            exit_conflict_mode();
+            // The aborted commit is still selected, so `refresh` re-selecting it
+            // (rows are reused, not rebuilt) wouldn't re-fire `row-selected` —
+            // leaving the diff pane showing the abandoned conflict markers until
+            // the user clicks away and back. Drop the selection first so the
+            // reselect fires and reloads the now-conflict-free diff.
+            list.unselect_all();
+            refresh();
+            show_status("Rewrite aborted — history unchanged.");
+        }
+    });
+
+    // ◀ / ▶ jump the view to the previous/next conflict block, anchored on the
+    // caret line (which scroll_to_line parks on each block's opening marker, so
+    // repeated presses step through the file).
+    let goto_conflict: Rc<dyn Fn(bool)> = {
+        let file_buffer = file_buffer.clone();
+        let file_view = file_view.clone();
+        let pane_mode = pane_mode.clone();
+        Rc::new(move |forward: bool| {
+            if !pane_mode.borrow().is_conflict() {
+                return;
+            }
+            let blocks = conflict_block_lines(&file_buffer);
+            let caret = file_buffer.iter_at_mark(&file_buffer.get_insert()).line() as usize;
+            let target = if forward {
+                blocks.iter().find(|&&l| l > caret).copied()
+            } else {
+                blocks.iter().rev().find(|&&l| l < caret).copied()
+            };
+            if let Some(line) = target {
+                scroll_to_line(&file_view, &file_buffer, line);
+            }
+        })
+    };
+    prev_conflict_button.connect_clicked({
+        let goto_conflict = goto_conflict.clone();
+        move |_| goto_conflict(false)
+    });
+    next_conflict_button.connect_clicked({
+        let goto_conflict = goto_conflict.clone();
+        move |_| goto_conflict(true)
+    });
+
+    // Keep the nav buttons enabled only while there's a conflict to jump to,
+    // relative to the caret. Driven off the cursor-position property, which the
+    // buffer fires on every caret move — clicks, typing, set_text (which resets
+    // the caret), and scroll_to_line's place_cursor — so this stays in sync as
+    // the file is navigated and conflicts get resolved away.
+    file_buffer.connect_cursor_position_notify({
+        let pane_mode = pane_mode.clone();
+        let prev_conflict_button = prev_conflict_button.clone();
+        let next_conflict_button = next_conflict_button.clone();
+        move |buffer| {
+            if !pane_mode.borrow().is_conflict() {
+                return;
+            }
+            let blocks = conflict_block_lines(buffer);
+            let caret = buffer.iter_at_mark(&buffer.get_insert()).line() as usize;
+            prev_conflict_button.set_sensitive(blocks.iter().any(|&l| l < caret));
+            next_conflict_button.set_sensitive(blocks.iter().any(|&l| l > caret));
+        }
+    });
 }

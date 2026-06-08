@@ -14,7 +14,7 @@ use commedit_engine::diff::{ConflictPiece, ContextExpansion};
 use commedit_engine::history::CommitInfo;
 use commedit_engine::repo::Repo;
 use commedit_engine::workcopy::WorkingCopyEntry;
-use gtk::{Box as GtkBox, ListBox, ListBoxRow, ScrolledWindow};
+use gtk::{Box as GtkBox, Button, Label, ListBox, ListBoxRow, ScrolledWindow};
 
 pub(crate) const APP_ID: &str = "net.willi.commedit";
 
@@ -195,6 +195,14 @@ pub(crate) struct Widgets {
     pub(crate) trash_scroll: ScrolledWindow,
     pub(crate) trash_box: GtkBox,
     pub(crate) wc_list: ListBox,
+    pub(crate) file_buffer: sourceview5::Buffer,
+    pub(crate) file_view: sourceview5::View,
+    pub(crate) save_button: Button,
+    pub(crate) prev_conflict_button: Button,
+    pub(crate) next_conflict_button: Button,
+    pub(crate) conflict_banner: GtkBox,
+    pub(crate) conflict_label: Label,
+    pub(crate) abort_button: Button,
 }
 
 /// The model cells a peeled module reads/writes.
@@ -205,6 +213,8 @@ pub(crate) struct Data {
     pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
     pub(crate) wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>>,
     pub(crate) selected_change: Rc<RefCell<Option<String>>>,
+    pub(crate) pane_mode: Rc<RefCell<PaneMode>>,
+    pub(crate) conflict_view: Rc<RefCell<Vec<ConflictFileView>>>,
 }
 
 /// The transient drag-only cells.
@@ -224,4 +234,5 @@ pub(crate) struct Callbacks {
     pub(crate) refresh: Rc<dyn Fn()>,
     pub(crate) show_status: Rc<dyn Fn(&str)>,
     pub(crate) enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)>,
+    pub(crate) exit_conflict_mode: Rc<dyn Fn()>,
 }

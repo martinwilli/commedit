@@ -187,6 +187,49 @@ impl Repo {
         self.materialize_after_rewrite(self.head_commit())
     }
 
+    /// Discard a working-copy entry (identified by its stable change id, or the
+    /// leaf `@` when `change_hex` is `None`) — drop its slice of the uncommitted
+    /// changes. Like [`Self::split_working_copy`] this is a pure jj-side
+    /// reorganization committed directly with no git export (HEAD / refs / index
+    /// stay put): the entry is abandoned and any deeper chain entries rebase onto
+    /// its parent, so its delta drops out, then the rebased leaf `@` is checked
+    /// back out to disk. Abandoning the working-copy commit itself leaves jj's
+    /// recreated empty `@` (a clean tree); abandoning an intermediate split-chain
+    /// entry removes just that entry's changes and keeps the rest. There is no git
+    /// object to graft back, so — unlike a dropped commit — a discarded entry is
+    /// gone for good (not kept in the trash).
+    pub fn drop_working_copy(&mut self, change_hex: Option<&str>) -> Result<()> {
+        crate::repo::catch_jj("dropping the working copy", || {
+            self.drop_working_copy_inner(change_hex)
+        })
+    }
+
+    fn drop_working_copy_inner(&mut self, change_hex: Option<&str>) -> Result<()> {
+        // Snapshot the disk into the leaf @ first (its commit id churns here),
+        // then resolve the target entry's stable change id to its current id.
+        self.snapshot_working_copy()?;
+        let target = self
+            .resolve_working_copy_change(change_hex)
+            .context("no working copy to drop")?;
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&target)
+            .context("loading the working-copy entry")?;
+
+        let mut tx = self.repo.start_transaction();
+        // Abandon the entry; deeper chain entries (and the leaf @) rebase onto its
+        // parent, so its delta drops out. When the entry is the working-copy
+        // commit itself, jj recreates a fresh empty @ on the parent.
+        tx.repo_mut().record_abandoned_commit(&commit);
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.repo = block_on(tx.commit("commedit: drop working copy"))
+            .context("committing the working-copy drop")?;
+
+        // Check the rebased leaf @ back out to disk (the branch tip is unchanged).
+        self.materialize_after_rewrite(self.head_commit())
+    }
+
     /// Materialize the rebased working-copy commit `@'` to disk after a rewrite,
     /// then reset the git index to the new tip so `git status` shows the
     /// preserved uncommitted changes. The jj-native replacement for the old

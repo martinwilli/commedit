@@ -348,3 +348,65 @@ fn editing_the_working_copy_file_updates_the_worktree_not_history() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn dropping_the_working_copy_discards_all_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let head_before = common::git(dir, &["rev-parse", "HEAD"]);
+
+    // Some uncommitted changes, then discard the lot by dropping the entry.
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nlocal\n").unwrap();
+    repo.drop_working_copy(None).expect("drop working copy");
+
+    // The tree is clean again: no uncommitted entry, disk reverted to HEAD.
+    assert!(repo.working_copy_info().is_none(), "tree clean after drop");
+    assert!(repo.working_copy_chain().is_empty());
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
+
+    // git is untouched: same tip, same branch, clean status.
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn dropping_one_split_chain_entry_discards_only_its_slice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two uncommitted changes, peeled into two entries: the edited entry keeps
+    // the a.txt change, the leaf carries the b.txt change.
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    repo.split_working_copy(None, &[("b.txt".to_string(), "b\n".to_string())])
+        .expect("split working copy");
+    let chain = repo.working_copy_chain();
+    assert_eq!(chain.len(), 2);
+
+    // Drop the leaf (the b.txt slice); the a.txt slice must survive.
+    let leaf = chain[0].info.change_id_hex();
+    repo.drop_working_copy(Some(&leaf)).expect("drop leaf");
+
+    // One entry left, holding only the a.txt change; b.txt is back to HEAD.
+    let chain = repo.working_copy_chain();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
+
+    // git is untouched throughout.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

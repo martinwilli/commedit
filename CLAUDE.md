@@ -119,6 +119,15 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
   is a *chain* of uncommitted entries. `squash_working_copy_into(change_hex, dest)`
   snapshots, resolves the entry, and delegates to `squash_into(.., Fixup)`; folding
   the whole leaf `@` leaves jj's recreated empty `@` as a clean tree.
+- `drop_working_copy` (`workcopy.rs`) — the trashbin's drop for an *uncommitted*
+  entry: discard that entry's slice of the changes. Snapshots, resolves the entry
+  by change id, `record_abandoned_commit`s it + `rebase_descendants`, then commits
+  the tx **directly** and re-materializes (same git-untouched path as
+  `split_working_copy`/`edit_working_copy_file`). Abandoning the leaf `@` makes jj
+  recreate an empty `@` (a clean tree); abandoning an intermediate split-chain
+  entry rebases the deeper entries onto its parent, keeping their changes. Unlike a
+  dropped *commit* it's **not** restorable — there's no git object to graft back —
+  so the UI neither adds it to the trash list nor offers to drag it back.
 
 ### Working-copy preservation (`workcopy.rs`)
 

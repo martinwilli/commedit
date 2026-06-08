@@ -12,7 +12,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 
-use crate::conflict_header_path;
+use crate::conflict::conflict_header_path;
 use crate::state::{CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, CUE_CAP_L, CUE_CAP_R};
 
 /// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.

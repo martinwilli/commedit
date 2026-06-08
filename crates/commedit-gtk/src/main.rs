@@ -2884,6 +2884,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
+                    let selected_change = selected_change.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let plan = repo.borrow().plan_squash(&commits.borrow(), from as usize, onto);
@@ -2891,6 +2892,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             return;
                         };
                         let subject = commits.borrow()[from as usize].subject.clone();
+                        // After the squash, select the drop target: its change id is
+                        // stable across the rewrite, the squashed-away source's is gone.
+                        let dest_change = commits.borrow()[onto].change_id_hex();
 
                         // Run a chosen mode and report the outcome.
                         let apply: Rc<dyn Fn(SquashMode)> = {
@@ -2898,10 +2902,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             let refresh = refresh.clone();
                             let show_status = show_status.clone();
                             let enter_conflict_mode = enter_conflict_mode.clone();
+                            let selected_change = selected_change.clone();
                             Rc::new(move |mode| {
                                 let outcome = repo.borrow_mut().squash_into(&source, &dest, mode);
                                 match outcome {
-                                    Ok(SaveOutcome::Clean) => refresh(),
+                                    Ok(SaveOutcome::Clean) => {
+                                        *selected_change.borrow_mut() = Some(dest_change.clone());
+                                        refresh();
+                                    }
                                     Ok(SaveOutcome::Conflicts { commits }) => {
                                         enter_conflict_mode(commits)
                                     }
@@ -2964,6 +2972,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
+                    let selected_change = selected_change.clone();
                     let trashed = trashed.clone();
                     let trash_list = trash_list.clone();
                     let trash_scroll = trash_scroll.clone();
@@ -2979,6 +2988,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         };
                         let subject = info.subject.clone();
                         let change_hex = info.change_id_hex();
+                        // After the squash, select the drop target: its change id is
+                        // stable across the rewrite, the squashed-in source's is gone.
+                        let dest_change = commits.borrow()[onto].change_id_hex();
 
                         // Run a chosen mode and report the outcome.
                         let apply: Rc<dyn Fn(SquashMode)> = {
@@ -2986,6 +2998,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             let refresh = refresh.clone();
                             let show_status = show_status.clone();
                             let enter_conflict_mode = enter_conflict_mode.clone();
+                            let selected_change = selected_change.clone();
                             let trashed = trashed.clone();
                             let trash_list = trash_list.clone();
                             let trash_scroll = trash_scroll.clone();
@@ -3002,6 +3015,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                                             .borrow_mut()
                                             .retain(|c| c.change_id_hex() != change_hex);
                                         populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        *selected_change.borrow_mut() = Some(dest_change.clone());
                                         refresh();
                                     }
                                     Ok(SaveOutcome::Conflicts { commits }) => {
@@ -3083,6 +3097,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
+                    let selected_change = selected_change.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let entry = wc_entries.borrow().get(from as usize).map(|e| e.info.clone());
                         let Some(entry) = entry else {
@@ -3100,12 +3115,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             return;
                         }
                         let dest = commits.borrow()[onto].id.clone();
+                        // After the fixup, select the drop target: its change id is
+                        // stable across the rewrite.
+                        let dest_change = commits.borrow()[onto].change_id_hex();
                         let change_hex = entry.change_id_hex();
                         let outcome = repo
                             .borrow_mut()
                             .squash_working_copy_into(Some(&change_hex), &dest);
                         match outcome {
-                            Ok(SaveOutcome::Clean) => refresh(),
+                            Ok(SaveOutcome::Clean) => {
+                                *selected_change.borrow_mut() = Some(dest_change);
+                                refresh();
+                            }
                             Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
                             Err(err) => show_status(&format!("Fixup failed: {err}")),
                         }

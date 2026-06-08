@@ -209,16 +209,34 @@ sit unreachable in the ODB (like keep-ref residue) and plain `git` keeps seeing
 the pre-rewrite history. The deferred export only runs once the whole chain is
 clean.
 
-A reorder's intermediate rebase can throw **spurious** conflicts — two commits
-touching adjacent-but-independent lines, where the reordered tip is nonetheless
-unchanged. Before holding such a rewrite back, `settle` tries
-`try_auto_resolve_spurious_reorder` **once** (opted into via
-`finish_mutation_auto_resolve`, which sets the `auto_resolve_spurious` flag):
-it rebuilds the chain by `peel_commit_change`-ing each commit's edit onto the tree
-above it through `replay.rs`'s asymmetric `replay_change` — replaying `base →
-theirs` onto `ours` while *trusting `ours` for context*, the one thing a symmetric
-3-way merge (jj/git/diff3) can't do. A genuine overlap (or a structural/binary
-change) returns `None`, so the rewrite falls back to the manual flow below.
+A reorder / squash / drop / restore's intermediate rebase can throw **spurious**
+conflicts — commits touching adjacent-but-independent lines that jj's symmetric
+3-way merge can't place even though the combined result is well-defined. Before
+holding such a rewrite back, `settle` tries `try_auto_resolve_spurious` **once**,
+opted into per-mutation by a `SpuriousResolve` strategy: `finish_mutation_auto_resolve`
+sets `CleanTip` (reorder/squash), `finish_mutation_spurious` sets `Drop` / `Restore`,
+and plain `finish_mutation` leaves it `Off` — so message/identity/file edits and
+split hand any conflict straight to the manual flow below. It rebuilds the
+conflicted range with **explicit trees** (so jj never re-merges) via
+`transform_tree` → `replay.rs`'s asymmetric `replay_change`, replaying `base →
+theirs` onto `ours` while *trusting `ours` for context* — the one thing a symmetric
+3-way merge (jj/git/diff3) can't do. Two reconstruction modes:
+
+- **`CleanTip`** (reorder/squash) — the net change set is preserved, so the
+  post-mutation tip is conflict-free and *is* the result. Anchor on it and peel
+  each commit above off the one below (`replay own → parent`, `Dir::Peel`),
+  top-down. A conflicted tip means a *true* conflict and bails.
+- **`Drop` / `Restore`** — the change set itself changed (a commit removed /
+  re-inserted), so the tip may be conflicted and can't anchor anything. Rebuild
+  forward from the clean prefix instead, applying each surviving commit's own
+  original change onto its rebuilt parent (`replay parent → own`, `Dir::Forward`),
+  bottom-up — which also keeps the chain order of adjacent insertions. `Restore`
+  additionally seeds the orphaned restored commit's change (absent from the
+  pre-restore history).
+
+In both modes the working copy `@`'s uncommitted delta is carried onto the rebuilt
+tip. A genuine overlap, a structural/binary change, or a split working-copy chain
+returns `None` / bails, so the rewrite falls back to the manual flow below.
 
 While a `PendingResolution` is held, the UI drives it by **change id** (commit
 ids churn on every resolution step): `read_conflict(change_hex, path)`

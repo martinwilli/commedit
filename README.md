@@ -42,10 +42,14 @@ their own.
 
 You can also **reorder** commits by dragging them in the history, or **drop**
 one into the trash (and drag it back to restore it). A reorder or drop is a
-real rebase, so it can conflict. When it does, comm(ed)it never writes the
-conflict into your git history: the rewrite is held back — `git` still sees your
-original, untouched history — and the conflicted files are shown right in the
-diff pane with `<<<<<<<` / `=======` / `>>>>>>>` markers. Resolve each by hand or
+real rebase, so it can conflict. Many apparent conflicts are *spurious*, though
+— two commits touching nearby but independent lines, which an ordinary 3-way
+merge flags even though the combined result is unambiguous — and comm(ed)it
+resolves those for you automatically, so you only ever deal with conflicts that
+genuinely need a decision. When a real one does surface, comm(ed)it never writes
+the conflict into your git history: the rewrite is held back — `git` still sees
+your original, untouched history — and the conflicted files are shown right in
+the diff pane with `<<<<<<<` / `=======` / `>>>>>>>` markers. Resolve each by hand or
 with the *Use ours / theirs / both* buttons. When a rewrite conflicts across
 several files you resolve them one at a time, saving each in turn; the rewrite
 is applied to git automatically once the last conflict is cleared, or you can

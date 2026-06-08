@@ -776,7 +776,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     trash_header.set_margin_end(8);
     trash_header.set_margin_top(4);
     trash_header.set_margin_bottom(2);
-    trash_header.set_tooltip_text(Some("Trash — drop commits here to remove them"));
+    trash_header.set_tooltip_text(Some(
+        "Trash — drop a commit here to remove it (drag it back to restore), \
+         or drop uncommitted changes here to discard them",
+    ));
     trash_header.add_css_class("dim-label");
     let trash_box = GtkBox::new(Orientation::Vertical, 0);
     trash_box.append(&gtk::Separator::new(Orientation::Horizontal));
@@ -3264,20 +3267,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trashed = trashed.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         move |_target, value, _x, _y| {
-            if drag_origin.get() != DragOrigin::History {
-                return false; // dragging within the trash: nothing to do
+            // The trash accepts a history commit (abandoned, but kept so it can be
+            // dragged back to restore) or an uncommitted-changes entry (discarded
+            // outright). A trash→trash drag has nothing to do.
+            let origin = drag_origin.get();
+            if origin != DragOrigin::History && origin != DragOrigin::WorkingCopy {
+                return false;
             }
             let Ok(from) = value.get::<i32>() else {
                 return false;
             };
-            // Stage the work; the history drag source runs it from `drag-end`,
-            // once the gesture is fully over (rewriting + rebuilding the rows
-            // mid-drag frees a row GTK still tracks, crashing the next event).
+            // Stage the work; the drag source runs it from `drag-end`, once the
+            // gesture is fully over (rewriting + rebuilding the rows mid-drag
+            // frees a row GTK still tracks, crashing the next event).
             let repo = repo.clone();
             let commits = commits.clone();
+            let wc_entries = wc_entries.clone();
             let refresh = refresh.clone();
             let show_status = show_status.clone();
             let trashed = trashed.clone();
@@ -3285,6 +3294,29 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let trash_scroll = trash_scroll.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
             *post_drag.borrow_mut() = Some(Box::new(move || {
+                if origin == DragOrigin::WorkingCopy {
+                    // Discard an uncommitted-changes entry. It has no git object to
+                    // graft back, so — unlike a dropped commit — it is gone for
+                    // good: not pushed to `trashed`, not listed in the trash. Drop
+                    // by the entry's stable change id (the leaf's commit id churns
+                    // on the internal snapshot).
+                    let change = wc_entries
+                        .borrow()
+                        .get(from as usize)
+                        .map(|e| e.info.change_id_hex());
+                    let Some(change) = change else {
+                        return;
+                    };
+                    // Bind the outcome before matching so the `borrow_mut` is
+                    // released — `refresh` borrows `repo` again (a `match`
+                    // scrutinee's temporary otherwise lives across the arms).
+                    let outcome = repo.borrow_mut().drop_working_copy(Some(&change));
+                    match outcome {
+                        Ok(()) => refresh(),
+                        Err(err) => show_status(&format!("Drop failed: {err}")),
+                    }
+                    return;
+                }
                 let Some(info) = commits.borrow().get(from as usize).cloned() else {
                     return;
                 };

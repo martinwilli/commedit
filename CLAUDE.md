@@ -192,9 +192,12 @@ Caveats this creates:
   row is a drag *source* whose drop onto a commit folds it in as a fixup
   (`DragOrigin::WorkingCopy`): the history list is the drop target, but for these
   drags `show_zone` offers only the red onto-a-commit squash target — never the blue
-  reorder gap (uncommitted entries can't be reordered into history). During conflict
-  resolution the rows are hidden and each conflicted entry is prepended into the
-  conflict chain so it resolves inline like any commit.
+  reorder gap (uncommitted entries can't be reordered into history). Dropping the
+  row onto the **trashbin** instead discards it (`drop_working_copy`); since it
+  can't be restored, the trash drop handler runs the discard and refreshes but
+  (unlike a dropped commit) never pushes it to `trashed` or repopulates the trash
+  list. During conflict resolution the rows are hidden and each conflicted entry is
+  prepended into the conflict chain so it resolves inline like any commit.
 
 ### Conflict resolution (`conflict.rs`)
 

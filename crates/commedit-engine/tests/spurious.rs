@@ -231,6 +231,59 @@ fn spurious_drop_conflict_is_auto_resolved() {
 }
 
 #[test]
+fn spurious_drop_then_restore_round_trips_via_auto_resolve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Same spurious shape as the drop test. Drop C1 (auto-resolves to foo/baz),
+    // then restore it to its original slot: re-inserting C1 below C2 re-applies
+    // `bar` under C2's `baz`, conflicting the (now tip) C2 spuriously again. The
+    // Restore strategy computes the expected tip by applying C1's change forward
+    // onto the post-drop tip, recovering the original history.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "C1-bar"),
+            ("f.txt", "foo\nbar\nbaz\n", "C2-baz"),
+        ],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Drop C1-bar; remember its CommitInfo (its id stays resolvable, like the trash).
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "C1-bar").unwrap();
+    let c1 = commits[from].clone();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    assert!(matches!(repo.abandon_commit(&target).expect("drop"), SaveOutcome::Clean));
+    assert_eq!(common::git_log_subjects(dir), vec!["C2-baz", "base"]);
+
+    // Restore C1-bar into the gap between C2-baz and base (its original slot).
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let mv = repo.plan_restore(&commits, &c1, 1).expect("restore plan");
+    let outcome = repo
+        .restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("restore");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "expected the spurious restore to auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing should be left pending");
+
+    // Back to the original history, byte-for-byte.
+    assert_eq!(common::git_log_subjects(dir), vec!["C2-baz", "C1-bar", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbar");
+
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+    assert!(!std::fs::read_to_string(dir.join("f.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+}
+
+#[test]
 fn a_true_drop_conflict_still_falls_back_to_manual() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

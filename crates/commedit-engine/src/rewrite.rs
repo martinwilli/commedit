@@ -181,7 +181,7 @@ impl Repo {
             new_child_ids,
             new_tip,
             "commedit: reorder commit",
-            true,
+            SpuriousResolve::CleanTip,
         )
     }
 
@@ -202,7 +202,9 @@ impl Repo {
             new_child_ids,
             new_tip,
             "commedit: restore commit from trash",
-            false,
+            SpuriousResolve::Restore {
+                commit: target.clone(),
+            },
         )
     }
 
@@ -216,7 +218,7 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
         op_msg: &str,
-        auto_resolve: bool,
+        strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("moving the commit", || {
             self.splice_commit_inner(
@@ -225,7 +227,7 @@ impl Repo {
                 new_child_ids,
                 new_tip,
                 op_msg,
-                auto_resolve,
+                strategy,
             )
         })
     }
@@ -237,7 +239,7 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
         op_msg: &str,
-        auto_resolve: bool,
+        strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -273,11 +275,7 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
-        if auto_resolve {
-            self.finish_mutation_auto_resolve(tx, op_msg, pre_op, old_head, bookmarks, heads)
-        } else {
-            self.finish_mutation(tx, op_msg, pre_op, old_head, bookmarks, heads)
-        }
+        self.finish_mutation_spurious(tx, op_msg, pre_op, old_head, bookmarks, heads, strategy)
     }
 
     /// Drop `target` from history entirely: its descendants are rebased onto its
@@ -309,10 +307,9 @@ impl Repo {
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
         // Dropping removes the commit's change, so a descendant that edited an
-        // adjacent-but-independent line conflicts only spuriously. Auto-resolve it
-        // by peeling the dropped commit's change off the original tip (the dropped
-        // object lingers in the store for the peel). The dropped commit itself can
-        // be the conflicted tip, which the Drop strategy tolerates.
+        // adjacent-but-independent line conflicts only spuriously — including when
+        // that descendant is the tip itself. Auto-resolve it by rebuilding the
+        // conflicted range forward from the surviving commits' original changes.
         self.finish_mutation_spurious(
             tx,
             "commedit: drop commit",
@@ -320,9 +317,7 @@ impl Repo {
             old_head,
             bookmarks,
             heads,
-            SpuriousResolve::Drop {
-                commit: target.clone(),
-            },
+            SpuriousResolve::Drop,
         )
     }
 }

@@ -7,6 +7,7 @@ pub mod conflict;
 pub mod diff;
 pub mod history;
 pub mod patch_edit;
+pub mod replay;
 pub mod repo;
 pub mod rewrite;
 pub mod split;

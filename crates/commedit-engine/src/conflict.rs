@@ -413,8 +413,10 @@ impl Repo {
     /// would otherwise make the global resolver bail as ambiguous.
     fn resolve_change_on_chain(&self, change_hex: &str) -> Result<CommitId> {
         let change_id = ChangeId::try_from_hex(change_hex).context("invalid change id")?;
-        // The working-copy commit @ isn't on the ancestor chain; match it first.
-        if let Some(wc_id) = self.working_copy_commit_id() {
+        // The working-copy chain (@ and any split-off entries) sits above the
+        // branch tip, so the ancestor walk below never sees it; match those
+        // entries first.
+        for wc_id in self.working_copy_chain_ids() {
             if let Ok(commit) = self.repo.store().get_commit(&wc_id) {
                 if commit.change_id() == &change_id {
                     return Ok(wc_id);
@@ -437,7 +439,7 @@ impl Repo {
     /// The branch tip as jj currently sees it (read from the checked-out
     /// bookmark). `None` on a detached HEAD, where there is no branch to scope a
     /// conflict walk to.
-    fn current_head_in_jj(&self) -> Option<CommitId> {
+    pub(crate) fn current_head_in_jj(&self) -> Option<CommitId> {
         let name = self.current_bookmark()?;
         self.repo
             .view()
@@ -476,31 +478,33 @@ impl Repo {
                 files,
             });
         }
-        // The working-copy commit @ is a *child* of the tip, so the ancestor walk
-        // above never sees it. Include it (last, i.e. newest) so an overlap
-        // between the user's uncommitted changes and the rewrite defers the
-        // export and is resolved in the diff pane like any other commit.
-        if let Some(wc_id) = self.working_copy_commit_id() {
+        // The working-copy chain (@ and any split-off entries) is a *descendant*
+        // of the tip, so the ancestor walk above never sees it. Append each
+        // conflicted entry, oldest first (the chain is newest-first), so an
+        // overlap between the user's uncommitted changes and the rewrite defers
+        // the export and is resolved in the diff pane like any other commit.
+        for wc_id in self.working_copy_chain_ids().into_iter().rev() {
             let commit = store
                 .get_commit(&wc_id)
-                .context("loading the working-copy commit")?;
-            if commit.has_conflict() {
-                let tree = commit.tree();
-                let mut files = Vec::new();
-                for (path, value) in tree.conflicts() {
-                    let value = value.context("reading conflict entry")?;
-                    files.push(ConflictedPath {
-                        path,
-                        resolvable: value.to_file_merge().is_some(),
-                    });
-                }
-                out.push(ConflictedCommit {
-                    change_id: commit.change_id().clone(),
-                    commit_id: wc_id,
-                    subject: "Uncommitted changes".to_string(),
-                    files,
+                .context("loading a working-copy chain commit")?;
+            if !commit.has_conflict() {
+                continue;
+            }
+            let tree = commit.tree();
+            let mut files = Vec::new();
+            for (path, value) in tree.conflicts() {
+                let value = value.context("reading conflict entry")?;
+                files.push(ConflictedPath {
+                    path,
+                    resolvable: value.to_file_merge().is_some(),
                 });
             }
+            out.push(ConflictedCommit {
+                change_id: commit.change_id().clone(),
+                commit_id: wc_id,
+                subject: "Uncommitted changes".to_string(),
+                files,
+            });
         }
         Ok(out)
     }

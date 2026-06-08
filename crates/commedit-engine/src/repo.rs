@@ -90,6 +90,12 @@ impl Repo {
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;
         this.reattach_head()?;
+        // A previous session may have left a working-copy *chain* (Split peels @
+        // into pieces) in jj's op log. Git only ever saw one unstaged pile, so a
+        // fresh session reconciles to that: collapse any chain back to a single @
+        // on HEAD before snapshotting, rather than resurrecting a split git can't
+        // represent.
+        this.collapse_working_copy_chain()?;
         // Record any uncommitted changes into @ so they show in the history and
         // ride through rewrites from the start.
         this.snapshot_working_copy()?;

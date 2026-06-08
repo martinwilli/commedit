@@ -34,6 +34,92 @@ fn id_of(repo: &Repo, subject: &str) -> jj_lib::backend::CommitId {
 }
 
 #[test]
+fn folding_the_whole_working_copy_into_a_commit_leaves_a_clean_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "1\n", "A"), ("b.txt", "b\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // An uncommitted change that belongs in the older commit "A".
+    std::fs::write(dir.join("a.txt"), "1\n2\n").unwrap();
+    let dest = id_of(&repo, "A");
+
+    // Dragging the whole pile (the leaf @) onto "A" folds it in as a Fixup.
+    let outcome = repo.squash_working_copy_into(None, &dest).expect("fold");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // "A" gained the change, the branch is unchanged, and the tree is clean —
+    // jj recreated a fresh empty @, so there are no uncommitted entries left.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "1\n2");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    assert!(repo.working_copy_chain().is_empty(), "clean tree after folding");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "1\n2\n");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn folding_a_peeled_entry_keeps_the_remainder_uncommitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two uncommitted changes; peel the a.txt change into its own entry.
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    repo.split_working_copy(None, &[("b.txt".to_string(), "b\n".to_string())])
+        .expect("split");
+    // The peeled (oldest) entry carries the a.txt change; fold it into "A".
+    let chain = repo.working_copy_chain();
+    assert_eq!(chain.len(), 2);
+    let peeled = chain.last().expect("oldest entry").info.change_id_hex();
+    let dest = id_of(&repo, "A");
+    let outcome = repo
+        .squash_working_copy_into(Some(&peeled), &dest)
+        .expect("fold peeled entry");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // "A" gained the a.txt change; the b.txt change is still uncommitted; disk is
+    // unchanged (both edits still present, one now committed).
+    assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "a\nAA");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    let remaining = repo.working_copy_chain();
+    assert_eq!(remaining.len(), 1, "only the b.txt change remains uncommitted");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn a_conflicting_fold_defers_and_leaves_git_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[("a.txt", "1\n2\n3\n", "A"), ("a.txt", "1\nB\n3\n", "B")],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Uncommitted change to the same line "B" touched; folding into "A" can't apply.
+    std::fs::write(dir.join("a.txt"), "1\nLOCAL\n3\n").unwrap();
+    let dest = id_of(&repo, "A");
+    let outcome = repo.squash_working_copy_into(None, &dest).expect("fold");
+
+    let SaveOutcome::Conflicts { commits } = outcome else {
+        panic!("expected the fold to defer as a conflict");
+    };
+    assert!(!commits.is_empty());
+    // git is left untouched while the conflict is pending.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "1\nB\n3");
+    assert!(
+        !std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("<<<<<<<"),
+        "the worktree must be untouched while the conflict is pending"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn fixup_merges_content_keeps_target_message_drops_source() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

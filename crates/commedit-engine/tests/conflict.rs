@@ -8,6 +8,62 @@ use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
 
+#[test]
+fn a_history_rewrite_detects_and_resolves_conflicts_across_the_whole_wc_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("f.txt", "1\n2\n3\n", "A"), ("g.txt", "g\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Uncommitted: change f.txt's line 2 and g.txt; split so the f.txt change
+    // lands in the intermediate entry and the g.txt change in the leaf.
+    std::fs::write(dir.join("f.txt"), "1\nUNC\n3\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "g\nGG\n").unwrap();
+    repo.split_working_copy(None, &[("g.txt".to_string(), "g\n".to_string())])
+        .expect("split");
+    assert_eq!(repo.working_copy_chain().len(), 2);
+
+    // Rewrite f.txt's line 2 in commit "A"; rebasing the intermediate entry (which
+    // also changed line 2) conflicts — a conflict that lives *above* the branch
+    // tip, which the old leaf-only walk would only partly see.
+    let a = history(&repo.repo, &repo.head_commit_id().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|c| c.subject == "A")
+        .unwrap()
+        .id;
+    let outcome = repo
+        .rewrite_file(&a, "f.txt", "1\nREWRITTEN\n3\n")
+        .expect("rewrite");
+
+    let SaveOutcome::Conflicts { commits } = outcome else {
+        panic!("expected the rewrite to conflict the uncommitted chain");
+    };
+    // Both uncommitted entries are surfaced — proof the whole chain is walked.
+    let wc: Vec<_> = commits
+        .iter()
+        .filter(|c| c.subject == "Uncommitted changes")
+        .collect();
+    assert_eq!(wc.len(), 2, "both uncommitted entries detected");
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+
+    // Resolve the intermediate (oldest "Uncommitted changes"); the leaf's
+    // inherited conflict clears on rebase, so the chain settles clean and exports.
+    let intermediate = wc[0].change_id_hex();
+    let cf = repo.read_conflict(&intermediate, "f.txt").expect("read conflict");
+    let outcome = repo
+        .resolve_conflict(&intermediate, "f.txt", "1\nRESOLVED\n3\n", cf.marker_len)
+        .expect("resolve");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // The rewrite now applies to git and the resolved uncommitted changes land on
+    // disk (both the resolved f.txt and the still-uncommitted g.txt edit).
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\nREWRITTEN\n3");
+    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "1\nRESOLVED\n3\n");
+    assert_eq!(std::fs::read_to_string(dir.join("g.txt")).unwrap(), "g\nGG\n");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
 /// Build `base <- A <- B` where A and B both change the middle line of `f.txt`,
 /// so moving A on top of B can't be applied cleanly.
 fn conflicting_repo(dir: &std::path::Path) {

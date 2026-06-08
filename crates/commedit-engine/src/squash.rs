@@ -305,6 +305,28 @@ impl Repo {
         })
     }
 
+    /// Fold a working-copy entry (identified by its stable change id, or the leaf
+    /// `@` when `change_hex` is `None`) into the history commit `dest` as a
+    /// Fixup — the primitive behind dragging an "uncommitted changes" row onto a
+    /// commit. Snapshots first, then resolves the entry to its *current* commit id
+    /// (the leaf's churns on snapshot) before delegating to [`Self::squash_into`];
+    /// folding the whole leaf leaves jj's recreated empty `@` as a clean working
+    /// copy. Returns the usual [`SaveOutcome`], so a conflicting fold enters the
+    /// shared conflict-resolution flow.
+    pub fn squash_working_copy_into(
+        &mut self,
+        change_hex: Option<&str>,
+        dest: &CommitId,
+    ) -> Result<SaveOutcome> {
+        // Snapshot before resolving so the resolved id survives squash_into's own
+        // (now no-op) snapshot — otherwise a churned leaf id would go stale.
+        self.snapshot_working_copy()?;
+        let source = self
+            .resolve_working_copy_change(change_hex)
+            .context("no working-copy entry to fold")?;
+        self.squash_into(&source, dest, SquashMode::Fixup)
+    }
+
     fn squash_into_inner(
         &mut self,
         source: &CommitId,

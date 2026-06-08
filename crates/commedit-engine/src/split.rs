@@ -100,6 +100,78 @@ impl Repo {
             heads,
         )
     }
+
+    /// Split a working-copy entry (identified by its stable change id, or the
+    /// leaf `@` when `change_hex` is `None`) the same way [`Self::split_commit`]
+    /// splits a history commit — but as a pure jj-side reorganization: the
+    /// transaction is committed directly with no git export (like
+    /// [`Self::edit_working_copy_file`]), so HEAD / refs / index / working tree
+    /// are untouched and the on-disk content is byte-identical. The entry is
+    /// rewritten to the edited diff and a new commit holding its original tree is
+    /// inserted as its child, peeling the edit into a separate "uncommitted
+    /// changes" entry (see [`Self::working_copy_chain`]).
+    pub fn split_working_copy(
+        &mut self,
+        change_hex: Option<&str>,
+        files: &[(String, String)],
+    ) -> Result<()> {
+        crate::repo::catch_jj("splitting the working copy", || {
+            self.split_working_copy_inner(change_hex, files)
+        })
+    }
+
+    fn split_working_copy_inner(
+        &mut self,
+        change_hex: Option<&str>,
+        files: &[(String, String)],
+    ) -> Result<()> {
+        if files.is_empty() {
+            bail!("nothing to split: the diff has no edits");
+        }
+        // Snapshot the disk into the leaf @ first (its commit id churns here),
+        // then resolve the target entry's stable change id to its current id.
+        self.snapshot_working_copy()?;
+        let target = self
+            .resolve_working_copy_change(change_hex)
+            .context("no working copy to split")?;
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&target)
+            .context("loading the working-copy entry")?;
+        let store = self.repo.store().clone();
+        let orig_tree = commit.tree();
+        let edited_tree = crate::tree::splice_files_into_tree(commit.tree(), &store, files)?;
+
+        let mut tx = self.repo.start_transaction();
+        // E': the entry, rewritten to the edited diff (keeps its change id).
+        let edited = pollster::block_on(
+            tx.repo_mut()
+                .rewrite_commit(&commit)
+                .set_tree(edited_tree)
+                .write(),
+        )
+        .context("writing edited entry")?;
+        // N: a new commit holding the original tree, inserted as E''s child. It
+        // restores the exact tree the leaf (and any deeper entries) were built
+        // on, so they rebase unchanged; redirecting E -> N (overwriting the
+        // E -> E' rewrite above) carries the working-copy pointer to N.
+        let split = pollster::block_on(
+            tx.repo_mut()
+                .new_commit(vec![edited.id().clone()], orig_tree)
+                .write(),
+        )
+        .context("writing split entry")?;
+        tx.repo_mut()
+            .set_rewritten_commit(commit.id().clone(), split.id().clone());
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.repo = pollster::block_on(tx.commit("commedit: split working copy"))
+            .context("committing the working-copy split")?;
+
+        // The leaf @ holds the unchanged full tree, so this re-checkout is a
+        // no-op on disk; it just resets the git index to HEAD (unchanged).
+        self.materialize_after_rewrite(self.head_commit())
+    }
 }
 
 /// Compose the inserted commit's message from the original commit's description:

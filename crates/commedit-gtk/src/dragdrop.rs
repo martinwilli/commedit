@@ -16,7 +16,7 @@ use gtk::prelude::*;
 use gtk::{gdk, glib, Box as GtkBox, Button, DragSource, DropTarget, ListBoxRow, Orientation, Popover};
 
 use crate::rows::populate_trash;
-use crate::state::{Callbacks, Data, DragOrigin, DragState, Widgets};
+use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, Widgets};
 
 /// Install the drag-and-drop controllers on the history, trash and working-copy
 /// lists. See the module docs.
@@ -34,6 +34,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let repo = d.repo.clone();
     let commits = d.commits.clone();
     let trashed = d.trashed.clone();
+    let pending_trash_op = d.pending_trash_op.clone();
     let wc_entries = d.wc_entries.clone();
     let selected_change = d.selected_change.clone();
     let drag_origin = drag.drag_origin.clone();
@@ -376,6 +377,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let list = list.clone();
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
+        let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let selected_change = selected_change.clone();
@@ -576,6 +578,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let trashed = trashed.clone();
+                    let pending_trash_op = pending_trash_op.clone();
                     let trash_list = trash_list.clone();
                     let trash_scroll = trash_scroll.clone();
                     let selected_change = selected_change.clone();
@@ -602,9 +605,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                             }
                             Ok(SaveOutcome::Conflicts { commits }) => {
-                                trashed.borrow_mut().remove(from as usize);
+                                // Don't remove from the trash yet: the rewrite is
+                                // held back from git until the conflicts clear, so
+                                // the trash mustn't change either. Defer the removal
+                                // — applied on a clean resolution, dropped on abort.
+                                *pending_trash_op.borrow_mut() =
+                                    Some(PendingTrashOp::Restore(info));
                                 enter_conflict_mode(commits);
-                                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                             }
                             Err(err) => show_status(&format!("Restore failed: {err}")),
                         }
@@ -810,6 +817,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let show_status = show_status.clone();
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
+        let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let wc_entries = wc_entries.clone();
@@ -835,6 +843,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             let refresh = refresh.clone();
             let show_status = show_status.clone();
             let trashed = trashed.clone();
+            let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
@@ -880,9 +889,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                     }
                     Ok(SaveOutcome::Conflicts { commits }) => {
-                        trashed.borrow_mut().push(info);
+                        // Don't add to the trash yet: the rewrite is held back from
+                        // git until the conflicts clear. Defer the add — applied on
+                        // a clean resolution, dropped on abort. `enter_conflict_mode`
+                        // selects the commit being resolved, so the pane refreshes.
+                        *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(info));
                         enter_conflict_mode(commits);
-                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                     }
                     Err(err) => show_status(&format!("Drop failed: {err}")),
                 }

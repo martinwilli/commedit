@@ -99,6 +99,17 @@ impl ConflictCtx {
     }
 }
 
+/// A trash-list change deferred while a dropped/restored commit's rewrite is held
+/// back for conflict resolution. The rewrite isn't applied to git until the
+/// conflicts clear, so the trash list must not change yet either: the op is
+/// applied on a clean resolution and discarded on abort. `Drop` adds the commit
+/// to the trash (a history→trash drop that conflicted); `Restore` removes it (a
+/// trash→history restore that conflicted).
+pub(crate) enum PendingTrashOp {
+    Drop(CommitInfo),
+    Restore(CommitInfo),
+}
+
 /// Which side(s) of a conflict block a quick-resolve action keeps.
 #[derive(Clone, Copy)]
 pub(crate) enum Side {
@@ -211,6 +222,8 @@ pub(crate) struct Data {
     pub(crate) repo: Rc<RefCell<Repo>>,
     pub(crate) commits: Rc<RefCell<Vec<CommitInfo>>>,
     pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
+    /// A trash-list change deferred until a conflicted drop/restore resolves.
+    pub(crate) pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>>,
     pub(crate) wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>>,
     pub(crate) selected_change: Rc<RefCell<Option<String>>>,
     pub(crate) pane_mode: Rc<RefCell<PaneMode>>,

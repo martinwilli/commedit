@@ -194,6 +194,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // longer on the branch but their objects survive, so they can be dragged back
     // into history to restore them (see `Repo::restore_commit`).
     let trashed: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // A trash add/remove held back while a conflicted drop/restore is resolved —
+    // applied on a clean resolution, discarded on abort (see `PendingTrashOp`).
+    let pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>> = Rc::new(RefCell::new(None));
     // Which list the in-flight drag started in, set on drag prepare.
     let drag_origin: Rc<Cell<DragOrigin>> = Rc::new(Cell::new(DragOrigin::History));
     // The row currently being dragged, so it can be un-dimmed when the drag ends.
@@ -613,6 +616,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         repo: repo.clone(),
         commits: commits.clone(),
         trashed: trashed.clone(),
+        pending_trash_op: pending_trash_op.clone(),
         wc_entries: wc_entries.clone(),
         selected_change: selected_change.clone(),
         pane_mode: pane_mode.clone(),
@@ -1768,6 +1772,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // the whole chain: when the last conflict clears it exports the rewrite and we
     // return to the normal view, otherwise the remaining conflicts are re-shown.
     let resolve_current = conflict::build_resolve_current(
+        &widgets,
         &data,
         refresh.clone(),
         refresh_conflict.clone(),
@@ -1839,6 +1844,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let show_status = show_status.clone();
         let list = list.clone();
         let trashed = trashed.clone();
+        let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let review_button = review_button.clone();
@@ -1867,6 +1873,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let show_status = show_status.clone();
             let list = list.clone();
             let trashed = trashed.clone();
+            let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
             let review_button = review_button.clone();
@@ -1886,7 +1893,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                     // Drop conflict mode if we were resolving (idempotent otherwise).
                     exit_conflict_mode();
-                    // The session's drops are undone, so empty the trash bin.
+                    // The session's drops are undone, so empty the trash bin and
+                    // drop any trash change a held-back rewrite was waiting on.
+                    pending_trash_op.borrow_mut().take();
                     trashed.borrow_mut().clear();
                     populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
                     // Force the reselect to re-fire `row-selected` (rows are reused),

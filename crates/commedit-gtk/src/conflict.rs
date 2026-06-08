@@ -16,9 +16,9 @@ use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
 use crate::highlight::pill;
-use crate::rows::populate_list;
+use crate::rows::{populate_list, populate_trash};
 use crate::state::{
-    Callbacks, ConflictCtx, Data, PaneMode, Side, Widgets, CONFLICT_CUE_LABEL,
+    Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, Side, Widgets, CONFLICT_CUE_LABEL,
     CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS, SAVE_HINT_CONFLICT,
     SAVE_HINT_DIFF,
 };
@@ -405,6 +405,7 @@ pub(crate) fn build_enter_conflict_mode(
 /// it exports the rewrite and we return to the normal view, otherwise the
 /// remaining conflicts are re-shown.
 pub(crate) fn build_resolve_current(
+    w: &Widgets,
     d: &Data,
     refresh: Rc<dyn Fn()>,
     refresh_conflict: Rc<dyn Fn()>,
@@ -416,6 +417,10 @@ pub(crate) fn build_resolve_current(
     let pane_mode = d.pane_mode.clone();
     let selected_change = d.selected_change.clone();
     let conflict_view = d.conflict_view.clone();
+    let trashed = d.trashed.clone();
+    let pending_trash_op = d.pending_trash_op.clone();
+    let trash_list = w.trash_list.clone();
+    let trash_scroll = w.trash_scroll.clone();
     Rc::new(move || {
         if !pane_mode.borrow().is_conflict() {
             return;
@@ -455,6 +460,18 @@ pub(crate) fn build_resolve_current(
         let outcome = repo.borrow_mut().resolve_conflicts(&change_hex, &files);
         match outcome {
             Ok(SaveOutcome::Clean) => {
+                // The held-back rewrite is now exported, so apply the trash change
+                // that was waiting on it (the dropped commit lands in the trash, or
+                // the restored one leaves it).
+                if let Some(op) = pending_trash_op.borrow_mut().take() {
+                    match op {
+                        PendingTrashOp::Drop(info) => trashed.borrow_mut().push(info),
+                        PendingTrashOp::Restore(info) => trashed
+                            .borrow_mut()
+                            .retain(|c| c.change_id_hex() != info.change_id_hex()),
+                    }
+                    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                }
                 exit_conflict_mode();
                 refresh();
                 show_status("Conflicts resolved — rewrite applied.");
@@ -492,11 +509,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
         let refresh = refresh.clone();
         let show_status = show_status.clone();
         let list = list.clone();
+        let pending_trash_op = d.pending_trash_op.clone();
         move |_| {
             if let Err(err) = repo.borrow_mut().abort() {
                 show_status(&format!("Abort failed: {err}"));
                 return;
             }
+            // The rewrite is rolled back, so drop any trash change it was waiting
+            // on — leaving the trash as it was before the drop/restore. (The trash
+            // was never optimistically changed, so nothing to repopulate.)
+            pending_trash_op.borrow_mut().take();
             exit_conflict_mode();
             // The aborted commit is still selected, so `refresh` re-selecting it
             // (rows are reused, not rebuilt) wouldn't re-fire `row-selected` —

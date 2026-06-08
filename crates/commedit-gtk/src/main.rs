@@ -3212,10 +3212,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Save: rewrite the message and/or the selected file's content, then reload.
     // Reloading re-selects the commit, which cascades through `row-selected` ->
-    // `load_changes` and resets the file dropdown to index 0 with the cursor at
-    // the start. We capture the selected file and cursor offset beforehand and
-    // restore them afterwards so a save is invisible to the user's place in the
-    // diff.
+    // `load_changes` and re-renders the diff from the top. We capture the scroll
+    // position (as a fraction of the range, the only anchor that survives the
+    // re-render's line shifts) beforehand and re-pin it afterwards, so a save is
+    // invisible to the user's place in the diff.
     let save: Rc<dyn Fn()> = {
         let repo = repo.clone();
         let commits = commits.clone();
@@ -3225,6 +3225,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let file_dropdown = file_dropdown.clone();
+        let nav_sync = nav_sync.clone();
         let selected_change = selected_change.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
@@ -3286,8 +3287,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             };
 
             // Remember where the user is so we can restore it after the reload.
-            let saved_file = current_file.borrow().clone();
-            let saved_cursor = file_buffer.cursor_position();
+            // The reload re-renders the diff from scratch (context expansions
+            // cleared, edits applied), so the buffer's length and absolute line
+            // numbers change — restoring a saved line/offset overshoots the now
+            // shorter buffer and scrolls to the end. A *fraction* of the
+            // scrollable range survives the re-render; the (uniform, monospace,
+            // unwrapped) line height lets us recompute the post-render offset
+            // arithmetically rather than wait for GTK's deferred layout.
+            let scroll_frac = file_view.vadjustment().map(|v| {
+                let range = (v.upper() - v.page_size()).max(1.0);
+                (v.value() / range).clamp(0.0, 1.0)
+            });
+            let line_height = file_view.iter_location(&file_buffer.start_iter()).height() as f64;
             let file_had_focus = file_view.has_focus();
 
             // Message edit (if changed).
@@ -3359,18 +3370,41 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             }
 
+            // Reload, keeping the diff visually where it was. `refresh` re-selects
+            // the commit, cascading through `row-selected` -> `load_changes` ->
+            // `render_diff_view`, which `set_text`s the buffer (resetting the scroll
+            // to the top) and calls `scroll_to_file(0)`. We guard the whole reload
+            // with `nav_sync` so that scroll-to-top — and the scroll->dropdown sync —
+            // is suppressed and queues no competing deferred scroll, then re-pin the
+            // scroll ourselves to the fraction captured above.
+            nav_sync.set(true);
             refresh();
-
-            // Restore the selected file and cursor (refresh reset both).
-            if let Some(path) = saved_file {
-                if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
-                    file_dropdown.set_selected(idx as u32);
+            if let (Some(frac), Some(vadj)) = (scroll_frac, file_view.vadjustment()) {
+                let page = vadj.page_size();
+                if line_height > 0.0 && page > 0.0 {
+                    // `set_text` left the adjustment's range stale (layout validates
+                    // on a later frame). Recompute it arithmetically and set the
+                    // offset synchronously, before GTK paints, so the saved fraction
+                    // shows on the next frame instead of a jump-to-top flash; GTK's
+                    // own validation later sets the same values, leaving it put.
+                    let top = file_view.top_margin() as f64;
+                    let bottom = file_view.bottom_margin() as f64;
+                    let height = file_buffer.line_count() as f64 * line_height + top + bottom;
+                    let upper = height.max(page);
+                    let target = (frac * (upper - page)).clamp(0.0, (upper - page).max(0.0));
+                    vadj.set_upper(upper);
+                    vadj.set_value(target);
+                    // Sync the dropdown to the file now at the top of the viewport
+                    // (refresh reset it to the first file), and put the cursor on a
+                    // visible line so grab_focus / validation don't scroll it away.
+                    let top_line = ((target - top) / line_height).max(0.0) as usize;
+                    if let Some(iter) = file_buffer.iter_at_line(top_line as i32) {
+                        file_buffer.place_cursor(&iter);
+                    }
+                    file_dropdown.set_selected(diff_file_index_at_line(&file_buffer, top_line) as u32);
                 }
             }
-            let offset = saved_cursor.min(file_buffer.char_count());
-            let cursor = file_buffer.iter_at_offset(offset);
-            file_buffer.place_cursor(&cursor);
-            file_view.scroll_to_mark(&file_buffer.get_insert(), 0.0, false, 0.0, 0.0);
+            nav_sync.set(false);
             if file_had_focus {
                 file_view.grab_focus();
             }

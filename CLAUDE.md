@@ -304,11 +304,51 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
   *character* offsets where col 0 is the prefix char (matches GTK's
   `iter_at_line_offset`).
 
-`commedit-gtk/src/main.rs` is the whole UI: `build_ui` wires the history list,
-message/identity fields, and the SourceView diff buffer, intercepting key events
-through `plan_edit` and re-rendering via a boxed `Renderer` closure when hunks
-expand. The diff pane shows the **whole change in one buffer**; the file dropdown
-is a jump aid — selecting a file scrolls its `diff --git` header to the top
+### GTK module layout
+
+`commedit-gtk` is a **binary crate** (no lib target), so every module is
+`mod`-declared in `main.rs`. The file was split by topic to stop `build_ui`'s
+growth; new GTK features land in (and are prefixed in commit messages by) the
+relevant module, not in `main.rs`:
+
+- `state.rs` — the shared vocabulary: `DragOrigin`/`PaneMode`/`ConflictCtx`/
+  `ConflictFileView`/`Side`/`DiffCue`, the `Renderer` alias, the cue/hint/label
+  `const`s, **and** the four grouped bundles `Widgets`/`Data`/`DragState`/
+  `Callbacks` (every field an `Rc` or widget handle, so `Clone` is cheap).
+- `buffer_util.rs` — buffer/selection/text helpers (`buffer_text`, `iter_at`,
+  `buffer_selection`, `apply_patch_edit`, `splice_buffer_text`, `change_label`).
+- `highlight.rs` — the TextTag palette, syntect colouring (`highlight_diff`/
+  `highlight_conflict`), and the inline "pill" geometry/painting (`pill`,
+  `pills_on_line`).
+- `rows.rs` — commit/working-copy row build + the drag-safe `populate_*`
+  refreshers (the "hide, never unparent" discipline lives in `populate_rows`).
+- `identity.rs` — the author/committer identity/date fields and the
+  `Identity`↔fields conversions.
+- `conflict.rs` — the pure conflict-text helpers (header/cue/block helpers,
+  `with_resolve_cues`, the buffer scanners) **and** the conflict-mode wiring: the
+  callback builders (`build_refresh_conflict`/`build_exit_conflict_mode`/
+  `build_enter_conflict_mode`/`build_resolve_current`, called by `build_ui` in
+  that strict dependency order) and `conflict::wire` (abort + prev/next-conflict
+  navigation).
+- `dragdrop.rs` — the whole drag-and-drop surface behind `dragdrop::wire`: the
+  zone reorder-gap/squash-target feedback, the drag sources / drop targets, the
+  deferred `post_drag` staging (`run_post_drag`), and the unprefixed-squash
+  `show_squash_popover`.
+
+`build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
+diff-pane render/firewall/navigation closures, `save`/`refresh`, and `present`.
+It assembles the four bundles by **cloning its existing locals** (so a bundle
+field and the local point at the *same* `Rc`/widget — no duplicated state), then
+hands them by reference to `dragdrop::wire`, the conflict builders, and
+`conflict::wire`. Those modules clone the individual handles their closures
+capture out of the bundles; the staged `post_drag` boxes still capture cloned
+individual `Rc`s (never a borrow of a bundle). When migrating code that reads
+`d.commits.borrow()` etc., **keep the statement-level borrow scoping** the
+original had — e.g. `build_resolve_current` binds `repo.borrow_mut()`'s outcome
+before its `match` because the arms re-borrow `repo`.
+
+The diff pane shows the **whole change in one buffer**; the file dropdown is a
+jump aid — selecting a file scrolls its `diff --git` header to the top
 (`scroll_to_file`), scrolling the view updates the dropdown to the file at the top
 edge (a `nav_sync` guard stops the two fighting), and `highlight_diff` switches
 syntect language per file at each `--- a/PATH`. Save splits the buffer per file
@@ -317,8 +357,7 @@ and applies every edit in one `rewrite_files`. Each `@@` header also carries a
 clicking one `revert_groups`-rewrites the shown diff against the *render baseline*
 (`changes`), while `orig_changes` keeps the pristine content so Save/Split still
 see the revert as a divergence to apply — a revert never saves on its own. History
-drag-and-drop is
-**zone-based** (`show_zone`): a row's top/bottom
+drag-and-drop is **zone-based** (`show_zone` in `dragdrop`): a row's top/bottom
 quarter opens a reorder gap (the placeholder), its middle half marks a squash
 target (`set_squash_target`); dragging an autosquash-prefixed commit highlights
 recommended targets green and sibling fixups yellow, and dropping an unprefixed

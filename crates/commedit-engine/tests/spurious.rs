@@ -187,6 +187,83 @@ fn spurious_squash_across_an_interior_commit_is_auto_resolved() {
 }
 
 #[test]
+fn spurious_drop_conflict_is_auto_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // foo / +bar / +baz: C1 inserts `bar`, C2 inserts the adjacent `baz`. Dropping
+    // C1 rebases C2 onto the base where `bar` is gone, so jj conflicts the (now
+    // tip) C2 spuriously — yet "the surviving change with C1's removed" is
+    // well-defined. The conflict lands on the tip itself, which the Drop strategy
+    // tolerates.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "C1-bar"),
+            ("f.txt", "foo\nbar\nbaz\n", "C2-baz"),
+        ],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "C1-bar").unwrap();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    let outcome = repo.abandon_commit(&target).expect("drop");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "expected the spurious drop to auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing should be left pending");
+
+    // C1 is gone; C2's `baz` survives on top of the base, without `bar`.
+    assert_eq!(common::git_log_subjects(dir), vec!["C2-baz", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbaz");
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo");
+
+    // Transparency invariants.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+    assert!(!std::fs::read_to_string(dir.join("f.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+}
+
+#[test]
+fn a_true_drop_conflict_still_falls_back_to_manual() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // C1 and C2 both rewrite the *same* middle line, so removing C1 leaves C2's
+    // edit dangling on content it never saw — a genuine conflict auto-resolution
+    // must not paper over.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "1\n2\n3\n", "base"),
+            ("f.txt", "1\nA\n3\n", "C1"),
+            ("f.txt", "1\nB\n3\n", "C2"),
+        ],
+    );
+    let head_before = common::git(dir, &["rev-parse", "HEAD"]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "C1").unwrap();
+    let target = repo.plan_drop(&commits, from).expect("droppable");
+    let outcome = repo.abandon_commit(&target).expect("drop");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a true conflict must still be held back for manual resolution, got {outcome:?}"
+    );
+    assert!(repo.is_pending(), "a true conflict leaves a pending resolution");
+    // git is untouched while pending.
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(common::git_log_subjects(dir), vec!["C2", "C1", "base"]);
+}
+
+#[test]
 fn a_true_reorder_conflict_still_falls_back_to_manual() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

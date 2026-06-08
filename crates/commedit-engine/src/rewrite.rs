@@ -9,7 +9,7 @@ use jj_lib::rewrite::{
     move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
 };
 
-use crate::conflict::SaveOutcome;
+use crate::conflict::{SaveOutcome, SpuriousResolve};
 use crate::history::{
     plan_drop, plan_reorder, plan_restore, parse_timestamp, CommitInfo, ReorderMove,
 };
@@ -308,6 +308,21 @@ impl Repo {
         tx.repo_mut().record_abandoned_commit(&commit);
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
-        self.finish_mutation(tx, "commedit: drop commit", pre_op, old_head, bookmarks, heads)
+        // Dropping removes the commit's change, so a descendant that edited an
+        // adjacent-but-independent line conflicts only spuriously. Auto-resolve it
+        // by peeling the dropped commit's change off the original tip (the dropped
+        // object lingers in the store for the peel). The dropped commit itself can
+        // be the conflicted tip, which the Drop strategy tolerates.
+        self.finish_mutation_spurious(
+            tx,
+            "commedit: drop commit",
+            pre_op,
+            old_head,
+            bookmarks,
+            heads,
+            SpuriousResolve::Drop {
+                commit: target.clone(),
+            },
+        )
     }
 }

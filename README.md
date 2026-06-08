@@ -24,6 +24,13 @@ surrounding file, and the diff is syntax-highlighted per file type with changed
 words tinted within each line. The intent is that you edit hunks intuitively
 while never producing a broken patch.
 
+Each hunk also carries a *revert hunk* control, and every file a *revert file*
+one, to **drop** those changes from the commit. Reverting doesn't save on its
+own — it just rewrites the shown diff — so you then **Save** to drop the changes
+or **Split** to peel them into a separate commit. (Reverting re-renders from the
+unedited diff, so it discards any in-progress manual edits, just like *expand
+context*; to undo reverts, reselect the commit.)
+
 You can also **reorder** commits by dragging them in the history, or **drop**
 one into the trash (and drag it back to restore it). A reorder or drop is a
 real rebase, so it can conflict. When it does, comm(ed)it never writes the

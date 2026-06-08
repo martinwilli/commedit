@@ -1,0 +1,125 @@
+//! End-to-end: a reorder whose intermediate commits conflict only *spuriously*
+//! (adjacent but independent edits) is auto-resolved silently — the branch tip is
+//! identical to the original, so the chain is rebuilt clean and exported without
+//! any pending resolution. A reorder that *truly* conflicts still falls back to
+//! manual resolution.
+
+mod common;
+
+use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::history::history;
+use commedit_engine::repo::Repo;
+
+/// Plan and perform "drag display row `from` to the top gap".
+fn reorder_row_to_top(repo: &mut Repo, from: usize) -> SaveOutcome {
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let mv = repo.plan_reorder(&commits, from, 0).expect("reorder plan");
+    repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder")
+}
+
+#[test]
+fn spurious_reorder_conflict_is_auto_resolved_silently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // foo / +bar / +baz : C1 inserts `bar`, C2 inserts the adjacent `baz`. The two
+    // are independent, so reordering C2 below C1 yields the same final file — but
+    // jj's 3-way merge conflicts the intermediate.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "C1-bar"),
+            ("f.txt", "foo\nbar\nbaz\n", "C2-baz"),
+        ],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Move C1-bar (display row 1) to the top, i.e. apply C2-baz first.
+    let outcome = reorder_row_to_top(&mut repo, 1);
+
+    // The spurious intermediate conflict is resolved without bothering the user.
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "expected the spurious reorder to auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing should be left pending");
+
+    // git sees the reordered, conflict-free history: base <- C2-baz <- C1-bar.
+    assert_eq!(common::git_log_subjects(dir), vec!["C1-bar", "C2-baz", "base"]);
+    // The tip is byte-identical to the original combined result...
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
+    // ...and each commit keeps its own change: C2-baz introduces just `baz` onto
+    // the base (correct per-commit attribution, not an empty or absorbed commit).
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbaz");
+    assert_eq!(common::git(dir, &["show", "HEAD~2:f.txt"]), "foo");
+
+    // Transparency invariants: HEAD attached, clean tree, intact repo, no residue.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+    // No leftover conflict markers anywhere in the working tree.
+    assert!(!std::fs::read_to_string(dir.join("f.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+}
+
+#[test]
+fn spurious_reorder_resolves_across_multiple_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Two files, each with the same adjacent-insertion shape. Reordering exercises
+    // the per-file peel for every conflicted path of the intermediate commit.
+    common::init_repo(dir, &[("f.txt", "f0\n", "base-f")]);
+    std::fs::write(dir.join("g.txt"), "g0\n").unwrap();
+    common::git(dir, &["add", "g.txt"]);
+    common::git(dir, &["commit", "-q", "-m", "base-g"]);
+    std::fs::write(dir.join("f.txt"), "f0\nf1\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "g0\ng1\n").unwrap();
+    common::git(dir, &["commit", "-aqm", "C1"]);
+    std::fs::write(dir.join("f.txt"), "f0\nf1\nf2\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "g0\ng1\ng2\n").unwrap();
+    common::git(dir, &["commit", "-aqm", "C2"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let outcome = reorder_row_to_top(&mut repo, 1); // apply C2 first
+
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "f0\nf1\nf2");
+    assert_eq!(common::git(dir, &["show", "HEAD:g.txt"]), "g0\ng1\ng2");
+    // The new bottom commit (C2) carries just its own additions on each file.
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "f0\nf2");
+    assert_eq!(common::git(dir, &["show", "HEAD~1:g.txt"]), "g0\ng2");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn a_true_reorder_conflict_still_falls_back_to_manual() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A and B both rewrite the *same* middle line, so reordering genuinely
+    // conflicts — the tip can't be the original and auto-resolution must not fire.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "1\n2\n3\n", "base"),
+            ("f.txt", "1\nA\n3\n", "A"),
+            ("f.txt", "1\nB\n3\n", "B"),
+        ],
+    );
+    let head_before = common::git(dir, &["rev-parse", "HEAD"]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    let outcome = reorder_row_to_top(&mut repo, 1);
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a true conflict must still be held back for manual resolution, got {outcome:?}"
+    );
+    assert!(repo.is_pending(), "a true conflict leaves a pending resolution");
+    // git is untouched while pending.
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
+}

@@ -1096,7 +1096,7 @@ fn ensure_trailing_newline(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Read a file value as UTF-8 text. Returns `(None, true)` for binary content,
 /// `(None, false)` for non-file/absent values.
-fn read_text(
+pub(crate) fn read_text(
     store: &Arc<Store>,
     path: &RepoPath,
     value: Option<&TreeValue>,

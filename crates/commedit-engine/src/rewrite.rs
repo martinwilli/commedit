@@ -181,6 +181,7 @@ impl Repo {
             new_child_ids,
             new_tip,
             "commedit: reorder commit",
+            true,
         )
     }
 
@@ -201,6 +202,7 @@ impl Repo {
             new_child_ids,
             new_tip,
             "commedit: restore commit from trash",
+            false,
         )
     }
 
@@ -214,9 +216,17 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
         op_msg: &str,
+        auto_resolve: bool,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("moving the commit", || {
-            self.splice_commit_inner(target, new_parent_ids, new_child_ids, new_tip, op_msg)
+            self.splice_commit_inner(
+                target,
+                new_parent_ids,
+                new_child_ids,
+                new_tip,
+                op_msg,
+                auto_resolve,
+            )
         })
     }
 
@@ -227,6 +237,7 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
         op_msg: &str,
+        auto_resolve: bool,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -262,7 +273,11 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
-        self.finish_mutation(tx, op_msg, pre_op, old_head, bookmarks, heads)
+        if auto_resolve {
+            self.finish_mutation_auto_resolve(tx, op_msg, pre_op, old_head, bookmarks, heads)
+        } else {
+            self.finish_mutation(tx, op_msg, pre_op, old_head, bookmarks, heads)
+        }
     }
 
     /// Drop `target` from history entirely: its descendants are rebased onto its

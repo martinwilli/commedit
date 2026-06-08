@@ -96,6 +96,47 @@ fn spurious_reorder_resolves_across_multiple_files() {
 }
 
 #[test]
+fn spurious_reorder_auto_resolves_and_preserves_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Same spurious shape as above, plus a dirty working tree: an uncommitted edit
+    // to the reordered file and to an unrelated one — the real-world case.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "C1-bar"),
+            ("f.txt", "foo\nbar\nbaz\n", "C2-baz"),
+        ],
+    );
+    // Uncommitted: append to the reordered file and add a second, unrelated file.
+    std::fs::write(dir.join("f.txt"), "foo\nbar\nbaz\nlocal\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "scratch\n").unwrap();
+
+    let mut repo = Repo::open(dir).expect("open");
+    let outcome = reorder_row_to_top(&mut repo, 1); // apply C2 first
+
+    // Auto-resolves despite the dirty tree...
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    assert_eq!(common::git_log_subjects(dir), vec!["C1-bar", "C2-baz", "base"]);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbaz");
+    // ...and the uncommitted changes are preserved on disk and still uncommitted.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "foo\nbar\nbaz\nlocal\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("other.txt")).unwrap(),
+        "scratch\n"
+    );
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
+    let status = common::git(dir, &["status", "--porcelain"]);
+    assert!(status.contains("f.txt") && status.contains("other.txt"), "status: {status:?}");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn a_true_reorder_conflict_still_falls_back_to_manual() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

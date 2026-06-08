@@ -587,10 +587,11 @@ impl Repo {
     /// trees so jj never re-merges. The new tip is set to the original tree, so the
     /// final result is provably unchanged.
     ///
-    /// Returns `Ok(true)` once it rebuilt the chain clean (the caller re-settles to
-    /// export), `Ok(false)` when it bailed — a real conflict, a non-text/structural
-    /// change, uncommitted changes, or anything it can't prove safe — leaving jj at
-    /// the post-reorder state for ordinary manual resolution.
+    /// Uncommitted changes are preserved (the working copy re-parents onto the
+    /// new, identical tip). Returns `Ok(true)` once it rebuilt the chain clean (the
+    /// caller re-settles to export), `Ok(false)` when it bailed — a real conflict, a
+    /// non-text/structural change, a split working-copy chain, or anything it can't
+    /// prove safe — leaving jj at the post-reorder state for manual resolution.
     fn try_auto_resolve_spurious_reorder(&mut self) -> Result<bool> {
         let (pre_op, old_head_hex) = match self.pending.as_ref() {
             Some(p) => (p.pre_op.clone(), p.old_head.clone()),
@@ -630,8 +631,11 @@ impl Repo {
             return Ok(false); // the root is conflicted: not a plain reorder
         }
 
-        // Only the simple single-`@` working copy with no uncommitted changes is
-        // handled, so we never silently touch the user's in-progress edits.
+        // Only a simple single-`@` working copy is handled; a split chain falls
+        // back. Uncommitted changes are *preserved*, not a reason to bail: the new
+        // tip is byte-identical to the original, so the working copy's pre-reorder
+        // tree (captured at the snapshot just before the reorder) re-parents onto it
+        // cleanly — its delta applies to identical content, so it can never clash.
         if self.working_copy_chain_ids().len() > 1 {
             return Ok(false);
         }
@@ -645,12 +649,6 @@ impl Repo {
             ),
             None => None,
         };
-        if let Some(wc_tree) = &orig_wc_tree {
-            // Uncommitted changes present -> bail (don't auto-resolve over them).
-            if wc_tree.tree_ids_and_labels() != expected_tip_tree.tree_ids_and_labels() {
-                return Ok(false);
-            }
-        }
 
         // The original (pre-reorder) introduced change of each commit, by change id:
         // (parent tree, own tree). Used to peel a commit's change back off the tip.
@@ -699,11 +697,15 @@ impl Repo {
         }
         if let Some(wc_id) = self.working_copy_commit_id() {
             let wc = store.get_commit(&wc_id).context("loading the working copy")?;
+            // Carry the working copy's pre-reorder content onto the new tip,
+            // preserving any uncommitted changes (it equals the tip tree when the
+            // tree was clean, so an empty `@` stays empty).
+            let wc_tree = orig_wc_tree.clone().unwrap_or_else(|| expected_tip_tree.clone());
             block_on(
                 tx.repo_mut()
                     .rewrite_commit(&wc)
                     .set_parents(vec![new_tip.clone()])
-                    .set_tree(expected_tip_tree.clone())
+                    .set_tree(wc_tree)
                     .write(),
             )
             .context("re-parenting the working copy")?;

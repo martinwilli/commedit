@@ -198,35 +198,32 @@ pub struct RenderedDiff {
     pub group_count: usize,
 }
 
-/// Render a unified diff of `old` → `new` like [`unified_diff`], but with the
-/// context radius of each hunk controlled by `exp`. With the default (empty)
-/// expansion this matches `unified_diff`'s output. The returned [`RenderedDiff`]
-/// maps each `@@` hunk back to its change groups so the caller can ask for more
-/// surrounding context per hunk; the text always reverse-applies via
-/// [`apply_patch`].
-pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> RenderedDiff {
-    let old_n = ensure_trailing_newline(old);
-    let new_n = ensure_trailing_newline(new);
-    let old_lines: Vec<&str> = old_n.lines().collect();
-    let new_lines: Vec<&str> = new_n.lines().collect();
-    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+/// One line of a flattened line-level diff: whether it is context / removed /
+/// added, its old/new line index (for `@@` headers), and its text.
+#[derive(Clone, Copy)]
+enum Tag {
+    Ctx,
+    Del,
+    Ins,
+}
 
-    // Flatten the line ops into a single sequence of segments, tracking each
-    // line's old/new index for the `@@` header.
-    #[derive(Clone, Copy)]
-    enum Tag {
-        Ctx,
-        Del,
-        Ins,
-    }
-    struct Seg<'a> {
-        tag: Tag,
-        old: usize,
-        new: usize,
-        text: &'a str,
-    }
+struct Seg<'a> {
+    tag: Tag,
+    old: usize,
+    new: usize,
+    text: &'a str,
+}
+
+/// Flatten a line-level diff's ops into one sequence of segments, tracking each
+/// line's old/new index and its text. Shared by [`render_diff`] and
+/// [`revert_groups`] so both see identical segmentation and change grouping.
+fn diff_segments<'a>(
+    old_lines: &[&'a str],
+    new_lines: &[&'a str],
+    ops: &[DiffOp],
+) -> Vec<Seg<'a>> {
     let mut segs: Vec<Seg> = Vec::new();
-    for op in diff.ops() {
+    for op in ops {
         match *op {
             DiffOp::Equal {
                 old_index,
@@ -295,8 +292,12 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
             }
         }
     }
+    segs
+}
 
-    // Maximal runs of changed segments — the "change groups".
+/// Maximal runs of changed (non-context) segments — the "change groups". Each is
+/// a half-open `[start, end)` range into `segs`, ordered and non-overlapping.
+fn change_groups(segs: &[Seg]) -> Vec<(usize, usize)> {
     let is_change = |s: &Seg| !matches!(s.tag, Tag::Ctx);
     let mut groups: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -311,6 +312,75 @@ pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> 
             i += 1;
         }
     }
+    groups
+}
+
+/// Reconstruct `new` with the change groups in the inclusive range
+/// `[first_group, last_group]` reverted to `old`, leaving the other groups'
+/// changes intact. Group indexing matches [`render_diff`] / [`HunkInfo`], so a
+/// UI hunk's `first_group`/`last_group` selects exactly that hunk's content to
+/// drop. The result is newline-normalized like [`apply_patch`]'s output, so the
+/// rendered diff of `old` → result still reverse-applies. Out-of-range indices
+/// (or a file with no changes) return `new` unchanged (normalized).
+pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize) -> String {
+    let old_n = ensure_trailing_newline(old);
+    let new_n = ensure_trailing_newline(new);
+    let old_lines: Vec<&str> = old_n.lines().collect();
+    let new_lines: Vec<&str> = new_n.lines().collect();
+    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+
+    let segs = diff_segments(&old_lines, &new_lines, diff.ops());
+    let groups = change_groups(&segs);
+
+    // Walk the segments, tracking which change group each changed segment belongs
+    // to. A reverted group emits its old side (the `-` lines, dropping the `+`);
+    // a kept group emits its new side (the `+` lines, dropping the `-`); context
+    // is emitted verbatim.
+    let mut out: Vec<&str> = Vec::with_capacity(segs.len());
+    let mut g = 0usize;
+    let mut i = 0usize;
+    while i < segs.len() {
+        if matches!(segs[i].tag, Tag::Ctx) {
+            out.push(segs[i].text);
+            i += 1;
+            continue;
+        }
+        while g < groups.len() && i >= groups[g].1 {
+            g += 1;
+        }
+        let reverted = g < groups.len() && g >= first_group && g <= last_group;
+        match (segs[i].tag, reverted) {
+            (Tag::Del, true) => out.push(segs[i].text),
+            (Tag::Ins, false) => out.push(segs[i].text),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if out.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", out.join("\n"))
+    }
+}
+
+/// Render a unified diff of `old` → `new` like [`unified_diff`], but with the
+/// context radius of each hunk controlled by `exp`. With the default (empty)
+/// expansion this matches `unified_diff`'s output. The returned [`RenderedDiff`]
+/// maps each `@@` hunk back to its change groups so the caller can ask for more
+/// surrounding context per hunk; the text always reverse-applies via
+/// [`apply_patch`].
+pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> RenderedDiff {
+    let old_n = ensure_trailing_newline(old);
+    let new_n = ensure_trailing_newline(new);
+    let old_lines: Vec<&str> = old_n.lines().collect();
+    let new_lines: Vec<&str> = new_n.lines().collect();
+    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+
+    // Flatten the line ops into segments and find the change groups (both shared
+    // with `revert_groups` so they agree on grouping).
+    let segs = diff_segments(&old_lines, &new_lines, diff.ops());
+    let groups = change_groups(&segs);
     let group_count = groups.len();
     if group_count == 0 {
         return RenderedDiff::default();
@@ -1117,8 +1187,8 @@ pub(crate) fn read_text(
 mod tests {
     use super::{
         apply_patch, parse_diff_lines, reconstruct_conflict_file, render_commit_diff,
-        render_conflict_snippets, render_diff, split_combined_patch, unified_diff, ChangeKind,
-        ContextExpansion, DiffLineKind, FileChange,
+        render_conflict_snippets, render_diff, revert_groups, split_combined_patch, unified_diff,
+        ChangeKind, ContextExpansion, DiffLineKind, FileChange,
     };
     use std::collections::HashMap;
 
@@ -1184,6 +1254,70 @@ mod tests {
         assert_eq!(rendered.group_count, 0);
         assert!(rendered.text.is_empty());
         assert!(rendered.hunks.is_empty());
+    }
+
+    #[test]
+    fn revert_one_of_two_groups_keeps_the_other() {
+        let (old, new) = two_change_file();
+        // Two change groups: line 3 (l3->L3) and line 15 (l15->L15).
+        let reverted = revert_groups(&old, &new, 0, 0);
+        assert!(reverted.contains("\nl3\n"), "group 0 reverted to old");
+        assert!(reverted.contains("\nL15\n"), "group 1 kept the new content");
+        // Only one hunk remains, and it still reverse-applies from old.
+        let rendered = render_diff(&old, &reverted, "f", &ContextExpansion::default());
+        assert_eq!(rendered.hunks.len(), 1);
+        assert_eq!(apply_patch(&old, &rendered.text).unwrap(), reverted);
+    }
+
+    #[test]
+    fn revert_all_groups_equals_old() {
+        let (old, new) = two_change_file();
+        assert_eq!(revert_groups(&old, &new, 0, 1), old);
+    }
+
+    #[test]
+    fn revert_noop_when_unchanged() {
+        assert_eq!(revert_groups("a\nb\n", "a\nb\n", 0, 0), "a\nb\n");
+    }
+
+    #[test]
+    fn revert_pure_insertion_drops_added_lines() {
+        let old = "a\nc\n";
+        let new = "a\nb\nc\n";
+        assert_eq!(revert_groups(old, new, 0, 0), old);
+    }
+
+    #[test]
+    fn revert_pure_deletion_restores_lines() {
+        let old = "a\nb\nc\n";
+        let new = "a\nc\n";
+        assert_eq!(revert_groups(old, new, 0, 0), old);
+    }
+
+    #[test]
+    fn revert_then_render_still_applies() {
+        let (old, new) = two_change_file();
+        let reverted = revert_groups(&old, &new, 0, 0);
+        // The property collect_file_edits relies on: the buffer the UI builds from
+        // the reverted baseline reverse-applies back to that same content.
+        let rendered = render_diff(&old, &reverted, "f", &ContextExpansion::default());
+        assert_eq!(apply_patch(&old, &rendered.text).unwrap(), reverted);
+    }
+
+    #[test]
+    fn revert_normalizes_missing_trailing_newline() {
+        // Input new lacks a trailing newline; the result is normalized to carry
+        // one, matching apply_patch's output so the save-side newline handling is
+        // consistent.
+        let old = "a\nb";
+        let new = "a\nB";
+        assert_eq!(revert_groups(old, new, 0, 0), "a\nb\n");
+    }
+
+    #[test]
+    fn revert_out_of_range_index_is_noop() {
+        let (old, new) = two_change_file();
+        assert_eq!(revert_groups(&old, &new, 9, 9), new);
     }
 
     /// Concatenate the substrings a line's intra ranges select from its code.
@@ -1364,6 +1498,43 @@ mod tests {
         assert_eq!(chunks[1].0, "b.txt");
         assert_eq!(apply_patch("a1\na2\n", &chunks[0].1).unwrap(), "a1\nA2\n");
         assert_eq!(apply_patch("b1\nb2\n", &chunks[1].1).unwrap(), "B1\nb2\n");
+    }
+
+    #[test]
+    fn reverting_a_hunk_then_rendering_saves_back_the_partially_reverted_content() {
+        // Mirror the UI's revert flow end to end: set the render baseline's
+        // new_text to the hunk-reverted content, then reproduce `collect_file_edits`
+        // (render + split + apply). The content Save would write equals the
+        // partially-reverted new — line 3 restored, line 15 kept — and differs from
+        // the original, so it is detected as an edit.
+        let (old, new) = two_change_file();
+        let reverted = revert_groups(&old, &new, 0, 0);
+        let changes = vec![modified("f", &old, &reverted)];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        let chunks = split_combined_patch(&combined.text);
+        let saved = apply_patch(&old, &chunks[0].1).unwrap();
+        assert_eq!(saved, reverted);
+        assert_ne!(saved, new);
+        assert!(saved.contains("\nl3\n") && saved.contains("\nL15\n"));
+    }
+
+    #[test]
+    fn reverting_a_whole_file_renders_a_notice_that_saves_back_to_old() {
+        // Full-file revert: the baseline's new_text is set to old. render_commit_diff
+        // shows the `(no textual changes)` notice *with* `--- a/PATH` headers, so
+        // split finds the path and apply returns old — which differs from the
+        // commit's real new, so Save drops the file's changes.
+        let old = "a1\na2\n";
+        let new = "A1\nA2\n";
+        let changes = vec![modified("a.txt", old, old)];
+        let combined = render_commit_diff(&changes, &HashMap::new());
+        assert!(combined.text.contains("(no textual changes)"));
+        let chunks = split_combined_patch(&combined.text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, "a.txt");
+        let saved = apply_patch(old, &chunks[0].1).unwrap();
+        assert_eq!(saved, old);
+        assert_ne!(saved, new);
     }
 
     #[test]

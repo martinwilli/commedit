@@ -4,85 +4,68 @@
 
 
 comm(ed)it is a GTK4 desktop application for editing the history of a git
-repository directly and visually — not just the latest commit, but any commit
-in the graph. Browse the history like in `gitk`, pick a commit, and edit its
-message, its author/committer identity and dates, or the actual content of the
-files it changed. Saving rewrites that commit in place and automatically rebases
-its descendants, so a one-line fix deep in the history is a couple of clicks
-rather than an interactive-rebase session.
+repository directly and visually — not just the latest commit, but any commit in
+the graph. Browse the history like in `gitk`, pick a commit, edit it, and save:
+comm(ed)it rewrites that commit in place and automatically rebases its
+descendants. A one-line fix deep in the history is a couple of clicks rather than
+an interactive-rebase session.
 
 <p align="center">
   <img src="assets/diffview.png" alt="comm(ed)it editing a commit: history list, identity fields, and an editable diff" width="800">
 </p>
 
-The file changes are presented as an editable unified diff. Editing is
-*structured*: a firewall intercepts every change to the diff so the result is
-always a patch that still applies — typing on a context line splits it into a
-removed/added pair, deleting a removed line restores it, and `@@` headers stay
-read-only. Each hunk carries an *expand context* control to reveal more of the
-surrounding file, and the diff is syntax-highlighted per file type with changed
-words tinted within each line. The intent is that you edit hunks intuitively
-while never producing a broken patch.
+## Features
 
-Each hunk also carries a *revert hunk* control, and every file a *revert file*
-one, to **drop** those changes from the commit. Reverting doesn't save on its
-own — it just rewrites the shown diff — so you then **Save** to drop the changes
-or **Split** to peel them into a separate commit. (Reverting re-renders from the
-unedited diff, so it discards any in-progress manual edits, just like *expand
-context*; to undo reverts, reselect the commit.)
+- **Edit any commit in place** — change its message, its author/committer
+  identity and dates, or the actual content of the files it changed. Saving
+  rewrites the commit and rebases everything built on top of it.
 
-Whenever the diff has pending edits, a **Split** button appears beside **Save**.
-Where *Save* rewrites the commit to your edited diff, *Split* keeps that edited
-version *and* inserts a new follow-up commit holding everything you changed away
-from the original — so the two together still reproduce the commit's original
-result and its descendants are untouched, but one commit has become two. Paired
-with *revert*, that's how you carve a commit apart: revert the hunks you want to
-separate out, then *Split*, and exactly those changes move into a commit of
-their own.
+- **Structured diff editing** — file changes are an editable unified diff with a
+  firewall that keeps the buffer a patch that still applies: typing on a context
+  line splits it into a removed/added pair, deleting a removed line restores it,
+  and `@@` headers stay read-only. It's syntax-highlighted per file type with
+  changed words tinted inline, and each hunk has an *expand context* control to
+  reveal more of the surrounding file.
 
-You can also **reorder** commits by dragging them in the history, or **drop**
-one into the trash (and drag it back to restore it). A reorder or drop is a
-real rebase, so it can conflict. Many apparent conflicts are *spurious*, though
-— two commits touching nearby but independent lines, which an ordinary 3-way
-merge flags even though the combined result is unambiguous — and comm(ed)it
-resolves those for you automatically, so you only ever deal with conflicts that
-genuinely need a decision. When a real one does surface, comm(ed)it never writes
-the conflict into your git history: the rewrite is held back — `git` still sees
-your original, untouched history — and the conflicted files are shown right in
-the diff pane with `<<<<<<<` / `=======` / `>>>>>>>` markers. Resolve each by hand or
-with the *Use ours / theirs / both* buttons. When a rewrite conflicts across
-several files you resolve them one at a time, saving each in turn; the rewrite
-is applied to git automatically once the last conflict is cleared, or you can
-abort it and leave history exactly as it was. Some conflicts are structural
-(a directory, symlink, or submodule rather than text) and can't be resolved in
-the diff pane — for those, aborting the rewrite is the only way out.
+- **Revert hunks or files** — every hunk and every file carries a *revert*
+  control to drop those changes from the commit. Reverting doesn't save on its
+  own; you then **Save** to drop the changes or **Split** to peel them off.
 
-And you can **squash** one commit into another by dragging it *onto* a commit —
-drop on the middle of a row (its top and bottom edges still open a gap to
-reorder). A commit marked with git's autosquash prefix — `fixup! <subject>`,
-`squash! <subject>` or `amend! <subject>` — lights up its matching target
-**green** while you drag (and any sibling autosquash commits aimed at the same
-target **yellow**), and folds in immediately when dropped: `fixup!` keeps the
-target's message, `squash!` appends the dragged commit's message to it, and
-`amend!` replaces it. Dropping an ordinary commit onto another instead opens a
-small popup to pick fixup / squash / amend (or cancel — handy if the drop was an
-accident). A squash is a rebase too, so it can conflict, and is then held back
-and resolved exactly like a reorder.
+- **Split one commit into two** — when the diff has pending edits, **Split**
+  keeps your edited version *and* inserts a follow-up commit holding everything
+  you changed away from the original, so the two together still reproduce the
+  commit's result and its descendants are untouched. Paired with *revert*, that's
+  how you carve a commit apart.
 
-Your **uncommitted changes** aren't left out of all this. Whatever you've edited
-or added on disk but not yet committed appears as its own row (or rows) *above*
-the history list — selectable like a commit, with the same editable diff, where
-**Save** writes back to the working tree rather than rewriting history. You can
-drag such a row **onto a commit** to fold those changes into it (as a fixup),
-**Split** it to peel off a piece, or drop it onto the **trash** to discard it.
-And because the working copy rides through every rewrite untouched, your changes
-are still there — and still uncommitted — once any reorder, squash or edit
-finishes.
+- **Reorder, drop and restore** — drag commits to reorder them in the history,
+  drop one into the trash, or drag it back to restore it.
 
-Finally, the toolbar's **Review** toggle flips the whole window into a
-read-only, full-window diff of every content change you've made this session —
-the repository as it stands now versus how it was when you opened it — so you
-can sanity-check the cumulative result before you call it done.
+- **Squash by dragging** — drag a commit *onto* another to fold it in. A commit
+  with an autosquash prefix (`fixup!` / `squash!` / `amend!`) highlights its
+  matching target while you drag and folds in on drop; an ordinary commit opens a
+  small fixup / squash / amend picker.
+
+- **Conflicts never reach your git history** — a reorder, drop or squash is a
+  real rebase, so it can conflict. Spurious conflicts (nearby but independent
+  edits) are resolved for you automatically; a genuine one is held back — `git`
+  keeps seeing your original, untouched history — and shown right in the diff pane
+  with conflict markers and *Use ours / theirs / both* buttons. Resolve them file
+  by file; the rewrite reaches git only once the last is cleared, or you abort and
+  leave history exactly as it was.
+
+- **Uncommitted changes are first-class** — whatever you've edited or added on
+  disk but not committed appears as its own row above the history, with the same
+  editable diff (here **Save** writes back to the working tree). Fold it into a
+  commit, **Split** off a piece, or drop it onto the trash to discard it — and it
+  rides through every rewrite untouched, still uncommitted when you're done.
+
+- **Review before you're done** — the toolbar's **Review** toggle flips the
+  window into a read-only, full-window diff of every content change you've made
+  this session: the repository now versus how it was when you opened it.
+
+- **Undo the whole session** — one click on **Revert all** rolls the repository
+  back to the state it was in when you opened it, undoing every rewrite, reorder,
+  squash and working-copy edit made since.
 
 ## Installing a binary release
 
@@ -140,13 +123,38 @@ cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 - `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
   `+` additions, restores `-` removals to context).
 
+## How it works
+
 Under the hood, comm(ed)it is built on [jujutsu](https://github.com/jj-vcs/jj)
 (`jj-lib`) for its rewrite-and-rebase engine, operating on a transparently
-colocated jj+git repository: jj does the heavy lifting, but the working copy
-and `git` itself see an ordinary, attached-HEAD git repository the whole time.
-The code is split into a headless `commedit-engine` crate (all repository logic,
+colocated jj+git repository: jj does the heavy lifting, but the working copy and
+`git` itself see an ordinary, attached-HEAD git repository the whole time. The
+code is split into a headless `commedit-engine` crate (all repository logic,
 unit-tested against scratch repos) and a `commedit-gtk` crate (the UI), so the
 rewrite logic carries no GTK dependency.
+
+That transparency is what keeps conflicts out of your history. While a rewrite is
+conflicted, comm(ed)it moves no git ref, `HEAD` or working-tree file: the
+conflicted commit objects sit unreachable in the object store and plain `git`
+keeps seeing your original history, until the chain resolves clean (then it
+exports in one step) or you abort (then nothing happened). *Spurious* conflicts
+— adjacent but independent edits that an ordinary 3-way merge can't place even
+though the combined result is unambiguous — are reconstructed and resolved
+automatically before any of that, so you only ever face conflicts that genuinely
+need a decision. Some conflicts are structural (a directory, symlink or submodule
+rather than text) and can't be resolved in the diff pane; for those, aborting the
+rewrite is the only way out.
+
+Your uncommitted changes ride through every rewrite because jj keeps them in its
+working-copy commit and rebases them forward like any other descendant. The one
+thing the jj model can't see is content that lives *only* in the git index — a
+file you `git add`ed and then changed or removed on disk — so before each rewrite
+resets the index, comm(ed)it pins the whole index to a
+`refs/commedit/backup/index-*` ref. These are silent, transient safety nets: only
+the most recent one is kept (older ones are pruned automatically on the next
+rewrite), and you almost never need them. If you do, recover with
+`git read-tree <ref>` (restage) or `git checkout <ref> -- .` (write to disk);
+`git for-each-ref refs/commedit/backup/` lists any that exist.
 
 ## Disclaimer
 
@@ -160,17 +168,6 @@ undoes every rewrite, reorder, squash and working-copy edit made since. If a
 session goes wrong beyond that (the app crashes, say), `git reflog` still holds
 the commit your branch pointed at when you opened it, so a `git reset --hard`
 gets you back.
-
-Your uncommitted changes (edits on disk and untracked files) ride through every
-rewrite and are restored to the working tree as-is. The one thing the underlying
-jj model can't see is content that lives *only* in the git index — a file you
-`git add`ed and then changed or removed on disk — so before each rewrite resets
-the index, comm(ed)it pins the whole index to a `refs/commedit/backup/index-*`
-ref. These are silent, transient safety nets: only the most recent one is kept
-(older ones are pruned automatically on the next rewrite), and you almost never
-need them. If you do, recover with `git read-tree <ref>` (restage) or
-`git checkout <ref> -- .` (write to disk); `git for-each-ref refs/commedit/backup/`
-lists any that exist.
 
 ## License
 

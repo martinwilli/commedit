@@ -16,7 +16,7 @@ its descendants. See `README.md` for the user-facing pitch.
 cargo build                      # build the workspace
 cargo test                       # all tests (engine unit + integration)
 cargo test -p commedit-engine    # engine only
-cargo test --test rewrite        # one integration test binary (open/history/tree/rewrite)
+cargo test --test rewrite        # one integration test binary (each tests/*.rs is its own)
 cargo test plan_reorder          # tests matching a name
 cargo run -- /path/to/repo       # launch the GTK app against a repo (defaults to ".")
 ```
@@ -209,6 +209,17 @@ sit unreachable in the ODB (like keep-ref residue) and plain `git` keeps seeing
 the pre-rewrite history. The deferred export only runs once the whole chain is
 clean.
 
+A reorder's intermediate rebase can throw **spurious** conflicts — two commits
+touching adjacent-but-independent lines, where the reordered tip is nonetheless
+unchanged. Before holding such a rewrite back, `settle` tries
+`try_auto_resolve_spurious_reorder` **once** (opted into via
+`finish_mutation_auto_resolve`, which sets the `auto_resolve_spurious` flag):
+it rebuilds the chain by `peel_commit_change`-ing each commit's edit onto the tree
+above it through `replay.rs`'s asymmetric `replay_change` — replaying `base →
+theirs` onto `ours` while *trusting `ours` for context*, the one thing a symmetric
+3-way merge (jj/git/diff3) can't do. A genuine overlap (or a structural/binary
+change) returns `None`, so the rewrite falls back to the manual flow below.
+
 While a `PendingResolution` is held, the UI drives it by **change id** (commit
 ids churn on every resolution step): `read_conflict(change_hex, path)`
 materializes a file with Git 2-way markers (jj's diff3 base section is stripped);
@@ -251,6 +262,20 @@ which lags a rewrite until re-imported) avoids resurfacing stale, pre-rewrite
 commits. `change_id` (stable across rewrites) is what the UI uses to re-select a
 commit after a save.
 
+### Session revert & review
+
+`Repo::open` captures the session-start operation (`session_op`) and HEAD
+(`session_head`, exposed as `session_start_head_hex` for the revert confirmation).
+`revert_all` (`conflict.rs`) restores the whole session in one step — backing the
+toolbar's **Revert all** button: it drops any pending conflicted rewrite, rewinds
+jj's view to `session_op` (recorded as a new op, like `abort`), and — unlike
+`abort`, since clean saves during the session already moved git refs / HEAD / the
+worktree — runs the same `export_and_sync` tail to materialize the session-start
+tree back to git and disk. `session_changes` (`repo.rs`) diffs the current
+working-copy tree against its session-start counterpart (the cumulative content
+delta), powering the read-only **Review** toggle. Both are no-ops before the first
+operation.
+
 ### Structured diff editing (the other hard part)
 
 The diff pane is an *editable* unified diff, with a "firewall" guaranteeing the
@@ -260,6 +285,9 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
   unified diff with per-hunk expandable context (`render_diff` + `ContextExpansion`
   / `HunkInfo`, both over the shared `window_groups`), classify lines
   (`classify_line`/`DiffLineKind`), and apply an edited patch back (`apply_patch`).
+  `revert_groups(old, new, first, last)` rebuilds `new` with one hunk's change
+  groups dropped back to `old` (group indexing shared with `render_diff`/`HunkInfo`),
+  backing the diff view's *revert hunk* / *revert file* cues.
   `render_commit_diff` lays **all** of a commit's files into one buffer (separated
   by `diff --git` lines; per-file placement in `CombinedFile`) and
   `split_combined_patch` cuts the edited buffer back per file; `rewrite_files`
@@ -284,7 +312,12 @@ is a jump aid — selecting a file scrolls its `diff --git` header to the top
 (`scroll_to_file`), scrolling the view updates the dropdown to the file at the top
 edge (a `nav_sync` guard stops the two fighting), and `highlight_diff` switches
 syntect language per file at each `--- a/PATH`. Save splits the buffer per file
-and applies every edit in one `rewrite_files`. History drag-and-drop is
+and applies every edit in one `rewrite_files`. Each `@@` header also carries a
+*revert hunk* cue and each `diff --git` line a *revert file* cue (`DiffCue`);
+clicking one `revert_groups`-rewrites the shown diff against the *render baseline*
+(`changes`), while `orig_changes` keeps the pristine content so Save/Split still
+see the revert as a divergence to apply — a revert never saves on its own. History
+drag-and-drop is
 **zone-based** (`show_zone`): a row's top/bottom
 quarter opens a reorder gap (the placeholder), its middle half marks a squash
 target (`set_squash_target`); dragging an autosquash-prefixed commit highlights

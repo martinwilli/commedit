@@ -39,6 +39,15 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
 }
 
+/// Direction in which [`Repo::transform_tree`] replays a commit's change.
+#[derive(Clone, Copy)]
+enum Dir {
+    /// Remove the change (peel a commit off the tree above it).
+    Peel,
+    /// Apply the change forward (onto a new base).
+    Forward,
+}
+
 /// Outcome of a mutation (or a resolution step): either the history is now
 /// conflict-free and was exported to git, or one or more commits on the branch
 /// tip's ancestor chain are conflicted and the rewrite is held pending in jj
@@ -100,6 +109,29 @@ pub struct ConflictedFile {
     pub num_sides: usize,
 }
 
+/// Which spurious-conflict auto-resolution to attempt before falling back to
+/// manual resolution. *Spurious* conflicts are adjacent-but-independent edits
+/// that conflict under jj's symmetric 3-way merge yet leave a well-defined
+/// result. See [`Repo::try_auto_resolve_spurious`].
+pub(crate) enum SpuriousResolve {
+    /// Don't auto-resolve — message/identity/file edits and split hand any
+    /// conflict straight to manual resolution.
+    Off,
+    /// Reorder or squash: the net change set is preserved, so the post-mutation
+    /// branch tip is conflict-free and identical to the original. Anchor the
+    /// reconstruction on that clean tip.
+    CleanTip,
+    /// Drop: the dropped commit's change is *removed*, so the post-drop tip may
+    /// itself be conflicted and the expected tip is the original tip with the
+    /// dropped commit's introduced change peeled off. Identifies the dropped
+    /// commit (an orphan that lingers in the store).
+    Drop { commit: CommitId },
+    /// Restore: the restored commit's change is *re-applied*, so the post-restore
+    /// tip may be conflicted and the expected tip is the (post-drop) tip with the
+    /// restored commit's change applied forward.
+    Restore { commit: CommitId },
+}
+
 /// The held-back state of a rewrite whose chain is conflicted, carried across
 /// the per-file resolution steps until the chain goes clean (then exported) or
 /// the user aborts (then rolled back).
@@ -119,11 +151,9 @@ pub(crate) struct PendingResolution {
     heads: BTreeMap<String, String>,
     /// Conflicted commits, oldest first; re-derived after every resolution.
     conflicts: Vec<ConflictedCommit>,
-    /// Set by a *reorder*: before falling back to manual resolution, try to
-    /// auto-resolve *spurious* conflicts — adjacent-but-independent edits that
-    /// conflict under jj's symmetric 3-way merge yet leave the branch tip
-    /// identical to the original. See [`Repo::try_auto_resolve_spurious_reorder`].
-    auto_resolve_spurious: bool,
+    /// Which spurious-conflict auto-resolution to attempt (one-shot) before
+    /// falling back to manual resolution. See [`SpuriousResolve`].
+    strategy: SpuriousResolve,
 }
 
 impl Repo {
@@ -159,11 +189,12 @@ impl Repo {
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, false)
+        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, SpuriousResolve::Off)
     }
 
-    /// Like [`Self::finish_mutation`] but, for a reorder, opts the held-back chain
-    /// into spurious-conflict auto-resolution (see [`PendingResolution`]).
+    /// Like [`Self::finish_mutation`] but, for a reorder or squash, opts the
+    /// held-back chain into spurious-conflict auto-resolution anchored on the
+    /// clean post-mutation tip (see [`SpuriousResolve::CleanTip`]).
     pub(crate) fn finish_mutation_auto_resolve(
         &mut self,
         tx: Transaction,
@@ -173,7 +204,23 @@ impl Repo {
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, true)
+        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, SpuriousResolve::CleanTip)
+    }
+
+    /// Like [`Self::finish_mutation`] but opts into an explicit
+    /// spurious-conflict auto-resolution strategy — used by drop/restore, whose
+    /// post-mutation tip may itself be conflicted (see [`SpuriousResolve`]).
+    pub(crate) fn finish_mutation_spurious(
+        &mut self,
+        tx: Transaction,
+        op_msg: &str,
+        pre_op: Operation,
+        old_head: Option<String>,
+        bookmarks: Vec<(RefNameBuf, RefTarget)>,
+        heads: BTreeMap<String, String>,
+        strategy: SpuriousResolve,
+    ) -> Result<SaveOutcome> {
+        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, strategy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -185,7 +232,7 @@ impl Repo {
         old_head: Option<String>,
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
-        auto_resolve_spurious: bool,
+        strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
         self.repo = block_on(tx.commit(op_msg)).context("committing rewrite")?;
         self.pending = Some(PendingResolution {
@@ -195,7 +242,7 @@ impl Repo {
             bookmarks,
             heads,
             conflicts: Vec::new(),
-            auto_resolve_spurious,
+            strategy,
         });
         self.settle()
     }
@@ -554,45 +601,51 @@ impl Repo {
             self.export_and_sync(p.old_head, &p.bookmarks, &p.heads)?;
             return Ok(SaveOutcome::Clean);
         }
-        // A reorder whose tip is already identical to the original may have only
-        // *spurious* intermediate conflicts (adjacent-but-independent edits). Try
-        // to rebuild the chain clean before handing the conflicts to the user.
-        // Attempt at most once: clear the flag so a failed attempt — or the
-        // recursive settle below — falls straight through to manual resolution.
-        let auto = self
+        // A reorder/squash/drop/restore whose conflicts are merely *spurious*
+        // (adjacent-but-independent edits) has a well-defined result. Try to
+        // rebuild the chain clean before handing the conflicts to the user.
+        // Attempt at most once: take the strategy (leaving `Off`) so a failed
+        // attempt — or the recursive settle below — falls straight through to
+        // manual resolution.
+        let strategy = self
             .pending
-            .as_ref()
-            .is_some_and(|p| p.auto_resolve_spurious);
-        if auto {
-            if let Some(p) = self.pending.as_mut() {
-                p.auto_resolve_spurious = false;
-            }
-            if self.try_auto_resolve_spurious_reorder()? {
-                // The chain was rebuilt clean in jj; settle again to export it.
-                return self.settle();
-            }
+            .as_mut()
+            .map(|p| std::mem::replace(&mut p.strategy, SpuriousResolve::Off))
+            .unwrap_or(SpuriousResolve::Off);
+        if !matches!(strategy, SpuriousResolve::Off) && self.try_auto_resolve_spurious(strategy)? {
+            // The chain was rebuilt clean in jj; settle again to export it.
+            return self.settle();
         }
         let p = self.pending.as_mut().expect("settle requires a pending resolution");
         p.conflicts = conflicts.clone();
         Ok(SaveOutcome::Conflicts { commits: conflicts })
     }
 
-    /// Try to rebuild a held-back *reorder* whose conflicts are spurious — the
-    /// branch tip is already byte-identical to the original, and only intermediate
-    /// commits conflict because jj's symmetric 3-way merge can't place
-    /// adjacent-but-independent edits. Anchored on the clean tip, it reconstructs
-    /// each commit's tree top-down by *peeling* the commits above it off the tip
-    /// (replaying each one's introduced change in reverse, see [`crate::replay`]),
-    /// then rewrites the conflicted range — and the working copy `@` — with explicit
-    /// trees so jj never re-merges. The new tip is set to the original tree, so the
-    /// final result is provably unchanged.
+    /// Try to rebuild a held-back rewrite whose conflicts are merely *spurious* —
+    /// adjacent-but-independent edits that jj's symmetric 3-way merge can't place
+    /// even though the combined result is well-defined. It reconstructs each
+    /// conflicted commit's tree top-down by *peeling* the commits above it off an
+    /// anchor tree (replaying each one's introduced change in reverse, see
+    /// [`crate::replay`]), then rewrites the conflicted range — and the working
+    /// copy `@` — with explicit trees so jj never re-merges.
     ///
-    /// Uncommitted changes are preserved (the working copy re-parents onto the
-    /// new, identical tip). Returns `Ok(true)` once it rebuilt the chain clean (the
-    /// caller re-settles to export), `Ok(false)` when it bailed — a real conflict, a
-    /// non-text/structural change, a split working-copy chain, or anything it can't
-    /// prove safe — leaving jj at the post-reorder state for manual resolution.
-    fn try_auto_resolve_spurious_reorder(&mut self) -> Result<bool> {
+    /// The anchor (the tree the new tip must end up with) depends on the
+    /// [`SpuriousResolve`] strategy:
+    /// - [`SpuriousResolve::CleanTip`] (reorder/squash): the net change set is
+    ///   preserved, so the post-mutation tip is already clean and *is* the anchor;
+    ///   a conflicted tip means a *true* conflict and bails.
+    /// - [`SpuriousResolve::Drop`] / [`SpuriousResolve::Restore`]: the post-mutation
+    ///   tip may itself be conflicted, so the anchor is *computed* from the captured
+    ///   original tip tree by peeling off (drop) or applying (restore) the
+    ///   dropped/restored commit's introduced change.
+    ///
+    /// Uncommitted changes are preserved: the working copy re-parents onto the new
+    /// tip carrying the same per-strategy transform. Returns `Ok(true)` once it
+    /// rebuilt the chain clean (the caller re-settles to export), `Ok(false)` when
+    /// it bailed — a real conflict, a non-text/structural change, a split
+    /// working-copy chain, or anything it can't prove safe — leaving jj at the
+    /// post-mutation state for manual resolution.
+    fn try_auto_resolve_spurious(&mut self, strategy: SpuriousResolve) -> Result<bool> {
         let (pre_op, old_head_hex) = match self.pending.as_ref() {
             Some(p) => (p.pre_op.clone(), p.old_head.clone()),
             None => return Ok(false),
@@ -605,16 +658,63 @@ impl Repo {
         };
         let store = self.repo.store().clone();
 
-        // The post-reorder branch chain, oldest first. Bail unless the tip is clean
-        // (a conflicted tip is a *true* conflict, not a spurious one).
+        // The dropped/restored commit's own (original) introduced change and the
+        // direction in which it transforms a tree below it. `None` for CleanTip
+        // (the post-mutation tip already carries the right net change).
+        let xform: Option<(ChangeId, MergedTree, MergedTree, Dir)> = match &strategy {
+            SpuriousResolve::Off => return Ok(false),
+            SpuriousResolve::CleanTip => None,
+            SpuriousResolve::Drop { commit } | SpuriousResolve::Restore { commit } => {
+                let c = store
+                    .get_commit(commit)
+                    .context("loading the dropped/restored commit")?;
+                let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
+                    .context("reading the dropped/restored commit's parent tree")?;
+                let dir = if matches!(strategy, SpuriousResolve::Drop { .. }) {
+                    Dir::Peel
+                } else {
+                    Dir::Forward
+                };
+                Some((c.change_id().clone(), parent_tree, c.tree(), dir))
+            }
+        };
+
+        // The post-mutation branch chain, oldest first.
         let Some(head) = self.current_head_in_jj() else {
             return Ok(false);
         };
-        let tip = store.get_commit(&head).context("loading the reordered tip")?;
-        if tip.has_conflict() {
-            return Ok(false);
-        }
-        let expected_tip_tree = tip.tree();
+        let tip = store.get_commit(&head).context("loading the rewritten tip")?;
+
+        // For drop/restore the anchor is computed from the original tip tree (the
+        // jj tip may itself be conflicted, so we can't read it back).
+        let orig_tip_tree = match &xform {
+            Some(_) => Some(
+                store
+                    .get_commit(&orig_head)
+                    .context("loading the original tip")?
+                    .tree(),
+            ),
+            None => None,
+        };
+        let anchor = match &xform {
+            // CleanTip: the post-mutation tip is clean and *is* the anchor; a
+            // conflicted tip is a *true* conflict, not a spurious one.
+            None => {
+                if tip.has_conflict() {
+                    return Ok(false);
+                }
+                tip.tree()
+            }
+            // Drop/Restore: remove/apply the commit's change to the original tip.
+            Some((_, parent_tree, own_tree, dir)) => {
+                let orig_tip = orig_tip_tree.clone().expect("orig tip loaded for drop/restore");
+                match self.transform_tree(&store, parent_tree, own_tree, orig_tip, *dir)? {
+                    Some(t) => t,
+                    None => return Ok(false),
+                }
+            }
+        };
+
         let chain_infos = crate::history::history(&self.repo, &head)?;
         if chain_infos.is_empty() {
             return Ok(false);
@@ -628,14 +728,12 @@ impl Repo {
             return Ok(false); // nothing conflicted on the branch — not our case
         };
         if lo == 0 {
-            return Ok(false); // the root is conflicted: not a plain reorder
+            return Ok(false); // the root is conflicted: not a plain rewrite
         }
 
         // Only a simple single-`@` working copy is handled; a split chain falls
-        // back. Uncommitted changes are *preserved*, not a reason to bail: the new
-        // tip is byte-identical to the original, so the working copy's pre-reorder
-        // tree (captured at the snapshot just before the reorder) re-parents onto it
-        // cleanly — its delta applies to identical content, so it can never clash.
+        // back. Uncommitted changes are *preserved*, not a reason to bail: their
+        // delta re-applies onto the (transformed) new tip.
         if self.working_copy_chain_ids().len() > 1 {
             return Ok(false);
         }
@@ -650,8 +748,8 @@ impl Repo {
             None => None,
         };
 
-        // The original (pre-reorder) introduced change of each commit, by change id:
-        // (parent tree, own tree). Used to peel a commit's change back off the tip.
+        // The original introduced change of each commit, by change id: (parent
+        // tree, own tree). Used to peel a commit's change back off the anchor.
         let orig_infos = crate::history::history(&self.repo, &orig_head)?;
         let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
         for info in &orig_infos {
@@ -660,18 +758,26 @@ impl Repo {
                 .context("reading an original parent tree")?;
             originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
         }
+        // Restore: `orig_head` is the *post-drop* tip, which lacks the restored
+        // commit; yet its rewrite sits on the post-restore chain and may fall in
+        // the peel range, so seed its original change too.
+        if let Some((cid, parent_tree, own_tree, _)) = &xform {
+            if matches!(strategy, SpuriousResolve::Restore { .. }) {
+                originals.insert(cid.clone(), (parent_tree.clone(), own_tree.clone()));
+            }
+        }
 
-        // Reconstruct each tree from the clean tip down to `lo`, peeling off the
+        // Reconstruct each tree from the anchor down to `lo`, peeling off the
         // change of the commit directly above it.
         let mut trees: Vec<Option<MergedTree>> = vec![None; chain.len()];
-        trees[n] = Some(expected_tip_tree.clone());
+        trees[n] = Some(anchor.clone());
         for i in (lo..n).rev() {
             let above = trees[i + 1].clone().expect("upper tree computed");
             let change_id = chain[i + 1].change_id();
             let Some((parent_tree, own_tree)) = originals.get(change_id) else {
                 return Ok(false);
             };
-            match self.peel_commit_change(&store, parent_tree, own_tree, above)? {
+            match self.transform_tree(&store, parent_tree, own_tree, above, Dir::Peel)? {
                 Some(tree) => trees[i] = Some(tree),
                 None => return Ok(false), // a real overlap or a structural change
             }
@@ -691,16 +797,32 @@ impl Repo {
                     .set_tree(tree)
                     .write(),
             )
-            .context("rewriting a reordered commit")?;
+            .context("rewriting a reconstructed commit")?;
             parent_id = new_commit.id().clone();
             new_tip = new_commit.id().clone();
         }
         if let Some(wc_id) = self.working_copy_commit_id() {
             let wc = store.get_commit(&wc_id).context("loading the working copy")?;
-            // Carry the working copy's pre-reorder content onto the new tip,
-            // preserving any uncommitted changes (it equals the tip tree when the
-            // tree was clean, so an empty `@` stays empty).
-            let wc_tree = orig_wc_tree.clone().unwrap_or_else(|| expected_tip_tree.clone());
+            // Carry the working copy's pre-mutation content onto the new tip,
+            // transformed the same way the tip was. A clean `@` (its tree equals the
+            // original tip's) maps exactly onto the anchor, so it stays empty — take
+            // the anchor verbatim to dodge `replay_change`'s newline normalization
+            // introducing a spurious one-line delta.
+            let wc_tree = match (&orig_wc_tree, &xform) {
+                (None, _) => anchor.clone(),
+                (Some(w), None) => w.clone(),
+                (Some(w), Some((_, parent_tree, own_tree, dir))) => {
+                    let orig_tip = orig_tip_tree.clone().expect("orig tip loaded for drop/restore");
+                    if w.tree_ids() == orig_tip.tree_ids() {
+                        anchor.clone()
+                    } else {
+                        match self.transform_tree(&store, parent_tree, own_tree, w.clone(), *dir)? {
+                            Some(t) => t,
+                            None => return Ok(false),
+                        }
+                    }
+                }
+            };
             block_on(
                 tx.repo_mut()
                     .rewrite_commit(&wc)
@@ -715,22 +837,27 @@ impl Repo {
         // explicit rewrites; every commit is already rewritten with the right
         // parents, so nothing is actually rebased.
         block_on(tx.repo_mut().rebase_descendants()).context("settling the rebuilt chain")?;
-        self.repo = block_on(tx.commit("commedit: auto-resolve spurious reorder"))
+        self.repo = block_on(tx.commit("commedit: auto-resolve spurious conflict"))
             .context("committing the rebuilt chain")?;
         Ok(true)
     }
 
-    /// Remove one commit's introduced change (`parent_tree` → `own_tree`) from the
-    /// tree `above` it, file by file, via [`crate::replay::replay_change`] in its
-    /// "peel" direction. Returns `None` (so the caller falls back to manual) when
+    /// Replay one commit's introduced change (`parent_tree` → `own_tree`) onto the
+    /// tree `onto`, file by file, via [`crate::replay::replay_change`]. With
+    /// [`Dir::Peel`] it *removes* the change (replays `own → parent`, to peel a
+    /// commit off the tree above it); with [`Dir::Forward`] it *applies* the change
+    /// (replays `parent → own` onto a new base). In both directions `onto` is
+    /// trusted for context, so an independent adjacent edit is relocated rather
+    /// than conflicting. Returns `None` (so the caller falls back to manual) when
     /// the commit adds/removes a file, touches binary content, or an edit genuinely
-    /// overlaps content `above` already changed.
-    fn peel_commit_change(
+    /// overlaps content `onto` already changed.
+    fn transform_tree(
         &self,
         store: &std::sync::Arc<jj_lib::store::Store>,
         parent_tree: &MergedTree,
         own_tree: &MergedTree,
-        above: MergedTree,
+        onto: MergedTree,
+        dir: Dir,
     ) -> Result<Option<MergedTree>> {
         let changes = crate::diff::tree_changes(store, parent_tree, own_tree)?;
         let mut entries: Vec<(String, String)> = Vec::new();
@@ -739,19 +866,21 @@ impl Repo {
                 return Ok(None); // structural change: not safely replayable here
             }
             let path = RepoPath::from_internal_string(&ch.path).context("invalid path")?;
-            let Some(above_text) = self.tree_file_text(store, &above, path)? else {
+            let Some(onto_text) = self.tree_file_text(store, &onto, path)? else {
                 return Ok(None);
             };
-            // Peel: undo this commit's `old -> new` edit on `above`, i.e. replay the
-            // change `own (= new) -> parent (= old)` onto `above`.
-            let own = ch.new_text.as_deref().unwrap_or("");
-            let parent = ch.old_text.as_deref().unwrap_or("");
-            let Some(resolved) = crate::replay::replay_change(own, &above_text, parent) else {
+            let old = ch.old_text.as_deref().unwrap_or("");
+            let new = ch.new_text.as_deref().unwrap_or("");
+            let resolved = match dir {
+                Dir::Peel => crate::replay::replay_change(new, &onto_text, old),
+                Dir::Forward => crate::replay::replay_change(old, &onto_text, new),
+            };
+            let Some(resolved) = resolved else {
                 return Ok(None);
             };
             entries.push((ch.path.clone(), resolved));
         }
-        let tree = crate::tree::splice_files_into_tree(above, store, &entries)?;
+        let tree = crate::tree::splice_files_into_tree(onto, store, &entries)?;
         Ok(Some(tree))
     }
 

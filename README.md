@@ -135,9 +135,11 @@ working copy and `git` itself see an ordinary, attached-HEAD git repository the
 whole time. jj's own metadata is kept entirely out of your repository — it lives
 in a throwaway directory that is discarded when you close the app — so comm(ed)it
 never leaves a `.jj` behind and never disturbs a repo you already manage with jj.
-The code is split into a headless `commedit-engine` crate (all repository logic,
-unit-tested against scratch repos) and a `commedit-gtk` crate (the UI), so the
-rewrite logic carries no GTK dependency.
+It rewrites only the branch you have checked out; your other local branches and
+tags stay exactly where they are (they simply diverge, as they would after a
+`git commit --amend`). The code is split into a headless `commedit-engine` crate
+(all repository logic, unit-tested against scratch repos) and a `commedit-gtk`
+crate (the UI), so the rewrite logic carries no GTK dependency.
 
 That transparency is what keeps conflicts out of your history. While a rewrite is
 conflicted, comm(ed)it moves no git ref, `HEAD` or working-tree file: the

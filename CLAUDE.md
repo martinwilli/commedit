@@ -38,7 +38,8 @@ keep seeing an ordinary, attached-HEAD repository the whole time. This invariant
 drives much of the code:
 
 - `repo.rs` — `Repo::open` attaches jj to the user's existing `.git`, imports git
-  refs/HEAD into jj's view, and holds the `Workspace` + `ReadonlyRepo`. jj's own
+  HEAD and **only the checked-out branch's** local ref into jj's view (`import_git`
+  via `import_some_refs`), and holds the `Workspace` + `ReadonlyRepo`. jj's own
   metadata (repo store + working-copy state) is **never written into the user's
   repo**: `init_detached` spins up a fresh jj workspace in a throwaway `TempDir`
   (held as `Repo::_workdir`, RAII-deleted on session end) whose checkout target is
@@ -48,10 +49,17 @@ drives much of the code:
   primitives because no high-level constructor separates the checkout target from
   the state location; that's the one place sensitive to a jj-lib bump.) Because
   each session is an isolated workspace, concurrent commedit sessions can no longer
-  produce a divergent shared op log. It **refuses a folder that isn't already a git
-  repo** (no `.git`) rather than initializing one — commedit edits existing
-  history, it never spawns a new repository. Every mutating flow commits a jj
-  transaction and replaces `self.repo` with the result.
+  produce a divergent shared op log. The import is **scoped to the current branch**
+  — commedit only ever displays/edits HEAD's ancestors, so a git ref jj never
+  imports is absent from jj's export diff and sibling branches/tags are left
+  exactly where git has them (the same divergence `git commit --amend` produces),
+  while jj's commit index is built over HEAD's ancestry rather than the whole ref
+  graph. So no jj-level bookmark confinement is needed; the only safety net is the
+  git-level head backstop (`protect_unrelated_heads`, backed by `transparency.rs`'s
+  `restore_unrelated_heads`). It **refuses a folder that isn't already a git repo**
+  (no `.git`) rather than initializing one — commedit edits existing history, it
+  never spawns a new repository. Every mutating flow commits a jj transaction and
+  replaces `self.repo` with the result.
 - `transparency.rs` — the glue that hides jj from git: re-attach HEAD to its
   original branch (jj uses detached HEAD by design), export jj bookmarks to git
   refs, and reset the git index to the rewritten tip. The post-rewrite invariant

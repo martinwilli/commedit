@@ -12,12 +12,12 @@ use anyhow::{Context, Result};
 use jj_lib::backend::{Backend, BackendInitError, CommitId};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::git::{self, GitImportOptions};
+use jj_lib::git::{self, GitImportOptions, GitRefKind, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
 use jj_lib::git_backend::GitBackend;
 use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
-use jj_lib::ref_name::{RefNameBuf, WorkspaceName};
+use jj_lib::ref_name::{RefNameBuf, RemoteRefSymbol, WorkspaceName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _};
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
@@ -475,29 +475,50 @@ impl Repo {
         Ok(())
     }
 
-    /// Pull git refs and HEAD into jj's view as a single transaction. No-op
-    /// (empty operation) when jj is already in sync with git.
+    /// Pull git HEAD and the **checked-out branch's** local ref into jj's view as
+    /// a single transaction. No-op (empty operation) when jj is already in sync
+    /// with git.
+    ///
+    /// We import *only* the current branch, not every ref. commedit only ever
+    /// displays and edits the ancestors of HEAD (see [`crate::history`]), so
+    /// scoping the import to that one branch is all the view needs — and it keeps
+    /// jj's commit index built over HEAD's ancestry rather than the whole ref
+    /// graph. The deeper reason is correctness: a git ref that is never imported
+    /// is invisible to jj's export (`diff_refs_to_export` only ever touches
+    /// `local_bookmarks ∪ git_refs`, and `git_refs` records only imported refs),
+    /// so sibling branches and tags are left exactly where they sit in git — the
+    /// same outcome git's own `commit --amend`/rebase produce. The old
+    /// import-everything path instead moved every bookmark that shared the
+    /// rewritten tip and had to undo that by hand at export via
+    /// [`Self::confine_bookmark_moves`].
+    ///
+    /// The filter admits only the local (`remote == "git"`) bookmark whose name is
+    /// the checked-out branch; remote-tracking refs (`origin/*`) and tags are all
+    /// excluded. Excluding the remote-tracking ref also sidesteps the diverged-
+    /// upstream trap where jj merges the local and remote refs into one
+    /// *conflicted* bookmark it can't export (still defended by
+    /// [`Self::ensure_branch_exportable`]). On a detached HEAD the filter matches
+    /// nothing, so only `import_head` runs — there is no branch to edit anyway.
+    /// `record_synthetic_predecessors: false` keeps imported commits free of
+    /// jj-only predecessor metadata.
     fn import_git(&mut self) -> Result<()> {
+        let current = self.current_bookmark();
         let mut tx = self.repo.start_transaction();
         pollster::block_on(git::import_head(tx.repo_mut())).context("importing git HEAD")?;
-        // An empty `remote_auto_track_bookmarks` is deliberate: it stops jj from
-        // *tracking* remote-tracking refs (`origin/*`) and merging them into the
-        // local bookmark. With tracking on, a branch that has diverged from its
-        // upstream — an ordinary git state plain git edits freely — imports as a
-        // *conflicted* local bookmark (local position merged with the remote one),
-        // which jj can't export to a single git ref, so every edit silently failed
-        // to reach git (now guarded by `ensure_branch_exportable`). commedit only
-        // ever rewrites the checked-out *local* branch and walks HEAD's ancestors
-        // (remotes are intentionally excluded from the history view), so it has no
-        // use for the remote merge; importing the local ref straight keeps a
-        // diverged branch cleanly editable. `record_synthetic_predecessors: false`
-        // keeps imported commits free of jj-only predecessor metadata.
         let options = GitImportOptions {
             abandon_unreachable_commits: false,
             record_synthetic_predecessors: false,
             remote_auto_track_bookmarks: HashMap::new(),
         };
-        pollster::block_on(git::import_refs(tx.repo_mut(), &options)).context("importing git refs")?;
+        let git_ref_filter = |kind: GitRefKind, symbol: RemoteRefSymbol<'_>| {
+            current.as_ref().is_some_and(|name| {
+                kind == GitRefKind::Bookmark
+                    && symbol.remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                    && symbol.name == *name
+            })
+        };
+        pollster::block_on(git::import_some_refs(tx.repo_mut(), &options, git_ref_filter))
+            .context("importing the checked-out branch")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing after import")?;
         self.repo = pollster::block_on(tx.commit("import git refs")).context("committing import")?;
         Ok(())

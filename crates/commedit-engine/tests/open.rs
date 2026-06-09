@@ -1,5 +1,5 @@
-//! End-to-end: attach jj to a scratch git repo and confirm the colocated layout
-//! stays invisible to plain git (HEAD attached, clean status).
+//! End-to-end: attach jj to a scratch git repo and confirm it stays invisible to
+//! plain git — no `.jj` written into the repo, HEAD attached, clean status.
 
 mod common;
 
@@ -20,10 +20,13 @@ fn opens_repo_transparently() {
 
     let _repo = Repo::open(dir).expect("open colocated repo");
 
-    assert!(dir.join(".jj").is_dir(), ".jj should be created");
-    // jj manages colocated repos with a detached HEAD; we must re-attach it.
+    // jj's metadata lives in a throwaway dir outside the repo, so nothing is
+    // written into the user's tree (a real jj user's .jj is left untouched, and a
+    // non-jj user's tree is not polluted).
+    assert!(!dir.join(".jj").exists(), ".jj must not be created in the repo");
+    // jj checks out a detached HEAD; we must re-attach it.
     assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
-    // .jj is excluded, so a plain-git user sees a clean working tree.
+    // Nothing was written into the repo, so a plain-git user sees a clean tree.
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }

@@ -372,35 +372,40 @@ fn resolving_works_despite_divergent_commits() {
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
-/// jj-lib raises internal invariant violations with `panic!` (not a `Result`) —
-/// e.g. "graph has cycle" when a rebase runs over a divergent operation graph.
-/// Such a panic must surface as an ordinary `Err`: in the GTK app the mutation
-/// runs inside a C (`nounwind`) callback frame, where an uncaught panic aborts
-/// the whole process instead of just failing the action. Regression for that
-/// crash.
+/// Each commedit session gets its own throwaway jj workspace, so concurrent
+/// sessions on the same repo no longer share a persistent jj op log. That
+/// sharing used to let two sessions record divergent reorder operations which,
+/// once a later open reconciled them, corrupted jj's operation graph and made
+/// the next rebase panic with "graph has cycle". With independent workspaces the
+/// divergence can't happen: a fresh session sees only git's (unchanged) refs and
+/// reorders cleanly. (The panic→`Err` safety net itself is covered by a unit
+/// test on `catch_jj`.)
 #[test]
-fn a_jj_panic_becomes_a_recoverable_error() {
+fn concurrent_sessions_do_not_corrupt_a_shared_op_log() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     conflicting_repo(dir);
 
-    // Two instances at the same op head each reorder — divergent operations that
-    // a later open reconciles, leaving a graph a further reorder can't rebase.
+    // Two sessions at the same starting point each reorder. Their rewrites are
+    // held back as conflicts (overlapping edits) and never reach git, and — being
+    // independent workspaces — they leave no shared jj state behind.
     let mut a = Repo::open(dir).expect("open a");
     let mut b = Repo::open(dir).expect("open b");
     let _ = reorder_a_to_top(&mut a);
     let _ = reorder_a_to_top(&mut b);
 
-    let mut repo = Repo::open(dir).expect("open after divergence");
+    // A later session reorders without tripping jj's "graph has cycle" panic.
+    let mut repo = Repo::open(dir).expect("open after the other sessions");
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     let mv = repo.plan_reorder(&commits, 1, 0).expect("reorder plan");
-    // jj panics "graph has cycle" deep inside this call; the engine must catch it.
     let result = repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip);
     assert!(
-        result.is_err(),
-        "a jj-lib panic should be reported as Err, not abort the process: {result:?}"
+        result.is_ok(),
+        "independent sessions must not corrupt each other: {result:?}"
     );
-    // The session survived: the repo is still usable and git is untouched.
+
+    // No commedit metadata leaked into the user's repo, and git is intact.
+    assert!(!dir.join(".jj").exists(), "commedit must not create .jj in the repo");
     assert!(repo.head_commit_id().is_some());
     common::git(dir, &["fsck", "--no-progress"]);
 }

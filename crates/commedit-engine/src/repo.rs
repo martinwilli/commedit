@@ -9,16 +9,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use jj_lib::backend::CommitId;
+use jj_lib::backend::{Backend, BackendInitError, CommitId};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions};
+use jj_lib::git_backend::GitBackend;
+use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
-use jj_lib::ref_name::RefNameBuf;
-use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, StoreFactories};
+use jj_lib::ref_name::{RefNameBuf, WorkspaceName};
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _};
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::{default_working_copy_factories, Workspace};
+use jj_lib::signing::Signer;
+use jj_lib::working_copy::WorkingCopyFactory;
+use jj_lib::workspace::Workspace;
+use tempfile::TempDir;
 
 /// An opened, colocated jj+git repository.
 ///
@@ -60,17 +65,29 @@ pub struct Repo {
     /// than in `PendingResolution`, so the abort/conflict state object is
     /// unchanged). See [`Repo::record_op`].
     pub(crate) pending_op_desc: Option<crate::conflict::OpDescriptor>,
+    /// The throwaway directory holding jj's metadata (repo store + working-copy
+    /// state) for this session. It lives outside the user's repository so
+    /// commedit leaves no `.jj` behind and never touches a real jj user's
+    /// metadata; RAII deletes it when the `Repo` drops. Never read — held only
+    /// to keep the directory alive for the session's lifetime.
+    _workdir: TempDir,
 }
 
 impl Repo {
-    /// Open the repository at `workspace_root`, creating the colocated jj
-    /// metadata (`.jj`) if it does not exist yet, then import git refs/HEAD so
-    /// jj's view matches the git repository.
+    /// Open the repository at `workspace_root`: spin up a fresh, throwaway jj
+    /// workspace whose metadata lives in a temp dir (see [`Self::init_detached`]),
+    /// then import git refs/HEAD so jj's view matches the git repository.
     ///
     /// commedit edits the history of an *existing* git repository; it never
     /// initializes one. A folder that is not already a git repo is refused here,
     /// so a stray path (or a directory mistaken for a repo) can't silently spawn a
     /// fresh repository.
+    ///
+    /// jj's metadata is **never** written into the user's repo: a real jj user's
+    /// `.jj` is left untouched (commedit only reads/writes git objects + refs, as
+    /// the transparency contract already requires), and a non-jj user's tree is
+    /// not polluted. The temp workspace is discarded when the session ends, so no
+    /// stale jj state survives between runs.
     pub fn open(workspace_root: &Path) -> Result<Self> {
         if !workspace_root.join(".git").exists() {
             anyhow::bail!(
@@ -83,24 +100,12 @@ impl Repo {
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
         let git_head_branch = crate::transparency::head_branch(workspace_root);
-        let (workspace, repo) = if workspace_root.join(".jj").is_dir() {
-            let workspace = Workspace::load(
-                &settings,
-                workspace_root,
-                &StoreFactories::default(),
-                &default_working_copy_factories(),
-            )
-            .context("loading existing jj workspace")?;
-            let repo = pollster::block_on(workspace.repo_loader().load_at_head())
-                .context("loading repo at head")?;
-            (workspace, repo)
-        } else {
-            // Existing git repo: attach jj to the in-tree .git so both tools
-            // share the same object database (a colocated layout).
-            let git_dir = workspace_root.join(".git");
-            pollster::block_on(Workspace::init_external_git(&settings, workspace_root, &git_dir))
-                .context("attaching jj to existing git repo")?
-        };
+        // Put jj's metadata in a throwaway temp dir rather than workspace_root/.jj.
+        let workdir = tempfile::Builder::new()
+            .prefix("commedit-")
+            .tempdir()
+            .context("creating temporary jj workspace")?;
+        let (workspace, repo) = Self::init_detached(&settings, workspace_root, workdir.path())?;
 
         let mut this = Self {
             workspace,
@@ -113,15 +118,14 @@ impl Repo {
             session_ops: Vec::new(),
             op_cursor: 0,
             pending_op_desc: None,
+            _workdir: workdir,
         };
         this.import_git()?;
-        crate::transparency::ensure_jj_excluded(workspace_root)?;
         this.reattach_head()?;
-        // A previous session may have left a working-copy *chain* (Split peels @
-        // into pieces) in jj's op log. Git only ever saw one unstaged pile, so a
-        // fresh session reconciles to that: collapse any chain back to a single @
-        // on HEAD before snapshotting, rather than resurrecting a split git can't
-        // represent.
+        // A freshly-initialized jj workspace has @ sitting on the empty root
+        // commit; reattach it onto the just-imported git HEAD (a single @ on the
+        // tip) before snapshotting, so the working copy is based on the real
+        // history rather than nothing.
         this.collapse_working_copy_chain()?;
         // Record any uncommitted changes into @ so they show in the history and
         // ride through rewrites from the start.
@@ -132,6 +136,82 @@ impl Repo {
         this.session_op = Some(this.repo.operation().clone());
         this.session_head = this.head_commit();
         Ok(this)
+    }
+
+    /// Initialize a fresh jj workspace whose metadata — the repo store and the
+    /// working-copy state — lives under `state_dir`, entirely outside the user's
+    /// repository, while the working copy still operates on `workspace_root` (the
+    /// user's worktree).
+    ///
+    /// This is jj-lib's `Workspace::init_external_git` taken apart and reassembled
+    /// with the state paths pointed at `state_dir` instead of the hardcoded
+    /// `workspace_root/.jj`: the git backend attaches to the in-tree `.git` so jj
+    /// and git share one object database, but nothing is written into the user's
+    /// repo. jj-lib offers no high-level constructor that separates the checkout
+    /// target from the state location, so we replicate the (small) bodies of
+    /// `init_with_factories` + the private `init_working_copy` here using public
+    /// primitives. If a future jj-lib bump changes that init shape, this is the
+    /// one place to revisit.
+    fn init_detached(
+        settings: &UserSettings,
+        workspace_root: &Path,
+        state_dir: &Path,
+    ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
+        let repo_dir = state_dir.join("repo");
+        std::fs::create_dir(&repo_dir).context("creating jj repo dir")?;
+        let wc_state = state_dir.join("working_copy");
+        std::fs::create_dir(&wc_state).context("creating jj working-copy state dir")?;
+
+        // Absolute path to the user's .git. The store lives outside the
+        // workspace, so (unlike init_external_git) there is no relative-path
+        // optimization — GitBackend::init_external joins this onto the store path,
+        // and an absolute path makes that join resolve to .git itself.
+        let git_dir = std::fs::canonicalize(workspace_root.join(".git"))
+            .context("locating the .git directory")?;
+        let backend_initializer =
+            |settings: &UserSettings, store_path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
+                let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
+                Ok(Box::new(backend))
+            };
+
+        let repo = pollster::block_on(ReadonlyRepo::init(
+            settings,
+            &repo_dir,
+            &backend_initializer,
+            Signer::from_settings(settings)?,
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            ReadonlyRepo::default_index_store_initializer(),
+            ReadonlyRepo::default_submodule_store_initializer(),
+        ))
+        .context("initializing the jj repo")?;
+
+        // Check out the root commit, then attach a working copy whose checkout
+        // target is the user's worktree but whose state lives in `state_dir`.
+        // (`Repo::open` reattaches @ onto the imported git HEAD afterwards.)
+        let mut tx = repo.start_transaction();
+        pollster::block_on(
+            tx.repo_mut()
+                .check_out(WorkspaceName::DEFAULT.to_owned(), &repo.store().root_commit()),
+        )
+        .context("checking out the root commit")?;
+        let repo = pollster::block_on(tx.commit("add workspace"))
+            .context("committing the initial workspace")?;
+
+        let working_copy = LocalWorkingCopyFactory {}
+            .init_working_copy(
+                repo.store().clone(),
+                workspace_root.to_path_buf(),
+                wc_state,
+                repo.op_id().clone(),
+                WorkspaceName::DEFAULT.to_owned(),
+                settings,
+            )
+            .context("initializing the working copy")?;
+
+        let workspace = Workspace::new(workspace_root, repo_dir, working_copy, repo.loader().clone())
+            .context("assembling the jj workspace")?;
+        Ok((workspace, repo))
     }
 
     /// Re-attach git HEAD to the originally checked-out branch, undoing jj's
@@ -503,4 +583,84 @@ fn committer_field(
         .filter(|v| !v.is_empty())
         .or_else(|| crate::transparency::config_value(workspace_root, committer_key))
         .or_else(|| crate::transparency::config_value(workspace_root, user_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// jj-lib signals internal invariant violations with `panic!`; our mutations
+    /// run inside GTK's C (`nounwind`) callback frames, where an uncaught panic
+    /// aborts the whole process. [`catch_jj`] must turn such a panic into an
+    /// ordinary `Err` so the session survives, and pass success through. The
+    /// op-log divergence that used to provoke jj's "graph has cycle" panic across
+    /// concurrent commedit sessions is now structurally impossible (each session
+    /// gets an independent, throwaway jj workspace — see [`Repo::init_detached`]),
+    /// but jj can still panic for other reasons, so this safety net stays.
+    #[test]
+    fn catch_jj_turns_a_panic_into_an_error() {
+        // Silence the default hook's backtrace for the deliberate panic below.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = catch_jj("testing", || -> Result<()> { panic!("graph has cycle") });
+        let passed = catch_jj("testing", || Ok(7));
+        std::panic::set_hook(prev);
+
+        let err = caught.expect_err("a panic must surface as Err");
+        assert!(err.to_string().contains("graph has cycle"), "{err}");
+        assert!(err.to_string().contains("testing failed inside jj-lib"), "{err}");
+        assert_eq!(passed.unwrap(), 7);
+    }
+
+    /// A *conflicted* checked-out-branch bookmark (pointing at several commits)
+    /// can't be exported — jj silently skips it, so the edit would never reach
+    /// git. [`Repo::ensure_branch_exportable`] must refuse it with a clear error.
+    /// Reaching this state through commedit's own flow is no longer possible now
+    /// that each session gets an isolated jj workspace (no shared op-log
+    /// divergence — see [`Repo::init_detached`]), so we manufacture it directly to
+    /// keep the guard covered.
+    #[test]
+    fn a_conflicted_branch_bookmark_is_refused() {
+        use jj_lib::op_store::RefTarget;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+        std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "A"]);
+        std::fs::write(dir.join("f.txt"), "b\n").unwrap();
+        git(&["commit", "-q", "-am", "B"]);
+
+        let repo = Repo::open(dir).expect("open");
+        let head = repo.head_commit_id().expect("head");
+        let commits = crate::history::history(&repo.repo, &head).expect("history");
+        let (a, b) = (commits[0].id.clone(), commits[1].id.clone());
+
+        // Manufacture a conflicted `main` bookmark (two divergent targets).
+        let mut tx = repo.repo.start_transaction();
+        let name = repo.current_bookmark().expect("on a branch");
+        tx.repo_mut()
+            .set_local_bookmark_target(&name, RefTarget::from_legacy_form([], [a, b]));
+        assert!(tx.repo_mut().get_local_bookmark(&name).has_conflict());
+
+        let err = repo
+            .ensure_branch_exportable(tx.repo_mut())
+            .expect_err("a conflicted branch bookmark must be refused");
+        assert!(err.to_string().contains("conflicted"), "{err}");
+    }
 }

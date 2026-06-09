@@ -248,27 +248,6 @@ fn rev_list(workspace_root: &Path, args: &[&str]) -> Result<std::collections::Ha
         .collect())
 }
 
-/// Ensure git ignores jj's `.jj` metadata directory via `.git/info/exclude`,
-/// so it never shows up in `git status`. This is repo-local and does not touch
-/// the user's tracked `.gitignore`.
-pub fn ensure_jj_excluded(workspace_root: &Path) -> Result<()> {
-    let exclude = workspace_root.join(".git").join("info").join("exclude");
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == ".jj/") {
-        return Ok(());
-    }
-    if let Some(parent) = exclude.parent() {
-        std::fs::create_dir_all(parent).context("creating .git/info")?;
-    }
-    let mut contents = existing;
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(".jj/\n");
-    std::fs::write(&exclude, contents).context("writing .git/info/exclude")?;
-    Ok(())
-}
-
 /// The commit sha HEAD currently resolves to, or `None` if it can't be read.
 pub fn head_commit(workspace_root: &Path) -> Option<String> {
     let output = Command::new("git")

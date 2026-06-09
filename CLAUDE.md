@@ -37,10 +37,12 @@ The engine operates on a **colocated jj+git repo**: jj does rewrite+rebase, but
 plain `git` must keep seeing an ordinary, attached-HEAD repository the whole
 time. This invariant drives much of the code:
 
-- `repo.rs` — `Repo::open` attaches jj to an existing `.git` (or inits a
-  colocated workspace), imports git refs/HEAD into jj's view, and holds the
-  `Workspace` + `ReadonlyRepo`. Every mutating flow commits a jj transaction and
-  replaces `self.repo` with the result.
+- `repo.rs` — `Repo::open` attaches jj to an existing `.git` (creating only the
+  `.jj` metadata on first open), imports git refs/HEAD into jj's view, and holds
+  the `Workspace` + `ReadonlyRepo`. It **refuses a folder that isn't already a git
+  repo** (no `.git`) rather than initializing one — commedit edits existing
+  history, it never spawns a new repository. Every mutating flow commits a jj
+  transaction and replaces `self.repo` with the result.
 - `transparency.rs` — the glue that hides jj from git: re-attach HEAD to its
   original branch (jj uses detached HEAD by design), export jj bookmarks to git
   refs, exclude `.jj/` via `.git/info/exclude`, and reset the git index to the

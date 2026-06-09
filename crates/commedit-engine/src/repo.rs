@@ -51,7 +51,19 @@ impl Repo {
     /// Open the repository at `workspace_root`, creating the colocated jj
     /// metadata (`.jj`) if it does not exist yet, then import git refs/HEAD so
     /// jj's view matches the git repository.
+    ///
+    /// commedit edits the history of an *existing* git repository; it never
+    /// initializes one. A folder that is not already a git repo is refused here,
+    /// so a stray path (or a directory mistaken for a repo) can't silently spawn a
+    /// fresh repository.
     pub fn open(workspace_root: &Path) -> Result<Self> {
+        if !workspace_root.join(".git").exists() {
+            anyhow::bail!(
+                "{} is not a git repository — commedit edits the history of an \
+                 existing git repo and will not create one",
+                workspace_root.display()
+            );
+        }
         let settings = build_settings(workspace_root)?;
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
@@ -67,15 +79,12 @@ impl Repo {
             let repo = pollster::block_on(workspace.repo_loader().load_at_head())
                 .context("loading repo at head")?;
             (workspace, repo)
-        } else if workspace_root.join(".git").exists() {
+        } else {
             // Existing git repo: attach jj to the in-tree .git so both tools
             // share the same object database (a colocated layout).
             let git_dir = workspace_root.join(".git");
             pollster::block_on(Workspace::init_external_git(&settings, workspace_root, &git_dir))
                 .context("attaching jj to existing git repo")?
-        } else {
-            pollster::block_on(Workspace::init_colocated_git(&settings, workspace_root))
-                .context("initializing colocated jj workspace")?
         };
 
         let mut this = Self {

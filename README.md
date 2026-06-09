@@ -130,10 +130,12 @@ cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 ## How it works
 
 Under the hood, comm(ed)it is built on [jujutsu](https://github.com/jj-vcs/jj)
-(`jj-lib`) for its rewrite-and-rebase engine, operating on a transparently
-colocated jj+git repository: jj does the heavy lifting, but the working copy and
-`git` itself see an ordinary, attached-HEAD git repository the whole time. The
-code is split into a headless `commedit-engine` crate (all repository logic,
+(`jj-lib`) for its rewrite-and-rebase engine: jj does the heavy lifting, but the
+working copy and `git` itself see an ordinary, attached-HEAD git repository the
+whole time. jj's own metadata is kept entirely out of your repository — it lives
+in a throwaway directory that is discarded when you close the app — so comm(ed)it
+never leaves a `.jj` behind and never disturbs a repo you already manage with jj.
+The code is split into a headless `commedit-engine` crate (all repository logic,
 unit-tested against scratch repos) and a `commedit-gtk` crate (the UI), so the
 rewrite logic carries no GTK dependency.
 

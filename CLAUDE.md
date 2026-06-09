@@ -33,22 +33,31 @@ unit-testable headless:
 
 ### The jj-over-git "transparency" model (the central idea)
 
-The engine operates on a **colocated jj+git repo**: jj does rewrite+rebase, but
-plain `git` must keep seeing an ordinary, attached-HEAD repository the whole
-time. This invariant drives much of the code:
+The engine operates on jj attached to the user's git repo, but plain `git` must
+keep seeing an ordinary, attached-HEAD repository the whole time. This invariant
+drives much of the code:
 
-- `repo.rs` — `Repo::open` attaches jj to an existing `.git` (creating only the
-  `.jj` metadata on first open), imports git refs/HEAD into jj's view, and holds
-  the `Workspace` + `ReadonlyRepo`. It **refuses a folder that isn't already a git
+- `repo.rs` — `Repo::open` attaches jj to the user's existing `.git`, imports git
+  refs/HEAD into jj's view, and holds the `Workspace` + `ReadonlyRepo`. jj's own
+  metadata (repo store + working-copy state) is **never written into the user's
+  repo**: `init_detached` spins up a fresh jj workspace in a throwaway `TempDir`
+  (held as `Repo::_workdir`, RAII-deleted on session end) whose checkout target is
+  still the user's worktree but whose state lives outside it — so a real jj user's
+  `.jj` is left untouched, a non-jj user's tree is not polluted, and no stale jj
+  state survives between sessions. (It reuses jj-lib's lower-level public init
+  primitives because no high-level constructor separates the checkout target from
+  the state location; that's the one place sensitive to a jj-lib bump.) Because
+  each session is an isolated workspace, concurrent commedit sessions can no longer
+  produce a divergent shared op log. It **refuses a folder that isn't already a git
   repo** (no `.git`) rather than initializing one — commedit edits existing
   history, it never spawns a new repository. Every mutating flow commits a jj
   transaction and replaces `self.repo` with the result.
 - `transparency.rs` — the glue that hides jj from git: re-attach HEAD to its
   original branch (jj uses detached HEAD by design), export jj bookmarks to git
-  refs, exclude `.jj/` via `.git/info/exclude`, and reset the git index to the
-  rewritten tip. The post-rewrite invariant verified by tests is: HEAD symbolic +
-  `git fsck` passes + `git status` shows exactly the user's uncommitted changes
-  (clean when there were none — see "Working-copy preservation").
+  refs, and reset the git index to the rewritten tip. The post-rewrite invariant
+  verified by tests is: HEAD symbolic + `git fsck` passes + `git status` shows
+  exactly the user's uncommitted changes (clean when there were none — see
+  "Working-copy preservation").
 
 ### Mutation pipeline (every edit follows the same shape)
 

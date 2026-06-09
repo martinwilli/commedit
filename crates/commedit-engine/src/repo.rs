@@ -283,44 +283,6 @@ impl Repo {
         }
     }
 
-    /// Snapshot every local bookmark's target as of the current (pre-rewrite)
-    /// repo view, to be handed to [`Self::confine_bookmark_moves`] after the
-    /// rewrite so the unrelated ones can be held in place.
-    pub(crate) fn local_bookmark_targets(&self) -> Vec<(RefNameBuf, RefTarget)> {
-        self.repo
-            .view()
-            .local_bookmarks()
-            .map(|(name, target)| (name.to_owned(), target.clone()))
-            .collect()
-    }
-
-    /// Hold every local bookmark *except* the current branch at the target it
-    /// had before the rewrite (`before`). jj moves every bookmark that pointed
-    /// at a rewritten commit onto the rewrite, and `export_to_git` would then
-    /// write all of them back to git — silently dragging unrelated branches
-    /// (e.g. a user's backup branch that happened to share the rewritten tip)
-    /// forward and clobbering them. Only the checked-out branch should follow
-    /// our rewrite into git; the others must keep pointing at the now-old
-    /// commits, which still exist in the object store. No-op on a detached HEAD,
-    /// where there is no current branch to single out (behavior unchanged).
-    pub(crate) fn confine_bookmark_moves(
-        &self,
-        mut_repo: &mut MutableRepo,
-        before: &[(RefNameBuf, RefTarget)],
-    ) {
-        let Some(current) = self.current_bookmark() else {
-            return;
-        };
-        for (name, target) in before {
-            if *name == current {
-                continue;
-            }
-            if mut_repo.get_local_bookmark(name) != *target {
-                mut_repo.set_local_bookmark_target(name, target.clone());
-            }
-        }
-    }
-
     /// The git commit HEAD currently points at — capture this before a rewrite
     /// so the working tree can be synced to the new tip afterwards.
     pub(crate) fn head_commit(&self) -> Option<String> {

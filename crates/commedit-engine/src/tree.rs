@@ -55,7 +55,6 @@ impl Repo {
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -82,7 +81,6 @@ impl Repo {
             desc,
             pre_op,
             old_head,
-            bookmarks,
             heads,
         )
     }

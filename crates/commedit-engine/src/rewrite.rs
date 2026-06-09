@@ -40,7 +40,6 @@ impl Repo {
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -66,7 +65,6 @@ impl Repo {
             desc,
             pre_op,
             old_head,
-            bookmarks,
             heads,
         )
     }
@@ -86,7 +84,6 @@ impl Repo {
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -123,7 +120,6 @@ impl Repo {
             desc,
             pre_op,
             old_head,
-            bookmarks,
             heads,
         )
     }
@@ -258,7 +254,6 @@ impl Repo {
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         let loc = MoveCommitsLocation {
             new_parent_ids,
@@ -288,7 +283,7 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
-        self.finish_mutation_spurious(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, strategy)
+        self.finish_mutation_spurious(tx, op_msg, desc, pre_op, old_head, heads, strategy)
     }
 
     /// Drop `target` from history entirely: its descendants are rebased onto its
@@ -304,7 +299,6 @@ impl Repo {
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -330,7 +324,6 @@ impl Repo {
             desc,
             pre_op,
             old_head,
-            bookmarks,
             heads,
             SpuriousResolve::Drop,
         )

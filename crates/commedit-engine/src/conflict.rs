@@ -27,9 +27,7 @@ use jj_lib::conflicts::{
 use jj_lib::merge::MergedTreeValue;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
-use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
-use jj_lib::ref_name::RefNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
@@ -196,9 +194,6 @@ pub(crate) struct PendingResolution {
     /// op-log message of the originating mutation (kept for reference).
     #[allow(dead_code)]
     op_msg: String,
-    /// Pre-rewrite local bookmark targets, to hold unrelated branches in place
-    /// at export time (see [`Repo::confine_bookmark_moves`]).
-    bookmarks: Vec<(RefNameBuf, RefTarget)>,
     /// Pre-rewrite git branch heads, for the export-time backstop
     /// (see [`Repo::protect_unrelated_heads`]).
     heads: BTreeMap<String, String>,
@@ -241,10 +236,9 @@ impl Repo {
         desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
-        bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, SpuriousResolve::Off)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, heads, SpuriousResolve::Off)
     }
 
     /// Like [`Self::finish_mutation`] but, for a reorder or squash, opts the
@@ -258,10 +252,9 @@ impl Repo {
         desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
-        bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, SpuriousResolve::CleanTip)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, heads, SpuriousResolve::CleanTip)
     }
 
     /// Like [`Self::finish_mutation`] but opts into an explicit
@@ -275,11 +268,10 @@ impl Repo {
         desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
-        bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
         strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, strategy)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, heads, strategy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -290,7 +282,6 @@ impl Repo {
         desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
-        bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
         strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
@@ -307,7 +298,6 @@ impl Repo {
             pre_op,
             old_head,
             op_msg: op_msg.to_string(),
-            bookmarks,
             heads,
             conflicts: Vec::new(),
             strategy,
@@ -582,9 +572,8 @@ impl Repo {
         // Drop any held-back conflicted rewrite; git was never touched for it.
         self.pending = None;
         // The export tail needs the *current* (rewritten) on-disk state to sync
-        // away from and the unrelated branches to hold in place.
+        // away from; the git-level head backstop holds unrelated branches in place.
         let old_head = self.head_commit();
-        let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         // jj's recorded git-ref state tracks what it last wrote to git's
         // refs/*; the session's clean saves left it at the current tips. Keep a
@@ -615,7 +604,7 @@ impl Repo {
         // Push the restored state back to git and check its working copy back out
         // to disk. Every recorded op was a clean exported git history, so the
         // restored chain is always conflict-free.
-        self.export_and_sync(old_head, &bookmarks, &heads)
+        self.export_and_sync(old_head, &heads)
     }
 
     /// Append a landed mutation to the session op-log the time-travel dropdown
@@ -820,7 +809,7 @@ impl Repo {
         let conflicts = self.collect_conflicts(head.as_ref())?;
         if conflicts.is_empty() {
             let p = self.pending.take().expect("settle requires a pending resolution");
-            self.export_and_sync(p.old_head, &p.bookmarks, &p.heads)?;
+            self.export_and_sync(p.old_head, &p.heads)?;
             // The mutation landed clean and is now in git: record it as a
             // session op-log entry the "Edit history" dropdown can travel back to.
             if let Some(desc) = self.pending_op_desc.take() {
@@ -1115,11 +1104,9 @@ impl Repo {
     fn export_and_sync(
         &mut self,
         old_head: Option<String>,
-        bookmarks: &[(RefNameBuf, RefTarget)],
         heads: &BTreeMap<String, String>,
     ) -> Result<()> {
         let mut tx = self.repo.start_transaction();
-        self.confine_bookmark_moves(tx.repo_mut(), bookmarks);
         crate::transparency::export_to_git(tx.repo_mut())?;
         self.repo = block_on(tx.commit("commedit: export to git"))
             .context("committing export")?;

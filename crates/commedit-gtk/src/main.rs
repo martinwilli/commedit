@@ -336,8 +336,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let author_date = identity_entry("YYYY-MM-DD HH:MM:SS ±HHMM");
     let committer_id = identity_entry("Committer — Name <email>");
     let committer_date = identity_entry("YYYY-MM-DD HH:MM:SS ±HHMM");
-    author_date.set_width_chars(26);
-    committer_date.set_width_chars(26);
+    // The date fields need only fit a formatted "YYYY-MM-DD HH:MM:SS ±HHMM"; pin
+    // them to that width and stop them expanding so the grid gives the slack to
+    // the identity column instead.
+    for date in [&author_date, &committer_date] {
+        date.set_hexpand(false);
+        date.set_width_chars(26);
+        date.set_max_width_chars(26);
+    }
     // Distinct identities harvested from history, offered by the in-field ▼.
     let identities: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
     attach_identity_picker(&author_id, &identities);

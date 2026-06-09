@@ -132,9 +132,11 @@ cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 Under the hood, comm(ed)it is built on [jujutsu](https://github.com/jj-vcs/jj)
 (`jj-lib`) for its rewrite-and-rebase engine: jj does the heavy lifting, but the
 working copy and `git` itself see an ordinary, attached-HEAD git repository the
-whole time. jj's own metadata is kept entirely out of your repository — it lives
-in a throwaway directory that is discarded when you close the app — so comm(ed)it
-never leaves a `.jj` behind and never disturbs a repo you already manage with jj.
+whole time. jj's own metadata — and every internal ref it would otherwise write —
+is kept entirely out of your repository: it operates on a throwaway directory that
+shares only your repo's object database and is discarded when you close the app,
+so comm(ed)it never leaves a `.jj` directory or stray `refs/jj/*` behind, and
+never disturbs a repo you already manage with jj.
 It rewrites only the branch you have checked out; your other local branches and
 tags stay exactly where they are (they simply diverge, as they would after a
 `git commit --amend`). The code is split into a headless `commedit-engine` crate

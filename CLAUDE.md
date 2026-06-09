@@ -37,25 +37,36 @@ The engine operates on jj attached to the user's git repo, but plain `git` must
 keep seeing an ordinary, attached-HEAD repository the whole time. This invariant
 drives much of the code:
 
-- `repo.rs` — `Repo::open` attaches jj to the user's existing `.git`, imports git
-  HEAD and **only the checked-out branch's** local ref into jj's view (`import_git`
-  via `import_some_refs`), and holds the `Workspace` + `ReadonlyRepo`. jj's own
-  metadata (repo store + working-copy state) is **never written into the user's
-  repo**: `init_detached` spins up a fresh jj workspace in a throwaway `TempDir`
-  (held as `Repo::_workdir`, RAII-deleted on session end) whose checkout target is
-  still the user's worktree but whose state lives outside it — so a real jj user's
-  `.jj` is left untouched, a non-jj user's tree is not polluted, and no stale jj
-  state survives between sessions. (It reuses jj-lib's lower-level public init
-  primitives because no high-level constructor separates the checkout target from
-  the state location; that's the one place sensitive to a jj-lib bump.) Because
-  each session is an isolated workspace, concurrent commedit sessions can no longer
-  produce a divergent shared op log. The import is **scoped to the current branch**
-  — commedit only ever displays/edits HEAD's ancestors, so a git ref jj never
-  imports is absent from jj's export diff and sibling branches/tags are left
-  exactly where git has them (the same divergence `git commit --amend` produces),
-  while jj's commit index is built over HEAD's ancestry rather than the whole ref
-  graph. So no jj-level bookmark confinement is needed; the only safety net is the
-  git-level head backstop (`protect_unrelated_heads`, backed by `transparency.rs`'s
+- `repo.rs` — `Repo::open` attaches jj **not** to the user's `.git` but to a
+  session-local, throwaway git dir whose object store is *shared* with the user's
+  repo (a symlinked `objects`, set up by `transparency.rs`'s `init_shared_git_dir`),
+  imports git HEAD and **only the checked-out branch's** local ref into jj's view
+  (`import_git` via `import_some_refs`), and holds the `Workspace` + `ReadonlyRepo`.
+  Sharing *only* the object database is the heart of the transparency model: jj's
+  rewritten commits land in the user's ODB (so plain `git` sees them), while
+  everything jj would otherwise scribble into the user's `.git` — its repo store +
+  working-copy state **and** every ref it writes (`refs/jj/keep/*` GC anchors, its
+  detached HEAD, the bookmark export) — stays in the throwaway dir. `init_detached`
+  spins up that fresh jj workspace under a `TempDir` (held as `Repo::_workdir`,
+  RAII-deleted on session end) whose checkout target is still the user's worktree
+  but whose state + git dir live outside it — so a real jj user's `.jj` is left
+  untouched, a non-jj user's tree is not polluted (not even a transient `refs/jj`
+  on a browse-only session), and no stale jj state survives between sessions. (It
+  reuses jj-lib's lower-level public init primitives because no high-level
+  constructor separates the checkout target from the state location; that's the one
+  place sensitive to a jj-lib bump.) Because each session is an isolated workspace,
+  concurrent commedit sessions can no longer produce a divergent shared op log. The
+  import is **scoped to the current branch** — commedit only ever displays/edits
+  HEAD's ancestors, so a git ref jj never imports is absent from jj's export diff
+  and sibling branches/tags are left exactly where git has them (the same
+  divergence `git commit --amend` produces), while jj's commit index is built over
+  HEAD's ancestry rather than the whole ref graph. So no jj-level bookmark
+  confinement is needed. jj exports the one branch it moved into the throwaway git
+  dir, not the user's repo, so the mutation tail **mirrors that branch tip back
+  out** with `bridge_branch_to_git` (a compare-and-swap `git update-ref`, run
+  before the worktree is materialized so the user's HEAD already resolves to the
+  new tip); the only other safety net is the git-level head backstop
+  (`protect_unrelated_heads`, backed by `transparency.rs`'s
   `restore_unrelated_heads`). It **refuses a folder that isn't already a git repo**
   (no `.git`) rather than initializing one — commedit edits existing history, it
   never spawns a new repository. Every mutating flow commits a jj transaction and
@@ -78,8 +89,8 @@ inline.
 
 `finish_mutation` (`conflict.rs`) is the shared tail: it commits the jj
 transaction, then walks the branch tip's ancestors for `commit.has_conflict()`.
-If clean it runs the deferred export (`export_to_git` → `reattach_head` →
-`materialize_after_rewrite(old_head)` → `prune_orphaned_keep_refs`) in a second
+If clean it runs the deferred export (`export_to_git` → `bridge_branch_to_git` →
+`reattach_head` → `materialize_after_rewrite(old_head)`) in a second
 transaction and returns `SaveOutcome::Clean`. If conflicted it stores a `PendingResolution`
 and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — see
 "Conflict resolution" below.
@@ -197,11 +208,12 @@ Caveats this creates:
   **silent** safety net (no stderr, no UI surface — documented in the README); a
   rewrite then `prune_backup_refs` keeps only the most-recent backup so they don't
   accumulate one per session.
-- `prune_orphaned_keep_refs` now drops *our own* working-copy keep-refs (the
-  current `@`, its superseded snapshots sharing its change id, and jj's empty
-  scaffolding) so they don't surface as phantom commits in `git log --all`, while
-  still preserving a manual jj user's anonymous head (real content + description,
-  unrelated change id).
+- jj's working-copy commits (the current `@`, its superseded snapshots, jj's empty
+  scaffolding) never surface as phantom commits in the user's `git log --all`,
+  because their `refs/jj/keep/*` anchors live in the throwaway git dir, not the
+  user's repo (see the `repo.rs` note above) — no scrubbing needed. Their objects
+  do land in the shared ODB but are unreachable from any user ref, so git's own gc
+  reclaims them.
 - The GTK UI shows the working-copy chain via `working_copy_chain` as **rows above
   the history list** (`populate_wc`) — their own list (`wc_entries` mirrors them),
   deliberately *not* part of the history list, so the reorder/drop/squash index
@@ -224,8 +236,8 @@ Caveats this creates:
 serializes those as `.jjconflict-*` subtrees, so exporting them would corrupt the
 git history. Transparency is preserved purely by **not moving any git ref /
 HEAD / worktree while the chain is conflicted** — the conflicted commit objects
-sit unreachable in the ODB (like keep-ref residue) and plain `git` keeps seeing
-the pre-rewrite history. The deferred export only runs once the whole chain is
+sit unreachable in the shared ODB (reclaimed by git's own gc) and plain `git`
+keeps seeing the pre-rewrite history. The deferred export only runs once the whole chain is
 clean.
 
 A reorder / squash / drop / restore's intermediate rebase can throw **spurious**

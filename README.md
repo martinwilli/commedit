@@ -125,6 +125,7 @@ cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.
 - `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
   `+` additions, restores `-` removals to context).
+- `Ctrl+Z` / `Ctrl+Y` — in the diff pane, undo and redo your edits.
 - `Ctrl+Q` — close the window.
 
 ## How it works

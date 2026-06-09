@@ -136,6 +136,44 @@ pub fn history_limited(
     Ok((commits, has_more))
 }
 
+/// The commits reachable from `head` but not from `base` — the range rewritten
+/// since `base`, newest first (the jj `base..head` revset).
+///
+/// A rewrite/rebase only ever produces new commits *above* the unchanged base it
+/// shares with the pre-rewrite tip; the untouched ancestors below stay byte-for-
+/// byte identical (and so, having come from clean git history, conflict-free).
+/// Only the rewritten commits can be conflicted, so conflict detection walks this
+/// range instead of [`history`]'s full — possibly huge — ancestry of `head`.
+/// `base` is the pre-rewrite branch tip; it and its ancestors are excluded.
+pub fn history_range(
+    repo: &ReadonlyRepo,
+    base: &CommitId,
+    head: &CommitId,
+) -> Result<Vec<CommitInfo>> {
+    let symbol_resolver =
+        SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
+    let expression = RevsetExpression::commits(vec![base.clone()])
+        .range(&RevsetExpression::commits(vec![head.clone()]))
+        .resolve_user_expression(repo, &symbol_resolver)
+        .context("resolving rewritten-range revset")?;
+    let revset = expression
+        .evaluate(repo)
+        .context("evaluating rewritten-range revset")?;
+
+    let store = repo.store();
+    let root = store.root_commit_id().clone();
+    let mut commits = Vec::new();
+    for entry in revset.commit_change_ids() {
+        let (id, _change_id) = entry.context("iterating the rewritten range")?;
+        if id == root {
+            continue;
+        }
+        let commit = store.get_commit(&id).context("loading commit")?;
+        commits.push(CommitInfo::from_commit(&commit));
+    }
+    Ok(commits)
+}
+
 /// A single-commit reorder, in the terms [`crate::repo::Repo::reorder_commit`]
 /// wants: the moved commit, the parents to rebase it onto, the children to rebase
 /// on top of it, and which commit should end up as the branch head.

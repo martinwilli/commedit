@@ -517,7 +517,9 @@ impl Repo {
         let head = self
             .current_head_in_jj()
             .context("no current branch head to resolve the conflict against")?;
-        let infos = crate::history::history(&self.repo, &head)?;
+        // The conflict being resolved is always a rewritten commit, so it lives in
+        // the rewritten range; walk only that, not the whole ancestry.
+        let infos = self.rewritten_history(&head)?;
         infos
             .into_iter()
             .find(|i| i.change_id == change_id)
@@ -525,6 +527,23 @@ impl Repo {
             .with_context(|| {
                 format!("change {change_hex} is not on the current branch chain")
             })
+    }
+
+    /// The branch history that conflict detection must scan: the range rewritten
+    /// since the pending rewrite's pre-rewrite tip ([`crate::history::history_range`]),
+    /// newest first. Only rewritten commits can be conflicted — the untouched
+    /// ancestors below the rewrite stay clean — so this skips them, which matters on
+    /// a deep history where the full ancestry is thousands of commits. Falls back to
+    /// the full [`crate::history::history`] walk when there is no pending base (e.g.
+    /// a detached HEAD, or the rare unrelated-tip case).
+    fn rewritten_history(&self, head: &CommitId) -> Result<Vec<crate::history::CommitInfo>> {
+        match self.pending.as_ref().and_then(|p| p.old_head.as_deref()) {
+            Some(base_hex) => match CommitId::try_from_hex(base_hex) {
+                Some(base) => crate::history::history_range(&self.repo, &base, head),
+                None => crate::history::history(&self.repo, head),
+            },
+            None => crate::history::history(&self.repo, head),
+        }
     }
 
     /// The branch tip as jj currently sees it (read from the checked-out
@@ -539,13 +558,15 @@ impl Repo {
             .cloned()
     }
 
-    /// Walk the ancestors of `head` (oldest first) collecting the commits whose
-    /// trees are conflicted, with their conflicted paths.
+    /// Walk the rewritten range of `head` (oldest first) collecting the commits
+    /// whose trees are conflicted, with their conflicted paths. Only rewritten
+    /// commits can be conflicted, so this scans [`Self::rewritten_history`] rather
+    /// than the whole — possibly huge — ancestry.
     fn collect_conflicts(&self, head: Option<&CommitId>) -> Result<Vec<ConflictedCommit>> {
         let Some(head) = head else {
             return Ok(Vec::new());
         };
-        let infos = crate::history::history(&self.repo, head)?;
+        let infos = self.rewritten_history(head)?;
         let store = self.repo.store();
         let mut out = Vec::new();
         for info in infos.iter().rev() {

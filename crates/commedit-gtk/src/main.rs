@@ -240,7 +240,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              row.squash-sibling { background-color: rgba(245, 194, 17, 0.18); \
              border: 1px dashed rgb(245, 194, 17); border-radius: 5px; } \
              row.squash-drop-target { background-color: rgba(224, 27, 36, 0.38); \
-             border: 1px solid rgb(224, 27, 36); border-radius: 5px; }",
+             border: 1px solid rgb(224, 27, 36); border-radius: 5px; } \
+             .commit-id-copy { background-color: @theme_base_color; \
+             color: @theme_fg_color; border-radius: 4px; padding: 0 1px; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,

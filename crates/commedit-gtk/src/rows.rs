@@ -8,7 +8,71 @@ use std::collections::HashSet;
 use commedit_engine::history::CommitInfo;
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow};
+use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
+
+/// Build the commit-id cell: a short-id [`Label`] wrapped in an [`Overlay`] so a
+/// copy icon can float over the id's right edge on hover. Overlay children are
+/// excluded from the size request, so the icon clips against — and may hide —
+/// the id's last characters but never widens the column. Clicking the *icon*
+/// copies the full hash and claims the press, so it does not select the commit;
+/// clicking the id itself selects the commit as usual (no copy). The hash is
+/// carried in the cell's tooltip (both the copy source and a hover hint showing
+/// the id in full).
+fn id_cell(short: &str, full_hash: &str) -> Overlay {
+    let id_label = Label::builder().xalign(0.0).build();
+    id_label.set_markup(&format!("<tt>{short}</tt>"));
+
+    let cell = Overlay::new();
+    cell.set_child(Some(&id_label));
+    cell.set_halign(gtk::Align::Start);
+    set_id_hash(&cell, full_hash);
+
+    let copy = gtk::Image::from_icon_name("edit-copy-symbolic");
+    // An explicit pixel size is required: as a non-measured overlay child the
+    // icon would otherwise request zero size and never show.
+    copy.set_pixel_size(16);
+    copy.set_halign(gtk::Align::End);
+    copy.set_valign(gtk::Align::Center);
+    copy.set_cursor_from_name(Some("pointer"));
+    copy.add_css_class("commit-id-copy");
+    copy.set_visible(false);
+    cell.add_overlay(&copy);
+
+    // Reveal the copy icon only while the pointer is over the id.
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter({
+        let copy = copy.clone();
+        move |_, _, _| copy.set_visible(true)
+    });
+    motion.connect_leave({
+        let copy = copy.clone();
+        move |_| copy.set_visible(false)
+    });
+    cell.add_controller(motion);
+
+    // Clicking the icon copies the full hash. Claim the press so the click stays
+    // off the row: unlike clicking the id, it must not select the commit.
+    let click = gtk::GestureClick::new();
+    click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    click.connect_released({
+        let cell = cell.clone();
+        move |_, _, _, _| {
+            if let Some(hash) = cell.tooltip_text() {
+                cell.clipboard().set_text(&hash);
+            }
+        }
+    });
+    copy.add_controller(click);
+    cell
+}
+
+/// Store a commit's full hash on its id cell. The cell's tooltip is both the
+/// copy source (read back on click) and a hover hint showing the id in full.
+fn set_id_hash(cell: &Overlay, full_hash: &str) {
+    cell.set_tooltip_text(Some(full_hash));
+}
 
 /// Build the `short-id   subject   ⚠` content box shown inside a history/trash
 /// row. The trailing warning icon is present but hidden unless `conflicted`.
@@ -19,8 +83,7 @@ fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
     } else {
         &commit.subject
     };
-    let id_label = Label::builder().xalign(0.0).build();
-    id_label.set_markup(&format!("<tt>{short}</tt>"));
+    let id_cell = id_cell(&short, &commit.id_hex());
     let subject_label = Label::builder()
         .label(subject)
         .xalign(0.0)
@@ -39,7 +102,7 @@ fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
         .margin_top(4)
         .margin_bottom(4)
         .build();
-    row_box.append(&id_label);
+    row_box.append(&id_cell);
     row_box.append(&subject_label);
     row_box.append(&badge);
     row_box
@@ -56,21 +119,23 @@ fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool) {
         &commit.subject
     };
     let row_box = row.child().and_downcast::<GtkBox>();
-    let id_label = row_box
+    let id_cell = row_box
         .as_ref()
         .and_then(|b| b.first_child())
-        .and_downcast::<Label>();
-    let subject_label = id_label
+        .and_downcast::<Overlay>();
+    let id_label = id_cell.as_ref().and_then(|c| c.child()).and_downcast::<Label>();
+    let subject_label = id_cell
         .as_ref()
-        .and_then(|l| l.next_sibling())
+        .and_then(|c| c.next_sibling())
         .and_downcast::<Label>();
     let badge = row_box
         .as_ref()
         .and_then(|b| b.last_child())
         .and_downcast::<gtk::Image>();
-    match (id_label, subject_label, badge) {
-        (Some(id_label), Some(subject_label), Some(badge)) => {
+    match (id_cell, id_label, subject_label, badge) {
+        (Some(id_cell), Some(id_label), Some(subject_label), Some(badge)) => {
             id_label.set_markup(&format!("<tt>{short}</tt>"));
+            set_id_hash(&id_cell, &commit.id_hex());
             subject_label.set_text(subject);
             badge.set_visible(conflicted);
         }

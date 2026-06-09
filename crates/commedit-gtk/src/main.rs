@@ -156,7 +156,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let repo = match Repo::open(&repo_path) {
         Ok(repo) => Rc::new(RefCell::new(repo)),
         Err(err) => {
-            present_error(app, &format!("Failed to open {repo_path:?}:\n{err:?}"));
+            present_error(
+                app,
+                "Unable to open repository",
+                &format!("{}\n\n{err:#}", repo_path.display()),
+            );
             return;
         }
     };
@@ -2395,22 +2399,48 @@ fn resolve_commit(
         .find(|c| c.change_id_hex() == change_id)
 }
 
-fn present_error(app: &Application, message: &str) {
-    let label = Label::builder()
-        .label(message)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
+/// Show a standalone, GNOME-style error page in place of the editor — used when
+/// the repository can't be opened. Laid out like an `AdwStatusPage` (centred
+/// icon, heading, dimmed detail) but with plain GTK4 so we pull in no extra
+/// dependency. `title` is the one-line heading; `detail` the explanation below it.
+fn present_error(app: &Application, title: &str, detail: &str) {
+    let icon = gtk::Image::from_icon_name("dialog-error-symbolic");
+    icon.set_pixel_size(96);
+    icon.add_css_class("error");
+
+    let heading = Label::builder().label(title).wrap(true).build();
+    heading.add_css_class("title-2");
+
+    let body = Label::builder()
+        .label(detail)
         .wrap(true)
+        .justify(gtk::Justification::Center)
+        .max_width_chars(50)
         .build();
+    body.add_css_class("dim-label");
+
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .margin_start(36)
+        .margin_end(36)
+        .margin_top(36)
+        .margin_bottom(36)
+        .build();
+    content.append(&icon);
+    content.append(&heading);
+    content.append(&body);
+
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("commedit — error")
-        .default_width(600)
-        .default_height(200)
-        .child(&label)
+        .title("commedit")
+        .default_width(460)
+        .default_height(340)
+        .child(&content)
         .build();
+    window.set_titlebar(Some(&HeaderBar::new()));
     window.present();
 }
 

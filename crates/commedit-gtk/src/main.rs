@@ -745,7 +745,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if splice {
                 splice_buffer_text(&file_buffer, &text);
             } else {
+                // A fresh render is a new editing context, not an undoable edit:
+                // mark it irreversible so it clears the undo history rather than
+                // letting a later Ctrl+Z revert the load itself.
+                file_buffer.begin_irreversible_action();
                 file_buffer.set_text(&text);
+                file_buffer.end_irreversible_action();
             }
             file_view.set_editable(files.iter().any(|f| f.editable));
             *rendered_hunks.borrow_mut() = all_hunks;
@@ -1094,7 +1099,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if splice {
                 splice_buffer_text(&file_buffer, &text);
             } else {
+                // A fresh render starts a new editing context (see the diff
+                // pane): clear the undo history rather than letting Ctrl+Z revert
+                // the rendered snippets themselves.
+                file_buffer.begin_irreversible_action();
                 file_buffer.set_text(&text);
+                file_buffer.end_irreversible_action();
             }
             editing.set(false);
             file_view.set_editable(conflict_view.borrow().iter().any(|fv| fv.resolvable));
@@ -1366,12 +1376,38 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if !file_view.is_editable() {
                 return glib::Propagation::Proceed;
             }
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            // Undo/redo replay their changes as ordinary buffer insert/delete ops.
+            // Left to the view's built-in bindings they'd fire those signals with
+            // the `editing` guard clear, so the structured-edit firewall (and the
+            // conflict-layout guard) below would re-plan or block them and corrupt
+            // the operation. Drive them ourselves under the guard — which the
+            // firewall honours as "our own edit" — then re-highlight, since the
+            // guard also suppresses the debounced `changed` re-highlight. The
+            // capture-phase `Stop` pre-empts the view's own Ctrl+Z / Ctrl+Y so the
+            // undo isn't then applied a second time.
+            if ctrl {
+                let is_undo = matches!(keyval, gdk::Key::z | gdk::Key::Z) && !shift;
+                let is_redo = matches!(keyval, gdk::Key::y | gdk::Key::Y)
+                    || (matches!(keyval, gdk::Key::z | gdk::Key::Z) && shift);
+                if is_undo || is_redo {
+                    editing.set(true);
+                    if is_undo {
+                        file_buffer.undo();
+                    } else {
+                        file_buffer.redo();
+                    }
+                    editing.set(false);
+                    highlight();
+                    return glib::Propagation::Stop;
+                }
+            }
             // In conflict mode, structural diff gestures don't apply — let the view
             // handle Enter/Backspace/Delete as ordinary text editing.
             if pane_mode.borrow().is_conflict() {
                 return glib::Propagation::Proceed;
             }
-            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let gesture = match keyval {
                 gdk::Key::Return | gdk::Key::KP_Enter => EditGesture::Newline,
                 gdk::Key::BackSpace => EditGesture::Backspace,

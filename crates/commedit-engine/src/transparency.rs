@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -33,6 +33,151 @@ pub fn export_to_git(mut_repo: &mut MutableRepo) -> Result<()> {
     //     bailing here would break an intentionally-tolerated flow.
     git::export_refs(mut_repo).context("exporting refs to git")?;
     Ok(())
+}
+
+/// Create the throwaway git directory jj operates on for this session, with its
+/// object database **shared** with the user's repository but its refs kept
+/// private. Returns nothing; the caller already knows the path.
+///
+/// `git_dir` is a session-local path (under jj's temp workdir). We initialize a
+/// bare repo there, then replace its `objects` directory with a symlink to the
+/// user's object store, so:
+///   * every object jj writes (the rewritten commits) lands in the user's ODB —
+///     this is what keeps plain `git` able to see the rewrite (transparency);
+///   * every ref jj creates — its `refs/jj/keep/*` GC anchors, its detached
+///     HEAD, the bookmark it exports — lives here, **out of the user's `.git`**.
+///
+/// The checked-out branch (or a detached HEAD) and its tip are seeded so jj's
+/// import sees the live history through the shared objects. The one branch ref
+/// jj later moves is mirrored back into the user's repo by
+/// [`crate::repo::Repo::bridge_branch_to_git`].
+pub fn init_shared_git_dir(git_dir: &Path, workspace_root: &Path) -> Result<()> {
+    let objects = git_objects_dir(workspace_root)?;
+    // A known-valid bare layout (HEAD, config, refs/, …) for gix to open.
+    let out = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(git_dir)
+        .output()
+        .context("initializing the session git dir")?;
+    if !out.status.success() {
+        bail!(
+            "failed to initialize the session git dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Point its object store at the user's, so the two repos share one ODB.
+    let local_objects = git_dir.join("objects");
+    std::fs::remove_dir_all(&local_objects)
+        .with_context(|| format!("clearing {}", local_objects.display()))?;
+    symlink_dir(&objects, &local_objects)?;
+    // Seed the checked-out branch / detached HEAD and its tip (resolvable now via
+    // the shared objects) so jj imports the current history.
+    if let Some(tip) = head_commit(workspace_root) {
+        match head_branch(workspace_root) {
+            Some(branch) => {
+                git_in_dir(git_dir, &["update-ref", &branch, &tip])?;
+                git_in_dir(git_dir, &["symbolic-ref", "HEAD", &branch])?;
+            }
+            None => git_in_dir(git_dir, &["update-ref", "--no-deref", "HEAD", &tip])?,
+        }
+    }
+    Ok(())
+}
+
+/// The absolute path to the user's git object store, as git itself resolves it —
+/// honouring linked worktrees and a separate common dir. Used to share the ODB
+/// with jj's session-local git dir (see [`init_shared_git_dir`]).
+pub fn git_objects_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", "--git-path", "objects"])
+        .output()
+        .context("locating the git object store")?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse --git-path objects failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let raw = String::from_utf8(out.stdout)
+        .context("decoding the object store path")?
+        .trim()
+        .to_string();
+    // `--git-path` prints relative to the workspace root (e.g. `.git/objects`) or
+    // absolute (a worktree's common dir); join handles both, canonicalize resolves.
+    let joined = workspace_root.join(&raw);
+    std::fs::canonicalize(&joined)
+        .with_context(|| format!("resolving object store path {}", joined.display()))
+}
+
+/// Point `ref_name` at `new` in the user's repository — the single git ref move
+/// commedit performs itself now that jj exports into a session-local git dir.
+/// `old`, when given, is git's compare-and-swap precondition (so a racing
+/// commedit instance that already moved the ref is detected rather than
+/// clobbered). `no_deref` updates the ref itself rather than its target, for a
+/// detached HEAD. Errors carry git's message; the caller tolerates a
+/// precondition miss (reconciled on the next open).
+pub fn update_user_ref(
+    workspace_root: &Path,
+    ref_name: &str,
+    new: &str,
+    old: Option<&str>,
+    no_deref: bool,
+) -> Result<()> {
+    let mut args: Vec<&str> = vec!["update-ref"];
+    if no_deref {
+        args.push("--no-deref");
+    }
+    args.push(ref_name);
+    args.push(new);
+    if let Some(old) = old {
+        args.push(old);
+    }
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(&args)
+        .output()
+        .context("running git update-ref")?;
+    if !out.status.success() {
+        bail!(
+            "git update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Run `git --git-dir <git_dir> <args>`, erroring on a non-zero exit. Used to
+/// seed [`init_shared_git_dir`]'s session git dir.
+fn git_in_dir(git_dir: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {args:?}"))?;
+    if !out.status.success() {
+        bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Symlink the directory `target` at `link`. commedit shares jj's object store
+/// with the user's by symlink; this is a unix-only mechanism (there is no
+/// Windows release).
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))
+}
+
+#[cfg(not(unix))]
+fn symlink_dir(_target: &Path, _link: &Path) -> Result<()> {
+    bail!("commedit needs a unix-like platform to share the git object store")
 }
 
 /// Delete the jj `refs/jj/keep/*` GC-protection refs that belong to commedit's

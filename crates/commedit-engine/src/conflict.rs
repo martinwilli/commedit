@@ -1110,6 +1110,11 @@ impl Repo {
         crate::transparency::export_to_git(tx.repo_mut())?;
         self.repo = block_on(tx.commit("commedit: export to git"))
             .context("committing export")?;
+        // jj exported the moved bookmark into its throwaway git dir, not the
+        // user's repo; mirror that one branch tip into the real repository. Must
+        // precede materialize_after_rewrite, which resets the index to the user's
+        // HEAD (now the new tip).
+        self.bridge_branch_to_git(old_head.as_deref());
         self.reattach_head()?;
         self.protect_unrelated_heads(heads);
         // Write the rebased working-copy commit @' back to disk (preserving the

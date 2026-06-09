@@ -15,6 +15,7 @@ use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions, GitRefKind, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
 use jj_lib::git_backend::GitBackend;
 use jj_lib::local_working_copy::LocalWorkingCopyFactory;
+use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefNameBuf, RemoteRefSymbol, WorkspaceName};
@@ -145,13 +146,20 @@ impl Repo {
     ///
     /// This is jj-lib's `Workspace::init_external_git` taken apart and reassembled
     /// with the state paths pointed at `state_dir` instead of the hardcoded
-    /// `workspace_root/.jj`: the git backend attaches to the in-tree `.git` so jj
-    /// and git share one object database, but nothing is written into the user's
-    /// repo. jj-lib offers no high-level constructor that separates the checkout
-    /// target from the state location, so we replicate the (small) bodies of
-    /// `init_with_factories` + the private `init_working_copy` here using public
-    /// primitives. If a future jj-lib bump changes that init shape, this is the
-    /// one place to revisit.
+    /// `workspace_root/.jj`. jj-lib offers no high-level constructor that
+    /// separates the checkout target from the state location, so we replicate the
+    /// (small) bodies of `init_with_factories` + the private `init_working_copy`
+    /// here using public primitives. If a future jj-lib bump changes that init
+    /// shape, this is the one place to revisit.
+    ///
+    /// The git backend attaches not to the user's `.git` but to a session-local,
+    /// throwaway git dir (under `state_dir`) whose object store is *shared* with
+    /// the user's repo (see [`crate::transparency::init_shared_git_dir`]). So jj
+    /// and git share one object database — rewritten commits land in the user's
+    /// ODB, keeping plain `git` able to see them — while every ref jj writes (its
+    /// `refs/jj/keep/*` GC anchors, its detached HEAD, the bookmark export) stays
+    /// in the throwaway dir, never the user's `.git`. The one branch ref jj moves
+    /// is mirrored out by [`Self::bridge_branch_to_git`].
     fn init_detached(
         settings: &UserSettings,
         workspace_root: &Path,
@@ -162,12 +170,12 @@ impl Repo {
         let wc_state = state_dir.join("working_copy");
         std::fs::create_dir(&wc_state).context("creating jj working-copy state dir")?;
 
-        // Absolute path to the user's .git. The store lives outside the
-        // workspace, so (unlike init_external_git) there is no relative-path
-        // optimization — GitBackend::init_external joins this onto the store path,
-        // and an absolute path makes that join resolve to .git itself.
-        let git_dir = std::fs::canonicalize(workspace_root.join(".git"))
-            .context("locating the .git directory")?;
+        // The git dir jj writes into: session-local, with an object store shared
+        // with the user's repo but private refs. Absolute (state_dir is), so
+        // GitBackend::init_external's `store_path.join` resolves to it directly.
+        let git_dir = state_dir.join("git");
+        crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
+            .context("setting up the session git dir")?;
         let backend_initializer =
             |settings: &UserSettings, store_path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
                 let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
@@ -370,6 +378,49 @@ impl Repo {
     /// reordering to the current branch's linear chain.
     pub fn head_commit_id(&self) -> Option<CommitId> {
         CommitId::try_from_hex(self.head_commit()?)
+    }
+
+    /// The branch tip jj just exported into its session-local git dir, read from
+    /// jj's own view — the user's git ref still holds the pre-rewrite tip until
+    /// [`Self::bridge_branch_to_git`] mirrors this out. The checked-out branch's
+    /// local bookmark, falling back to jj's git HEAD on a detached HEAD.
+    fn exported_tip(&self) -> Option<String> {
+        if let Some(name) = self.current_bookmark() {
+            if let Some(id) = self.repo.view().get_local_bookmark(&name).as_normal() {
+                return Some(id.hex());
+            }
+        }
+        self.repo.view().git_head().as_normal().map(|id| id.hex())
+    }
+
+    /// Mirror the branch tip jj exported into its throwaway git dir back into the
+    /// user's real repository — the single git ref move commedit performs itself
+    /// now that jj's objects land in the shared ODB but its refs stay session-
+    /// local (see [`Self::init_detached`]). Runs in the export tail *before*
+    /// materializing the working tree, so the user's HEAD resolves to the new tip
+    /// by the time the index is reset.
+    ///
+    /// Compare-and-swaps against `old_head` so a racing commedit instance is
+    /// detected, not clobbered; a mismatch (or any other failure) is logged and
+    /// tolerated, reconciled on the next open — the same posture jj's own ref
+    /// export takes (see [`crate::transparency::export_to_git`]).
+    pub(crate) fn bridge_branch_to_git(&self, old_head: Option<&str>) {
+        let Some(new_tip) = self.exported_tip() else {
+            return;
+        };
+        let root = self.workspace.workspace_root();
+        let (ref_name, no_deref) = match self.git_head_branch.as_deref() {
+            Some(branch) => (branch, false),
+            None => ("HEAD", true),
+        };
+        if let Err(e) =
+            crate::transparency::update_user_ref(root, ref_name, &new_tip, old_head, no_deref)
+        {
+            eprintln!(
+                "commedit: could not move {ref_name} to the rewritten tip {new_tip} ({e}); \
+                 git will reconcile on the next open"
+            );
+        }
     }
 
     /// Scrub the `refs/jj/keep/*` GC-protection refs that this rewrite orphaned

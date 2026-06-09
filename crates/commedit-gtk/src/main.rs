@@ -26,7 +26,7 @@ use gtk::{
     gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction,
     DropDown, Entry, EventControllerKey, EventControllerScroll,
     EventControllerScrollFlags, Grid, HeaderBar, Label, ListBox, ListBoxRow,
-    Orientation, Paned, PolicyType, PropagationPhase, ScrolledWindow, Shortcut,
+    Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
     ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
 };
 use syntect::highlighting::{Theme, ThemeSet};
@@ -245,6 +245,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              border: 1px dashed rgb(245, 194, 17); border-radius: 5px; } \
              row.squash-drop-target { background-color: rgba(224, 27, 36, 0.38); \
              border: 1px solid rgb(224, 27, 36); border-radius: 5px; } \
+             row.op-affected { background-color: rgba(53, 132, 228, 0.22); \
+             border: 1px dashed rgb(53, 132, 228); border-radius: 5px; } \
              .commit-id-copy { background-color: @theme_base_color; \
              color: @theme_fg_color; border-radius: 4px; padding: 0 1px; }",
         );
@@ -560,18 +562,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // full-window diff of every content change made this session. Both are wired
     // below, once `refresh` & co. exist.
     let header = HeaderBar::new();
-    let revert_button = Button::with_label("Revert all");
-    revert_button.add_css_class("destructive-action");
-    revert_button.set_tooltip_text(Some(
-        "Discard all changes made this session and restore the repository to its original state",
+    // The "Edit history" button: a clock-with-arrow icon opening a dropdown of
+    // this session's snapshots (every history edit, plus the session-start state)
+    // to travel back — and forward — to. It replaces the old "Revert all" button:
+    // jumping to the bottom "Session start" entry is exactly that revert.
+    let history_button = Button::from_icon_name("document-open-recent-symbolic");
+    history_button.set_tooltip_text(Some(
+        "Edit history — travel to an earlier state from this session",
     ));
     let review_button = ToggleButton::with_label("Review");
     review_button.set_tooltip_text(Some(
         "Review all content changes made this session (current tree vs. the session start)",
     ));
-    // pack_end fills right-to-left, so packing "Revert all" first leaves "Review"
-    // to its left: [ Review ][ Revert all ].
-    header.pack_end(&revert_button);
+    // pack_end fills right-to-left, so packing the history button first leaves
+    // "Review" to its left: [ Review ][ ↺ ].
+    header.pack_end(&history_button);
     header.pack_end(&review_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
@@ -1880,93 +1885,157 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
-    // "Revert all" (top-right header button): after confirmation, roll the whole
-    // session back to the state the repo was opened in — original commits *and*
-    // the session-start working copy — then reload. Mirrors the abort handler's
-    // reload, and additionally empties the trash (its drops are undone).
-    revert_button.connect_clicked({
+    // "Edit history" (top-right header button): open a dropdown of this session's
+    // snapshots — every recorded edit, newest first, plus the session-start floor
+    // — and let the user travel the repository back (or forward) to any of them.
+    // The bottom "Session start" entry is the old "Revert all". Clicking an entry
+    // calls `jump_to_op`, then runs the same post-rewrite reset the revert handler
+    // used (drop conflict mode, empty the trash, reload + reselect); hovering an
+    // entry highlights the history row(s) that operation touched.
+    history_button.connect_clicked({
         let repo = repo.clone();
-        let window = window.clone();
         let exit_conflict_mode = exit_conflict_mode.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
         let list = list.clone();
+        let commits = commits.clone();
         let trashed = trashed.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let review_button = review_button.clone();
         let render_review = render_review.clone();
-        move |_| {
-            let target = repo
-                .borrow()
-                .session_start_head_hex()
-                .map(|h| h[..h.len().min(12)].to_string())
-                .unwrap_or_else(|| "its original state".to_string());
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message("Revert all changes?")
-                .detail(format!(
-                    "Discard everything done this session and restore the repository to \
-                     {target}. Uncommitted changes made this session are lost. This cannot \
-                     be undone."
-                ))
-                .buttons(["Cancel", "Revert all"])
-                .cancel_button(0)
-                .default_button(0)
-                .build();
-            let repo = repo.clone();
-            let exit_conflict_mode = exit_conflict_mode.clone();
-            let refresh = refresh.clone();
-            let show_status = show_status.clone();
-            let list = list.clone();
-            let trashed = trashed.clone();
-            let pending_trash_op = pending_trash_op.clone();
-            let trash_list = trash_list.clone();
-            let trash_scroll = trash_scroll.clone();
-            let review_button = review_button.clone();
-            let render_review = render_review.clone();
-            dialog.choose(
-                Some(&window),
-                gtk::gio::Cancellable::NONE,
-                move |result| {
-                    // Index 1 is "Revert all"; anything else (Cancel / dismissed)
-                    // leaves the session untouched.
-                    if result != Ok(1) {
-                        return;
+        move |btn| {
+            // Snapshot the dropdown's data: (jump target, label, affected change-ids),
+            // newest first, then the session-start floor (target 0). `cursor` marks
+            // the current state; entries ahead of it are redo targets.
+            let mut entries: Vec<(usize, String, Vec<String>)> = Vec::new();
+            let cursor;
+            let floor_subtitle;
+            {
+                let r = repo.borrow();
+                cursor = r.op_cursor();
+                for (i, entry) in r.session_ops().iter().enumerate().rev() {
+                    entries.push((i + 1, entry.label().to_string(), entry.affected().to_vec()));
+                }
+                floor_subtitle = r
+                    .session_start_head_hex()
+                    .map(|h| h[..h.len().min(12)].to_string());
+                entries.push((0, "Session start".to_string(), Vec::new()));
+            }
+            let entries = Rc::new(entries);
+
+            let list_box = ListBox::new();
+            list_box.set_selection_mode(gtk::SelectionMode::None);
+            for (target, label, affected) in entries.iter() {
+                let subtitle = if *target == 0 {
+                    floor_subtitle.as_deref()
+                } else {
+                    None
+                };
+                let row = history_row(label, subtitle, *target == cursor, *target > cursor);
+                // Hover the entry → highlight the commit row(s) it touched.
+                let motion = gtk::EventControllerMotion::new();
+                motion.connect_enter({
+                    let list = list.clone();
+                    let commits = commits.clone();
+                    let affected = affected.clone();
+                    move |_, _, _| {
+                        clear_highlight(&list);
+                        highlight_affected(&list, &commits.borrow(), &affected);
                     }
-                    if let Err(err) = repo.borrow_mut().revert_all() {
-                        show_status(&format!("Revert failed: {err}"));
+                });
+                motion.connect_leave({
+                    let list = list.clone();
+                    move |_| clear_highlight(&list)
+                });
+                row.add_controller(motion);
+                list_box.append(&row);
+            }
+
+            let scroll = ScrolledWindow::builder()
+                .propagate_natural_height(true)
+                .propagate_natural_width(true)
+                .min_content_width(260)
+                .max_content_height(360)
+                .hscrollbar_policy(PolicyType::Never)
+                .child(&list_box)
+                .build();
+            let popover = Popover::new();
+            popover.set_parent(btn);
+            popover.set_autohide(true);
+            popover.set_child(Some(&scroll));
+
+            list_box.connect_row_activated({
+                let popover = popover.clone();
+                let entries = entries.clone();
+                let repo = repo.clone();
+                let exit_conflict_mode = exit_conflict_mode.clone();
+                let enter_conflict_mode = enter_conflict_mode.clone();
+                let refresh = refresh.clone();
+                let show_status = show_status.clone();
+                let list = list.clone();
+                let trashed = trashed.clone();
+                let pending_trash_op = pending_trash_op.clone();
+                let trash_list = trash_list.clone();
+                let trash_scroll = trash_scroll.clone();
+                let review_button = review_button.clone();
+                let render_review = render_review.clone();
+                move |_, row| {
+                    let Some((target, label, _)) = entries.get(row.index() as usize) else {
+                        return;
+                    };
+                    let (target, label) = (*target, label.clone());
+                    popover.popdown();
+                    // Bind the outcome before the match so `repo`'s borrow is
+                    // dropped before the reset closures re-borrow it.
+                    let outcome = repo.borrow_mut().jump_to_op(target);
+                    let outcome = match outcome {
+                        Ok(o) => o,
+                        Err(err) => {
+                            show_status(&format!("Time-travel failed: {err}"));
+                            return;
+                        }
+                    };
+                    // A recorded op should always re-export clean; handle conflicts
+                    // defensively by entering the resolution flow.
+                    if let SaveOutcome::Conflicts { commits } = outcome {
+                        enter_conflict_mode(commits);
                         return;
                     }
                     // Drop conflict mode if we were resolving (idempotent otherwise).
                     exit_conflict_mode();
-                    // The session's drops are undone, so empty the trash bin and
-                    // drop any trash change a held-back rewrite was waiting on.
+                    // The jump undoes the session's drops, so empty the trash bin
+                    // and drop any trash change a held-back rewrite was waiting on.
                     pending_trash_op.borrow_mut().take();
                     trashed.borrow_mut().clear();
                     populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
-                    // Force the reselect to re-fire `row-selected` (rows are reused),
-                    // so the diff pane reloads the reverted content — same reasoning
-                    // as the abort handler above.
+                    // Re-fire `row-selected` (rows are reused) so the diff pane
+                    // reloads the travelled-to content.
                     list.unselect_all();
                     refresh();
-                    // If the selection no longer names a live commit (it was a
-                    // conflict the revert undid), fall back to the branch tip so the
-                    // pane reloads instead of keeping stale content.
                     if list.selected_row().is_none() {
                         if let Some(row) = list.row_at_index(0) {
                             list.select_row(Some(&row));
                         }
                     }
-                    // If we're reviewing, re-render: the revert restored the
-                    // session-start tree, so the review now shows no changes.
                     if review_button.is_active() {
                         render_review();
                     }
-                    show_status("Reverted to the original session state.");
-                },
-            );
+                    show_status(&format!("Travelled to: {label}"));
+                }
+            });
+
+            // Drop any lingering hover highlight and detach the popover on close.
+            popover.connect_closed({
+                let list = list.clone();
+                move |p| {
+                    clear_highlight(&list);
+                    p.unparent();
+                }
+            });
+            popover.popup();
         }
     });
 
@@ -2346,6 +2415,47 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     }
 
     window.present();
+}
+
+/// Build one row for the "Edit history" dropdown: the op `label`, prefixed with a
+/// `●` and bolded when it is the current state, and dimmed when it is a redo
+/// target (a state ahead of the cursor — still clickable). `subtitle`, when given,
+/// is shown dimmed below the label (the session-start short hash).
+fn history_row(label: &str, subtitle: Option<&str>, current: bool, future: bool) -> ListBoxRow {
+    let vbox = GtkBox::new(Orientation::Vertical, 0);
+    vbox.set_margin_top(3);
+    vbox.set_margin_bottom(3);
+    vbox.set_margin_start(8);
+    vbox.set_margin_end(12);
+
+    let hbox = GtkBox::new(Orientation::Horizontal, 6);
+    let marker = Label::new(Some(if current { "\u{25CF}" } else { " " }));
+    marker.set_width_chars(1);
+    hbox.append(&marker);
+    let text = Label::new(None);
+    text.set_xalign(0.0);
+    if current {
+        text.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(label)));
+    } else {
+        text.set_text(label);
+    }
+    hbox.append(&text);
+    vbox.append(&hbox);
+
+    if let Some(sub) = subtitle {
+        let s = Label::new(Some(sub));
+        s.set_xalign(0.0);
+        s.add_css_class("dim-label");
+        s.set_margin_start(18);
+        vbox.append(&s);
+    }
+
+    let row = ListBoxRow::new();
+    row.set_child(Some(&vbox));
+    if future {
+        row.add_css_class("dim-label");
+    }
+    row
 }
 
 /// Split the combined diff buffer into the per-file edits whose reconstructed

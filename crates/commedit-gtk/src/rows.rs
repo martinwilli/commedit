@@ -189,6 +189,29 @@ pub(crate) fn populate_list(list: &ListBox, commits: &[CommitInfo], conflicts: &
     populate_rows(list, commits, true, conflicts);
 }
 
+/// Add the `op-affected` highlight to every history row whose commit's change id
+/// is in `affected` — used while hovering an "Edit history" dropdown entry, to
+/// show which commit(s) that operation touched before committing to a jump.
+pub(crate) fn highlight_affected(list: &ListBox, commits: &[CommitInfo], affected: &[String]) {
+    for (i, commit) in commits.iter().enumerate() {
+        if affected.iter().any(|c| *c == commit.change_id_hex()) {
+            if let Some(row) = list.row_at_index(i as i32) {
+                row.add_css_class("op-affected");
+            }
+        }
+    }
+}
+
+/// Remove the `op-affected` highlight from every history row (on hover leave or
+/// when the "Edit history" popover closes).
+pub(crate) fn clear_highlight(list: &ListBox) {
+    let mut i = 0;
+    while let Some(row) = list.row_at_index(i) {
+        row.remove_css_class("op-affected");
+        i += 1;
+    }
+}
+
 /// Fill the trash list with the session's dropped commits, reusing rows. When
 /// empty, the scrolled list is hidden so the panel collapses to just its trash
 /// icon (the icon still carries the drop target).

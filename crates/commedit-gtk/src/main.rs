@@ -2281,8 +2281,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             .expect("valid shortcut trigger");
         Shortcut::new(Some(trigger), Some(action))
     };
+    // Ctrl+Q closes the window.
+    let quit_shortcut = {
+        let window = window.clone();
+        let action = CallbackAction::new(move |_, _| {
+            window.close();
+            glib::Propagation::Stop
+        });
+        let trigger = ShortcutTrigger::parse_string("<Control>q")
+            .expect("valid shortcut trigger");
+        Shortcut::new(Some(trigger), Some(action))
+    };
     let shortcuts = ShortcutController::new();
     shortcuts.add_shortcut(save_shortcut);
+    shortcuts.add_shortcut(quit_shortcut);
     window.add_controller(shortcuts);
 
     // Initial population and selection.

@@ -235,6 +235,14 @@ impl Repo {
         heads: BTreeMap<String, String>,
         strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
+        // If this rewrite leaves the branch bookmark conflicted, jj can't export
+        // it to git, so the edit would silently never reach git. Refuse before
+        // committing — the tx is dropped here, leaving jj untouched, rather than
+        // piling up an unexportable divergent commit. Checked on the tx's own
+        // post-rewrite view: reorder/restore resolved the bookmark (set the head
+        // explicitly) and pass; a message/identity/squash/split edit can't, so a
+        // diverged branch is caught here.
+        self.ensure_branch_exportable(tx.repo())?;
         self.repo = block_on(tx.commit(op_msg)).context("committing rewrite")?;
         self.pending = Some(PendingResolution {
             pre_op,

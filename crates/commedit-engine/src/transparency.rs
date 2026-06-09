@@ -20,6 +20,17 @@ use jj_lib::repo::MutableRepo;
 /// moved bookmarks that pointed at rewritten commits during
 /// `rebase_descendants`, so this makes those moves visible to git.
 pub fn export_to_git(mut_repo: &mut MutableRepo) -> Result<()> {
+    // NB: `export_refs` returns per-ref failures in `GitExportStats`, but we
+    // deliberately *don't* turn them into an error. The two interesting cases
+    // here are both already handled better elsewhere or must stay tolerated:
+    //   * A bookmark whose *new* target is conflicted is silently skipped by jj
+    //     (`diff_refs_to_export`) and never reported as failed at all — so this
+    //     check couldn't catch it. That case is refused up front by
+    //     `Repo::ensure_branch_exportable`, before any rewrite is committed.
+    //   * A `FailedToSet` arises legitimately when two app instances race (one
+    //     already moved git's ref, so the other's "must-match-old" precondition
+    //     fails); that divergence is reconciled on the next `Repo::open`, so
+    //     bailing here would break an intentionally-tolerated flow.
     git::export_refs(mut_repo).context("exporting refs to git")?;
     Ok(())
 }

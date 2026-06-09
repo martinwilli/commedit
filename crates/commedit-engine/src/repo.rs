@@ -125,6 +125,47 @@ impl Repo {
             .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).into())
     }
 
+    /// Refuse a rewrite whose transaction leaves the checked-out branch's
+    /// bookmark in a *conflicted* state — pointing at several commits at once.
+    /// jj **cannot export a conflicted bookmark** to a single git ref:
+    /// `diff_refs_to_export` silently *skips* it (it never lands in
+    /// `GitExportStats::failed_bookmarks`, so the export tail can't notice). The
+    /// rewrite would then commit on the jj side yet never reach git — the silent
+    /// no-op that just piles up divergent commits.
+    ///
+    /// Checked against the *transaction's* post-rewrite view (`mut_repo`), so the
+    /// test is purely on the outcome: a reorder/restore sets the head bookmark
+    /// explicitly, resolving any pre-existing conflict, and passes; a
+    /// message/identity/squash/split edit only relies on jj's automatic bookmark
+    /// move, which can't collapse a conflict, so it stays conflicted and is
+    /// refused here — before [`Self::finish_mutation`] commits the tx, so it is
+    /// dropped untouched and nothing piles up. A bookmark is typically left
+    /// conflicted because the git branch and its upstream diverged (jj's import
+    /// merges the local and remote-tracking refs into one bookmark). No-op on a
+    /// detached HEAD and on the normal resolved case.
+    pub(crate) fn ensure_branch_exportable(&self, mut_repo: &MutableRepo) -> Result<()> {
+        let Some(name) = self.current_bookmark() else {
+            return Ok(());
+        };
+        if !mut_repo.get_local_bookmark(&name).has_conflict() {
+            return Ok(());
+        }
+        let branch = self
+            .git_head_branch
+            .as_deref()
+            .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
+            .unwrap_or("the current branch");
+        anyhow::bail!(
+            "branch '{branch}' is in a conflicted state in jj, so commedit can't \
+             rewrite its history: jj cannot export a conflicted bookmark to a git \
+             ref, so the edit would never reach git. This usually means the git \
+             branch and its upstream have diverged (their refs merged into one \
+             ambiguous bookmark on import). Reconcile the divergence first (merge \
+             or rebase onto the remote, or `jj bookmark set {branch} -r <commit>`), \
+             then reopen the repository."
+        );
+    }
+
     /// Point the originally checked-out branch at `target` inside `mut_repo`.
     /// Reordering can produce a new history head that is not a rewrite of the old
     /// head, so jj's automatic bookmark moves don't always follow; callers set it

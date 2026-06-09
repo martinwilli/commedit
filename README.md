@@ -63,9 +63,12 @@ an interactive-rebase session.
   window into a read-only, full-window diff of every content change you've made
   this session: the repository now versus how it was when you opened it.
 
-- **Undo the whole session** — one click on **Revert all** rolls the repository
-  back to the state it was in when you opened it, undoing every rewrite, reorder,
-  squash and working-copy edit made since.
+- **Travel through your edits** — the toolbar's **Edit history** button (the
+  clock icon) opens a dropdown of every change you've made this session, newest
+  first, with a marker on where you are now. Click any entry to roll the
+  repository — commits, branch and working tree — back, or forward, to that
+  snapshot; hovering one highlights the commit rows it touched. The bottom
+  **Session start** entry undoes the whole session at once.
 
 ## Installing a binary release
 
@@ -163,12 +166,13 @@ This project has been completely vibe-coded. It rewrites git history, and it may
 eat your commits and your git repository. Use it only on repositories you can
 afford to lose, and keep a backup.
 
-As a recovery anchor, the toolbar's **Revert all** button rolls the whole
-session back to the state your repository was in when you opened it — one click
-undoes every rewrite, reorder, squash and working-copy edit made since. If a
-session goes wrong beyond that (the app crashes, say), `git reflog` still holds
-the commit your branch pointed at when you opened it, so a `git reset --hard`
-gets you back.
+As a recovery anchor, the toolbar's **Edit history** dropdown can travel the
+repository to any snapshot from this session — and its bottom **Session start**
+entry rolls the whole session back to the state your repository was in when you
+opened it, undoing every rewrite, reorder, squash and working-copy edit made
+since. If a session goes wrong beyond that (the app crashes, say), `git reflog`
+still holds the commit your branch pointed at when you opened it, so a
+`git reset --hard` gets you back.
 
 ## License
 

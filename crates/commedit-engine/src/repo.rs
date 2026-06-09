@@ -373,20 +373,21 @@ impl Repo {
     fn import_git(&mut self) -> Result<()> {
         let mut tx = self.repo.start_transaction();
         pollster::block_on(git::import_head(tx.repo_mut())).context("importing git HEAD")?;
-        // `auto_local_bookmark: false` is deliberate: it stops jj from *tracking*
-        // remote-tracking refs (`origin/*`) and merging them into the local
-        // bookmark. With tracking on, a branch that has diverged from its upstream
-        // — an ordinary git state plain git edits freely — imports as a
+        // An empty `remote_auto_track_bookmarks` is deliberate: it stops jj from
+        // *tracking* remote-tracking refs (`origin/*`) and merging them into the
+        // local bookmark. With tracking on, a branch that has diverged from its
+        // upstream — an ordinary git state plain git edits freely — imports as a
         // *conflicted* local bookmark (local position merged with the remote one),
         // which jj can't export to a single git ref, so every edit silently failed
         // to reach git (now guarded by `ensure_branch_exportable`). commedit only
         // ever rewrites the checked-out *local* branch and walks HEAD's ancestors
         // (remotes are intentionally excluded from the history view), so it has no
         // use for the remote merge; importing the local ref straight keeps a
-        // diverged branch cleanly editable.
+        // diverged branch cleanly editable. `record_synthetic_predecessors: false`
+        // keeps imported commits free of jj-only predecessor metadata.
         let options = GitImportOptions {
-            auto_local_bookmark: false,
             abandon_unreachable_commits: false,
+            record_synthetic_predecessors: false,
             remote_auto_track_bookmarks: HashMap::new(),
         };
         pollster::block_on(git::import_refs(tx.repo_mut(), &options)).context("importing git refs")?;

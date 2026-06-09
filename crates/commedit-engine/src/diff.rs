@@ -13,7 +13,7 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::RepoPath;
 use jj_lib::store::Store;
-use tokio::io::AsyncReadExt;
+use futures::io::AsyncReadExt;
 
 /// How a file changed in a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

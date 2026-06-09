@@ -15,8 +15,8 @@ backend = "none"
 
 [git]
 abandon-unreachable-commits = true
-auto-local-bookmark = true
 executable-path = "git"
+record-synthetic-predecessors = false
 write-change-id-header = true
 
 [merge]

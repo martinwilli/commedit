@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
+use futures::StreamExt;
 use jj_lib::backend::{ChangeId, CommitId, Timestamp};
 use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
@@ -121,7 +122,8 @@ pub fn history_limited(
     let root = store.root_commit_id().clone();
     let mut commits = Vec::new();
     let mut has_more = false;
-    for entry in revset.commit_change_ids() {
+    let mut ids = revset.commit_change_ids();
+    while let Some(entry) = pollster::block_on(ids.next()) {
         let (id, _change_id) = entry.context("iterating history")?;
         if id == root {
             continue;
@@ -163,7 +165,8 @@ pub fn history_range(
     let store = repo.store();
     let root = store.root_commit_id().clone();
     let mut commits = Vec::new();
-    for entry in revset.commit_change_ids() {
+    let mut ids = revset.commit_change_ids();
+    while let Some(entry) = pollster::block_on(ids.next()) {
         let (id, _change_id) = entry.context("iterating the rewritten range")?;
         if id == root {
             continue;

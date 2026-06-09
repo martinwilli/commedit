@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use jj_lib::backend::{Backend, BackendInitError, CommitId};
-use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{self, GitImportOptions, GitRefKind, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
 use jj_lib::git_backend::GitBackend;
@@ -420,61 +419,6 @@ impl Repo {
                 "commedit: could not move {ref_name} to the rewritten tip {new_tip} ({e}); \
                  git will reconcile on the next open"
             );
-        }
-    }
-
-    /// Scrub the `refs/jj/keep/*` GC-protection refs that this rewrite orphaned
-    /// (see [`crate::transparency::prune_orphaned_keep_refs`]). `old_head` is the
-    /// branch tip from before the operation. Best-effort cleanup: it runs after a
-    /// mutation has already been committed and exported, so a failure here must not
-    /// invalidate that successful rewrite — errors are intentionally swallowed.
-    pub(crate) fn prune_orphaned_keep_refs(&self, old_head: &str) {
-        // commedit's own jj working-copy commits are ours to drop: the user's
-        // uncommitted changes are preserved by materializing @ to the working
-        // tree, so neither @ nor its superseded snapshots need linger as keep-refs
-        // (which would surface phantom working-copy commits in `git log --all`).
-        let owned = self.owned_workingcopy_keep_refs();
-        let _ = crate::transparency::prune_orphaned_keep_refs(
-            self.workspace.workspace_root(),
-            old_head,
-            &owned,
-        );
-    }
-
-    /// The `refs/jj/keep/*` oids that protect commedit's own working-copy
-    /// commits — the current `@`, its superseded snapshots (sharing its change
-    /// id), and jj's empty, description-less scaffolding commits. A manual jj
-    /// user's anonymous head (real content and description, an unrelated change
-    /// id) is deliberately excluded so its keep-ref survives.
-    fn owned_workingcopy_keep_refs(&self) -> Vec<String> {
-        let root = self.workspace.workspace_root();
-        let wc_change = self
-            .working_copy_commit_id()
-            .and_then(|id| self.repo.store().get_commit(&id).ok())
-            .map(|c| c.change_id().clone());
-        crate::transparency::keep_ref_oids(root)
-            .into_iter()
-            .filter(|oid| {
-                let Some(cid) = CommitId::try_from_hex(oid) else {
-                    return false;
-                };
-                let Ok(commit) = self.repo.store().get_commit(&cid) else {
-                    return false;
-                };
-                Some(commit.change_id()) == wc_change.as_ref()
-                    || (commit.description().is_empty() && self.is_empty_commit(&commit))
-            })
-            .collect()
-    }
-
-    /// Whether `commit` carries no changes over its parent(s) — true for jj's
-    /// empty working-copy scaffolding and a clean `@`.
-    fn is_empty_commit(&self, commit: &Commit) -> bool {
-        match pollster::block_on(commit.parent_tree(self.repo.as_ref())) {
-            Ok(parent_tree) => {
-                commit.tree().tree_ids_and_labels() == parent_tree.tree_ids_and_labels()
-            }
-            Err(_) => false,
         }
     }
 

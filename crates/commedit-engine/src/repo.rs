@@ -38,13 +38,28 @@ pub struct Repo {
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
     /// The jj operation captured at the end of [`Repo::open`] — the
-    /// fully-initialized, pre-session state (working copy included).
-    /// [`Repo::revert_all`] rolls the whole session back to it. `None` only in
-    /// the (unreachable) window before `open` finishes capturing it.
+    /// fully-initialized, pre-session state (working copy included). Cursor index
+    /// 0 (the "Edit history" dropdown's floor / [`Repo::revert_all`]) rolls the
+    /// whole session back to it. `None` only in the (unreachable) window before
+    /// `open` finishes capturing it.
     pub(crate) session_op: Option<Operation>,
-    /// The git HEAD commit (hex) as of session start, shown in the UI's
-    /// "Revert all" confirmation so the user sees what they revert to.
+    /// The git HEAD commit (hex) as of session start, shown as a subtitle on the
+    /// "Edit history" dropdown's session-start floor.
     session_head: Option<String>,
+    /// The operations performed this session, oldest first — the snapshots the
+    /// "Edit history" time-travel dropdown steps through (see
+    /// [`crate::conflict::OpEntry`]). `session_op` is the implicit floor below
+    /// index 0.
+    pub(crate) session_ops: Vec<crate::conflict::OpEntry>,
+    /// The live cursor over `session_ops`: `0` is the session-start floor,
+    /// `session_ops.len()` the latest recorded state. Undo decrements, redo
+    /// increments; a fresh edit truncates any tail above it.
+    pub(crate) op_cursor: usize,
+    /// The description of the in-flight mutation, set when `pending` is set and
+    /// recorded as a session op once the rewrite settles clean (held here, rather
+    /// than in `PendingResolution`, so the abort/conflict state object is
+    /// unchanged). See [`Repo::record_op`].
+    pub(crate) pending_op_desc: Option<crate::conflict::OpDescriptor>,
 }
 
 impl Repo {
@@ -95,6 +110,9 @@ impl Repo {
             pending: None,
             session_op: None,
             session_head: None,
+            session_ops: Vec::new(),
+            op_cursor: 0,
+            pending_op_desc: None,
         };
         this.import_git()?;
         crate::transparency::ensure_jj_excluded(workspace_root)?;

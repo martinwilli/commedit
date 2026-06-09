@@ -9,7 +9,7 @@ use jj_lib::rewrite::{
     move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
 };
 
-use crate::conflict::{SaveOutcome, SpuriousResolve};
+use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::history::{
     plan_drop, plan_reorder, plan_restore, parse_timestamp, CommitInfo, ReorderMove,
 };
@@ -47,6 +47,7 @@ impl Repo {
             .store()
             .get_commit(target)
             .context("loading target commit")?;
+        let desc = self.op_desc_for("Edit message of", target);
 
         let mut tx = self.repo.start_transaction();
         pollster::block_on(
@@ -62,6 +63,7 @@ impl Repo {
         self.finish_mutation(
             tx,
             "commedit: edit commit message",
+            desc,
             pre_op,
             old_head,
             bookmarks,
@@ -102,6 +104,7 @@ impl Repo {
             email: id.committer_email.clone(),
             timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
         };
+        let desc = self.op_desc_for("Edit identity of", target);
 
         let mut tx = self.repo.start_transaction();
         pollster::block_on(
@@ -117,6 +120,7 @@ impl Repo {
         self.finish_mutation(
             tx,
             "commedit: edit commit identity",
+            desc,
             pre_op,
             old_head,
             bookmarks,
@@ -175,6 +179,7 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
     ) -> Result<SaveOutcome> {
+        let desc = self.op_desc_for("Reorder", target);
         self.splice_commit(
             target,
             new_parent_ids,
@@ -182,6 +187,7 @@ impl Repo {
             new_tip,
             "commedit: reorder commit",
             SpuriousResolve::CleanTip,
+            desc,
         )
     }
 
@@ -196,6 +202,7 @@ impl Repo {
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
     ) -> Result<SaveOutcome> {
+        let desc = self.op_desc_for("Restore", target);
         self.splice_commit(
             target,
             new_parent_ids,
@@ -205,12 +212,14 @@ impl Repo {
             SpuriousResolve::Restore {
                 commit: target.clone(),
             },
+            desc,
         )
     }
 
     /// Shared body of [`Self::reorder_commit`] and [`Self::restore_commit`]: move
     /// `target` between `new_parent_ids` and `new_child_ids`, rebase descendants,
     /// point the branch at `new_tip`, and export — all in one transaction.
+    #[allow(clippy::too_many_arguments)]
     fn splice_commit(
         &mut self,
         target: &CommitId,
@@ -219,6 +228,7 @@ impl Repo {
         new_tip: &CommitId,
         op_msg: &str,
         strategy: SpuriousResolve,
+        desc: OpDescriptor,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("moving the commit", || {
             self.splice_commit_inner(
@@ -228,10 +238,12 @@ impl Repo {
                 new_tip,
                 op_msg,
                 strategy,
+                desc,
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn splice_commit_inner(
         &mut self,
         target: &CommitId,
@@ -240,6 +252,7 @@ impl Repo {
         new_tip: &CommitId,
         op_msg: &str,
         strategy: SpuriousResolve,
+        desc: OpDescriptor,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -275,7 +288,7 @@ impl Repo {
         };
         self.set_head_bookmark(tx.repo_mut(), new_tip_id);
 
-        self.finish_mutation_spurious(tx, op_msg, pre_op, old_head, bookmarks, heads, strategy)
+        self.finish_mutation_spurious(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, strategy)
     }
 
     /// Drop `target` from history entirely: its descendants are rebased onto its
@@ -298,6 +311,7 @@ impl Repo {
             .store()
             .get_commit(target)
             .context("loading target commit")?;
+        let desc = self.op_desc_for("Drop", target);
 
         let mut tx = self.repo.start_transaction();
         // Record the abandon, then rebase: children re-parent onto the commit's
@@ -313,6 +327,7 @@ impl Repo {
         self.finish_mutation_spurious(
             tx,
             "commedit: drop commit",
+            desc,
             pre_op,
             old_head,
             bookmarks,

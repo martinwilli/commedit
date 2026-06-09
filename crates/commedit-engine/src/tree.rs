@@ -64,6 +64,7 @@ impl Repo {
             .context("loading target commit")?;
         let store = self.repo.store().clone();
         let new_tree = splice_files_into_tree(commit.tree(), &store, files)?;
+        let desc = self.op_desc_for("Edit files of", target);
 
         let mut tx = self.repo.start_transaction();
         pollster::block_on(
@@ -78,6 +79,7 @@ impl Repo {
         self.finish_mutation(
             tx,
             "commedit: edit file content",
+            desc,
             pre_op,
             old_head,
             bookmarks,

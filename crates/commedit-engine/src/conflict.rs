@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Context, Result};
 use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
+use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::conflicts::{
     choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
@@ -37,6 +38,17 @@ use crate::repo::Repo;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
+}
+
+/// The first line of `commit`'s description, quoted for an op-log label
+/// (e.g. `"Add feature"`), or a placeholder when the message is empty.
+pub(crate) fn op_subject(commit: &Commit) -> String {
+    let subject = commit.description().lines().next().unwrap_or("").trim();
+    if subject.is_empty() {
+        "(no message)".to_string()
+    } else {
+        format!("\"{subject}\"")
+    }
 }
 
 /// Direction in which [`Repo::transform_tree`] replays a commit's change.
@@ -60,6 +72,46 @@ pub enum SaveOutcome {
     /// resolution; drive it with [`Repo::read_conflict`] / [`Repo::resolve_conflict`]
     /// (or discard it with [`Repo::abort`]).
     Conflicts { commits: Vec<ConflictedCommit> },
+}
+
+/// A description of a session mutation, built at the call site and consumed by
+/// [`Repo::record_op`] once the mutation lands clean. It is held on `Repo`
+/// (`pending_op_desc`) while a conflicted rewrite is still being resolved, then
+/// recorded when the chain finally goes clean. `label` is the human string the
+/// "Edit history" dropdown shows; `affected` is the change-id hex(es) the op
+/// touched, for the dropdown's hover-highlight of history rows.
+#[derive(Clone)]
+pub struct OpDescriptor {
+    label: String,
+    affected: Vec<String>,
+}
+
+impl OpDescriptor {
+    pub(crate) fn new(label: String, affected: Vec<String>) -> Self {
+        Self { label, affected }
+    }
+}
+
+/// One recorded operation in this session's linear op-log — the unit the
+/// "Edit history" time-travel dropdown steps through. Holds the jj [`Operation`]
+/// to rewind to (cheap to clone — two `Arc`s) plus its display label and the
+/// change-ids it touched.
+#[derive(Clone)]
+pub struct OpEntry {
+    op: Operation,
+    label: String,
+    affected: Vec<String>,
+}
+
+impl OpEntry {
+    /// The human-readable label shown in the "Edit history" dropdown.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+    /// Change-id hex(es) this op touched, for hover-highlighting history rows.
+    pub fn affected(&self) -> &[String] {
+        &self.affected
+    }
 }
 
 /// A conflicted commit awaiting resolution.
@@ -181,47 +233,53 @@ impl Repo {
     /// tip's ancestor chain is conflict-free) or hold the rewrite pending while
     /// the conflicts are resolved. Every mutation ends here in place of the old
     /// inline export tail.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_mutation(
         &mut self,
         tx: Transaction,
         op_msg: &str,
+        desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, SpuriousResolve::Off)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, SpuriousResolve::Off)
     }
 
     /// Like [`Self::finish_mutation`] but, for a reorder or squash, opts the
     /// held-back chain into spurious-conflict auto-resolution anchored on the
     /// clean post-mutation tip (see [`SpuriousResolve::CleanTip`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_mutation_auto_resolve(
         &mut self,
         tx: Transaction,
         op_msg: &str,
+        desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, SpuriousResolve::CleanTip)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, SpuriousResolve::CleanTip)
     }
 
     /// Like [`Self::finish_mutation`] but opts into an explicit
     /// spurious-conflict auto-resolution strategy — used by drop/restore, whose
     /// post-mutation tip may itself be conflicted (see [`SpuriousResolve`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_mutation_spurious(
         &mut self,
         tx: Transaction,
         op_msg: &str,
+        desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
         heads: BTreeMap<String, String>,
         strategy: SpuriousResolve,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, pre_op, old_head, bookmarks, heads, strategy)
+        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, bookmarks, heads, strategy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -229,6 +287,7 @@ impl Repo {
         &mut self,
         tx: Transaction,
         op_msg: &str,
+        desc: OpDescriptor,
         pre_op: Operation,
         old_head: Option<String>,
         bookmarks: Vec<(RefNameBuf, RefTarget)>,
@@ -253,6 +312,11 @@ impl Repo {
             conflicts: Vec::new(),
             strategy,
         });
+        // Remember the op's description until the chain settles clean; `settle`
+        // records it as a session op-log entry once the deferred export runs
+        // (so a conflicted-then-resolved mutation records exactly once, on the
+        // final clean step — see `record_op`).
+        self.pending_op_desc = Some(desc);
         self.settle()
     }
 
@@ -397,29 +461,124 @@ impl Repo {
         Ok(())
     }
 
-    /// Roll the entire session back to its starting point: restore jj's view to
-    /// the operation captured at [`Repo::open`] (the original commits *and* the
-    /// session-start working copy) and re-export it to git, so plain `git` sees
-    /// the original history and the working tree is reset to its session-start
-    /// content. Discards every rewrite/reorder/squash/drop and every
-    /// working-copy edit made this session — the in-app equivalent of
-    /// `git reset --hard <session head>`.
+    /// Roll the entire session back to its starting point — the in-app
+    /// equivalent of `git reset --hard <session head>`. A thin wrapper over
+    /// [`Self::set_op_cursor`]`(0)`: cursor index 0 is the session-start floor,
+    /// so reverting is just time-travelling to the very first snapshot. Kept as a
+    /// named method because the engine tests and the session-review flow lean on
+    /// its exact semantics (restore the original commits *and* working copy).
+    pub fn revert_all(&mut self) -> Result<()> {
+        crate::repo::catch_jj("reverting the session", || {
+            self.set_op_cursor(0).map(|_| ())
+        })
+    }
+
+    /// Whether there is a recorded session op to step back to (`op_cursor > 0`).
+    pub fn can_undo(&self) -> bool {
+        self.op_cursor > 0
+    }
+
+    /// Whether there is a recorded session op ahead of the cursor to step
+    /// forward to (`op_cursor < session_ops.len()`).
+    pub fn can_redo(&self) -> bool {
+        self.op_cursor < self.session_ops.len()
+    }
+
+    /// The recorded session operations, oldest first — the snapshots the
+    /// "Edit history" dropdown lists. The session-start state (index 0 / the
+    /// dropdown's floor) is *not* in this list; it is the implicit floor below
+    /// the first entry, reached with [`Self::jump_to_op`]`(0)`.
+    pub fn session_ops(&self) -> &[OpEntry] {
+        &self.session_ops
+    }
+
+    /// The live cursor over [`Self::session_ops`]: `0` is the session-start
+    /// floor, `session_ops.len()` is the latest recorded state.
+    pub fn op_cursor(&self) -> usize {
+        self.op_cursor
+    }
+
+    /// Step back one recorded operation (a no-op at the session-start floor).
+    pub fn undo(&mut self) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("undoing", || {
+            if self.op_cursor == 0 {
+                return Ok(SaveOutcome::Clean);
+            }
+            self.set_op_cursor(self.op_cursor - 1)
+        })
+    }
+
+    /// Step forward one recorded operation (a no-op at the latest state).
+    pub fn redo(&mut self) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("redoing", || {
+            if self.op_cursor >= self.session_ops.len() {
+                return Ok(SaveOutcome::Clean);
+            }
+            self.set_op_cursor(self.op_cursor + 1)
+        })
+    }
+
+    /// Travel the repository to a recorded session snapshot: `target == 0` is the
+    /// session-start floor, `target == session_ops().len()` the latest state. The
+    /// surface behind the "Edit history" dropdown.
+    pub fn jump_to_op(&mut self, target: usize) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("jumping to a recorded state", || {
+            if target > self.session_ops.len() {
+                bail!("op-log target out of range");
+            }
+            self.set_op_cursor(target)
+        })
+    }
+
+    /// Move the session op-cursor to `target` and materialize that state to
+    /// git/disk. The shared core of [`Self::undo`]/[`Self::redo`]/
+    /// [`Self::jump_to_op`]/[`Self::revert_all`].
+    ///
+    /// Snapshots the working copy first, so any on-disk edits not yet captured
+    /// survive in jj's op log; the jump itself then replaces the working tree
+    /// with the target snapshot's content (`git reset --hard`-style — uncommitted
+    /// changes made since the target are reset, but remain recoverable via jj's
+    /// op log). Drops any held conflicted rewrite (you cannot step the timeline
+    /// mid-resolution). Every recorded op was a clean, exported state, so the
+    /// rewind always lands [`SaveOutcome::Clean`].
+    fn set_op_cursor(&mut self, target: usize) -> Result<SaveOutcome> {
+        if self.pending.is_none() {
+            // No held conflict: capture any on-disk edits into @ first, so they
+            // are preserved in jj's op log even though the rewind below resets the
+            // working tree. (When a conflicted rewrite is held, git/disk are still
+            // the pre-rewrite state and the whole rewrite is about to be
+            // discarded, so there is nothing new to snapshot.)
+            self.snapshot_working_copy()?;
+        }
+        // Drop any held-back conflicted rewrite and its pending description; git
+        // was never touched for it.
+        self.pending = None;
+        self.pending_op_desc = None;
+        let op = if target == 0 {
+            match &self.session_op {
+                Some(op) => op.clone(),
+                // The (unreachable) window before `open` finishes capturing it.
+                None => return Ok(SaveOutcome::Clean),
+            }
+        } else {
+            self.session_ops[target - 1].op.clone()
+        };
+        self.rewind_to_op(op)?;
+        self.op_cursor = target;
+        Ok(SaveOutcome::Clean)
+    }
+
+    /// Rewind jj's view to a previously-recorded operation and re-export it to
+    /// git/disk — the generalized core of the old `revert_all`. Drops any held
+    /// rewrite, then restores the target view and reconciles git with it.
     ///
     /// Like [`Self::abort`], the restore is *recorded* as a new operation rather
     /// than a bare reload (see that method's note on why a divergent op head
-    /// would otherwise resurface the old state). Unlike `abort`, clean saves
-    /// during the session already moved git refs / HEAD / the worktree, so the
-    /// restored state must be exported and materialized back to disk — hence the
-    /// `export_and_sync` tail. Reverting drops any pending conflicted rewrite
-    /// first (git was never touched for it).
-    pub fn revert_all(&mut self) -> Result<()> {
-        crate::repo::catch_jj("reverting the session", || self.revert_all_inner())
-    }
-
-    fn revert_all_inner(&mut self) -> Result<()> {
-        let Some(session_op) = self.session_op.clone() else {
-            return Ok(());
-        };
+    /// would otherwise resurface the old state). Clean saves during the session
+    /// already moved git refs / HEAD / the worktree, so the restored state must
+    /// be exported and materialized back to disk — hence the `export_and_sync`
+    /// tail.
+    fn rewind_to_op(&mut self, op: Operation) -> Result<()> {
         // Drop any held-back conflicted rewrite; git was never touched for it.
         self.pending = None;
         // The export tail needs the *current* (rewritten) on-disk state to sync
@@ -428,11 +587,12 @@ impl Repo {
         let bookmarks = self.local_bookmark_targets();
         let heads = self.snapshot_heads();
         // jj's recorded git-ref state tracks what it last wrote to git's
-        // refs/*; the session's clean saves left it at the rewritten tips. Keep
-        // a copy: `set_view` below rewinds this record to the session-start
-        // values, but git's actual on-disk refs are still at the rewritten tips,
-        // so the export would see no bookmark/ref diff and push nothing. We
-        // re-stamp these afterwards so the export reconciles git with reality.
+        // refs/*; the session's clean saves left it at the current tips. Keep a
+        // copy sampled from the *live* view (so chained undo/redo reconciles in
+        // either direction): `set_view` below rewinds this record to the target
+        // op's values, but git's actual on-disk refs are still at the current
+        // tips, so the export would see no diff and push nothing. We re-stamp
+        // these afterwards so the export reconciles git with reality.
         let on_disk_git_refs: Vec<_> = self
             .repo
             .view()
@@ -440,22 +600,54 @@ impl Repo {
             .iter()
             .map(|(name, target)| (name.clone(), target.clone()))
             .collect();
-        // Restore the session-start view and record it as a new operation.
-        let view = block_on(session_op.view()).context("reading the session-start view")?;
+        // Restore the target view and record it as a new operation.
+        let view = block_on(op.view()).context("reading the target view")?;
         let mut tx = self.repo.start_transaction();
         tx.repo_mut().set_view(view.store_view().clone());
         // Re-point the recorded git refs at what git actually holds on disk, so
-        // the deferred export detects bookmark(session-start) != git-ref(current)
-        // and pushes the restored tips back to git.
+        // the deferred export detects bookmark(target) != git-ref(current) and
+        // pushes the target tips back to git.
         for (name, target) in &on_disk_git_refs {
             tx.repo_mut().set_git_ref_target(name, target.clone());
         }
-        self.repo = block_on(tx.commit("commedit: revert all to session start"))
-            .context("recording the revert")?;
-        // Push the restored state back to git and check the original working
-        // copy back out to disk. The session-start state was a clean exported
-        // git history, so the restored chain is always conflict-free.
+        self.repo = block_on(tx.commit("commedit: time-travel to a recorded state"))
+            .context("recording the time-travel")?;
+        // Push the restored state back to git and check its working copy back out
+        // to disk. Every recorded op was a clean exported git history, so the
+        // restored chain is always conflict-free.
         self.export_and_sync(old_head, &bookmarks, &heads)
+    }
+
+    /// Append a landed mutation to the session op-log the time-travel dropdown
+    /// steps through. Truncates any redo tail first (a fresh edit after a
+    /// back-jump makes the redo branch unreachable — standard undo-stack
+    /// semantics; the orphaned commits are pruned by the normal keep-ref path),
+    /// then records the current op (the clean, git-exported state) and advances
+    /// the cursor to the tip.
+    pub(crate) fn record_op(&mut self, desc: OpDescriptor) {
+        if self.op_cursor < self.session_ops.len() {
+            self.session_ops.truncate(self.op_cursor);
+        }
+        self.session_ops.push(OpEntry {
+            op: self.repo.operation().clone(),
+            label: desc.label,
+            affected: desc.affected,
+        });
+        self.op_cursor = self.session_ops.len();
+    }
+
+    /// Build an [`OpDescriptor`] for a mutation acting on a single commit
+    /// `target`: an `<action> "<subject>"` label and the commit's change id (for
+    /// the dropdown's hover-highlight). Falls back to a bare label if the commit
+    /// can't be loaded.
+    pub(crate) fn op_desc_for(&self, action: &str, target: &CommitId) -> OpDescriptor {
+        match self.repo.store().get_commit(target) {
+            Ok(commit) => OpDescriptor::new(
+                format!("{action} {}", op_subject(&commit)),
+                vec![commit.change_id().hex()],
+            ),
+            Err(_) => OpDescriptor::new(action.to_string(), Vec::new()),
+        }
     }
 
     /// Materialize one conflicted file of the commit with change id `change_id`
@@ -629,6 +821,11 @@ impl Repo {
         if conflicts.is_empty() {
             let p = self.pending.take().expect("settle requires a pending resolution");
             self.export_and_sync(p.old_head, &p.bookmarks, &p.heads)?;
+            // The mutation landed clean and is now in git: record it as a
+            // session op-log entry the "Edit history" dropdown can travel back to.
+            if let Some(desc) = self.pending_op_desc.take() {
+                self.record_op(desc);
+            }
             return Ok(SaveOutcome::Clean);
         }
         // A reorder/squash/drop/restore whose conflicts are merely *spurious*

@@ -19,6 +19,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
 use jj_lib::merge::{Merge, MergedTreeValue};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::working_copy::{CheckoutStats, SnapshotOptions};
@@ -159,6 +160,7 @@ impl Repo {
             .store()
             .get_commit(&wc_id)
             .context("loading the working-copy commit")?;
+        let change_hex = commit.change_id().hex();
         let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
         let base_tree = commit.tree();
         let (executable, copy_id) = crate::tree::existing_file_meta(&base_tree, &repo_path);
@@ -184,7 +186,9 @@ impl Repo {
             .context("committing the working-copy edit")?;
 
         // Write the edited @ to disk (the branch tip is unchanged).
-        self.materialize_after_rewrite(self.head_commit())
+        self.materialize_after_rewrite(self.head_commit())?;
+        self.record_working_copy_op("Edit uncommitted changes", change_hex);
+        Ok(())
     }
 
     /// Discard a working-copy entry (identified by its stable change id, or the
@@ -216,6 +220,7 @@ impl Repo {
             .store()
             .get_commit(&target)
             .context("loading the working-copy entry")?;
+        let change_hex = commit.change_id().hex();
 
         let mut tx = self.repo.start_transaction();
         // Abandon the entry; deeper chain entries (and the leaf @) rebase onto its
@@ -227,7 +232,9 @@ impl Repo {
             .context("committing the working-copy drop")?;
 
         // Check the rebased leaf @ back out to disk (the branch tip is unchanged).
-        self.materialize_after_rewrite(self.head_commit())
+        self.materialize_after_rewrite(self.head_commit())?;
+        self.record_working_copy_op("Drop uncommitted changes", change_hex);
+        Ok(())
     }
 
     /// Materialize the rebased working-copy commit `@'` to disk after a rewrite,
@@ -263,6 +270,35 @@ impl Repo {
     pub fn working_copy_commit_id(&self) -> Option<CommitId> {
         let name = self.workspace.workspace_name();
         self.repo.view().get_wc_commit_id(name).cloned()
+    }
+
+    /// True when any entry in the working-copy chain has a conflicted tree.
+    /// Gates recording a working-copy-direct edit as a session op: we record
+    /// only clean, materialized states, so the time-travel jumps can always land
+    /// [`crate::conflict::SaveOutcome::Clean`].
+    pub(crate) fn working_copy_has_conflict(&self) -> bool {
+        self.working_copy_chain_ids().iter().any(|id| {
+            self.repo
+                .store()
+                .get_commit(id)
+                .map(|c| c.has_conflict())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Record a working-copy-direct edit (one that commits straight to jj with no
+    /// `finish_mutation`/export) as a session op-log entry the "Edit history"
+    /// dropdown can travel back to — unless it left the working copy conflicted.
+    /// `change_hex` is the edited entry's change id, for the dropdown's
+    /// hover-highlight.
+    pub(crate) fn record_working_copy_op(&mut self, label: &str, change_hex: String) {
+        if self.working_copy_has_conflict() {
+            return;
+        }
+        self.record_op(crate::conflict::OpDescriptor::new(
+            label.to_string(),
+            vec![change_hex],
+        ));
     }
 
     /// The uncommitted-changes chain as commit ids, newest first: the

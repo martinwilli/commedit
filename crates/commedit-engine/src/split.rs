@@ -15,6 +15,7 @@
 
 use anyhow::{bail, Context, Result};
 use jj_lib::backend::CommitId;
+use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 
 use crate::conflict::SaveOutcome;
@@ -63,6 +64,7 @@ impl Repo {
         let edited_tree = crate::tree::splice_files_into_tree(commit.tree(), &store, files)?;
         let author = commit.author().clone();
         let message = split_message(commit.description());
+        let desc = self.op_desc_for("Split", target);
 
         let mut tx = self.repo.start_transaction();
         // C': the current commit, rewritten to the edited diff. Keeps its change
@@ -94,6 +96,7 @@ impl Repo {
         self.finish_mutation(
             tx,
             "commedit: split commit",
+            desc,
             pre_op,
             old_head,
             bookmarks,
@@ -139,6 +142,7 @@ impl Repo {
             .store()
             .get_commit(&target)
             .context("loading the working-copy entry")?;
+        let change_hex = commit.change_id().hex();
         let store = self.repo.store().clone();
         let orig_tree = commit.tree();
         let edited_tree = crate::tree::splice_files_into_tree(commit.tree(), &store, files)?;
@@ -170,7 +174,9 @@ impl Repo {
 
         // The leaf @ holds the unchanged full tree, so this re-checkout is a
         // no-op on disk; it just resets the git index to HEAD (unchanged).
-        self.materialize_after_rewrite(self.head_commit())
+        self.materialize_after_rewrite(self.head_commit())?;
+        self.record_working_copy_op("Split uncommitted changes", change_hex);
+        Ok(())
     }
 }
 

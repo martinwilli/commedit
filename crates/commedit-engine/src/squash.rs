@@ -10,10 +10,11 @@
 
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
+use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
 
-use crate::conflict::SaveOutcome;
+use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
 use crate::history::{branch_chain, CommitInfo};
 use crate::repo::Repo;
 
@@ -367,6 +368,17 @@ impl Repo {
         let new_desc =
             compose_squash_message(mode, dest_commit.description(), source_commit.description());
         let dest_author = dest_commit.author().clone();
+        let desc = OpDescriptor::new(
+            format!(
+                "Squash {} into {}",
+                op_subject(&source_commit),
+                op_subject(&dest_commit)
+            ),
+            vec![
+                source_commit.change_id().hex(),
+                dest_commit.change_id().hex(),
+            ],
+        );
 
         let mut tx = self.repo.start_transaction();
         if source_is_orphan {
@@ -407,6 +419,7 @@ impl Repo {
         self.finish_mutation_auto_resolve(
             tx,
             "commedit: squash commit",
+            desc,
             pre_op,
             old_head,
             bookmarks,

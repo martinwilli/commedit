@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind};
-use commedit_engine::history::history;
+use commedit_engine::history::history_limited;
 use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
@@ -19,8 +19,8 @@ use crate::highlight::pill;
 use crate::rows::{populate_list, populate_trash};
 use crate::state::{
     Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, Side, Widgets, CONFLICT_CUE_LABEL,
-    CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS, SAVE_HINT_CONFLICT,
-    SAVE_HINT_DIFF,
+    CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS, HISTORY_PAGE,
+    SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -287,30 +287,62 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
     let selected_change = d.selected_change.clone();
     let wc_list = w.wc_list.clone();
     Rc::new(move || {
-        let loaded = {
-            let r = repo.borrow();
-            match r.jj_head_commit_id() {
-                Some(head) => history(&r.repo, &head).unwrap_or_default(),
-                None => Vec::new(),
-            }
-        };
-        *commits.borrow_mut() = loaded;
+        // Conflict metadata up front: which commits are still conflicted (badges)
+        // and the totals shown in the banner.
         let (badges, n_files, n_commits) = {
             let mode = pane_mode.borrow();
             if let PaneMode::Conflict(ctx) = &*mode {
                 let badges = ctx.conflicted_changes();
                 let files: usize = ctx.commits.iter().map(|c| c.files.len()).sum();
-                (badges.clone(), files, badges.len())
+                let n_commits = badges.len();
+                (badges, files, n_commits)
             } else {
                 (HashSet::new(), 0, 0)
             }
         };
-        // The working-copy chain resolves inline among the conflicted
-        // commits, so hide the standalone rows and prepend each conflicted
-        // entry to the chain. Insert oldest-first (the chain is newest-first)
-        // so the newest entry lands at the top, above the branch tip.
+        // The working-copy chain entries resolve inline among the conflicted
+        // commits; gather them (newest first) and the change ids they cover, so
+        // the history walk below can exclude them from what it must reach.
+        let wc_chain = repo.borrow().working_copy_chain();
+        let wc_changes: HashSet<String> =
+            wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
+        let branch_conflicts: Vec<String> = badges
+            .iter()
+            .filter(|ch| !wc_changes.contains(*ch))
+            .cloned()
+            .collect();
+
+        // Load only as much of the (possibly huge) ancestor history as needed to
+        // show every conflicted branch commit, growing the window geometrically.
+        // Conflicts live on the rewritten range near the tip, so this is normally
+        // a single small page. Walking the *whole* history here instead built one
+        // GTK row per ancestor and froze the UI on deep repositories.
+        let loaded = {
+            let r = repo.borrow();
+            match r.jj_head_commit_id() {
+                Some(head) => {
+                    let mut limit = HISTORY_PAGE;
+                    loop {
+                        let (page, has_more) =
+                            history_limited(&r.repo, &head, limit).unwrap_or_default();
+                        let shown: HashSet<String> =
+                            page.iter().map(|c| c.change_id_hex()).collect();
+                        if !has_more || branch_conflicts.iter().all(|ch| shown.contains(ch)) {
+                            break page;
+                        }
+                        limit = limit.saturating_mul(2);
+                    }
+                }
+                None => Vec::new(),
+            }
+        };
+        *commits.borrow_mut() = loaded;
+        // The working-copy chain resolves inline among the conflicted commits, so
+        // hide the standalone rows and prepend each conflicted entry to the chain.
+        // Insert oldest-first (the chain is newest-first) so the newest entry lands
+        // at the top, above the branch tip.
         wc_list.set_visible(false);
-        for entry in repo.borrow().working_copy_chain().into_iter().rev() {
+        for entry in wc_chain.into_iter().rev() {
             if badges.contains(&entry.info.change_id_hex()) {
                 commits.borrow_mut().insert(0, entry.info);
             }

@@ -1,9 +1,10 @@
-//! End-to-end: rewriting *merge* commits. Message, identity and (evil-merge)
-//! content edits must preserve both parents and the merge topology; an ancestor
-//! rewrite must keep a downstream merge a merge; and the structural operations
-//! that have no single-parent splice (reorder/drop/squash) must stay refused.
-//! Each test asserts the transparency triple and that no `.jjconflict-*` residue
-//! leaks into git.
+//! End-to-end: editing history around (and on) *merge* commits. Message,
+//! identity and (evil-merge) content edits must preserve both parents and the
+//! merge topology; the structural operations — move, drop, restore, squash —
+//! work anywhere in the graph and must keep a merge's 2-parent shape through
+//! every rebase. Only the merge commit itself stays fixed: it is never a drag
+//! source, though it is a valid squash destination. Each test asserts the
+//! transparency triple and that no `.jjconflict-*` residue leaks into git.
 
 mod common;
 
@@ -13,6 +14,7 @@ use commedit_engine::graph::compute_graph;
 use commedit_engine::history::{history, CommitInfo, ReorderCandidate};
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
+use commedit_engine::squash::SquashMode;
 
 /// Look up a commit in `commits` by its subject line.
 fn by<'a>(commits: &'a [CommitInfo], subject: &str) -> &'a CommitInfo {
@@ -331,12 +333,12 @@ fn dropping_a_commit_below_the_merge_keeps_the_merge() {
 }
 
 #[test]
-fn reorder_drop_squash_on_a_merge_refused() {
+fn the_merge_commit_itself_stays_fixed() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     common::init_merge_repo(dir);
-    // Put two linear commits on top of the merge, so the branch chain is the
-    // run [tip-2, tip-1] above the merge — a merge that is *not* the branch tip.
+    // Put two linear commits on top of the merge, so the merge is *not* the
+    // branch tip and has both ancestors and descendants to (not) move between.
     for (file, msg) in [("t1.txt", "tip-1"), ("t2.txt", "tip-2")] {
         std::fs::write(dir.join(file), "x\n").unwrap();
         common::git(dir, &["add", file]);
@@ -348,17 +350,80 @@ fn reorder_drop_squash_on_a_merge_refused() {
     let pos = |s: &str| commits.iter().position(|c| c.subject == s).unwrap();
     let (merge, tip1, tip2) = (pos("merge"), pos("tip-1"), pos("tip-2"));
 
-    // The merge sits off the editable single-parent chain, so every structural
-    // op that needs a single-parent splice refuses to touch it…
+    // A merge node is never a drag source — dropping, moving or squashing it
+    // away would dissolve the join point's shape…
     assert_eq!(repo.plan_drop(&commits, merge), None, "merge is not droppable");
-    assert_eq!(repo.plan_reorder(&commits, merge, 0), None, "merge is not reorderable");
+    assert!(
+        reorder_candidates(&repo, &commits, merge, 0).is_empty(),
+        "merge is not reorderable"
+    );
     assert_eq!(repo.plan_squash(&commits, merge, tip1), None, "merge is not a squash source");
-    assert_eq!(repo.plan_squash(&commits, tip1, merge), None, "merge is not a squash target");
 
-    // …while the linear commits above it remain fully operable — proving the
-    // refusal is specific to the merge, not a blanket failure on a merge repo.
+    // …but it is a valid squash *destination* (an evil-merge style fold), and
+    // the commits around it remain fully operable.
+    assert!(repo.plan_squash(&commits, tip1, merge).is_some(), "merge is a squash target");
     assert!(repo.plan_drop(&commits, tip1).is_some(), "a linear commit is droppable");
     assert!(repo.plan_squash(&commits, tip2, tip1).is_some(), "linear commits squash");
+}
+
+#[test]
+fn squashing_across_merge_branches_lands_on_the_targets_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_merge_repo(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = current(&repo);
+    let pos = |s: &str| commits.iter().position(|c| c.subject == s).unwrap();
+
+    // Fold side-1 (second-parent line) into its cousin main-1 (first-parent
+    // line): the change crosses the fork, landing on the target's line.
+    let (source, dest) = repo
+        .plan_squash(&commits, pos("side-1"), pos("main-1"))
+        .expect("cousins on different sides squash");
+    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // main-1 now carries side.txt; the emptied side line degenerates onto the
+    // fork base but the merge keeps its 2-parent shape.
+    assert!(common::is_merge(dir, "HEAD"));
+    assert_eq!(parent_subjects(dir), vec!["base", "main-1"]);
+    let main1 = (1..=2)
+        .map(|p| format!("HEAD^{p}"))
+        .find(|r| common::git(dir, &["log", "-1", "--format=%s", r]) == "main-1")
+        .expect("main-1 is a parent of the merge");
+    assert_eq!(common::git(dir, &["show", &format!("{main1}:side.txt")]), "side");
+    assert_eq!(common::git(dir, &["show", "HEAD:side.txt"]), "side");
+    assert_transparent(dir);
+}
+
+#[test]
+fn squashing_into_a_merge_folds_the_change_into_its_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_merge_repo(dir);
+    // A commit above the merge whose change will fold *into* the merge.
+    std::fs::write(dir.join("top.txt"), "top\n").unwrap();
+    common::git(dir, &["add", "top.txt"]);
+    common::git(dir, &["commit", "-q", "-m", "top"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = current(&repo);
+    let pos = |s: &str| commits.iter().position(|c| c.subject == s).unwrap();
+
+    let (source, dest) = repo
+        .plan_squash(&commits, pos("top"), pos("merge"))
+        .expect("the merge is a squash target");
+    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // The merge is the tip again, with both parents, now carrying top.txt as
+    // its remerge delta — an evil merge by construction.
+    assert!(common::is_merge(dir, "HEAD"));
+    assert_eq!(common::git(dir, &["log", "-1", "--format=%s", "HEAD"]), "merge");
+    assert_eq!(parent_subjects(dir), vec!["main-1", "side-1"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:top.txt"]), "top");
+    assert_transparent(dir);
 }
 
 #[test]

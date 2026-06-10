@@ -248,7 +248,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              row.op-affected { background-color: rgba(53, 132, 228, 0.22); \
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; } \
              .commit-id-copy { background-color: @theme_base_color; \
-             color: @theme_fg_color; border-radius: 4px; padding: 0 1px; }",
+             color: @theme_fg_color; border-radius: 4px; padding: 0 1px; } \
+             .ref-pill { font-size: smaller; border-radius: 9px; padding: 0 7px; } \
+             .ref-branch { background-color: rgba(46, 194, 126, 0.25); \
+             border: 1px solid rgba(46, 194, 126, 0.8); } \
+             .ref-tag { background-color: rgba(245, 194, 17, 0.25); \
+             border: 1px solid rgba(245, 194, 17, 0.8); }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -1740,7 +1745,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             *commits.borrow_mut() = loaded;
             {
                 let cs = commits.borrow();
-                populate_list(&list, &cs, &HashSet::new());
+                let refs = repo.borrow().commit_refs();
+                populate_list(&list, &cs, &HashSet::new(), &refs);
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
                 let mut ids: Vec<(String, String)> = Vec::new();

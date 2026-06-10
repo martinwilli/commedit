@@ -3,9 +3,10 @@
 //! never unparent — the surplus" discipline in `populate_rows` is load-bearing
 //! for drag-and-drop safety; see its doc comment.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use commedit_engine::history::CommitInfo;
+use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
@@ -74,9 +75,12 @@ fn set_id_hash(cell: &Overlay, full_hash: &str) {
     cell.set_tooltip_text(Some(full_hash));
 }
 
-/// Build the `short-id   subject   ⚠` content box shown inside a history/trash
-/// row. The trailing warning icon is present but hidden unless `conflicted`.
-fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
+/// Build the `short-id   subject  [pills]   ⚠` content box shown inside a
+/// history/trash row. The pill box hugs the subject's right edge: the subject
+/// label does *not* expand, the pill box does (start-aligned), so the pills sit
+/// right after the text and the slack stays empty. The trailing warning icon is
+/// present but hidden unless `conflicted`.
+fn commit_row_box(commit: &CommitInfo, conflicted: bool, refs: &[RefDecoration]) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
@@ -87,10 +91,15 @@ fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
     let subject_label = Label::builder()
         .label(subject)
         .xalign(0.0)
-        .halign(gtk::Align::Fill)
-        .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    let pills = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build();
+    set_pills(&pills, refs);
     let badge = gtk::Image::from_icon_name("dialog-warning-symbolic");
     badge.set_tooltip_text(Some("This commit has unresolved conflicts"));
     badge.set_visible(conflicted);
@@ -104,14 +113,56 @@ fn commit_row_box(commit: &CommitInfo, conflicted: bool) -> GtkBox {
         .build();
     row_box.append(&id_cell);
     row_box.append(&subject_label);
+    row_box.append(&pills);
     row_box.append(&badge);
     row_box
+}
+
+/// Fill the pill box with one colored label per branch/tag pointing at the
+/// commit, reusing the existing labels and hiding the surplus — the same
+/// never-unparent discipline as [`populate_rows`], one level down.
+fn set_pills(pills: &GtkBox, refs: &[RefDecoration]) {
+    let mut next = pills.first_child();
+    for r in refs {
+        let label = match next.clone().and_downcast::<Label>() {
+            Some(label) => {
+                next = label.next_sibling();
+                label
+            }
+            None => {
+                let label = Label::new(None);
+                // Cap a runaway ref name rather than crowding out the badge;
+                // the tooltip below always carries it in full.
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label.set_max_width_chars(24);
+                label.add_css_class("ref-pill");
+                pills.append(&label);
+                label
+            }
+        };
+        label.set_visible(true);
+        label.set_text(&r.name);
+        label.set_tooltip_text(Some(&match r.kind {
+            RefKind::Branch => format!("Branch {}", r.name),
+            RefKind::Tag => format!("Tag {}", r.name),
+        }));
+        label.remove_css_class("ref-branch");
+        label.remove_css_class("ref-tag");
+        label.add_css_class(match r.kind {
+            RefKind::Branch => "ref-branch",
+            RefKind::Tag => "ref-tag",
+        });
+    }
+    while let Some(extra) = next {
+        next = extra.next_sibling();
+        extra.set_visible(false);
+    }
 }
 
 /// Update the content of a row's existing labels in place, without replacing the
 /// child widget — so the labels (and the row) survive a drag-triggered rebuild.
 /// Falls back to building a fresh child if the row has none yet.
-fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool) {
+fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool, refs: &[RefDecoration]) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
@@ -128,19 +179,24 @@ fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool) {
         .as_ref()
         .and_then(|c| c.next_sibling())
         .and_downcast::<Label>();
+    let pills = subject_label
+        .as_ref()
+        .and_then(|l| l.next_sibling())
+        .and_downcast::<GtkBox>();
     let badge = row_box
         .as_ref()
         .and_then(|b| b.last_child())
         .and_downcast::<gtk::Image>();
-    match (id_cell, id_label, subject_label, badge) {
-        (Some(id_cell), Some(id_label), Some(subject_label), Some(badge)) => {
+    match (id_cell, id_label, subject_label, pills, badge) {
+        (Some(id_cell), Some(id_label), Some(subject_label), Some(pills), Some(badge)) => {
             id_label.set_markup(&format!("<tt>{short}</tt>"));
             set_id_hash(&id_cell, &commit.id_hex());
             subject_label.set_text(subject);
+            set_pills(&pills, refs);
             badge.set_visible(conflicted);
         }
         // Older row layout (or a freshly-created empty row): build it whole.
-        _ => row.set_child(Some(&commit_row_box(commit, conflicted))),
+        _ => row.set_child(Some(&commit_row_box(commit, conflicted, refs))),
     }
 }
 
@@ -162,6 +218,7 @@ fn populate_rows(
     commits: &[CommitInfo],
     selectable: bool,
     conflicts: &HashSet<String>,
+    refs: &BTreeMap<String, Vec<RefDecoration>>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -173,7 +230,12 @@ fn populate_rows(
             row
         });
         row.set_visible(true);
-        set_row_commit(&row, commit, conflicts.contains(&commit.change_id_hex()));
+        set_row_commit(
+            &row,
+            commit,
+            conflicts.contains(&commit.change_id_hex()),
+            refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
+        );
     }
     // Hide surplus rows rather than removing them (see the note above).
     let mut i = commits.len() as i32;
@@ -184,9 +246,15 @@ fn populate_rows(
 }
 
 /// Show the history commits in `list` (newest first), reusing rows. See
-/// [`populate_rows`].
-pub(crate) fn populate_list(list: &ListBox, commits: &[CommitInfo], conflicts: &HashSet<String>) {
-    populate_rows(list, commits, true, conflicts);
+/// [`populate_rows`]. `refs` (commit hex → branch/tag names, from
+/// `Repo::commit_refs`) supplies the pill decorations after each subject.
+pub(crate) fn populate_list(
+    list: &ListBox,
+    commits: &[CommitInfo],
+    conflicts: &HashSet<String>,
+    refs: &BTreeMap<String, Vec<RefDecoration>>,
+) {
+    populate_rows(list, commits, true, conflicts, refs);
 }
 
 /// Add the `op-affected` highlight to every history row whose commit's change id
@@ -217,7 +285,9 @@ pub(crate) fn clear_highlight(list: &ListBox) {
 /// icon (the icon still carries the drop target).
 pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
     scroll.set_visible(!commits.is_empty());
-    populate_rows(list, commits, false, &HashSet::new());
+    // No ref pills in the trash: a dropped commit was just cut out of its
+    // branch, so a ref still naming it would only be confusing here.
+    populate_rows(list, commits, false, &HashSet::new(), &BTreeMap::new());
 }
 
 /// Fill the working-copy list with one summary row per uncommitted entry (newest

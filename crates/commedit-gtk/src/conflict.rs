@@ -347,7 +347,11 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                 commits.borrow_mut().insert(0, entry.info);
             }
         }
-        populate_list(&list, &commits.borrow(), &badges);
+        // Ref pills still resolve against the user's git refs: the rewrite is
+        // held back, so they keep decorating the untouched ancestors below it
+        // (the rewritten commits' pending ids match no ref, correctly).
+        let refs = repo.borrow().commit_refs();
+        populate_list(&list, &commits.borrow(), &badges, &refs);
         conflict_label.set_text(&format!(
             "Conflicts from the rewrite must be resolved before it applies to git — \
              {n_files} file(s) across {n_commits} commit(s) remaining."

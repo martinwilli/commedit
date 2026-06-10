@@ -255,6 +255,18 @@ impl Repo {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let heads = self.snapshot_heads();
+        // A top-gap splice (no new children) puts the target above the old head
+        // — where the working-copy chain also sits, and with no child to rebase,
+        // nothing would carry it onto the new tip (the snapshot above just
+        // re-attached it to the old head). Splice between the head and the
+        // chain's bottom entry instead, so the uncommitted changes ride the
+        // rebase onto the new tip like in any other splice.
+        let mut new_child_ids = new_child_ids;
+        if new_child_ids.is_empty() {
+            if let Some(bottom) = self.working_copy_chain_ids().last() {
+                new_child_ids.push(bottom.clone());
+            }
+        }
         let loc = MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,

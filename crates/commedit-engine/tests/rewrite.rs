@@ -249,6 +249,35 @@ fn committer_config_overrides_user_config_like_git() {
 }
 
 #[test]
+fn a_clean_move_to_the_top_keeps_the_worktree_on_the_new_tip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Independent files, so the move rebases clean — no spurious resolution
+    // (whose chain rebuild would mask a stranded working copy) gets involved.
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+    );
+    // An uncommitted edit that must survive the move.
+    std::fs::write(dir.join("local.txt"), "local\n").unwrap();
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let from = commits.iter().position(|c| c.subject == "B").unwrap();
+    let mv = repo.plan_reorder(&commits, from, 0).expect("plan");
+    repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder");
+
+    // B tops the branch, and the worktree followed it there: b.txt is on disk
+    // (not reported deleted), only the local edit shows as uncommitted.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "C", "A"]);
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "?? local.txt");
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn history_has_no_duplicate_rows_after_a_reorder() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

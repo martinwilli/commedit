@@ -28,19 +28,24 @@ fn snapshots_disk_into_working_copy_and_materializes_it_back() {
     std::fs::write(dir.join("a.txt"), "a\nlocal edit\n").unwrap();
     std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
 
-    // Snapshotting records that state into the working-copy commit @.
+    // Snapshotting records the tracked edit into @ but leaves the untracked
+    // file out — it's not part of the uncommitted-changes set.
     repo.snapshot_working_copy().expect("snapshot");
     let wc = repo.working_copy_commit_id().expect("@ present");
     assert_ne!(wc, head, "@ should be a distinct commit on top of HEAD");
 
-    // Checking out clean HEAD reverts the working tree: the tracked edit is
-    // undone and the (now-tracked) new file is removed.
+    // Checking out clean HEAD reverts the tracked edit, but the untracked file
+    // is left alone (jj never tracked it) — it stays alive on disk.
     repo.materialize_working_copy(&head).expect("materialize head");
     assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
-    assert!(!dir.join("new.txt").exists(), "untracked file cleared by checkout");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+        "brand new\n",
+        "untracked file survives a checkout"
+    );
 
-    // Checking @ back out restores exactly what we snapshotted, proving the
-    // snapshot captured both the edit and the untracked file.
+    // Checking @ back out restores exactly what we snapshotted — the tracked
+    // edit. The untracked file is still present, never having been removed.
     repo.materialize_working_copy(&wc).expect("materialize @");
     assert_eq!(
         std::fs::read_to_string(dir.join("a.txt")).unwrap(),
@@ -87,7 +92,7 @@ fn unstaged_edit_to_an_untouched_file_survives_a_rewrite() {
 }
 
 #[test]
-fn untracked_file_survives_a_rewrite_and_jj_dir_never_leaks() {
+fn untracked_file_is_excluded_from_at_but_survives_a_rewrite() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
@@ -95,11 +100,15 @@ fn untracked_file_survives_a_rewrite_and_jj_dir_never_leaks() {
     let mut repo = Repo::open(dir).expect("open");
     std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
 
-    // Snapshotting must capture the untracked file but never jj's own .jj dir.
+    // Snapshotting must NOT capture the untracked file into @ (it's not part of
+    // the uncommitted-changes set), and never jj's own .jj dir either.
     repo.snapshot_working_copy().expect("snapshot");
     let wc = repo.working_copy_commit_id().expect("@").to_string();
     let tracked = common::git(dir, &["ls-tree", "-r", "--name-only", &wc]);
-    assert!(tracked.lines().any(|l| l == "new.txt"), "untracked file captured");
+    assert!(
+        !tracked.lines().any(|l| l == "new.txt"),
+        "untracked file must stay out of @, got: {tracked}"
+    );
     assert!(
         !tracked.lines().any(|l| l.starts_with(".jj")),
         ".jj must never be snapshotted into @, got: {tracked}"
@@ -108,7 +117,9 @@ fn untracked_file_survives_a_rewrite_and_jj_dir_never_leaks() {
     let target = subject_id(&repo, "A").id;
     repo.rewrite_message(&target, "A (edited)").expect("rewrite");
 
-    // The untracked file is still on disk and still untracked.
+    // The rewrite went through, and the untracked file is still on disk and
+    // still untracked — it was never managed by jj, so it stays alive.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A (edited)"]);
     assert_eq!(
         std::fs::read_to_string(dir.join("new.txt")).unwrap(),
         "brand new\n"
@@ -374,6 +385,34 @@ fn dropping_the_working_copy_discards_all_uncommitted_changes() {
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
     assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn discarding_uncommitted_changes_keeps_an_untracked_file_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // A tracked edit plus a brand-new untracked file.
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+    std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+
+    // Dropping discards the tracked edit (a.txt reverts to HEAD) by checking out a
+    // clean tree — the untracked file must NOT be swept up with it, since jj never
+    // tracked it.
+    repo.drop_working_copy(None).expect("drop working copy");
+
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+        "brand new\n",
+        "untracked file survives discarding the uncommitted changes"
+    );
+    // The discard left only the untracked file behind, as git sees it.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "?? new.txt");
     common::git(dir, &["fsck", "--no-progress"]);
 }
 

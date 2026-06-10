@@ -32,8 +32,8 @@ fn working_tree_edits_show_up_as_content_changes() {
     std::fs::write(dir.join("a.txt"), "a edited\n").unwrap();
     std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
 
-    // session_changes snapshots the working copy itself, so the on-disk edits
-    // surface without any prior mutation.
+    // session_changes snapshots the working copy itself, so the on-disk edit to
+    // the tracked file surfaces without any prior mutation.
     let changes = repo.session_changes().expect("session changes");
 
     let edited = changes
@@ -43,12 +43,12 @@ fn working_tree_edits_show_up_as_content_changes() {
     assert_eq!(edited.kind, ChangeKind::Modified);
     assert_eq!(edited.new_text.as_deref(), Some("a edited\n"));
 
-    let added = changes
-        .iter()
-        .find(|c| c.path == "new.txt")
-        .expect("new.txt in the review");
-    assert_eq!(added.kind, ChangeKind::Added);
-    assert_eq!(added.new_text.as_deref(), Some("brand new\n"));
+    // The untracked file is excluded from the uncommitted-changes set, so it
+    // does not appear in the review.
+    assert!(
+        changes.iter().all(|c| c.path != "new.txt"),
+        "untracked file must not show up in the review: {changes:?}"
+    );
 }
 
 #[test]

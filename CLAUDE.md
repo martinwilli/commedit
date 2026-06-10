@@ -183,13 +183,22 @@ Uncommitted changes are first-class: they live in jj's **working-copy commit
 `@`**, so a rewrite never loses them. `snapshot_working_copy` (run at `Repo::open`
 and at the start of every mutation) keeps `@` attached above the current tip (see
 "the working-copy chain" below) and snapshots the on-disk tree into the leaf `@` —
-tracked edits **and** untracked, non-ignored
-files; jj skips `.git`/`.jj` and honours `.gitignore` + `.git/info/exclude`. So
+**only edits/deletions to git-tracked files**, never git's untracked files; jj
+also skips `.git`/`.jj` and honours `.gitignore` + `.git/info/exclude`. So
 `@`-vs-parent *is* the uncommitted delta, which `rebase_descendants` carries
-forward (`@`→`@'`) through the rewrite like any other descendant.
-`materialize_after_rewrite` (in the deferred export, replacing the old
-`sync_worktree`) checks `@'` out to disk via jj and resets the git index to the
-new tip. Non-overlapping local edits merge cleanly onto the rewritten content.
+forward (`@`→`@'`) through the rewrite like any other descendant. The tracked-only
+scope is enforced by the snapshot's `start_tracking_matcher`
+(`tracked_paths_matcher`): commedit's throwaway jj workspace starts with an *empty*
+on-disk tree state, so to the first snapshot every file looks brand-new — the
+matcher must name exactly the paths in `@`'s parent tip (HEAD's tracked set) so
+"track nothing" doesn't drop committed files and "track everything" doesn't pull
+in untracked ones. Untracked files are left out of `@` yet **stay alive on disk**:
+jj never tracks them, so `materialize_after_rewrite`'s checkout (which only diffs
+the tracked trees) never deletes them — they survive a rewrite untouched and git
+still sees them as `??`. `materialize_after_rewrite` (in the deferred export,
+replacing the old `sync_worktree`) checks `@'` out to disk via jj and resets the
+git index to the new tip. Non-overlapping local edits merge cleanly onto the
+rewritten content.
 
 **The working-copy *chain*.** `@` need not sit directly on HEAD: the Split button
 (`split_working_copy`) peels `@` into a short linear stack of jj commits between

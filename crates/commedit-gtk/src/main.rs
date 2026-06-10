@@ -13,6 +13,7 @@ use commedit_engine::diff::{
     render_commit_diff, render_conflict_snippets, revert_groups, split_combined_patch,
     CombinedFile, ContextExpansion, FileChange, HunkInfo,
 };
+use commedit_engine::graph::{compute_graph, GraphLayout};
 use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
     collapse_diff, deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, Selection,
@@ -173,6 +174,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Shared UI state.
     let commits: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // The ancestry-graph lane layout drawn beside the history rows, recomputed
+    // whenever `commits` is reloaded (each row's drawing area reads its slice).
+    let graph: Rc<RefCell<GraphLayout>> = Rc::new(RefCell::new(GraphLayout::default()));
     // How many history rows the normal (non-conflict) view currently loads, and
     // whether older commits remain below them. `refresh` reads the limit and sets
     // the flag; scrolling near the bottom bumps the limit by `HISTORY_PAGE`.
@@ -259,7 +263,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              .ref-branch { background-color: rgba(46, 194, 126, 0.25); \
              border: 1px solid rgba(46, 194, 126, 0.8); } \
              .ref-tag { background-color: rgba(245, 194, 17, 0.25); \
-             border: 1px solid rgba(245, 194, 17, 0.8); }",
+             border: 1px solid rgba(245, 194, 17, 0.8); } \
+             .history-list row { padding-top: 0; padding-bottom: 0; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -299,6 +304,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     ));
 
     let list = ListBox::new();
+    // Strip the theme's vertical row padding: the ancestry-graph lines must run
+    // edge-to-edge to connect across rows (the rows' content boxes keep their
+    // own margins for breathing space).
+    list.add_css_class("history-list");
     let history_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vexpand(true)
@@ -643,6 +652,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let data = Data {
         repo: repo.clone(),
         commits: commits.clone(),
+        graph: graph.clone(),
         trashed: trashed.clone(),
         pending_trash_op: pending_trash_op.clone(),
         wc_entries: wc_entries.clone(),
@@ -1732,6 +1742,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let refresh: Rc<dyn Fn()> = {
         let repo = repo.clone();
         let commits = commits.clone();
+        let graph = graph.clone();
         let list = list.clone();
         let selected_change = selected_change.clone();
         let identities = identities.clone();
@@ -1750,9 +1761,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             history_has_more.set(has_more);
             *commits.borrow_mut() = loaded;
             {
+                let root = repo.borrow().root_commit_id();
+                *graph.borrow_mut() = compute_graph(&commits.borrow(), &root);
+            }
+            {
                 let cs = commits.borrow();
                 let refs = repo.borrow().commit_refs();
-                populate_list(&list, &cs, &HashSet::new(), &refs);
+                populate_list(&list, &cs, &HashSet::new(), &refs, &graph);
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
                 let mut ids: Vec<(String, String)> = Vec::new();

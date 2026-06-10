@@ -3,13 +3,106 @@
 //! never unparent — the surplus" discipline in `populate_rows` is load-bearing
 //! for drag-and-drop safety; see its doc comment.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 
+use commedit_engine::graph::GraphLayout;
 use commedit_engine::history::CommitInfo;
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
+
+/// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
+/// (which recomputes it) and every row's drawing area (which reads its own row).
+pub(crate) type SharedGraph = Rc<RefCell<GraphLayout>>;
+
+/// Width of one graph lane column, px.
+const LANE_W: f64 = 12.0;
+/// Radius of a commit's node circle.
+const NODE_R: f64 = 3.5;
+/// Stroke width of the ancestry lines.
+const EDGE_W: f64 = 2.0;
+
+/// Per-lane line colors (cycled): saturated enough to stay readable on both
+/// light/dark themes and on the tinted selection / squash-target row backgrounds.
+const LANE_COLORS: [(f64, f64, f64); 8] = [
+    (0.21, 0.52, 0.89),
+    (0.18, 0.76, 0.49),
+    (0.85, 0.65, 0.13),
+    (0.88, 0.11, 0.14),
+    (0.61, 0.35, 0.71),
+    (0.10, 0.74, 0.61),
+    (0.90, 0.49, 0.13),
+    (0.55, 0.55, 0.55),
+];
+
+/// Pixel width of the graph column: uniform across rows (the layout's widest
+/// point) so the lane columns align down the list.
+fn graph_width(layout: &GraphLayout) -> i32 {
+    (layout.max_lanes.max(1) as f64 * LANE_W) as i32
+}
+
+/// Build the per-row ancestry drawing area. The draw func captures the shared
+/// layout plus this row's **creation index** and reads `rows[index]` at draw
+/// time — valid because `populate_rows` always shows `commits[i]` in the i-th
+/// appended row and never unparents (so a row keeps its index for life); a
+/// hidden surplus row indexes past the layout and draws nothing.
+///
+/// Each row draws edge-to-edge: incoming edges from the top edge to the vertical
+/// center, the node at the center, outgoing edges down to the bottom edge — so
+/// adjacent rows' lines connect without any cross-row drawing state. Colors
+/// follow `compute_graph`'s contract (above-edges by `from` lane, below-edges by
+/// `to` lane) to keep a line's color continuous across rows.
+fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(graph_width(&graph.borrow()));
+    // Purely decorative: keep GTK's pointer/drop picking on the row itself.
+    area.set_can_target(false);
+    let graph = graph.clone();
+    area.set_draw_func(move |_, cr, _w, h| {
+        let layout = graph.borrow();
+        let Some(row) = layout.rows.get(index) else { return };
+        let h = h as f64;
+        let mid = h / 2.0;
+        let x = |lane: usize| LANE_W * (lane as f64 + 0.5);
+        let set_color = |lane: usize| {
+            let (r, g, b) = LANE_COLORS[lane % LANE_COLORS.len()];
+            cr.set_source_rgb(r, g, b);
+        };
+        cr.set_line_width(EDGE_W);
+        for &(from, to) in &row.edges_above {
+            set_color(from);
+            cr.move_to(x(from), 0.0);
+            if from == to {
+                cr.line_to(x(to), mid);
+            } else {
+                cr.curve_to(x(from), mid * 0.7, x(to), mid * 0.3, x(to), mid);
+            }
+            let _ = cr.stroke();
+        }
+        for &(from, to) in &row.edges_below {
+            set_color(to);
+            cr.move_to(x(from), mid);
+            if from == to {
+                cr.line_to(x(to), h);
+            } else {
+                cr.curve_to(x(from), mid + (h - mid) * 0.7, x(to), mid + (h - mid) * 0.3, x(to), h);
+            }
+            let _ = cr.stroke();
+        }
+        cr.arc(x(row.node_lane), mid, NODE_R, 0.0, std::f64::consts::TAU);
+        if row.is_merge {
+            // A merge's node is a black disc, an ordinary commit's a lane-colored one.
+            cr.set_source_rgb(0.0, 0.0, 0.0);
+        } else {
+            set_color(row.node_lane);
+        }
+        let _ = cr.fill();
+    });
+    area
+}
 
 /// Build the commit-id cell: a short-id [`Label`] wrapped in an [`Overlay`] so a
 /// copy icon can float over the id's right edge on hover. Overlay children are
@@ -80,7 +173,18 @@ fn set_id_hash(cell: &Overlay, full_hash: &str) {
 /// label does *not* expand, the pill box does (start-aligned), so the pills sit
 /// right after the text and the slack stays empty. The trailing warning icon is
 /// present but hidden unless `conflicted`.
-fn commit_row_box(commit: &CommitInfo, conflicted: bool, refs: &[RefDecoration]) -> GtkBox {
+///
+/// With `graph` (the shared layout and this row's index — history rows only,
+/// trash rows pass `None`), the content box is wrapped in a margin-free outer
+/// box led by the ancestry drawing area: the graph lines must reach the row's
+/// top/bottom edges to connect across rows, which the content box's vertical
+/// margins would otherwise gap.
+fn commit_row_box(
+    commit: &CommitInfo,
+    conflicted: bool,
+    refs: &[RefDecoration],
+    graph: Option<(&SharedGraph, usize)>,
+) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
@@ -115,7 +219,18 @@ fn commit_row_box(commit: &CommitInfo, conflicted: bool, refs: &[RefDecoration])
     row_box.append(&subject_label);
     row_box.append(&pills);
     row_box.append(&badge);
-    row_box
+    match graph {
+        Some((graph, index)) => {
+            // The lane column supplies the leading whitespace.
+            row_box.set_margin_start(4);
+            row_box.set_hexpand(true);
+            let outer = GtkBox::new(Orientation::Horizontal, 0);
+            outer.append(&graph_area(graph, index));
+            outer.append(&row_box);
+            outer
+        }
+        None => row_box,
+    }
 }
 
 /// Fill the pill box with one colored label per branch/tag pointing at the
@@ -162,14 +277,30 @@ fn set_pills(pills: &GtkBox, refs: &[RefDecoration]) {
 /// Update the content of a row's existing labels in place, without replacing the
 /// child widget — so the labels (and the row) survive a drag-triggered rebuild.
 /// Falls back to building a fresh child if the row has none yet.
-fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool, refs: &[RefDecoration]) {
+fn set_row_commit(
+    row: &ListBoxRow,
+    commit: &CommitInfo,
+    conflicted: bool,
+    refs: &[RefDecoration],
+    graph: Option<(&SharedGraph, usize)>,
+) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
         "(no description)"
     } else {
         &commit.subject
     };
-    let row_box = row.child().and_downcast::<GtkBox>();
+    let child = row.child().and_downcast::<GtkBox>();
+    // A history row's child is the outer `[graph area, content box]` box from
+    // [`commit_row_box`]; a trash row's child is the content box itself.
+    let area = child
+        .as_ref()
+        .and_then(|b| b.first_child())
+        .and_downcast::<gtk::DrawingArea>();
+    let row_box = match &area {
+        Some(area) => area.next_sibling().and_downcast::<GtkBox>(),
+        None => child,
+    };
     let id_cell = row_box
         .as_ref()
         .and_then(|b| b.first_child())
@@ -194,9 +325,15 @@ fn set_row_commit(row: &ListBoxRow, commit: &CommitInfo, conflicted: bool, refs:
             subject_label.set_text(subject);
             set_pills(&pills, refs);
             badge.set_visible(conflicted);
+            if let (Some(area), Some((graph, _))) = (&area, graph) {
+                // The shared layout was just recomputed: re-fit the lane column
+                // and repaint this row's slice of it.
+                area.set_content_width(graph_width(&graph.borrow()));
+                area.queue_draw();
+            }
         }
         // Older row layout (or a freshly-created empty row): build it whole.
-        _ => row.set_child(Some(&commit_row_box(commit, conflicted, refs))),
+        _ => row.set_child(Some(&commit_row_box(commit, conflicted, refs, graph))),
     }
 }
 
@@ -219,6 +356,7 @@ fn populate_rows(
     selectable: bool,
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
+    graph: Option<&SharedGraph>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -235,6 +373,7 @@ fn populate_rows(
             commit,
             conflicts.contains(&commit.change_id_hex()),
             refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
+            graph.map(|g| (g, i)),
         );
     }
     // Hide surplus rows rather than removing them (see the note above).
@@ -247,14 +386,16 @@ fn populate_rows(
 
 /// Show the history commits in `list` (newest first), reusing rows. See
 /// [`populate_rows`]. `refs` (commit hex → branch/tag names, from
-/// `Repo::commit_refs`) supplies the pill decorations after each subject.
+/// `Repo::commit_refs`) supplies the pill decorations after each subject;
+/// `graph` (from `compute_graph` over the same commits) the ancestry lines.
 pub(crate) fn populate_list(
     list: &ListBox,
     commits: &[CommitInfo],
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
+    graph: &SharedGraph,
 ) {
-    populate_rows(list, commits, true, conflicts, refs);
+    populate_rows(list, commits, true, conflicts, refs, Some(graph));
 }
 
 /// Add the `op-affected` highlight to every history row whose commit's change id
@@ -285,9 +426,9 @@ pub(crate) fn clear_highlight(list: &ListBox) {
 /// icon (the icon still carries the drop target).
 pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
     scroll.set_visible(!commits.is_empty());
-    // No ref pills in the trash: a dropped commit was just cut out of its
-    // branch, so a ref still naming it would only be confusing here.
-    populate_rows(list, commits, false, &HashSet::new(), &BTreeMap::new());
+    // No ref pills and no ancestry graph in the trash: a dropped commit was
+    // just cut out of its branch, so neither applies here.
+    populate_rows(list, commits, false, &HashSet::new(), &BTreeMap::new(), None);
 }
 
 /// Fill the working-copy list with one summary row per uncommitted entry (newest

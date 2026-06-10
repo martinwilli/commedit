@@ -203,6 +203,67 @@ pub fn local_head_oids(workspace_root: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// What kind of git ref a [`RefDecoration`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    /// A local branch (`refs/heads/*`).
+    Branch,
+    /// A tag (`refs/tags/*`).
+    Tag,
+}
+
+/// A branch or tag name pointing at a commit, for decorating the history view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefDecoration {
+    /// Short name (`main`, `v1.0`), without the `refs/heads/`/`refs/tags/` prefix.
+    pub name: String,
+    pub kind: RefKind,
+}
+
+/// Every local branch and tag of the user's repo, grouped by the hex id of the
+/// commit it points at (annotated tags peeled to their target commit). Read
+/// straight from the user's git refs — jj's view deliberately imports only the
+/// checked-out branch, so it can't supply these. Best-effort: empty on failure.
+pub fn ref_decorations(workspace_root: &Path) -> BTreeMap<String, Vec<RefDecoration>> {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "for-each-ref",
+            // `%(*objectname)` is the peeled target — empty except for
+            // annotated tags, whose `%(objectname)` is the tag object itself.
+            "--format=%(objectname) %(*objectname) %(refname)",
+            "refs/heads/",
+            "refs/tags/",
+        ])
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    let mut map: BTreeMap<String, Vec<RefDecoration>> = BTreeMap::new();
+    for line in String::from_utf8(out.stdout).unwrap_or_default().lines() {
+        // Refnames cannot contain spaces, so token-splitting is unambiguous:
+        // 2 tokens when the peeled field is empty, 3 for an annotated tag.
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let (commit, refname) = match tokens[..] {
+            [oid, refname] => (oid, refname),
+            [_tag_obj, peeled, refname] => (peeled, refname),
+            _ => continue,
+        };
+        let decoration = if let Some(name) = refname.strip_prefix("refs/heads/") {
+            RefDecoration { name: name.to_string(), kind: RefKind::Branch }
+        } else if let Some(name) = refname.strip_prefix("refs/tags/") {
+            RefDecoration { name: name.to_string(), kind: RefKind::Tag }
+        } else {
+            continue;
+        };
+        map.entry(commit.to_string()).or_default().push(decoration);
+    }
+    map
+}
+
 /// Force every local branch *except* `current` (a full ref name like
 /// `refs/heads/main`) back to the commit it pointed at in `before`, undoing any
 /// move jj's ref export made to a branch other than the one being edited. This

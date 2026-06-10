@@ -6,7 +6,9 @@ mod common;
 
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
-use commedit_engine::transparency::{local_head_oids, restore_unrelated_heads};
+use commedit_engine::transparency::{
+    local_head_oids, ref_decorations, restore_unrelated_heads, RefKind,
+};
 
 /// jj's own refs — its `refs/jj/keep/*` GC anchors above all — must never appear
 /// in the user's repository: not after a rewrite, and not even during a
@@ -113,4 +115,66 @@ fn no_op_when_nothing_moved() {
 
     let restored = restore_unrelated_heads(dir, Some("refs/heads/main"), &before);
     assert!(restored.is_empty(), "untouched branches need no restoring");
+}
+
+/// `ref_decorations` groups every local branch and tag by the commit it points
+/// at, peeling annotated tags to their target commit — the data behind the
+/// history view's ref pills. jj's branch-scoped import can't supply this, so it
+/// reads the user's git refs directly.
+#[test]
+fn ref_decorations_group_branches_and_tags_by_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    g(&["branch", "feature", "main~1"]);
+    g(&["tag", "light", "main~1"]); // lightweight: points at the commit itself
+    g(&["tag", "-a", "-m", "release", "v1.0", "main"]); // annotated: needs peeling
+    let tip = g(&["rev-parse", "main"]);
+    let below = g(&["rev-parse", "main~1"]);
+
+    let decorations = ref_decorations(dir);
+
+    let names = |oid: &str| -> Vec<(String, RefKind)> {
+        decorations
+            .get(oid)
+            .map(|ds| ds.iter().map(|d| (d.name.clone(), d.kind)).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        names(&tip),
+        vec![("main".to_string(), RefKind::Branch), ("v1.0".to_string(), RefKind::Tag)]
+    );
+    assert_eq!(
+        names(&below),
+        vec![("feature".to_string(), RefKind::Branch), ("light".to_string(), RefKind::Tag)]
+    );
+}
+
+/// `Repo::commit_refs` reads the refs live, so after a clean rewrite the
+/// checked-out branch's pill follows the branch to the rewritten tip while a
+/// tag stays on the commit it named — which has left the visible history.
+#[test]
+fn commit_refs_track_a_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    g(&["tag", "v1.0", "main"]);
+    let old_tip = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let head = repo.head_commit_id().expect("head");
+    repo.rewrite_message(&head, "B (edited)").expect("rewrite");
+
+    let refs = repo.commit_refs();
+    let new_tip = g(&["rev-parse", "main"]);
+    assert_ne!(new_tip, old_tip);
+    let kinds = |oid: &str| -> Vec<(String, RefKind)> {
+        refs.get(oid)
+            .map(|ds| ds.iter().map(|d| (d.name.clone(), d.kind)).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(kinds(&new_tip), vec![("main".to_string(), RefKind::Branch)]);
+    assert_eq!(kinds(&old_tip), vec![("v1.0".to_string(), RefKind::Tag)]);
 }

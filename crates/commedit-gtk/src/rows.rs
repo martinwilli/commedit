@@ -38,6 +38,12 @@ const LANE_COLORS: [(f64, f64, f64); 8] = [
     (0.55, 0.55, 0.55),
 ];
 
+/// The line color of `lane`, cycled through the palette. Shared with the
+/// drag-and-drop lane picker so its swatches match the drawn graph.
+pub(crate) fn lane_color(lane: usize) -> (f64, f64, f64) {
+    LANE_COLORS[lane % LANE_COLORS.len()]
+}
+
 /// Pixel width of the graph column: uniform across rows (the layout's widest
 /// point) so the lane columns align down the list.
 fn graph_width(layout: &GraphLayout) -> i32 {
@@ -68,7 +74,7 @@ fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
         let mid = h / 2.0;
         let x = |lane: usize| LANE_W * (lane as f64 + 0.5);
         let set_color = |lane: usize| {
-            let (r, g, b) = LANE_COLORS[lane % LANE_COLORS.len()];
+            let (r, g, b) = lane_color(lane);
             cr.set_source_rgb(r, g, b);
         };
         cr.set_line_width(EDGE_W);

@@ -32,6 +32,27 @@ fn opens_repo_transparently() {
 }
 
 #[test]
+fn opens_from_a_subdirectory() {
+    // Pointed at a subdirectory of a repo, commedit walks up to the enclosing
+    // `.git` (like `git` itself) and opens that repository's root.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first")]);
+
+    let sub = dir.join("nested/deeper");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let _repo = Repo::open(&sub).expect("open from a subdirectory");
+
+    // It operated on the repo root, not the subdirectory: HEAD stays attached,
+    // the tree is clean, and no jj metadata leaked into the root or the subdir.
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    assert!(!dir.join(".jj").exists(), ".jj must not be created in the repo");
+    assert!(!sub.join(".jj").exists(), ".jj must not be created in the subdir");
+}
+
+#[test]
 fn refuses_a_non_git_folder() {
     // A plain directory that was never `git init`-ed: commedit edits existing
     // history, so it must refuse rather than spawn a fresh repository.

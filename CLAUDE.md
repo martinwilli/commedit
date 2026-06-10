@@ -67,10 +67,11 @@ drives much of the code:
   before the worktree is materialized so the user's HEAD already resolves to the
   new tip); the only other safety net is the git-level head backstop
   (`protect_unrelated_heads`, backed by `transparency.rs`'s
-  `restore_unrelated_heads`). It **refuses a folder that isn't already a git repo**
-  (no `.git`) rather than initializing one — commedit edits existing history, it
-  never spawns a new repository. Every mutating flow commits a jj transaction and
-  replaces `self.repo` with the result.
+  `restore_unrelated_heads`). Given a path *inside* a repo it walks up to the
+  enclosing `.git` (`find_git_root`, like `git` itself); it **refuses a path with
+  no git repo above it** rather than initializing one — commedit edits existing
+  history, it never spawns a new repository. Every mutating flow commits a jj
+  transaction and replaces `self.repo` with the result.
 - `transparency.rs` — the glue that hides jj from git: re-attach HEAD to its
   original branch (jj uses detached HEAD by design), export jj bookmarks to git
   refs, and reset the git index to the rewritten tip. The post-rewrite invariant

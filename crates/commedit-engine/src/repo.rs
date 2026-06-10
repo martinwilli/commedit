@@ -5,7 +5,7 @@
 //! completion with [`pollster::block_on`].
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -78,10 +78,12 @@ impl Repo {
     /// workspace whose metadata lives in a temp dir (see [`Self::init_detached`]),
     /// then import git refs/HEAD so jj's view matches the git repository.
     ///
-    /// commedit edits the history of an *existing* git repository; it never
-    /// initializes one. A folder that is not already a git repo is refused here,
-    /// so a stray path (or a directory mistaken for a repo) can't silently spawn a
-    /// fresh repository.
+    /// `workspace_root` may point *inside* a repository: like `git` itself,
+    /// [`find_git_root`] walks up the directory hierarchy to the enclosing `.git`
+    /// and opens that repository's root. commedit edits the history of an
+    /// *existing* git repository; it never initializes one, so a path with no git
+    /// repo above it is refused here rather than silently spawning a fresh
+    /// repository.
     ///
     /// jj's metadata is **never** written into the user's repo: a real jj user's
     /// `.jj` is left untouched (commedit only reads/writes git objects + refs, as
@@ -89,13 +91,10 @@ impl Repo {
     /// not polluted. The temp workspace is discarded when the session ends, so no
     /// stale jj state survives between runs.
     pub fn open(workspace_root: &Path) -> Result<Self> {
-        if !workspace_root.join(".git").exists() {
-            anyhow::bail!(
-                "{} is not a git repository — commedit edits the history of an \
-                 existing git repo and will not create one",
-                workspace_root.display()
-            );
-        }
+        // Resolve a path inside the repo to the repository root that encloses it
+        // (walking up to `.git`); bails if there is no git repo above it.
+        let workspace_root = find_git_root(workspace_root)?;
+        let workspace_root = workspace_root.as_path();
         let settings = build_settings(workspace_root)?;
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
@@ -520,6 +519,38 @@ pub(crate) fn catch_jj<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
             anyhow::bail!("{what} failed inside jj-lib ({detail}); the repository may have divergent or conflicted history")
+        }
+    }
+}
+
+/// Walk up from `start` to the nearest ancestor that is a git repository — a
+/// directory holding a `.git` entry (a directory for a normal repo, a file for a
+/// worktree/submodule checkout) — mirroring how `git` discovers its repository
+/// from a subdirectory. Returns that repository's root.
+///
+/// commedit edits the history of an *existing* git repo and never creates one, so
+/// a `start` with no git repo in itself or any ancestor is refused. The error
+/// keeps the "not a git repository" wording the rest of the contract relies on.
+fn find_git_root(start: &Path) -> Result<PathBuf> {
+    // Resolve to an absolute, symlink-free path first: the parent walk then
+    // terminates at the filesystem root rather than at a relative path's empty
+    // parent, and a file path (e.g. a path to a tracked file) climbs to its
+    // containing directory like any other.
+    let resolved = std::fs::canonicalize(start)
+        .with_context(|| format!("cannot access {}", start.display()))?;
+    let mut dir = resolved.as_path();
+    loop {
+        if dir.join(".git").exists() {
+            return Ok(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => anyhow::bail!(
+                "{} is not a git repository (nor is any parent directory) — \
+                 commedit edits the history of an existing git repo and will \
+                 not create one",
+                resolved.display()
+            ),
         }
     }
 }

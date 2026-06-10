@@ -21,6 +21,7 @@ use commedit_engine::patch_edit::{
 };
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
+use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
@@ -173,6 +174,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             return;
         }
     };
+
+    // Resolves the display tab width per file from the repo's editor-config files
+    // (`.editorconfig` / `.vscode/settings.json` / `.clang-format`), applied to the
+    // diff view as the user navigates between files. Built once: the config files
+    // are fixed for the session and resolution is cached per path.
+    let tab_resolver = Rc::new(TabWidthResolver::new(repo.borrow().workspace_root()));
 
     // Shared UI state.
     let commits: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1001,15 +1008,34 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // is rendered once by `render_diff_view`; the dropdown is just a navigation
     // aid. Skips the scroll when `nav_sync` is set — i.e. when this selection was
     // itself driven by the scroll→dropdown sync, so the two don't fight.
+    // Set the diff view's tab width to the value the repo's editor-config files
+    // declare for `path` (falling back to the default when none do). The diff
+    // buffer holds all of a commit's files but the view renders one tab width at a
+    // time, so this is re-applied whenever the file at the top of the view changes
+    // (both navigation entry points below funnel through `scroll_to_file` /
+    // `scroll_to_conflict_file`).
+    let apply_tab_width: Rc<dyn Fn(Option<&str>)> = {
+        let file_view = file_view.clone();
+        let tab_resolver = tab_resolver.clone();
+        Rc::new(move |path: Option<&str>| {
+            let width = path
+                .and_then(|p| tab_resolver.tab_width(p))
+                .unwrap_or(DEFAULT_TAB_WIDTH);
+            file_view.set_tab_width(width);
+        })
+    };
+
     let scroll_to_file: Rc<dyn Fn(usize)> = {
         let combined_files = combined_files.clone();
         let current_file = current_file.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let nav_sync = nav_sync.clone();
+        let apply_tab_width = apply_tab_width.clone();
         Rc::new(move |idx: usize| {
             let file = combined_files.borrow().get(idx).cloned();
             let Some(file) = file else { return };
+            apply_tab_width(Some(&file.path));
             *current_file.borrow_mut() = Some(file.path.clone());
             if nav_sync.get() {
                 return;
@@ -1200,9 +1226,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let nav_sync = nav_sync.clone();
+        let apply_tab_width = apply_tab_width.clone();
         Rc::new(move |idx: usize| {
             let path = conflict_view.borrow().get(idx).map(|fv| fv.path.clone());
             let Some(path) = path else { return };
+            apply_tab_width(Some(&path));
             *current_file.borrow_mut() = Some(path);
             if nav_sync.get() {
                 return;

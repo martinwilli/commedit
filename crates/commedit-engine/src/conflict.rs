@@ -906,6 +906,17 @@ impl Repo {
         if lo == 0 {
             return Ok(false); // the root is conflicted: not a plain rewrite
         }
+        // The rebuild below rewrites `[lo, n]` as a single-parent chain anchored
+        // on `chain[lo - 1]` — `history()`'s topological order reversed is only a
+        // parent chain when that range is linear. A merge or an interleaved
+        // sibling branch in the range would be silently linearized, so hand those
+        // to the manual flow. (`chain[lo - 1]` itself may be a merge: it is only
+        // read as a tree anchor, never re-parented.)
+        for i in lo..=n {
+            if chain[i].parent_ids() != std::slice::from_ref(chain[i - 1].id()) {
+                return Ok(false);
+            }
+        }
 
         // Only a simple single-`@` working copy is handled; a split chain falls
         // back. Uncommitted changes are *preserved*, not a reason to bail: their

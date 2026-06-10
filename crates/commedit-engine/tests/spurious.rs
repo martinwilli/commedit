@@ -284,6 +284,59 @@ fn spurious_drop_then_restore_round_trips_via_auto_resolve() {
 }
 
 #[test]
+fn a_conflicted_rewrite_spanning_a_merge_falls_back_to_manual() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // base / +bar on main; `side` adds side.txt off base; the merge is *evil* —
+    // it hand-inserts `baz` under main-1's `bar`. Dropping main-1 re-applies that
+    // remerge delta where `bar` is gone, so the rebased merge itself conflicts.
+    // The auto-resolver's rebuild would rewrite the conflicted range as a
+    // single-parent chain — linearizing the 2-parent merge — so it must bail and
+    // hand the conflict to the manual flow, leaving git untouched.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "foo\n", "base"),
+            ("f.txt", "foo\nbar\n", "main-1"),
+        ],
+    );
+    common::git(dir, &["checkout", "-q", "-b", "side", "main~1"]);
+    std::fs::write(dir.join("side.txt"), "side\n").unwrap();
+    common::git(dir, &["add", "side.txt"]);
+    common::git(dir, &["commit", "-q", "-m", "side-1"]);
+    common::git(dir, &["checkout", "-q", "main"]);
+    common::git_allow_failure(dir, &["merge", "--no-ff", "--no-commit", "side"]);
+    std::fs::write(dir.join("f.txt"), "foo\nbar\nbaz\n").unwrap();
+    common::git(dir, &["add", "f.txt"]);
+    common::git(dir, &["commit", "-q", "-m", "merge"]);
+    let head_before = common::git(dir, &["rev-parse", "HEAD"]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Drop main-1 by raw id (the merge sits between it and the tip, so no linear
+    // plan exists — the engine API is what a DAG-aware caller would use).
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let main1 = commits.iter().find(|c| c.subject == "main-1").unwrap().id.clone();
+    let outcome = repo.abandon_commit(&main1).expect("drop");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a conflicted range spanning a merge must go to manual resolution, got {outcome:?}"
+    );
+    assert!(repo.is_pending(), "the held-back rewrite leaves a pending resolution");
+    // git is untouched while pending: same tip, the merge still a 2-parent merge.
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert!(common::is_merge(dir, "HEAD"), "the merge keeps both parents");
+
+    // Aborting rolls jj back; git never moved.
+    repo.abort().expect("abort");
+    assert!(!repo.is_pending());
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn a_true_drop_conflict_still_falls_back_to_manual() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

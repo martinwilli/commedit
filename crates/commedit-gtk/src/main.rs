@@ -16,13 +16,15 @@ use commedit_engine::diff::{
 use commedit_engine::graph::{compute_graph, GraphLayout};
 use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
-    collapse_diff, deletion_is_safe, plan_edit, Cursor, EditGesture, EditPlan, Selection,
+    collapse_diff, deletion_is_safe, plan_edit, strip_selection_prefixes, Cursor, EditGesture,
+    EditPlan, Selection,
 };
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
+use sourceview5::prelude::ViewExt;
 use gtk::{
     gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction,
     DropDown, Entry, EventControllerKey, EventControllerScroll,
@@ -427,6 +429,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_view.set_monospace(true);
     file_view.set_left_margin(8);
     file_view.set_top_margin(8);
+    // Draw whitespace so indentation (tab vs. space) and trailing whitespace are
+    // visible. `ALL` locations is what surfaces leading indentation; the matrix
+    // must be enabled for the per-location/type selection to apply. Newlines are
+    // deliberately left undrawn (a glyph on every line is noisy). A context
+    // line's space prefix shows a faint leading dot — an accepted minor cosmetic.
+    let space_drawer = file_view.space_drawer();
+    space_drawer.set_types_for_locations(
+        sourceview5::SpaceLocationFlags::ALL,
+        sourceview5::SpaceTypeFlags::SPACE
+            | sourceview5::SpaceTypeFlags::TAB
+            | sourceview5::SpaceTypeFlags::NBSP,
+    );
+    space_drawer.set_enable_matrix(true);
     // Set while we mutate the diff buffer ourselves (loading a file, or applying
     // a structured edit) so the firewall signal handlers below let it through
     // instead of treating it as an interactive edit.
@@ -1439,6 +1454,46 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // handle Enter/Backspace/Delete as ordinary text editing.
             if pane_mode.borrow().is_conflict() {
                 return glib::Propagation::Proceed;
+            }
+            // Cut / copy operate on the diff's content, not its raw prefixed text:
+            // strip the one-char `+`/`-`/space marker per line so a later paste
+            // (which re-prefixes via the firewall) round-trips cleanly without
+            // doubling prefixes, and an external paste gets real code.
+            if ctrl && matches!(keyval, gdk::Key::c | gdk::Key::C) && !shift {
+                if let Some((s, e)) = file_buffer.selection_bounds() {
+                    let raw = file_buffer.text(&s, &e, false);
+                    let stripped = strip_selection_prefixes(raw.as_str(), s.line_offset() == 0);
+                    file_view.clipboard().set_text(&stripped);
+                    return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
+            if ctrl && matches!(keyval, gdk::Key::x | gdk::Key::X) {
+                let Some((s, e)) = file_buffer.selection_bounds() else {
+                    return glib::Propagation::Proceed;
+                };
+                // Route the delete through the same firewall Backspace/Delete use
+                // (with a selection `plan_delete` ignores direction).
+                return match plan_edit(
+                    &buffer_text(&file_buffer),
+                    buffer_selection(&file_buffer),
+                    EditGesture::Delete,
+                ) {
+                    // A safe single-line `+` cut: the selection is mid-content
+                    // (no prefix), so GTK's own cut copies and deletes it.
+                    EditPlan::Allow => glib::Propagation::Proceed,
+                    EditPlan::Block => {
+                        show_status(READ_ONLY_HINT);
+                        glib::Propagation::Stop
+                    }
+                    EditPlan::Edit(edit) => {
+                        let raw = file_buffer.text(&s, &e, false);
+                        let stripped = strip_selection_prefixes(raw.as_str(), s.line_offset() == 0);
+                        file_view.clipboard().set_text(&stripped);
+                        apply_patch_edit(&file_buffer, &editing, &edit, &*highlight);
+                        glib::Propagation::Stop
+                    }
+                };
             }
             let gesture = match keyval {
                 gdk::Key::Return | gdk::Key::KP_Enter => EditGesture::Newline,

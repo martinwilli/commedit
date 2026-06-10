@@ -389,7 +389,18 @@ impl Repo {
     /// they point at — the history view's ref pills. Read fresh from git on
     /// every call, so it tracks the branch moves a clean save exports.
     pub fn commit_refs(&self) -> BTreeMap<String, Vec<crate::transparency::RefDecoration>> {
-        crate::transparency::ref_decorations(self.workspace.workspace_root())
+        use crate::transparency::RefKind;
+        let mut refs = crate::transparency::ref_decorations(self.workspace.workspace_root());
+        // Flag the checked-out branch so the UI can pill it distinctly. Branch
+        // names are unique among branches, so matching by name is unambiguous.
+        if let Some(current) = self.current_bookmark() {
+            for decoration in refs.values_mut().flatten() {
+                if decoration.kind == RefKind::Branch && decoration.name == current.as_str() {
+                    decoration.current = true;
+                }
+            }
+        }
+        refs
     }
 
     /// The branch tip jj just exported into its session-local git dir, read from

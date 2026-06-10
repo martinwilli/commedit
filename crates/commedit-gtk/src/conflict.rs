@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind};
+use commedit_engine::graph::compute_graph;
 use commedit_engine::history::history_limited;
 use gtk::prelude::*;
 
@@ -281,6 +282,7 @@ pub(crate) fn conflict_cue_gap_at(buffer: &sourceview5::Buffer, line: usize) -> 
 pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
     let repo = d.repo.clone();
     let commits = d.commits.clone();
+    let graph = d.graph.clone();
     let list = w.list.clone();
     let pane_mode = d.pane_mode.clone();
     let conflict_label = w.conflict_label.clone();
@@ -347,11 +349,18 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                 commits.borrow_mut().insert(0, entry.info);
             }
         }
+        // Recompute the ancestry graph over the pending chain, prepended
+        // working-copy entries included — they stack above the tip, so they lay
+        // out as a plain continuation of its lane.
+        {
+            let root = repo.borrow().root_commit_id();
+            *graph.borrow_mut() = compute_graph(&commits.borrow(), &root);
+        }
         // Ref pills still resolve against the user's git refs: the rewrite is
         // held back, so they keep decorating the untouched ancestors below it
         // (the rewritten commits' pending ids match no ref, correctly).
         let refs = repo.borrow().commit_refs();
-        populate_list(&list, &commits.borrow(), &badges, &refs);
+        populate_list(&list, &commits.borrow(), &badges, &refs, &graph);
         conflict_label.set_text(&format!(
             "Conflicts from the rewrite must be resolved before it applies to git — \
              {n_files} file(s) across {n_commits} commit(s) remaining."

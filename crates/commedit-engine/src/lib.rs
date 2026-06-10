@@ -5,6 +5,7 @@
 
 pub mod conflict;
 pub mod diff;
+pub mod graph;
 pub mod history;
 pub mod patch_edit;
 pub mod replay;

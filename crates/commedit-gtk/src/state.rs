@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::ConflictedCommit;
 use commedit_engine::diff::{ConflictPiece, ContextExpansion};
+use commedit_engine::graph::GraphLayout;
 use commedit_engine::history::CommitInfo;
 use commedit_engine::repo::Repo;
 use commedit_engine::workcopy::WorkingCopyEntry;
@@ -221,6 +222,8 @@ pub(crate) struct Widgets {
 pub(crate) struct Data {
     pub(crate) repo: Rc<RefCell<Repo>>,
     pub(crate) commits: Rc<RefCell<Vec<CommitInfo>>>,
+    /// The history list's ancestry-graph layout, recomputed with `commits`.
+    pub(crate) graph: Rc<RefCell<GraphLayout>>,
     pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
     /// A trash-list change deferred until a conflicted drop/restore resolves.
     pub(crate) pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>>,

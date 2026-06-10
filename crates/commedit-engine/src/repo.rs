@@ -379,6 +379,13 @@ impl Repo {
         CommitId::try_from_hex(self.head_commit()?)
     }
 
+    /// The virtual root commit's id — the parent the oldest real commit reports.
+    /// The history-graph layout uses it to end that commit's ancestry line at its
+    /// node instead of drawing an edge to a never-listed parent.
+    pub fn root_commit_id(&self) -> CommitId {
+        self.repo.store().root_commit_id().clone()
+    }
+
     /// The user's local branches and tags, grouped by the hex id of the commit
     /// they point at — the history view's ref pills. Read fresh from git on
     /// every call, so it tracks the branch moves a clean save exports.

@@ -24,6 +24,7 @@ use commedit_engine::rewrite::Identity;
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
+use sourceview5::prelude::ViewExt;
 use gtk::{
     gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction,
     DropDown, Entry, EventControllerKey, EventControllerScroll,
@@ -428,6 +429,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_view.set_monospace(true);
     file_view.set_left_margin(8);
     file_view.set_top_margin(8);
+    // Draw whitespace so indentation (tab vs. space) and trailing whitespace are
+    // visible. `ALL` locations is what surfaces leading indentation; the matrix
+    // must be enabled for the per-location/type selection to apply. Newlines are
+    // deliberately left undrawn (a glyph on every line is noisy). A context
+    // line's space prefix shows a faint leading dot — an accepted minor cosmetic.
+    let space_drawer = file_view.space_drawer();
+    space_drawer.set_types_for_locations(
+        sourceview5::SpaceLocationFlags::ALL,
+        sourceview5::SpaceTypeFlags::SPACE
+            | sourceview5::SpaceTypeFlags::TAB
+            | sourceview5::SpaceTypeFlags::NBSP,
+    );
+    space_drawer.set_enable_matrix(true);
     // Set while we mutate the diff buffer ourselves (loading a file, or applying
     // a structured edit) so the firewall signal handlers below let it through
     // instead of treating it as an interactive edit.

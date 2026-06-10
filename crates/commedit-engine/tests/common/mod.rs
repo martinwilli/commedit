@@ -8,6 +8,39 @@
 use std::path::Path;
 use std::process::Command;
 
+use commedit_engine::graph::compute_graph;
+use commedit_engine::history::{CommitInfo, ReorderMove};
+use commedit_engine::repo::Repo;
+
+/// Plan moving display row `from` to insertion gap `to`, expecting exactly one
+/// destination line — the linear shape most tests drop into. Computes the lane
+/// layout on the fly, the way the UI feeds the planner.
+pub fn plan_reorder_single(
+    repo: &Repo,
+    commits: &[CommitInfo],
+    from: usize,
+    to: usize,
+) -> ReorderMove {
+    let layout = compute_graph(commits, &repo.root_commit_id());
+    let mut cands = repo.plan_reorder_candidates(commits, &layout, from, to);
+    assert_eq!(cands.len(), 1, "expected exactly one destination line for the gap");
+    cands.remove(0).mv
+}
+
+/// Plan grafting the trashed `restored` back in at gap `to`, expecting exactly
+/// one destination line. See [`plan_reorder_single`].
+pub fn plan_restore_single(
+    repo: &Repo,
+    commits: &[CommitInfo],
+    restored: &CommitInfo,
+    to: usize,
+) -> ReorderMove {
+    let layout = compute_graph(commits, &repo.root_commit_id());
+    let mut cands = repo.plan_restore_candidates(commits, &layout, restored, to);
+    assert_eq!(cands.len(), 1, "expected exactly one destination line for the gap");
+    cands.remove(0).mv
+}
+
 /// Run a `git` command in `dir`, asserting success, returning trimmed stdout.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let (ok, stdout, stderr) = git_raw(dir, args);

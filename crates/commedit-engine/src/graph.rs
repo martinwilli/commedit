@@ -1,6 +1,6 @@
 //! Lane layout for the gitk-style ancestry graph shown beside the history list:
 //! pure lane arithmetic over the newest-first commit list (no jj repo access, no
-//! GTK), in the spirit of `plan_reorder`.
+//! GTK), in the spirit of `plan_reorder_candidates`.
 //!
 //! Each row's geometry is split at its vertical center: `edges_above` run from
 //! the row's top edge down to the center, `edges_below` from the center to the
@@ -33,6 +33,19 @@ pub struct GraphRow {
     pub edges_below: Vec<(usize, usize)>,
 }
 
+/// One ancestry line crossing a row boundary: the lane it occupies and the DAG
+/// edges it bundles. Every listed child has `parent` as a direct parent —
+/// usually one child, several when converging lines share the lane (a merge
+/// fork reusing a lane that already descends to the same parent). Splicing a
+/// commit into this line means parenting it on `parent` and re-parenting all
+/// `children` onto it, which is exactly what the drawn line depicts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneEdge {
+    pub lane: usize,
+    pub children: Vec<CommitId>,
+    pub parent: CommitId,
+}
+
 /// The whole list's layout: one [`GraphRow`] per commit (same indexing as the
 /// input slice) plus the widest lane count, so every row's drawing area can be
 /// sized identically and the columns align.
@@ -40,6 +53,12 @@ pub struct GraphRow {
 pub struct GraphLayout {
     pub rows: Vec<GraphRow>,
     pub max_lanes: usize,
+    /// `boundaries[i]` is the set of lines crossing row *i*'s bottom edge — the
+    /// display gap *i + 1* (a gap `g > 0` is crossed by `boundaries[g - 1]`).
+    /// Edges to the virtual root are never listed, matching the drawing (the
+    /// oldest commit's line ends at its node); edges to parents truncated by
+    /// pagination are, since their lines run off the loaded page.
+    pub boundaries: Vec<Vec<LaneEdge>>,
 }
 
 /// Lay the newest-first, topologically ordered `commits` (children always before
@@ -56,13 +75,15 @@ pub struct GraphLayout {
 /// of a merge forks out to a free lane (reusing a lane that already expects the
 /// same parent, so converging lines meet early and the graph stays compact).
 pub fn compute_graph(commits: &[CommitInfo], root: &CommitId) -> GraphLayout {
-    let mut lanes: Vec<Option<CommitId>> = Vec::new();
+    // Each occupied lane tracks the parent its line descends toward and the
+    // children whose edges it carries (several once converging lines merge).
+    let mut lanes: Vec<Option<(CommitId, Vec<CommitId>)>> = Vec::new();
     let mut layout = GraphLayout::default();
     for commit in commits {
         let mut row = GraphRow::default();
 
         let matches: Vec<usize> = (0..lanes.len())
-            .filter(|&l| lanes[l].as_ref() == Some(&commit.id))
+            .filter(|&l| lanes[l].as_ref().is_some_and(|(p, _)| p == &commit.id))
             .collect();
         row.node_lane = match matches.first() {
             Some(&l) => l,
@@ -84,19 +105,27 @@ pub fn compute_graph(commits: &[CommitInfo], root: &CommitId) -> GraphLayout {
         // parent forks out. A fork into a *fresh* lane opens a new line, so that
         // lane gets no straight continuation edge this row.
         let mut parents = commit.parents.iter().filter(|p| *p != root);
-        lanes[row.node_lane] = parents.next().cloned();
+        lanes[row.node_lane] = parents.next().map(|p| (p.clone(), vec![commit.id.clone()]));
         let mut forks = Vec::new();
         let mut fresh = Vec::new();
         for parent in parents {
             row.is_merge = true;
             let found = (0..lanes.len())
-                .find(|&l| l != row.node_lane && lanes[l].as_ref() == Some(parent));
-            let l = found.unwrap_or_else(|| {
-                let l = take_free_lane(&mut lanes);
-                lanes[l] = Some(parent.clone());
-                fresh.push(l);
-                l
-            });
+                .find(|&l| l != row.node_lane && lanes[l].as_ref().is_some_and(|(p, _)| p == parent));
+            let l = match found {
+                // Converge into a lane already descending to this parent: the
+                // line now carries this commit's edge too.
+                Some(l) => {
+                    lanes[l].as_mut().expect("occupied lane").1.push(commit.id.clone());
+                    l
+                }
+                None => {
+                    let l = take_free_lane(&mut lanes);
+                    lanes[l] = Some((parent.clone(), vec![commit.id.clone()]));
+                    fresh.push(l);
+                    l
+                }
+            };
             forks.push(l);
         }
         for (l, lane) in lanes.iter().enumerate() {
@@ -114,6 +143,19 @@ pub fn compute_graph(commits: &[CommitInfo], root: &CommitId) -> GraphLayout {
         while lanes.last() == Some(&None) {
             lanes.pop();
         }
+        layout.boundaries.push(
+            lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(l, lane)| {
+                    lane.as_ref().map(|(parent, children)| LaneEdge {
+                        lane: l,
+                        children: children.clone(),
+                        parent: parent.clone(),
+                    })
+                })
+                .collect(),
+        );
         layout.rows.push(row);
     }
     layout
@@ -121,7 +163,7 @@ pub fn compute_graph(commits: &[CommitInfo], root: &CommitId) -> GraphLayout {
 
 /// Index of the leftmost free lane, growing the lane list by one if all are
 /// occupied. Leaves the lane `None`; the caller assigns it.
-fn take_free_lane(lanes: &mut Vec<Option<CommitId>>) -> usize {
+fn take_free_lane(lanes: &mut Vec<Option<(CommitId, Vec<CommitId>)>>) -> usize {
     match lanes.iter().position(Option::is_none) {
         Some(l) => l,
         None => {
@@ -133,7 +175,7 @@ fn take_free_lane(lanes: &mut Vec<Option<CommitId>>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_graph, GraphRow};
+    use super::{compute_graph, GraphRow, LaneEdge};
     use crate::history::CommitInfo;
     use jj_lib::backend::{ChangeId, CommitId};
 
@@ -169,6 +211,14 @@ mod tests {
             is_merge,
             edges_above: above.to_vec(),
             edges_below: below.to_vec(),
+        }
+    }
+
+    fn edge(lane: usize, children: &[u8], parent: u8) -> LaneEdge {
+        LaneEdge {
+            lane,
+            children: children.iter().map(|&c| cid(c)).collect(),
+            parent: cid(parent),
         }
     }
 
@@ -244,6 +294,55 @@ mod tests {
         let g = compute_graph(&h, &cid(0));
         assert_eq!(g.max_lanes, 1);
         assert_eq!(g.rows[0], row(0, false, &[], &[]));
+    }
+
+    #[test]
+    fn linear_boundaries_carry_one_edge_each() {
+        let h = vec![ci(3, &[2]), ci(2, &[1]), ci(1, &[0])];
+        let g = compute_graph(&h, &cid(0));
+        assert_eq!(g.boundaries[0], vec![edge(0, &[3], 2)]);
+        assert_eq!(g.boundaries[1], vec![edge(0, &[2], 1)]);
+        // The oldest commit sits on the root: its line ends, no edge crosses.
+        assert_eq!(g.boundaries[2], vec![]);
+    }
+
+    #[test]
+    fn merge_boundaries_list_both_descending_lines() {
+        // 4 merges 2 into 3; both branched off 1.
+        let h = vec![ci(4, &[3, 2]), ci(3, &[1]), ci(2, &[1]), ci(1, &[0])];
+        let g = compute_graph(&h, &cid(0));
+        assert_eq!(g.boundaries[0], vec![edge(0, &[4], 3), edge(1, &[4], 2)]);
+        assert_eq!(g.boundaries[1], vec![edge(0, &[3], 1), edge(1, &[4], 2)]);
+        // Two sibling lines both descend toward 1 — distinct edges, one per lane.
+        assert_eq!(g.boundaries[2], vec![edge(0, &[3], 1), edge(1, &[2], 1)]);
+        assert_eq!(g.boundaries[3], vec![]);
+    }
+
+    #[test]
+    fn converged_lane_bundles_its_children() {
+        // Criss-cross: the second merge's fork toward 1 reuses the lane the
+        // first one opened, so that line carries both edges below row 2.
+        let h = vec![
+            ci(6, &[5, 4]),
+            ci(5, &[2, 1]),
+            ci(4, &[2, 1]),
+            ci(2, &[0]),
+            ci(1, &[0]),
+        ];
+        let g = compute_graph(&h, &cid(0));
+        assert_eq!(
+            g.boundaries[2],
+            vec![edge(0, &[5], 2), edge(1, &[4], 2), edge(2, &[5, 4], 1)]
+        );
+    }
+
+    #[test]
+    fn truncated_page_keeps_offpage_edges_active() {
+        // Only the first two rows are loaded: the last boundary still lists the
+        // lines running off the page toward the unloaded parents.
+        let h = vec![ci(4, &[3, 2]), ci(3, &[1])];
+        let g = compute_graph(&h, &cid(0));
+        assert_eq!(g.boundaries[1], vec![edge(0, &[3], 1), edge(1, &[4], 2)]);
     }
 
     #[test]

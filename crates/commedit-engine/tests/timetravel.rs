@@ -24,7 +24,7 @@ fn id_of(repo: &Repo, subject: &str) -> CommitId {
 /// Plan and perform "drag the commit at display row `from` to gap `to`".
 fn reorder(repo: &mut Repo, from: usize, to: usize) -> SaveOutcome {
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = repo.plan_reorder(&commits, from, to).expect("reorder plan");
+    let mv = common::plan_reorder_single(repo, &commits, from, to);
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("reorder")
 }

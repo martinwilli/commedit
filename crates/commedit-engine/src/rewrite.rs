@@ -10,8 +10,10 @@ use jj_lib::rewrite::{
 };
 
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
+use crate::graph::GraphLayout;
 use crate::history::{
-    plan_drop, plan_reorder, plan_restore, parse_timestamp, CommitInfo, ReorderMove,
+    plan_drop, plan_reorder_candidates, plan_restore_candidates, parse_timestamp, CommitInfo,
+    ReorderCandidate,
 };
 use crate::repo::Repo;
 
@@ -124,18 +126,37 @@ impl Repo {
         )
     }
 
-    /// Plan a drag-to-reorder of the commit at display index `from` to the
-    /// insertion gap `to`, against the current branch's linear chain. Returns
-    /// `None` for an out-of-range/no-op drop, an off-branch row, or when HEAD is
-    /// unknown. See [`crate::history::plan_reorder`].
-    pub fn plan_reorder(
+    /// All destination lines for dragging the commit at display index `from` to
+    /// the insertion gap `to` — one candidate per ancestry line crossing the
+    /// gap. Empty for an out-of-range/no-op drop, a merge, an off-branch row, or
+    /// when HEAD is unknown. See [`crate::history::plan_reorder_candidates`].
+    pub fn plan_reorder_candidates(
         &self,
         commits: &[CommitInfo],
+        layout: &GraphLayout,
         from: usize,
         to: usize,
-    ) -> Option<ReorderMove> {
-        let head = self.head_commit_id()?;
-        plan_reorder(commits, &head, from, to)
+    ) -> Vec<ReorderCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_reorder_candidates(commits, &head, layout, &self.root_commit_id(), from, to)
+    }
+
+    /// All destination lines for grafting the trashed commit `restored` back
+    /// into the history at insertion gap `to`. Empty for an out-of-range drop or
+    /// when HEAD is unknown. See [`crate::history::plan_restore_candidates`].
+    pub fn plan_restore_candidates(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        restored: &CommitInfo,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_restore_candidates(commits, &head, layout, &self.root_commit_id(), restored, to)
     }
 
     /// The id of the commit at display `index` if it can be dropped to the trash,
@@ -146,21 +167,7 @@ impl Repo {
         plan_drop(commits, &head, index)
     }
 
-    /// Plan grafting the trashed commit `restored` (no longer in `commits`) back
-    /// into the linear history at insertion gap `to`. Returns `None` for an
-    /// out-of-range drop or when HEAD is unknown. See
-    /// [`crate::history::plan_restore`].
-    pub fn plan_restore(
-        &self,
-        commits: &[CommitInfo],
-        restored: &CommitInfo,
-        to: usize,
-    ) -> Option<ReorderMove> {
-        let head = self.head_commit_id()?;
-        plan_restore(commits, &head, restored, to)
-    }
-
-    /// Move `target` to a new slot in the linear history: rebased onto
+    /// Move `target` to a new slot in the history graph: rebased onto
     /// `new_parent_ids`, with `new_child_ids` rebased on top of it, cascading to
     /// all descendants. `new_tip` is the (pre-move) id of the commit that should
     /// end up as the branch head once the dust settles. Exported to git in one
@@ -255,6 +262,18 @@ impl Repo {
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let heads = self.snapshot_heads();
+        // A top-gap splice (no new children) puts the target above the old head
+        // — where the working-copy chain also sits, and with no child to rebase,
+        // nothing would carry it onto the new tip (the snapshot above just
+        // re-attached it to the old head). Splice between the head and the
+        // chain's bottom entry instead, so the uncommitted changes ride the
+        // rebase onto the new tip like in any other splice.
+        let mut new_child_ids = new_child_ids;
+        if new_child_ids.is_empty() {
+            if let Some(bottom) = self.working_copy_chain_ids().last() {
+                new_child_ids.push(bottom.clone());
+            }
+        }
         let loc = MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,

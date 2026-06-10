@@ -38,7 +38,11 @@ an interactive-rebase session.
   how you carve a commit apart.
 
 - **Reorder, drop and restore** — drag commits to reorder them in the history,
-  drop one into the trash, or drag it back to restore it.
+  drop one into the trash, or drag it back to restore it. Works anywhere in a
+  merge graph: side-branch commits move, trash and restore like mainline ones
+  (merges keep their shape; the merge commit itself stays put). Where several
+  ancestry lines cross the drop gap, a small picker of colored lines asks which
+  one to splice into.
 
 - **Squash by dragging** — drag a commit *onto* another to fold it in. A commit
   with an autosquash prefix (`fixup!` / `squash!` / `amend!`) highlights its

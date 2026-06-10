@@ -11,11 +11,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::history::{ReorderCandidate, ReorderMove};
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use gtk::prelude::*;
-use gtk::{gdk, glib, Box as GtkBox, Button, DragSource, DropTarget, ListBoxRow, Orientation, Popover};
+use gtk::{
+    gdk, glib, Box as GtkBox, Button, DragSource, DropTarget, ListBox, ListBoxRow, Orientation,
+    Popover,
+};
 
-use crate::rows::populate_trash;
+use crate::rows::{lane_color, populate_trash};
 use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, Widgets};
 
 /// Install the drag-and-drop controllers on the history, trash and working-copy
@@ -33,6 +37,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let wc_list = w.wc_list.clone();
     let repo = d.repo.clone();
     let commits = d.commits.clone();
+    let graph = d.graph.clone();
     let trashed = d.trashed.clone();
     let pending_trash_op = d.pending_trash_op.clone();
     let wc_entries = d.wc_entries.clone();
@@ -76,6 +81,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let list = list.clone();
         let placeholder = placeholder.clone();
         let commits = commits.clone();
+        let graph = graph.clone();
         let drop_gap = drop_gap.clone();
         let repo = repo.clone();
         let drag_from = drag_from.clone();
@@ -105,18 +111,20 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 return;
             }
             // Only open a gap where dropping would actually move/graft the
-            // commit. For a history drag the no-op gaps just above/below the
-            // dragged row (and off-chain rows) yield None; for a trash drag the
-            // same gate runs through plan_restore on the trashed commit.
+            // commit — i.e. at least one ancestry line crossing it is a valid
+            // destination. For a history drag the dragged row's own line (and a
+            // merge or off-branch row) yields no candidates; for a trash drag
+            // the same gate runs through the restore candidates.
             let real_move = drag_from.get().is_some_and(|from| match drag_origin.get() {
-                DragOrigin::History => repo
+                DragOrigin::History => !repo
                     .borrow()
-                    .plan_reorder(&commits.borrow(), from, new_gap)
-                    .is_some(),
+                    .plan_reorder_candidates(&commits.borrow(), &graph.borrow(), from, new_gap)
+                    .is_empty(),
                 DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
-                    repo.borrow()
-                        .plan_restore(&commits.borrow(), info, new_gap)
-                        .is_some()
+                    !repo
+                        .borrow()
+                        .plan_restore_candidates(&commits.borrow(), &graph.borrow(), info, new_gap)
+                        .is_empty()
                 }),
                 // A working-copy entry only folds *onto* a commit — never between.
                 DragOrigin::WorkingCopy => false,
@@ -461,28 +469,52 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 DragOrigin::History => {
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let graph = graph.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
+                    let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
-                        // Plan against the current branch's linear chain (the view
-                        // may also show other branches/tags); a no-op or off-branch
-                        // drop yields None.
-                        let plan =
-                            repo.borrow().plan_reorder(&commits.borrow(), from as usize, to);
-                        let Some(mv) = plan else {
-                            return;
-                        };
-                        let outcome = repo.borrow_mut().reorder_commit(
-                            &mv.target,
-                            mv.new_parents,
-                            mv.new_children,
-                            &mv.new_tip,
+                        // One candidate per ancestry line crossing the gap; a
+                        // no-op, merge or off-branch drop yields none.
+                        let cands = repo.borrow().plan_reorder_candidates(
+                            &commits.borrow(),
+                            &graph.borrow(),
+                            from as usize,
+                            to,
                         );
-                        match outcome {
-                            Ok(SaveOutcome::Clean) => refresh(),
-                            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
-                            Err(err) => show_status(&format!("Reorder failed: {err}")),
+                        if cands.is_empty() {
+                            return;
+                        }
+
+                        // Run the chosen splice and report the outcome.
+                        let apply: Rc<dyn Fn(&ReorderMove)> = {
+                            let repo = repo.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            Rc::new(move |mv: &ReorderMove| {
+                                let outcome = repo.borrow_mut().reorder_commit(
+                                    &mv.target,
+                                    mv.new_parents.clone(),
+                                    mv.new_children.clone(),
+                                    &mv.new_tip,
+                                );
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => refresh(),
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        enter_conflict_mode(commits)
+                                    }
+                                    Err(err) => show_status(&format!("Reorder failed: {err}")),
+                                }
+                            })
+                        };
+
+                        match &cands[..] {
+                            // A single crossing line: splice right in.
+                            [single] => apply(&single.mv),
+                            // Several lines cross the gap: ask which one.
+                            _ => show_lane_popover(&list, to, cands, &apply),
                         }
                     }));
                     true
@@ -571,10 +603,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     true
                 }
                 DragOrigin::Trash => {
-                    // Restoring a trashed commit: graft it back into the chain at
-                    // the drop gap, drop it from the trash, and select it.
+                    // Restoring a trashed commit: graft it back into the graph at
+                    // the drop gap (picking the line when several cross it), drop
+                    // it from the trash, and select it.
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let graph = graph.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let trashed = trashed.clone();
@@ -583,37 +617,70 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let trash_scroll = trash_scroll.clone();
                     let selected_change = selected_change.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
+                    let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let Some(info) = trashed.borrow().get(from as usize).cloned() else {
                             return;
                         };
-                        let plan = repo.borrow().plan_restore(&commits.borrow(), &info, to);
-                        let Some(mv) = plan else {
-                            return;
-                        };
-                        let outcome = repo.borrow_mut().restore_commit(
-                            &mv.target,
-                            mv.new_parents,
-                            mv.new_children,
-                            &mv.new_tip,
+                        let cands = repo.borrow().plan_restore_candidates(
+                            &commits.borrow(),
+                            &graph.borrow(),
+                            &info,
+                            to,
                         );
-                        match outcome {
-                            Ok(SaveOutcome::Clean) => {
-                                trashed.borrow_mut().remove(from as usize);
-                                *selected_change.borrow_mut() = Some(info.change_id_hex());
-                                refresh();
-                                populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
-                            }
-                            Ok(SaveOutcome::Conflicts { commits }) => {
-                                // Don't remove from the trash yet: the rewrite is
-                                // held back from git until the conflicts clear, so
-                                // the trash mustn't change either. Defer the removal
-                                // — applied on a clean resolution, dropped on abort.
-                                *pending_trash_op.borrow_mut() =
-                                    Some(PendingTrashOp::Restore(info));
-                                enter_conflict_mode(commits);
-                            }
-                            Err(err) => show_status(&format!("Restore failed: {err}")),
+                        if cands.is_empty() {
+                            return;
+                        }
+
+                        // Run the chosen splice and report the outcome. Forget the
+                        // restored commit by change id — the popover may have let
+                        // the trash drift (mirroring the trash-squash arm).
+                        let apply: Rc<dyn Fn(&ReorderMove)> = {
+                            let repo = repo.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let trashed = trashed.clone();
+                            let pending_trash_op = pending_trash_op.clone();
+                            let trash_list = trash_list.clone();
+                            let trash_scroll = trash_scroll.clone();
+                            let selected_change = selected_change.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            let info = info.clone();
+                            Rc::new(move |mv: &ReorderMove| {
+                                let outcome = repo.borrow_mut().restore_commit(
+                                    &mv.target,
+                                    mv.new_parents.clone(),
+                                    mv.new_children.clone(),
+                                    &mv.new_tip,
+                                );
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => {
+                                        let change_hex = info.change_id_hex();
+                                        trashed
+                                            .borrow_mut()
+                                            .retain(|c| c.change_id_hex() != change_hex);
+                                        *selected_change.borrow_mut() = Some(change_hex);
+                                        refresh();
+                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                    }
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        // Don't remove from the trash yet: the rewrite
+                                        // is held back from git until the conflicts
+                                        // clear, so the trash mustn't change either.
+                                        // Defer the removal — applied on a clean
+                                        // resolution, dropped on abort.
+                                        *pending_trash_op.borrow_mut() =
+                                            Some(PendingTrashOp::Restore(info.clone()));
+                                        enter_conflict_mode(commits);
+                                    }
+                                    Err(err) => show_status(&format!("Restore failed: {err}")),
+                                }
+                            })
+                        };
+
+                        match &cands[..] {
+                            [single] => apply(&single.mv),
+                            _ => show_lane_popover(&list, to, cands, &apply),
                         }
                     }));
                     true
@@ -1002,6 +1069,76 @@ fn show_squash_popover(target_row: &ListBoxRow, apply: &Rc<dyn Fn(SquashMode)>) 
 
     // Detach when dismissed (verb click or outside-click) so a popover doesn't
     // leak per drop.
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+/// Width/height of one lane swatch in the pick-a-line popover.
+const SWATCH_W: i32 = 16;
+const SWATCH_H: i32 = 28;
+
+/// A popover at the drop gap letting the user pick which ancestry line to
+/// splice the dragged commit into, when several cross it: one flat button per
+/// candidate (lane order, matching the graph's columns left-to-right), each
+/// drawing just a vertical line in its lane's color — no text. A click runs
+/// `apply` with that candidate's splice; a click outside dismisses. Shown from
+/// the post-drag idle like [`show_squash_popover`]: the gesture is fully torn
+/// down and no rewrite has happened yet, so the rows — and the candidates'
+/// commit ids — stay valid while it is open (autohide grabs input, so no second
+/// drag can start under it).
+fn show_lane_popover(
+    list: &ListBox,
+    gap: usize,
+    candidates: Vec<ReorderCandidate>,
+    apply: &Rc<dyn Fn(&ReorderMove)>,
+) {
+    let popover = Popover::new();
+    let hbox = GtkBox::new(Orientation::Horizontal, 0);
+    for cand in candidates {
+        let lane = cand.lane;
+        let swatch = gtk::DrawingArea::new();
+        swatch.set_content_width(SWATCH_W);
+        swatch.set_content_height(SWATCH_H);
+        swatch.set_draw_func(move |_, cr, w, h| {
+            let (r, g, b) = lane_color(lane);
+            cr.set_source_rgb(r, g, b);
+            cr.set_line_width(3.0);
+            cr.move_to(w as f64 / 2.0, 2.0);
+            cr.line_to(w as f64 / 2.0, h as f64 - 2.0);
+            let _ = cr.stroke();
+        });
+        let btn = Button::new();
+        btn.set_child(Some(&swatch));
+        btn.add_css_class("flat");
+        hbox.append(&btn);
+        let apply = apply.clone();
+        let popover = popover.clone();
+        let mv = cand.mv;
+        btn.connect_clicked(move |_| {
+            apply(&mv);
+            popover.popdown();
+        });
+    }
+    popover.set_child(Some(&hbox));
+
+    // Parent to the list, not a row (same selected-row color reasoning as
+    // `show_squash_popover`), pointing at the gap's 1px boundary strip: the
+    // placeholder is gone by post-drag time, so the gap is the edge between two
+    // rows — the top of the row at `gap`, or the bottom edge of the last row
+    // for the bottom gap. Skip hidden surplus rows (`populate_rows` hides, never
+    // unparents), whose allocations are stale.
+    let row_at = |i: usize| list.row_at_index(i as i32).filter(|r| r.is_visible());
+    let Some((row, at_top)) = row_at(gap)
+        .map(|r| (r, true))
+        .or_else(|| (gap > 0).then(|| row_at(gap - 1).map(|r| (r, false))).flatten())
+    else {
+        return;
+    };
+    let a = row.allocation();
+    let y = if at_top { a.y() } else { a.y() + a.height() - 1 };
+    popover.set_parent(list);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(a.x(), y, a.width(), 1)));
+    popover.set_autohide(true);
     popover.connect_closed(|p| p.unparent());
     popover.popup();
 }

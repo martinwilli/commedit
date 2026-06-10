@@ -80,7 +80,7 @@ fn conflicting_repo(dir: &std::path::Path) {
 /// Plan and perform "drag A (display row 1) to the top".
 fn reorder_a_to_top(repo: &mut Repo) -> SaveOutcome {
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = repo.plan_reorder(&commits, 1, 0).expect("reorder plan");
+    let mv = common::plan_reorder_single(&repo, &commits, 1, 0);
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("reorder")
 }
@@ -397,7 +397,7 @@ fn concurrent_sessions_do_not_corrupt_a_shared_op_log() {
     // A later session reorders without tripping jj's "graph has cycle" panic.
     let mut repo = Repo::open(dir).expect("open after the other sessions");
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = repo.plan_reorder(&commits, 1, 0).expect("reorder plan");
+    let mv = common::plan_reorder_single(&repo, &commits, 1, 0);
     let result = repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip);
     assert!(
         result.is_ok(),

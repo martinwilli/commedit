@@ -15,7 +15,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
 
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
-use crate::history::{branch_chain, CommitInfo};
+use crate::history::{branch_commits, CommitInfo};
 use crate::repo::Repo;
 
 /// Which `--autosquash`-style merge to perform when one commit is dropped onto
@@ -78,9 +78,9 @@ pub fn squash_target_subject(subject: &str) -> Option<String> {
 /// The rows to highlight when the commit at display index `from` (a prefixed
 /// commit) is dragged: green `targets` whose subject matches its bare target
 /// subject, and yellow `siblings` — other prefixed commits aimed at the same
-/// target. Both are scoped to the current branch's linear chain (like
-/// [`crate::history::plan_reorder`]) and exclude `from`. Empty when the dragged
-/// commit is unprefixed, off-chain, or nothing matches.
+/// target. Both span the whole graph reachable from the branch head (like
+/// [`crate::history::plan_reorder_candidates`]) and exclude `from`. Empty when
+/// the dragged commit is unprefixed, off-branch, a merge, or nothing matches.
 pub fn squash_recommendations(
     commits: &[CommitInfo],
     head: &CommitId,
@@ -92,17 +92,19 @@ pub fn squash_recommendations(
     let Some(target) = squash_target_subject(&src.subject) else {
         return SquashHighlights::default();
     };
-    let chain = branch_chain(commits, head);
-    if !chain.contains(&from) {
+    let branch = branch_commits(commits, head);
+    if src.parents.len() != 1 || !branch.contains(&src.id) {
         return SquashHighlights::default();
     }
-    let candidates: Vec<usize> = chain.into_iter().filter(|&i| i != from).collect();
+    let candidates: Vec<usize> = (0..commits.len())
+        .filter(|&i| i != from && branch.contains(&commits[i].id))
+        .collect();
     recommendations_in_chain(commits, &candidates, &target)
 }
 
 /// Like [`squash_recommendations`], but for dragging a *trashed* commit
 /// (`restored`, a [`CommitInfo`] no longer in `commits`) back over the history:
-/// highlight the chain rows its `fixup!`/`squash!`/`amend!` subject points at.
+/// highlight the branch rows its `fixup!`/`squash!`/`amend!` subject points at.
 /// Empty when the trashed commit is unprefixed or nothing matches.
 pub fn squash_recommendations_for(
     commits: &[CommitInfo],
@@ -112,10 +114,9 @@ pub fn squash_recommendations_for(
     let Some(target) = squash_target_subject(&restored.subject) else {
         return SquashHighlights::default();
     };
-    let chain = branch_chain(commits, head);
-    let candidates: Vec<usize> = chain
-        .into_iter()
-        .filter(|&i| commits[i].id != restored.id)
+    let branch = branch_commits(commits, head);
+    let candidates: Vec<usize> = (0..commits.len())
+        .filter(|&i| commits[i].id != restored.id && branch.contains(&commits[i].id))
         .collect();
     recommendations_in_chain(commits, &candidates, &target)
 }
@@ -151,8 +152,13 @@ fn recommendations_in_chain(
 }
 
 /// Validate a squash of the commit at display row `from` onto the commit at row
-/// `onto`: both must be distinct and on the current branch's linear chain (which
-/// already excludes merges, off-branch rows and the root). Returns
+/// `onto`: both must be distinct commits reachable from the branch head,
+/// anywhere in the graph — jj's `squash_commits` rebases the source's changes
+/// across branch lines, so squashing cousins from different merge sides works
+/// (the destination's own line is where the result lands). The *source* must
+/// not be a merge (its "own change" relative to two parents is its resolution,
+/// which stays editable in place instead); a merge as the *destination* is fine
+/// — the change folds into the merge's tree like an evil-merge edit. Returns
 /// `(source_id, dest_id)` or `None`.
 pub fn plan_squash(
     commits: &[CommitInfo],
@@ -163,16 +169,17 @@ pub fn plan_squash(
     if from == onto {
         return None;
     }
-    let chain = branch_chain(commits, head);
-    if !chain.contains(&from) || !chain.contains(&onto) {
+    let (src, dest) = (commits.get(from)?, commits.get(onto)?);
+    let branch = branch_commits(commits, head);
+    if src.parents.len() != 1 || !branch.contains(&src.id) || !branch.contains(&dest.id) {
         return None;
     }
-    Some((commits[from].id.clone(), commits[onto].id.clone()))
+    Some((src.id.clone(), dest.id.clone()))
 }
 
 /// Validate squashing a *trashed* commit (`restored`, a [`CommitInfo`] no longer
-/// in `commits`) onto the commit at display row `onto`: `onto` must sit on the
-/// current branch chain and not be the trashed commit itself. Returns
+/// in `commits`) onto the commit at display row `onto`: `onto` must be reachable
+/// from the branch head and not be the trashed commit itself. Returns
 /// `(source_id, dest_id)` or `None`.
 pub fn plan_squash_restore(
     commits: &[CommitInfo],
@@ -180,11 +187,11 @@ pub fn plan_squash_restore(
     restored: &CommitInfo,
     onto: usize,
 ) -> Option<(CommitId, CommitId)> {
-    let chain = branch_chain(commits, head);
-    if !chain.contains(&onto) || commits[onto].id == restored.id {
+    let dest = commits.get(onto)?;
+    if dest.id == restored.id || !branch_commits(commits, head).contains(&dest.id) {
         return None;
     }
-    Some((restored.id.clone(), commits[onto].id.clone()))
+    Some((restored.id.clone(), dest.id.clone()))
 }
 
 /// The source commit's message contribution: the description with a leading
@@ -528,6 +535,48 @@ mod tests {
         assert_eq!(plan_squash(&h, &cid(3), 0, 1), Some((cid(3), cid(2))));
         assert_eq!(plan_squash(&h, &cid(3), 1, 1), None); // onto itself
         assert_eq!(plan_squash(&h, &cid(3), 0, 9), None); // out of range
+    }
+
+    /// A commit with an explicit parent set, for merge topologies (0 = root).
+    fn merge_ci(id: u8, parents: &[u8], subject: &str) -> CommitInfo {
+        let mut c = ci(id, 0, subject);
+        c.parents = parents.iter().map(|&p| CommitId::new(vec![p])).collect();
+        c
+    }
+
+    /// Merge 4(3, 2) of main-1 (3) and side-1 (2), both branched off base (1).
+    fn merge_history() -> Vec<CommitInfo> {
+        vec![
+            merge_ci(4, &[3, 2], "merge"),
+            ci(3, 1, "main-1"),
+            ci(2, 1, "side-1"),
+            ci(1, 0, "base"),
+        ]
+    }
+
+    #[test]
+    fn plans_a_squash_across_merge_branches() {
+        let h = merge_history();
+        // Cousins on different sides squash (jj rebases the change across)…
+        assert_eq!(plan_squash(&h, &cid(4), 2, 1), Some((cid(2), cid(3))));
+        // …and the merge is a valid destination (an evil-merge style fold)…
+        assert_eq!(plan_squash(&h, &cid(4), 1, 0), Some((cid(3), cid(4))));
+        // …but a merge is not a source: its own change is its resolution.
+        assert_eq!(plan_squash(&h, &cid(4), 0, 1), None);
+    }
+
+    #[test]
+    fn recommendations_span_merge_branches() {
+        // The fixup sits on the side branch, its target on the mainline.
+        let h = vec![
+            merge_ci(4, &[3, 2], "merge"),
+            ci(3, 1, "main-1"),
+            ci(2, 1, "fixup! main-1"),
+            ci(1, 0, "base"),
+        ];
+        let r = squash_recommendations(&h, &cid(4), 2);
+        assert_eq!(r.targets, vec![1]);
+        assert_eq!(r.siblings, vec![]);
     }
 
     #[test]

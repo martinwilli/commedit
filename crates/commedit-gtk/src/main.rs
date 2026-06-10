@@ -264,6 +264,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              border: 1px solid rgba(46, 194, 126, 0.8); } \
              .ref-tag { background-color: rgba(245, 194, 17, 0.25); \
              border: 1px solid rgba(245, 194, 17, 0.8); } \
+             .ref-current { background-color: rgba(53, 132, 228, 0.30); \
+             border: 1px solid rgba(53, 132, 228, 0.9); font-weight: bold; } \
              .history-list row { padding-top: 0; padding-bottom: 0; }",
         );
         gtk::style_context_add_provider_for_display(

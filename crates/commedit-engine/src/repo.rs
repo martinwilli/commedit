@@ -379,6 +379,13 @@ impl Repo {
         CommitId::try_from_hex(self.head_commit()?)
     }
 
+    /// The user's local branches and tags, grouped by the hex id of the commit
+    /// they point at — the history view's ref pills. Read fresh from git on
+    /// every call, so it tracks the branch moves a clean save exports.
+    pub fn commit_refs(&self) -> BTreeMap<String, Vec<crate::transparency::RefDecoration>> {
+        crate::transparency::ref_decorations(self.workspace.workspace_root())
+    }
+
     /// The branch tip jj just exported into its session-local git dir, read from
     /// jj's own view — the user's git ref still holds the pre-rewrite tip until
     /// [`Self::bridge_branch_to_git`] mirrors this out. The checked-out branch's

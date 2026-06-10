@@ -14,7 +14,7 @@ use commedit_engine::squash::SquashMode;
 /// Plan and perform "drag display row `from` to the top gap".
 fn reorder_row_to_top(repo: &mut Repo, from: usize) -> SaveOutcome {
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = repo.plan_reorder(&commits, from, 0).expect("reorder plan");
+    let mv = common::plan_reorder_single(repo, &commits, from, 0);
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("reorder")
 }
@@ -259,7 +259,7 @@ fn spurious_drop_then_restore_round_trips_via_auto_resolve() {
 
     // Restore C1-bar into the gap between C2-baz and base (its original slot).
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = repo.plan_restore(&commits, &c1, 1).expect("restore plan");
+    let mv = common::plan_restore_single(&repo, &commits, &c1, 1);
     let outcome = repo
         .restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("restore");

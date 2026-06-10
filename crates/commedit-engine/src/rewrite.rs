@@ -12,8 +12,8 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    plan_drop, plan_reorder, plan_reorder_candidates, plan_restore, plan_restore_candidates,
-    parse_timestamp, CommitInfo, ReorderCandidate, ReorderMove,
+    plan_drop, plan_reorder_candidates, plan_restore_candidates, parse_timestamp, CommitInfo,
+    ReorderCandidate,
 };
 use crate::repo::Repo;
 
@@ -126,20 +126,6 @@ impl Repo {
         )
     }
 
-    /// Plan a drag-to-reorder of the commit at display index `from` to the
-    /// insertion gap `to`, against the current branch's linear chain. Returns
-    /// `None` for an out-of-range/no-op drop, an off-branch row, or when HEAD is
-    /// unknown. See [`crate::history::plan_reorder`].
-    pub fn plan_reorder(
-        &self,
-        commits: &[CommitInfo],
-        from: usize,
-        to: usize,
-    ) -> Option<ReorderMove> {
-        let head = self.head_commit_id()?;
-        plan_reorder(commits, &head, from, to)
-    }
-
     /// All destination lines for dragging the commit at display index `from` to
     /// the insertion gap `to` — one candidate per ancestry line crossing the
     /// gap. Empty for an out-of-range/no-op drop, a merge, an off-branch row, or
@@ -181,21 +167,7 @@ impl Repo {
         plan_drop(commits, &head, index)
     }
 
-    /// Plan grafting the trashed commit `restored` (no longer in `commits`) back
-    /// into the linear history at insertion gap `to`. Returns `None` for an
-    /// out-of-range drop or when HEAD is unknown. See
-    /// [`crate::history::plan_restore`].
-    pub fn plan_restore(
-        &self,
-        commits: &[CommitInfo],
-        restored: &CommitInfo,
-        to: usize,
-    ) -> Option<ReorderMove> {
-        let head = self.head_commit_id()?;
-        plan_restore(commits, &head, restored, to)
-    }
-
-    /// Move `target` to a new slot in the linear history: rebased onto
+    /// Move `target` to a new slot in the history graph: rebased onto
     /// `new_parent_ids`, with `new_child_ids` rebased on top of it, cascading to
     /// all descendants. `new_tip` is the (pre-move) id of the commit that should
     /// end up as the branch head once the dust settles. Exported to git in one

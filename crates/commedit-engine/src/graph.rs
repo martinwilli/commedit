@@ -1,6 +1,6 @@
 //! Lane layout for the gitk-style ancestry graph shown beside the history list:
 //! pure lane arithmetic over the newest-first commit list (no jj repo access, no
-//! GTK), in the spirit of `plan_reorder`.
+//! GTK), in the spirit of `plan_reorder_candidates`.
 //!
 //! Each row's geometry is split at its vertical center: `edges_above` run from
 //! the row's top edge down to the center, `edges_below` from the center to the

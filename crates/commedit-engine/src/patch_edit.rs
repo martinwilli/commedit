@@ -352,22 +352,40 @@ fn plan_newline(lines: &[&str], sel: Selection) -> EditPlan {
         return EditPlan::Block;
     }
     match classify_line(line) {
-        // Keep the context line, insert an empty `+` line below it.
-        DiffLineKind::Context => EditPlan::Edit(PatchEdit {
-            start: Cursor::at(l, char_len(line)),
-            end: Cursor::at(l, char_len(line)),
-            replacement: "\n+".to_string(),
-            cursor: Cursor::at(l + 1, 1),
-        }),
-        // Split the added line into two `+` lines at the caret/selection.
+        // Keep the context line, insert a `+` line below it auto-indented to the
+        // context line's own indentation.
+        DiffLineKind::Context => {
+            let indent = leading_ws(content(line));
+            EditPlan::Edit(PatchEdit {
+                start: Cursor::at(l, char_len(line)),
+                end: Cursor::at(l, char_len(line)),
+                replacement: format!("\n+{indent}"),
+                cursor: Cursor::at(l + 1, 1 + char_len(indent)),
+            })
+        }
+        // Split the added line into two `+` lines at the caret/selection; the new
+        // line carries the previous line's indentation (tab/space mix and all).
         DiffLineKind::Added => {
+            let body = content(line);
+            let indent = leading_ws(body);
+            // A collapsed caret on a line that's now only its (auto-added) indent:
+            // clear the departed line so it carries no trailing whitespace, then
+            // re-indent the fresh line below (sticky indent).
+            if lo == hi && !body.is_empty() && body.chars().all(|c| c == ' ' || c == '\t') {
+                return EditPlan::Edit(PatchEdit {
+                    start: Cursor::at(l, 1),
+                    end: Cursor::at(l, char_len(line)),
+                    replacement: format!("\n+{indent}"),
+                    cursor: Cursor::at(l + 1, 1 + char_len(indent)),
+                });
+            }
             let s = content_index(line, lo.col);
             let e = content_index(line, hi.col);
             EditPlan::Edit(PatchEdit {
                 start: Cursor::at(l, s + 1),
                 end: Cursor::at(l, e + 1),
-                replacement: "\n+".to_string(),
-                cursor: Cursor::at(l + 1, 1),
+                replacement: format!("\n+{indent}"),
+                cursor: Cursor::at(l + 1, 1 + char_len(indent)),
             })
         }
         _ => EditPlan::Block,
@@ -768,6 +786,13 @@ fn splice(s: &str, from: usize, to: usize, insert: &str) -> String {
     out
 }
 
+/// The leading run of spaces/tabs in `s` (its indentation). Preserves the exact
+/// tab/space mix so a new line can copy the previous line's indent style.
+fn leading_ws(s: &str) -> &str {
+    let end = s.find(|c| c != ' ' && c != '\t').unwrap_or(s.len());
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1093,60 @@ mod tests {
         let li2 = line_index(&patch, |l| l == "+B");
         let mid = plan_edit(&patch, caret(li2, 2), EditGesture::Newline);
         let _ = edit(mid);
+    }
+
+    #[test]
+    fn enter_in_indented_added_line_copies_indent() {
+        let old = "a\n";
+        let patch = unified_diff(old, "a\n    foo\n", "f");
+        let li = line_index(&patch, |l| l == "+    foo");
+        // Caret at the end of '+    foo' (col 8).
+        let e = edit(plan_edit(&patch, caret(li, 8), EditGesture::Newline));
+        let out = apply(&patch, &e);
+        assert!(out.contains("+    foo\n+    \n"), "got:\n{out:?}");
+        // Caret sits just after the copied 4-space indent on the new line.
+        assert_eq!(e.cursor, Cursor::at(li + 1, 5));
+        assert!(apply_patch(old, &out).is_ok());
+    }
+
+    #[test]
+    fn enter_copies_tab_indent_style() {
+        let old = "a\n";
+        let patch = unified_diff(old, "a\n\tfoo\n", "f");
+        let li = line_index(&patch, |l| l == "+\tfoo");
+        // Caret at the end of '+\tfoo' (col 5: '+', tab, f, o, o).
+        let e = edit(plan_edit(&patch, caret(li, 5), EditGesture::Newline));
+        let out = apply(&patch, &e);
+        assert!(out.contains("+\tfoo\n+\t\n"), "got:\n{out:?}");
+        assert_eq!(e.cursor, Cursor::at(li + 1, 2));
+        assert!(apply_patch(old, &out).is_ok());
+    }
+
+    #[test]
+    fn enter_on_indent_only_added_line_clears_it_and_reindents() {
+        // The first newline produces the indented-but-empty '+    ' line.
+        let old = "a\n";
+        let patch = unified_diff(old, "a\n    foo\n", "f");
+        let li = line_index(&patch, |l| l == "+    foo");
+        let out1 = apply(&patch, &edit(plan_edit(&patch, caret(li, 8), EditGesture::Newline)));
+        // Enter again on the '+    ' line (content is now only the indent).
+        let lj = line_index(&out1, |l| l == "+    ");
+        let e = edit(plan_edit(&out1, caret(lj, 5), EditGesture::Newline));
+        let out2 = apply(&out1, &e);
+        // Departed line cleared to a bare '+', a fresh re-indented line below.
+        assert!(out2.contains("+    foo\n+\n+    \n"), "got:\n{out2:?}");
+        assert_eq!(e.cursor, Cursor::at(lj + 1, 5));
+        assert!(apply_patch(old, &out2).is_ok());
+    }
+
+    #[test]
+    fn enter_on_unindented_added_line_adds_bare_plus() {
+        let patch = sample();
+        let li = line_index(&patch, |l| l == "+B");
+        let e = edit(plan_edit(&patch, caret(li, 2), EditGesture::Newline));
+        let out = apply(&patch, &e);
+        assert!(out.contains("+B\n+\n"), "got:\n{out:?}");
+        assert_eq!(e.cursor, Cursor::at(li + 1, 1));
     }
 
     #[test]

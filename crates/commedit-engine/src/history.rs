@@ -3,6 +3,8 @@
 //! `git log <current-branch>`. Other branches, remote-tracking refs and tags are
 //! not shown.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use futures::StreamExt;
@@ -11,6 +13,8 @@ use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
+
+use crate::graph::GraphLayout;
 
 /// A single row in the history view.
 #[derive(Debug, Clone)]
@@ -225,6 +229,174 @@ pub fn branch_chain(commits: &[CommitInfo], head: &CommitId) -> Vec<usize> {
     chain
 }
 
+/// One destination line for a reorder/restore drop: the concrete splice (`mv`)
+/// plus the lane that line occupies at the drop boundary — which is what the UI
+/// colors its pick-a-line swatch with, matching the drawn graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorderCandidate {
+    pub mv: ReorderMove,
+    pub lane: usize,
+}
+
+/// The commits reachable from `head` within the displayed list — the editable
+/// subgraph. The list is a topological prefix of head's ancestry, so every
+/// head-to-commit path is fully on-page and a parent walk over the list finds
+/// them all; rows not in the set (foreign branches/tags, should the view ever
+/// interleave them) are off-limits to structural edits.
+pub(crate) fn branch_commits(commits: &[CommitInfo], head: &CommitId) -> HashSet<CommitId> {
+    let mut reachable = HashSet::new();
+    let mut stack = vec![head.clone()];
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id.clone()) {
+            continue;
+        }
+        if let Some(c) = commits.iter().find(|c| c.id == id) {
+            stack.extend(c.parents.iter().cloned());
+        }
+    }
+    reachable
+}
+
+/// Enumerate the destination lines for splicing `target` into display gap `to`:
+/// one candidate per ancestry line crossing the boundary (the lane edges of
+/// [`GraphLayout::boundaries`]), plus — at the very bottom — a synthetic
+/// candidate for re-rooting onto the virtual root, whose line the graph never
+/// draws. The two halves of "dropped back onto its own line" skip out
+/// naturally: the line descending *toward* `target` is its own upper edge
+/// (`parent == target`), and a line left childless once `target` is removed
+/// from it is its own lower edge. Gap `0` has no boundary — the single
+/// candidate puts `target` on top of `head` as the new tip.
+///
+/// `new_tip` is the pre-splice id of the commit that ends up as the branch
+/// head for every gap below the top.
+fn splice_candidates(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    layout: &GraphLayout,
+    root: &CommitId,
+    branch: &HashSet<CommitId>,
+    target: &CommitId,
+    new_tip: &CommitId,
+    to: usize,
+) -> Vec<ReorderCandidate> {
+    let n = commits.len();
+    if to == 0 {
+        return vec![ReorderCandidate {
+            mv: ReorderMove {
+                target: target.clone(),
+                new_parents: vec![head.clone()],
+                new_children: Vec::new(),
+                new_tip: target.clone(),
+            },
+            lane: layout.rows[0].node_lane,
+        }];
+    }
+    let mut out = Vec::new();
+    for e in &layout.boundaries[to - 1] {
+        if e.parent == *target {
+            continue; // the line descending toward the dragged commit itself
+        }
+        let children: Vec<CommitId> =
+            e.children.iter().filter(|c| *c != target).cloned().collect();
+        if children.is_empty() || children.iter().any(|c| !branch.contains(c)) {
+            continue;
+        }
+        out.push(ReorderCandidate {
+            mv: ReorderMove {
+                target: target.clone(),
+                new_parents: vec![e.parent.clone()],
+                new_children: children,
+                new_tip: new_tip.clone(),
+            },
+            lane: e.lane,
+        });
+    }
+    if to == n {
+        // Below the oldest row: lines to off-page parents were listed above; the
+        // re-root splice (parent the dragged commit on the virtual root, root
+        // the current bottom commits on it) gets its synthetic candidate here,
+        // on the lane of the line that visually ends at the last row.
+        let children: Vec<CommitId> = commits
+            .iter()
+            .filter(|c| c.parents.contains(root) && c.id != *target && branch.contains(&c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        if !children.is_empty() {
+            out.push(ReorderCandidate {
+                mv: ReorderMove {
+                    target: target.clone(),
+                    new_parents: vec![root.clone()],
+                    new_children: children,
+                    new_tip: new_tip.clone(),
+                },
+                lane: layout.rows[n - 1].node_lane,
+            });
+        }
+    }
+    out
+}
+
+/// Plan a drag of the commit at display index `from` to the insertion gap `to`
+/// (`0..=len`) in the full ancestry graph: one [`ReorderCandidate`] per
+/// destination line crossing the gap (often exactly one; several where parallel
+/// merge lanes pass). Empty for an out-of-range or no-op drop, a merge commit
+/// (those stay fixed), an off-branch row, or a `layout` stale against `commits`.
+pub fn plan_reorder_candidates(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    layout: &GraphLayout,
+    root: &CommitId,
+    from: usize,
+    to: usize,
+) -> Vec<ReorderCandidate> {
+    let n = commits.len();
+    if from >= n || to > n || layout.boundaries.len() != n {
+        return Vec::new();
+    }
+    let dragged = &commits[from];
+    let branch = branch_commits(commits, head);
+    // A merge stays fixed — there is no single line to splice it into — and a
+    // row off the editable subgraph is refused.
+    if dragged.parents.len() != 1 || !branch.contains(&dragged.id) {
+        return Vec::new();
+    }
+    if to == 0 && dragged.id == *head {
+        return Vec::new(); // already the tip
+    }
+    // Moving the tip down exposes its sole parent as the new branch head; any
+    // other move leaves the head commit in place (rewritten, same change id).
+    let new_tip = if dragged.id == *head {
+        dragged.parents[0].clone()
+    } else {
+        head.clone()
+    };
+    splice_candidates(commits, head, layout, root, &branch, &dragged.id, &new_tip, to)
+}
+
+/// Plan grafting a trashed commit (one not currently in `commits`) back into
+/// the history at display gap `to`: like [`plan_reorder_candidates`], one
+/// candidate per destination line, but without the own-line no-op cases (the
+/// restored commit has no line in the graph). Empty for an out-of-range drop, a
+/// commit that is in the history after all, or a stale `layout`.
+pub fn plan_restore_candidates(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    layout: &GraphLayout,
+    root: &CommitId,
+    restored: &CommitInfo,
+    to: usize,
+) -> Vec<ReorderCandidate> {
+    let n = commits.len();
+    if n == 0 || to > n || layout.boundaries.len() != n {
+        return Vec::new();
+    }
+    if commits.iter().any(|c| c.id == restored.id) {
+        return Vec::new();
+    }
+    let branch = branch_commits(commits, head);
+    splice_candidates(commits, head, layout, root, &branch, &restored.id, head, to)
+}
+
 /// Splice the commit at chain position `from` into chain gap `to` (`0..=len`).
 /// `chain` is a linear list newest-first, so a row's upper neighbour is its child
 /// and its lower neighbour is its parent. After removing the dragged commit, the
@@ -378,8 +550,10 @@ pub fn plan_restore(
 mod tests {
     use super::{
         format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_reorder,
-        plan_restore, CommitInfo,
+        plan_reorder_candidates, plan_restore, plan_restore_candidates, CommitInfo,
+        ReorderCandidate, ReorderMove,
     };
+    use crate::graph::compute_graph;
     use jj_lib::backend::{ChangeId, CommitId};
 
     /// A bare [`CommitInfo`] with id `id` and a single parent `parent`, enough to
@@ -563,6 +737,204 @@ mod tests {
         assert_eq!(mv.new_parents, vec![cid(0)]); // onto the root
         assert_eq!(mv.new_children, vec![cid(1)]); // old oldest becomes its child
         assert_eq!(mv.new_tip, cid(3)); // tip unchanged
+    }
+
+    /// [`plan_reorder_candidates`] over `h` with the graph computed on the fly
+    /// (root `0`), the way the `Repo` wrapper calls it.
+    fn reorder_cands(
+        h: &[CommitInfo],
+        head: u8,
+        from: usize,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let g = compute_graph(h, &cid(0));
+        plan_reorder_candidates(h, &cid(head), &g, &cid(0), from, to)
+    }
+
+    /// [`plan_restore_candidates`] over `h`, graph computed on the fly.
+    fn restore_cands(
+        h: &[CommitInfo],
+        head: u8,
+        restored: &CommitInfo,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let g = compute_graph(h, &cid(0));
+        plan_restore_candidates(h, &cid(head), &g, &cid(0), restored, to)
+    }
+
+    fn mv(target: u8, parents: &[u8], children: &[u8], tip: u8) -> ReorderMove {
+        ReorderMove {
+            target: cid(target),
+            new_parents: parents.iter().map(|&p| cid(p)).collect(),
+            new_children: children.iter().map(|&c| cid(c)).collect(),
+            new_tip: cid(tip),
+        }
+    }
+
+    #[test]
+    fn candidates_match_the_linear_plan_on_a_linear_chain() {
+        // Every linear plan_reorder case yields exactly one candidate with the
+        // same splice: the lane planner subsumes the chain planner.
+        let h = history();
+        for (from, to) in
+            [(0, 2), (0, 3), (1, 0), (1, 3), (2, 0), (2, 1)]
+        {
+            let cands = reorder_cands(&h, 3, from, to);
+            assert_eq!(cands.len(), 1, "one line crosses a linear gap ({from}->{to})");
+            assert_eq!(cands[0].lane, 0);
+            assert_eq!(
+                Some(&cands[0].mv),
+                plan_reorder(&h, &cid(3), from, to).as_ref(),
+                "lane plan equals the chain plan ({from}->{to})"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_back_onto_the_own_line_yields_no_candidates() {
+        // Both halves of the dragged row's own slot: the line descending toward
+        // it (gap above) and the line leaving it (gap below).
+        let h = history();
+        assert_eq!(reorder_cands(&h, 3, 1, 1), vec![]);
+        assert_eq!(reorder_cands(&h, 3, 1, 2), vec![]);
+        // The tip dropped at the very top is equally a no-op.
+        assert_eq!(reorder_cands(&h, 3, 0, 0), vec![]);
+        // The bottom commit dropped at the very bottom likewise.
+        assert_eq!(reorder_cands(&h, 3, 2, 3), vec![]);
+    }
+
+    #[test]
+    fn candidate_indices_out_of_range_are_rejected() {
+        let h = history();
+        assert_eq!(reorder_cands(&h, 3, 3, 0), vec![]);
+        assert_eq!(reorder_cands(&h, 3, 0, 4), vec![]);
+    }
+
+    #[test]
+    fn a_stale_layout_yields_no_candidates() {
+        let h = history();
+        let g = compute_graph(&h[..2], &cid(0)); // one row short
+        assert_eq!(plan_reorder_candidates(&h, &cid(3), &g, &cid(0), 0, 2), vec![]);
+    }
+
+    /// A merge topology: 4 merges 2 into 3, both branched off 1 (head 4).
+    /// Display order: [4, 3, 2, 1]; lanes: 3 on lane 0, 2 on lane 1.
+    fn merge_history() -> Vec<CommitInfo> {
+        vec![merge(4, &[3, 2]), ci(3, 1), ci(2, 1), ci(1, 0)]
+    }
+
+    #[test]
+    fn a_merge_commit_is_not_a_reorder_source() {
+        let h = merge_history();
+        assert_eq!(reorder_cands(&h, 4, 0, 2), vec![]);
+        assert_eq!(reorder_cands(&h, 4, 0, 4), vec![]);
+    }
+
+    #[test]
+    fn a_parallel_lane_at_the_dragged_rows_height_is_a_candidate() {
+        // Drag 3 (lane 0) into the gap just below it: its own line skips out,
+        // but the sibling line 4->2 on lane 1 crosses there — moving 3 into the
+        // other branch between the merge and 2.
+        let h = merge_history();
+        let cands = reorder_cands(&h, 4, 1, 2);
+        assert_eq!(cands, vec![ReorderCandidate { mv: mv(3, &[2], &[4], 4), lane: 1 }]);
+    }
+
+    #[test]
+    fn a_gap_crossed_by_two_lanes_yields_two_candidates() {
+        // Drag the fork point 1 up into the gap below the merge: both parent
+        // lines of the merge cross it, one candidate per lane.
+        let h = merge_history();
+        let cands = reorder_cands(&h, 4, 3, 1);
+        assert_eq!(
+            cands,
+            vec![
+                ReorderCandidate { mv: mv(1, &[3], &[4], 4), lane: 0 },
+                ReorderCandidate { mv: mv(1, &[2], &[4], 4), lane: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_own_line_is_skipped_at_any_distance() {
+        // Drag the fork point 1 into the gap between 3 and 2: lane 0 descends
+        // toward 1 itself (skipped), lane 1 is the genuine sibling candidate.
+        let h = merge_history();
+        let cands = reorder_cands(&h, 4, 3, 2);
+        assert_eq!(cands, vec![ReorderCandidate { mv: mv(1, &[2], &[4], 4), lane: 1 }]);
+    }
+
+    #[test]
+    fn a_converged_lane_reparents_all_its_children() {
+        // Criss-cross: 5 and 4 both fork toward 1 on the shared lane 2. A
+        // restore into that line below the convergence re-parents both.
+        let h = vec![
+            merge(6, &[5, 4]),
+            merge(5, &[2, 1]),
+            merge(4, &[2, 1]),
+            ci(2, 0),
+            ci(1, 0),
+        ];
+        let cands = restore_cands(&h, 6, &ci(9, 0), 3);
+        assert_eq!(
+            cands,
+            vec![
+                ReorderCandidate { mv: mv(9, &[2], &[5], 6), lane: 0 },
+                ReorderCandidate { mv: mv(9, &[2], &[4], 6), lane: 1 },
+                ReorderCandidate { mv: mv(9, &[1], &[5, 4], 6), lane: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_truncated_page_offers_the_offpage_line_but_no_root_candidate() {
+        // Page cut below 3: the line toward the unloaded 2 crosses the bottom
+        // gap; no displayed commit sits on the root, so no re-root candidate.
+        let h = vec![merge(4, &[3, 2]), ci(3, 1)];
+        let cands = reorder_cands(&h, 4, 1, 2);
+        assert_eq!(cands, vec![ReorderCandidate { mv: mv(3, &[2], &[4], 4), lane: 1 }]);
+    }
+
+    #[test]
+    fn candidates_ignore_foreign_rows_and_lines() {
+        let h = history_with_foreign_branch();
+        // The foreign row 5 is not draggable…
+        assert_eq!(reorder_cands(&h, 4, 0, 3), vec![]);
+        // …and the gap under it is crossed only by its foreign line: refused.
+        assert_eq!(reorder_cands(&h, 4, 1, 1), vec![]);
+        // The bottom drop of the branch tip still plans like the chain did.
+        let cands = reorder_cands(&h, 4, 1, 5);
+        assert_eq!(cands, vec![ReorderCandidate { mv: mv(4, &[0], &[1], 3), lane: 0 }]);
+    }
+
+    #[test]
+    fn restore_candidates_cover_top_lanes_and_root() {
+        let h = merge_history();
+        let nine = ci(9, 0);
+        // Top: the restored commit becomes the tip.
+        assert_eq!(
+            restore_cands(&h, 4, &nine, 0),
+            vec![ReorderCandidate { mv: mv(9, &[4], &[], 9), lane: 0 }]
+        );
+        // Below the merge: one candidate per parent line.
+        assert_eq!(
+            restore_cands(&h, 4, &nine, 1),
+            vec![
+                ReorderCandidate { mv: mv(9, &[3], &[4], 4), lane: 0 },
+                ReorderCandidate { mv: mv(9, &[2], &[4], 4), lane: 1 },
+            ]
+        );
+        // Bottom: re-root, the old bottom commit becomes the child.
+        assert_eq!(
+            restore_cands(&h, 4, &nine, 4),
+            vec![ReorderCandidate { mv: mv(9, &[0], &[1], 4), lane: 0 }]
+        );
+    }
+
+    #[test]
+    fn restoring_a_commit_already_in_the_history_is_refused() {
+        let h = history();
+        assert_eq!(restore_cands(&h, 3, &ci(2, 1), 0), vec![]);
     }
 
     #[test]

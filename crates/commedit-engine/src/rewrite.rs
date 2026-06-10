@@ -10,8 +10,10 @@ use jj_lib::rewrite::{
 };
 
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
+use crate::graph::GraphLayout;
 use crate::history::{
-    plan_drop, plan_reorder, plan_restore, parse_timestamp, CommitInfo, ReorderMove,
+    plan_drop, plan_reorder, plan_reorder_candidates, plan_restore, plan_restore_candidates,
+    parse_timestamp, CommitInfo, ReorderCandidate, ReorderMove,
 };
 use crate::repo::Repo;
 
@@ -136,6 +138,39 @@ impl Repo {
     ) -> Option<ReorderMove> {
         let head = self.head_commit_id()?;
         plan_reorder(commits, &head, from, to)
+    }
+
+    /// All destination lines for dragging the commit at display index `from` to
+    /// the insertion gap `to` — one candidate per ancestry line crossing the
+    /// gap. Empty for an out-of-range/no-op drop, a merge, an off-branch row, or
+    /// when HEAD is unknown. See [`crate::history::plan_reorder_candidates`].
+    pub fn plan_reorder_candidates(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        from: usize,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_reorder_candidates(commits, &head, layout, &self.root_commit_id(), from, to)
+    }
+
+    /// All destination lines for grafting the trashed commit `restored` back
+    /// into the history at insertion gap `to`. Empty for an out-of-range drop or
+    /// when HEAD is unknown. See [`crate::history::plan_restore_candidates`].
+    pub fn plan_restore_candidates(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        restored: &CommitInfo,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_restore_candidates(commits, &head, layout, &self.root_commit_id(), restored, to)
     }
 
     /// The id of the commit at display `index` if it can be dropped to the trash,

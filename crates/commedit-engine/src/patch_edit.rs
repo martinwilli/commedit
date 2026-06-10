@@ -793,6 +793,22 @@ fn leading_ws(s: &str) -> &str {
     &s[..end]
 }
 
+/// Strip the one-char diff prefix (`+`/`-`/space) from each line of a selection's
+/// raw text, so the clipboard carries the underlying content rather than the diff
+/// markers. Interior and trailing segments always begin at a line start (their
+/// prefix is present); `first_has_prefix` says whether the first segment does too
+/// (i.e. the selection started at column 0).
+pub fn strip_selection_prefixes(raw: &str, first_has_prefix: bool) -> String {
+    raw.split('\n')
+        .enumerate()
+        .map(|(i, seg)| match seg.chars().next() {
+            Some(c) if i > 0 || first_has_prefix => &seg[c.len_utf8()..],
+            _ => seg,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1163,21 @@ mod tests {
         let out = apply(&patch, &e);
         assert!(out.contains("+B\n+\n"), "got:\n{out:?}");
         assert_eq!(e.cursor, Cursor::at(li + 1, 1));
+    }
+
+    #[test]
+    fn strip_prefixes_drops_one_marker_per_line() {
+        // Whole-line selection (started at column 0): every segment has a prefix.
+        assert_eq!(
+            strip_selection_prefixes("+foo\n+bar\n ctx", true),
+            "foo\nbar\nctx"
+        );
+        // Mid-line start: the first segment carries no prefix, the rest do.
+        assert_eq!(strip_selection_prefixes("oo\n+bar", false), "oo\nbar");
+        // A bare '+' (empty added line) strips to an empty line.
+        assert_eq!(strip_selection_prefixes("+foo\n+", true), "foo\n");
+        // An empty payload is left alone.
+        assert_eq!(strip_selection_prefixes("", true), "");
     }
 
     #[test]

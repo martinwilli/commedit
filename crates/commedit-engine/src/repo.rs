@@ -295,6 +295,13 @@ impl Repo {
         crate::transparency::head_commit(self.workspace.workspace_root())
     }
 
+    /// The repository root (the user's worktree). Relative file paths from a
+    /// commit's diff are resolved against it — e.g. to read the repo's
+    /// editor-config files (see [`crate::tabwidth`]).
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.workspace_root()
+    }
+
     /// The git HEAD commit (hex) captured at session start — the state
     /// [`Repo::revert_all`] restores. Shown in the UI's revert confirmation.
     pub fn session_start_head_hex(&self) -> Option<String> {

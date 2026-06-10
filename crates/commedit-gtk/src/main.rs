@@ -97,7 +97,13 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let app = Application::builder().application_id(APP_ID).build();
+    // Each invocation targets its own repo path, so GTK's single-instance
+    // activation (which would forward a second launch to the primary process
+    // and its repo) must be disabled.
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
     app.connect_activate(move |app| build_ui(app, repo_path.clone()));
     app.run_with_args::<&str>(&[]);
 }

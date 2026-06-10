@@ -263,16 +263,22 @@ fn set_pills(pills: &GtkBox, refs: &[RefDecoration]) {
         };
         label.set_visible(true);
         label.set_text(&r.name);
-        label.set_tooltip_text(Some(&match r.kind {
-            RefKind::Branch => format!("Branch {}", r.name),
-            RefKind::Tag => format!("Tag {}", r.name),
+        label.set_tooltip_text(Some(&match (r.kind, r.current) {
+            (RefKind::Branch, true) => format!("Branch {} (checked out)", r.name),
+            (RefKind::Branch, false) => format!("Branch {}", r.name),
+            (RefKind::Tag, _) => format!("Tag {}", r.name),
         }));
         label.remove_css_class("ref-branch");
         label.remove_css_class("ref-tag");
+        label.remove_css_class("ref-current");
         label.add_css_class(match r.kind {
             RefKind::Branch => "ref-branch",
             RefKind::Tag => "ref-tag",
         });
+        // The checked-out branch gets an extra class, layered over `ref-branch`.
+        if r.current {
+            label.add_css_class("ref-current");
+        }
     }
     while let Some(extra) = next {
         next = extra.next_sibling();

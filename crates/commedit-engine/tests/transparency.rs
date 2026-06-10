@@ -178,3 +178,29 @@ fn commit_refs_track_a_rewrite() {
     assert_eq!(kinds(&new_tip), vec![("main".to_string(), RefKind::Branch)]);
     assert_eq!(kinds(&old_tip), vec![("v1.0".to_string(), RefKind::Tag)]);
 }
+
+/// `Repo::commit_refs` flags only the checked-out branch's pill as `current`,
+/// so the UI can colour it distinctly — a sibling branch and a tag stay plain.
+#[test]
+fn commit_refs_flag_the_checked_out_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    g(&["branch", "feature", "main~1"]); // a sibling branch, not checked out
+    g(&["tag", "v1.0", "main"]);
+
+    let repo = Repo::open(dir).expect("open");
+    let refs = repo.commit_refs();
+
+    let current = |name: &str| -> bool {
+        refs.values()
+            .flatten()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no decoration {name}"))
+            .current
+    };
+    assert!(current("main"), "checked-out branch flagged");
+    assert!(!current("feature"), "sibling branch not flagged");
+    assert!(!current("v1.0"), "tag not flagged");
+}

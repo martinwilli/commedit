@@ -218,6 +218,10 @@ pub struct RefDecoration {
     /// Short name (`main`, `v1.0`), without the `refs/heads/`/`refs/tags/` prefix.
     pub name: String,
     pub kind: RefKind,
+    /// The currently checked-out branch. Set by [`crate::repo::Repo::commit_refs`],
+    /// which knows HEAD's branch; [`ref_decorations`] alone lacks that context and
+    /// always leaves it `false`.
+    pub current: bool,
 }
 
 /// Every local branch and tag of the user's repo, grouped by the hex id of the
@@ -253,9 +257,9 @@ pub fn ref_decorations(workspace_root: &Path) -> BTreeMap<String, Vec<RefDecorat
             _ => continue,
         };
         let decoration = if let Some(name) = refname.strip_prefix("refs/heads/") {
-            RefDecoration { name: name.to_string(), kind: RefKind::Branch }
+            RefDecoration { name: name.to_string(), kind: RefKind::Branch, current: false }
         } else if let Some(name) = refname.strip_prefix("refs/tags/") {
-            RefDecoration { name: name.to_string(), kind: RefKind::Tag }
+            RefDecoration { name: name.to_string(), kind: RefKind::Tag, current: false }
         } else {
             continue;
         };

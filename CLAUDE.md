@@ -373,7 +373,7 @@ operation.
 ### Structured diff editing (the other hard part)
 
 The diff pane is an *editable* unified diff, with a "firewall" guaranteeing the
-buffer always still applies as a patch. Two pure, GTK-free modules:
+buffer always still applies as a patch. Three pure, GTK-free modules:
 
 - `diff.rs` — extract a commit's per-file changes (`commit_changes`), render a
   unified diff with per-hunk expandable context (`render_diff` + `ContextExpansion`
@@ -397,6 +397,16 @@ buffer always still applies as a patch. Two pure, GTK-free modules:
   `-orig`/`+edited` pair; `@@`/header/meta lines are read-only. Columns are
   *character* offsets where col 0 is the prefix char (matches GTK's
   `iter_at_line_offset`).
+- `tabwidth.rs` — `TabWidthResolver` reads the repo's editor-config files to pick
+  a file's display tab width (the diff view renders one tab width at a time, so
+  it's resolved per file as the user navigates). Sources, first match wins so the
+  more specific config beats the global default: `.editorconfig` (glob-matched,
+  cascaded, via the `ec4rs` crate) → `.vscode/settings.json` language-specific
+  (`[langId].editor.tabSize`, matched by extension) → `.clang-format`
+  `TabWidth`/`IndentWidth` (C family) → `.vscode/settings.json` global. The vscode
+  (`jsonc-parser`) and clang-format (hand-scanned — no YAML dep) files are read
+  once from the repo root; editorconfig is resolved per path and results cached.
+  Built once at `Repo::open` time (the GTK side keys off `Repo::workspace_root`).
 
 ### GTK module layout
 
@@ -445,7 +455,11 @@ The diff pane shows the **whole change in one buffer**; the file dropdown is a
 jump aid — selecting a file scrolls its `diff --git` header to the top
 (`scroll_to_file`), scrolling the view updates the dropdown to the file at the top
 edge (a `nav_sync` guard stops the two fighting), and `highlight_diff` switches
-syntect language per file at each `--- a/PATH`. Save splits the buffer per file
+syntect language per file at each `--- a/PATH`. Both navigation entry points
+funnel through `scroll_to_file` / `scroll_to_conflict_file`, where `apply_tab_width`
+also sets the view's tab width to what the repo's editor configs declare for the
+top file (engine `TabWidthResolver`, built once from `Repo::workspace_root`). Save
+splits the buffer per file
 and applies every edit in one `rewrite_files`. Each `@@` header also carries a
 *revert hunk* cue and each `diff --git` line a *revert file* cue (`DiffCue`);
 clicking one `revert_groups`-rewrites the shown diff against the *render baseline*

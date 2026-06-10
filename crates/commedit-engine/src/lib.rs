@@ -13,6 +13,7 @@ pub mod repo;
 pub mod rewrite;
 pub mod split;
 pub mod squash;
+pub mod tabwidth;
 pub mod transparency;
 pub mod tree;
 pub mod workcopy;

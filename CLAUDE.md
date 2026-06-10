@@ -98,22 +98,39 @@ and returns `SaveOutcome::Conflicts`, leaving git **completely untouched** — s
 - `rewrite_message` / `rewrite_identity` — message + author/committer edits.
   Run identity **last** in a multi-part save: it overrides jj's habit of
   re-stamping the committer to "now".
-- `reorder_commit` (`rewrite.rs`) + `plan_reorder` (`history.rs`) — drag-to-reorder.
-  Planning (pure index arithmetic on a newest-first list) is separate from the
-  rebase. Reorder sets an explicit bookmark move (`set_head_bookmark`) in the
-  rewrite transaction — both because the head commit isn't always rewritten, and
-  so `finish_mutation` can read the new tip back from the bookmark to scope its
-  conflict walk.
+- `reorder_commit` (`rewrite.rs`) + `plan_reorder_candidates` (`history.rs`) —
+  drag-to-reorder, anywhere in the merge graph. Planning is pure and runs on the
+  graph's lane layout (`graph.rs`, see "History view"): a display gap is crossed
+  by one ancestry line per lane (`GraphLayout::boundaries`), and each line is a
+  splice candidate `(new_parents=[parent], new_children=line's children)` — one
+  candidate on a linear chain, several where parallel merge lanes pass (the UI
+  then asks via a colored-line popover). The two halves of "dropped onto its own
+  line" produce no candidate (the no-op); merge commits are never a drag source
+  (their splice has no single line); the bottom gap adds a synthetic re-root
+  candidate (the root edge isn't drawn). jj's `move_commits` replaces exactly
+  the matched parent edge of a merge child and keeps the others, so moving a
+  commit out of a merge's ancestry leaves a degenerate-but-intact 2-parent merge
+  (ancestor-redundant parents are deliberately not simplified). Reorder sets an
+  explicit bookmark move (`set_head_bookmark`) in the rewrite transaction — both
+  because the head commit isn't always rewritten, and so `finish_mutation` can
+  read the new tip back from the bookmark to scope its conflict walk. A top-gap
+  splice (no new children) splices between the head and the working-copy chain's
+  bottom entry instead, so the uncommitted changes ride onto the new tip.
 - `abandon_commit` / `restore_commit` (`rewrite.rs`) + `plan_drop` /
-  `plan_restore` (`history.rs`) — drag-to-trash and drag-back. Dropping records
-  an abandon and rebases children onto the commit's parent; the abandoned commit
-  object lingers in the ODB (kept reachable so a later restore can graft it
-  back). Restore reuses the `reorder_commit` body. Both share the same
-  plan-then-rebase shape as reorder.
+  `plan_restore_candidates` (`history.rs`) — drag-to-trash and drag-back, also
+  graph-wide: any single-parent commit reachable from head is droppable (its
+  children — possibly a merge, which keeps its other parents — rebase onto its
+  parent), and a restore offers the same per-line candidates as reorder. The
+  abandoned commit object lingers in the ODB (kept reachable so a later restore
+  can graft it back). Restore reuses the `reorder_commit` body.
 - `squash_into` (`squash.rs`) + `plan_squash` / `squash_recommendations` —
-  drag one commit *onto* another to merge it in. Built on jj-lib's native
-  `squash_commits` (full-commit selection): the source's changes are applied to
-  the target's tree, the source is abandoned, descendants rebase. Preserves the
+  drag one commit *onto* another to merge it in, across the whole graph. Built
+  on jj-lib's native `squash_commits` (full-commit selection): the source's
+  changes are applied to the target's tree (rebasing across branch lines for
+  cousins on different merge sides — the result lands on the target's line),
+  the source is abandoned, descendants rebase. A merge is a valid *target* (the
+  change folds into its tree like an evil-merge edit) but never a *source* (its
+  own change is its resolution, editable in place). Preserves the
   target's **author** but lets jj re-stamp the committer (git `--autosquash`
   style); the new message is `compose_squash_message`'d per `SquashMode` (Fixup
   keeps the target's, Squash appends the source's body, Amend replaces with it).
@@ -267,7 +284,13 @@ theirs` onto `ours` while *trusting `ours` for context* — the one thing a symm
 
 In both modes the working copy `@`'s uncommitted delta is carried onto the rebuilt
 tip. A genuine overlap, a structural/binary change, or a split working-copy chain
-returns `None` / bails, so the rewrite falls back to the manual flow below.
+returns `None` / bails, so the rewrite falls back to the manual flow below. The
+rebuild rewrites the conflicted range as a **single-parent chain**, so it also
+bails when that range isn't a parent-linked single-parent run — a conflicted
+merge, or a range spanning a fork's interleaved topo order, goes to the manual
+flow rather than being silently linearized (a linear run *above* a merge still
+auto-resolves; the anchor below the range may be a merge, it's only read as a
+tree).
 
 While a `PendingResolution` is held, the UI drives it by **change id** (commit
 ids churn on every resolution step): `read_conflict(change_hex, path)`
@@ -305,11 +328,23 @@ Follow that pattern rather than introducing a runtime.
 `history.rs` walks the **ancestors of HEAD only** (`history(repo, head)` with
 `head` = `Repo::head_commit_id`, the live branch tip) — like `git log
 <current-branch>`. Other local branches, remote-tracking refs (`origin/*`) and
-tags off the current branch are intentionally excluded, and only commits on this
-chain are droppable/reorderable. Using the live head (not jj's `git_head()`,
-which lags a rewrite until re-imported) avoids resurfacing stale, pre-rewrite
-commits. `change_id` (stable across rewrites) is what the UI uses to re-select a
-commit after a save.
+tags off the current branch are intentionally excluded; every displayed commit
+is structurally editable (move/drop/restore/squash) except merge commits, which
+stay fixed (never a drag source, though a valid squash target). Using the live
+head (not jj's `git_head()`, which lags a rewrite until re-imported) avoids
+resurfacing stale, pre-rewrite commits. `change_id` (stable across rewrites) is
+what the UI uses to re-select a commit after a save.
+
+`graph.rs` lays the list out into gitk-style lanes (`compute_graph`, pure lane
+arithmetic, no jj access): per row the node lane, the half-row drawing edges,
+and — the part planning runs on — `GraphLayout::boundaries`, the `LaneEdge`s
+(lane, children, parent) crossing each row's bottom edge. A lane edge usually
+bundles one child; converging lines (a merge fork reusing a lane already
+descending to the same parent) bundle several, and splicing into that line
+re-parents them all — the candidates always match the drawn pixels. The GTK
+side recomputes the layout in lockstep with `commits` on every refresh
+(`Data.graph`), draws it per row in `rows.rs` (`graph_area`, colors cycled by
+lane via `lane_color`), and plans drops against it.
 
 ### Session revert & review
 
@@ -407,10 +442,15 @@ clicking one `revert_groups`-rewrites the shown diff against the *render baselin
 (`changes`), while `orig_changes` keeps the pristine content so Save/Split still
 see the revert as a divergence to apply — a revert never saves on its own. History
 drag-and-drop is **zone-based** (`show_zone` in `dragdrop`): a row's top/bottom
-quarter opens a reorder gap (the placeholder), its middle half marks a squash
-target (`set_squash_target`); dragging an autosquash-prefixed commit highlights
+quarter opens a reorder gap (the placeholder — shown when the gap has at least
+one lane-edge candidate), its middle half marks a squash target
+(`set_squash_target`); dragging an autosquash-prefixed commit highlights
 recommended targets green and sibling fixups yellow, and dropping an unprefixed
 commit onto another opens the fixup/squash/amend popover (`show_squash_popover`).
+A gap drop with several candidates (parallel merge lanes crossing the gap) opens
+`show_lane_popover` instead — one color-swatch button per candidate line, colors
+matching the drawn lanes (`rows::lane_color`), anchored at the gap's row
+boundary; a single candidate splices directly.
 A working-copy row dragged onto a commit (`DragOrigin::WorkingCopy`) instead folds
 in silently as a fixup — `show_zone` offers it only the red onto-a-commit target,
 never the blue reorder gap. A drop only *stages* its rewrite into `post_drag`, run

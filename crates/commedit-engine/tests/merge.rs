@@ -288,6 +288,49 @@ fn restoring_a_dropped_commit_into_a_chosen_lane_rebuilds_the_side_branch() {
 }
 
 #[test]
+fn dropping_a_side_branch_commit_keeps_the_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_merge_repo(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = current(&repo);
+    let from = commits.iter().position(|c| c.subject == "side-1").unwrap();
+    let target = repo.plan_drop(&commits, from).expect("a side-branch commit is droppable");
+    let outcome = repo.abandon_commit(&target).expect("drop");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // side-1 is gone; the merge degenerates onto the fork base but keeps its
+    // 2-parent shape, and side.txt left the tip's tree.
+    assert!(common::is_merge(dir, "HEAD"));
+    assert_eq!(parent_subjects(dir), vec!["base", "main-1"]);
+    let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.contains("side.txt"), "side-1's change is gone: {tree}");
+    assert_transparent(dir);
+}
+
+#[test]
+fn dropping_a_commit_below_the_merge_keeps_the_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_merge_repo(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = current(&repo);
+    let from = commits.iter().position(|c| c.subject == "base").unwrap();
+    let target = repo.plan_drop(&commits, from).expect("the fork base is droppable");
+    let outcome = repo.abandon_commit(&target).expect("drop");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // Both of the merge's lines re-root; the merge itself survives.
+    assert!(common::is_merge(dir, "HEAD"));
+    assert_eq!(parent_subjects(dir), vec!["main-1", "side-1"]);
+    let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.contains("base.txt"), "base's change is gone: {tree}");
+    assert_transparent(dir);
+}
+
+#[test]
 fn reorder_drop_squash_on_a_merge_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

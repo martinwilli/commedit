@@ -481,16 +481,22 @@ pub fn plan_reorder(
 }
 
 /// The commit id of the display row `index`, if it can be dropped from history:
-/// it must sit on the current branch's linear chain (see [`branch_chain`], which
-/// already excludes merges, off-branch rows and the root), and dropping it must
-/// not empty the branch (the chain has more than one commit). Returns `None`
-/// otherwise — the UI uses this both to gate the drop and to validate it.
+/// any single-parent commit reachable from the branch head, anywhere in the
+/// graph — its children (possibly a merge, which keeps its other parents)
+/// rebase onto its parent. A merge commit stays fixed: abandoning one would
+/// fold both its lines into its children (and strand the bookmark between two
+/// parents when it is the tip). Off-branch rows and the branch's only commit
+/// are refused. Returns `None` otherwise — the UI uses this both to gate the
+/// drop and to validate it.
 pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Option<CommitId> {
-    let chain = branch_chain(commits, head);
-    if chain.len() < 2 || !chain.contains(&index) {
+    let c = commits.get(index)?;
+    if commits.len() < 2
+        || c.parents.len() != 1
+        || !branch_commits(commits, head).contains(&c.id)
+    {
         return None;
     }
-    Some(commits[index].id.clone())
+    Some(c.id.clone())
 }
 
 /// Splice a commit that is *not* in the chain into gap `g` (`0..=len`). Mirrors
@@ -693,6 +699,21 @@ mod tests {
     fn drop_returns_an_on_chain_commit() {
         // Row 1 ("2") is on the branch chain [3,2,1]; dropping it yields its id.
         assert_eq!(plan_drop(&history(), &cid(3), 1), Some(cid(2)));
+    }
+
+    #[test]
+    fn any_single_parent_commit_in_the_graph_is_droppable() {
+        let h = merge_history();
+        // Both sides of the merge and the fork point below it are droppable.
+        assert_eq!(plan_drop(&h, &cid(4), 1), Some(cid(3)));
+        assert_eq!(plan_drop(&h, &cid(4), 2), Some(cid(2)));
+        assert_eq!(plan_drop(&h, &cid(4), 3), Some(cid(1)));
+    }
+
+    #[test]
+    fn dropping_a_merge_commit_is_refused() {
+        let h = merge_history();
+        assert_eq!(plan_drop(&h, &cid(4), 0), None);
     }
 
     #[test]

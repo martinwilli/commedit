@@ -44,7 +44,16 @@ const INSTRUCTIONS: &str = "\
 commedit edits the history of the checked-out git branch in place: any commit \
 reachable from HEAD can be edited (message, identity, file contents), split, \
 reordered, dropped or squashed, and its descendants are rebased automatically. \
+New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
+
+When the task is to edit existing history — reword a message, change an \
+author or date, edit a commit's files, or reorder, squash, split, drop or \
+insert a commit — prefer these tools over raw git (reach for them instead of \
+`git commit --amend`, `git rebase -i` or `git cherry-pick`): they rewrite in \
+place and rebase the descendants for you, on any commit reachable from HEAD, \
+not just the tip. Building merge commits and managing branches, worktrees or \
+remotes stay plain-git tasks.
 
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
 full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
@@ -61,6 +70,15 @@ file's marker_len); fixing the earliest often auto-clears descendants. \
 abort_rewrite discards the held rewrite (and is the only way out of a \
 structural, resolvable=false conflict). No other mutation runs while pending.
 
+Creating commits: create_commit makes a new commit from given file contents \
+(empty for an empty commit) and inserts it — on top of HEAD by default, or under \
+any commit / at root via new_parent. revert_commit inserts the inverse of a \
+commit (like git revert). cherry_pick_commit copies a commit's change in (like \
+git cherry-pick) — the source may be off the current branch, named by its full \
+sha. commit_working_copy turns the current uncommitted changes into a commit on \
+top of HEAD (like git commit -a). A mid-history insert, revert or pick may \
+report conflicts like any rewrite.
+
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).
 
@@ -73,7 +91,12 @@ every rewrite automatically (working_copy_status shows them). Git state is \
 imported only at startup — after any out-of-band git operation (a commit, \
 branch switch, rebase made outside this server) call reload_repo before \
 continuing; it starts a fresh session in place, discarding the trash, the \
-operation log and any pending rewrite.";
+operation log and any pending rewrite.
+
+Reading results: every tool result is YAML. Long multi-line strings such as \
+diffs and file contents render as a literal block scalar, or — when a line \
+carries a tab or trailing whitespace — as a YAML sequence with one string per \
+line; reassemble such a sequence by joining its entries with newlines.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CommeditServer {

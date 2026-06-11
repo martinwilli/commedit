@@ -46,7 +46,7 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
     assert_eq!(dto.sha, CommitId::new(vec![3]).hex());
     assert_eq!(dto.change_id, ChangeId::new(vec![3]).hex());
     assert_eq!(dto.subject, "subject 3");
-    assert_eq!(dto.parent_shas, vec![CommitId::new(vec![2]).hex()]);
+    assert_eq!(dto.detail.as_ref().unwrap().parent_shas, vec![CommitId::new(vec![2]).hex()]);
     assert!(!dto.is_merge);
     assert_eq!(dto.refs.len(), 1);
     assert_eq!(dto.refs[0].name, "main");
@@ -55,12 +55,12 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
 
     // The oldest commit's parent is the virtual root: not a real commit.
     let oldest = commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new());
-    assert!(oldest.parent_shas.is_empty());
+    assert!(oldest.detail.as_ref().unwrap().parent_shas.is_empty());
     assert!(oldest.refs.is_empty());
 
     let merge = commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new());
     assert!(merge.is_merge);
-    assert_eq!(merge.parent_shas.len(), 2);
+    assert_eq!(merge.detail.as_ref().unwrap().parent_shas.len(), 2);
 }
 
 #[test]

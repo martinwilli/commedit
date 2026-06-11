@@ -29,7 +29,7 @@ fn conflicting_repo(dir: &std::path::Path) {
 /// Rewrite commit "A"'s content so the descendant "B" no longer applies.
 async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -38,6 +38,7 @@ async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
         .replace_files(Parameters(ReplaceFilesReq {
             commit: a.sha.clone(),
             files: vec![FileContentDto { path: "f.txt".into(), content: "1\nX\n3\n".into() }],
+            delete_paths: None,
         }))
         .await
         .unwrap()
@@ -101,8 +102,9 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
                 commit: oldest.change_id.clone(),
                 files: vec![ConflictFileEditDto {
                     path: path.path.clone(),
-                    text: "1\nR\n3\n".into(),
-                    marker_len: file.marker_len,
+                    text: Some("1\nR\n3\n".into()),
+                    marker_len: Some(file.marker_len),
+                    delete: None,
                 }],
             }))
             .await
@@ -197,7 +199,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
 
     // Dropping "A" leaves "B"'s same-line edit dangling: a true conflict.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -230,8 +232,9 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
             commit: oldest.change_id.clone(),
             files: vec![ConflictFileEditDto {
                 path: oldest.files[0].path.clone(),
-                text: "1\nB\n3\n".into(),
-                marker_len: file.marker_len,
+                text: Some("1\nB\n3\n".into()),
+                marker_len: Some(file.marker_len),
+                delete: None,
             }],
         }))
         .await
@@ -252,7 +255,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -304,8 +307,9 @@ async fn conflicts_resolve_by_sha_or_prefix() {
                 commit: oldest.change_id[..8].to_string(),
                 files: vec![ConflictFileEditDto {
                     path: oldest.files[0].path.clone(),
-                    text: "1\nR\n3\n".into(),
-                    marker_len: file.marker_len,
+                    text: Some("1\nR\n3\n".into()),
+                    marker_len: Some(file.marker_len),
+                    delete: None,
                 }],
             }))
             .await

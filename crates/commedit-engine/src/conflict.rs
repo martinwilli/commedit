@@ -24,7 +24,7 @@ use jj_lib::conflicts::{
     materialize_tree_value, resolve_file_executable, update_from_content,
     ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
 };
-use jj_lib::merge::MergedTreeValue;
+use jj_lib::merge::{Merge, MergedTreeValue};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
 use jj_lib::operation::Operation;
@@ -157,6 +157,18 @@ pub struct ConflictedFile {
     /// the resolved text parses against the same conflict shape.
     pub marker_len: usize,
     pub num_sides: usize,
+}
+
+/// How to resolve one conflicted path in [`Repo::resolve_conflicts_ext`].
+#[derive(Debug, Clone)]
+pub enum FileResolution {
+    /// Replace the path with resolved file content — all conflict markers
+    /// removed, `marker_len` echoing what [`Repo::read_conflict`] reported.
+    Content { text: String, marker_len: usize },
+    /// Remove the path from the commit. Resolves a modify/delete conflict (or
+    /// any other conflict kind, structural included) by deleting the file —
+    /// the one resolution that plain content cannot express.
+    Delete,
 }
 
 /// Which spurious-conflict auto-resolution to attempt before falling back to
@@ -325,19 +337,40 @@ impl Repo {
         )
     }
 
-    /// Apply the user's edited conflict text for several files of the commit with
-    /// change id `change_hex` at once: parse each back into file ids, splice every
-    /// result into the commit's tree in one rewrite, rebase descendants, and
-    /// re-settle the chain. Resolving a commit's conflicted paths together is
-    /// sound because they are independent — no intermediate re-materialization is
-    /// needed between them. Structural (non-file) paths are skipped. Returns the
-    /// refreshed outcome — `Clean` once the last conflict is gone (the rewrite is
-    /// exported at that point), otherwise the remaining `Conflicts`. `files` is
-    /// `(path, edited_text, marker_len)` tuples.
+    /// Apply edited conflict text for several files of the commit with change id
+    /// `change_hex` at once — the content-only entry point (`(path, text,
+    /// marker_len)`), kept for the GTK frontend and the single-file wrapper.
+    /// Delegates to [`Repo::resolve_conflicts_ext`].
     pub fn resolve_conflicts(
         &mut self,
         change_hex: &str,
         files: &[(String, String, usize)],
+    ) -> Result<SaveOutcome> {
+        let files: Vec<(String, FileResolution)> = files
+            .iter()
+            .map(|(path, text, marker_len)| {
+                (
+                    path.clone(),
+                    FileResolution::Content { text: text.clone(), marker_len: *marker_len },
+                )
+            })
+            .collect();
+        self.resolve_conflicts_ext(change_hex, &files)
+    }
+
+    /// Resolve several files of the commit with change id `change_hex`, each
+    /// either by edited content or by deleting the path: splice every result
+    /// into the commit's tree in one rewrite, rebase descendants, and re-settle
+    /// the chain. Resolving a commit's conflicted paths together is sound because
+    /// they are independent — no intermediate re-materialization is needed
+    /// between them. Content on a structural (non-file) path is skipped; a
+    /// deletion resolves any conflict kind. Returns the refreshed outcome —
+    /// `Clean` once the last conflict is gone (the rewrite is exported at that
+    /// point), otherwise the remaining `Conflicts`.
+    pub fn resolve_conflicts_ext(
+        &mut self,
+        change_hex: &str,
+        files: &[(String, FileResolution)],
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("resolving the conflict", || {
             self.resolve_conflicts_inner(change_hex, files)
@@ -347,7 +380,7 @@ impl Repo {
     fn resolve_conflicts_inner(
         &mut self,
         change_hex: &str,
-        files: &[(String, String, usize)],
+        files: &[(String, FileResolution)],
     ) -> Result<SaveOutcome> {
         if self.pending.is_none() {
             bail!("no conflict resolution in progress");
@@ -359,39 +392,46 @@ impl Repo {
             .context("loading conflicted commit")?;
         let tree = commit.tree();
 
-        // Parse each file's resolved text into a tree value up front (while `tree`
+        // Turn each file's resolution into a tree value up front (while `tree`
         // is still borrowable), then splice them all into one builder.
         let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(files.len());
-        for (path, edited_text, marker_len) in files {
+        for (path, resolution) in files {
             let path: &RepoPath = RepoPath::from_internal_string(path).context("invalid path")?;
             let value = block_on(tree.path_value(path)).context("reading conflicted path")?;
-            let Some(file_ids) = value.to_file_merge() else {
-                continue; // structural conflict — not text-resolvable, leave it
+            let merged_value: MergedTreeValue = match resolution {
+                // An absent value removes the path — resolves a modify/delete
+                // conflict (or any kind) by deleting the file.
+                FileResolution::Delete => Merge::absent(),
+                FileResolution::Content { text, marker_len } => {
+                    let Some(file_ids) = value.to_file_merge() else {
+                        continue; // structural conflict — not text-resolvable, leave it
+                    };
+                    let exec = value
+                        .to_executable_merge()
+                        .as_ref()
+                        .and_then(resolve_file_executable)
+                        .unwrap_or(false);
+
+                    let new_ids = block_on(update_from_content(
+                        &file_ids,
+                        &store,
+                        path,
+                        text.as_bytes(),
+                        *marker_len,
+                    ))
+                    .context("parsing resolved content")?;
+
+                    // Lift the resolved/again-conflicted file ids back into a tree
+                    // value, preserving the executable bit.
+                    new_ids.map(|oid| {
+                        oid.as_ref().map(|id| TreeValue::File {
+                            id: id.clone(),
+                            executable: exec,
+                            copy_id: CopyId::placeholder(),
+                        })
+                    })
+                }
             };
-            let exec = value
-                .to_executable_merge()
-                .as_ref()
-                .and_then(resolve_file_executable)
-                .unwrap_or(false);
-
-            let new_ids = block_on(update_from_content(
-                &file_ids,
-                &store,
-                path,
-                edited_text.as_bytes(),
-                *marker_len,
-            ))
-            .context("parsing resolved content")?;
-
-            // Lift the resolved/again-conflicted file ids back into a tree value,
-            // preserving the executable bit.
-            let merged_value: MergedTreeValue = new_ids.map(|oid| {
-                oid.as_ref().map(|id| TreeValue::File {
-                    id: id.clone(),
-                    executable: exec,
-                    copy_id: CopyId::placeholder(),
-                })
-            });
             entries.push((path.to_owned(), merged_value));
         }
 

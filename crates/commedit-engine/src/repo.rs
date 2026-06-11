@@ -392,6 +392,37 @@ impl Repo {
         self.repo.store().root_commit_id().clone()
     }
 
+    /// Resolve a full 40-char hex sha to its [`CommitId`] if that object exists
+    /// in the shared object store — even when it is *not* reachable from HEAD
+    /// (e.g. a commit on another branch). The object is read straight from the
+    /// ODB, so it needs no jj-side ref or index entry: editing the checked-out
+    /// branch imports only its own ref into jj's view, yet the symlinked object
+    /// store still holds every other branch's commits. Returns `None` for
+    /// malformed hex or a sha that is not an existing commit. Used to
+    /// cherry-pick a commit from outside the current branch's history.
+    pub fn lookup_commit_in_store(&self, hex: &str) -> Option<CommitId> {
+        let id = CommitId::try_from_hex(hex)?;
+        self.repo.store().get_commit(&id).ok().map(|_| id)
+    }
+
+    /// The repo's git-configured identity (`committer.*`/`user.*`, see
+    /// [`build_settings`]) as an [`crate::rewrite::Identity`], stamped "now" for
+    /// both author and committer — the baseline a freshly created commit gets
+    /// when the caller supplies no identity. The MCP layer overlays any explicit
+    /// author/committer fields on top of this.
+    pub fn default_identity(&self) -> crate::rewrite::Identity {
+        let sig = self.settings.signature();
+        let now = crate::history::format_timestamp(&sig.timestamp);
+        crate::rewrite::Identity {
+            author_name: sig.name.clone(),
+            author_email: sig.email.clone(),
+            author_time: now.clone(),
+            committer_name: sig.name,
+            committer_email: sig.email,
+            committer_time: now,
+        }
+    }
+
     /// The user's local branches and tags, grouped by the hex id of the commit
     /// they point at — the history view's ref pills. Read fresh from git on
     /// every call, so it tracks the branch moves a clean save exports.

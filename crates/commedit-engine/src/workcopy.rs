@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use jj_lib::backend::{CommitId, TreeValue};
+use anyhow::{bail, Context, Result};
+use jj_lib::backend::{CommitId, Signature, TreeValue};
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher};
 use jj_lib::merge::{Merge, MergedTreeValue};
@@ -34,7 +34,10 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::working_copy::{CheckoutStats, SnapshotOptions};
 
+use crate::conflict::{OpDescriptor, SaveOutcome};
+use crate::history::parse_timestamp;
 use crate::repo::Repo;
+use crate::rewrite::Identity;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
@@ -250,6 +253,100 @@ impl Repo {
         self.materialize_after_rewrite(self.head_commit())?;
         self.record_working_copy_op("Edit uncommitted changes", change_hex);
         Ok(())
+    }
+
+    /// Crystallize the current uncommitted changes into a real commit on top of
+    /// HEAD with `message` (and optional `identity`, defaulting to the repo's
+    /// git-configured user at "now"), then start a fresh empty working copy so the
+    /// tree ends up clean — like `git commit -a`. Unlike the working-copy-direct
+    /// edits (split/discard/edit) this *moves the branch tip*, so it exports to git
+    /// through the shared `finish_mutation` tail. Always lands clean: the new
+    /// commit is a fresh tip with no descendants to rebase. Refuses when the tree
+    /// is clean (nothing to commit) or HEAD is detached/unborn.
+    pub fn commit_working_copy(
+        &mut self,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("committing the working copy", || {
+            self.commit_working_copy_inner(message, identity)
+        })
+    }
+
+    fn commit_working_copy_inner(
+        &mut self,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
+        // turned out clean (nothing to commit).
+        self.snapshot_working_copy()?;
+        if self.working_copy_info().is_none() {
+            bail!("no uncommitted changes to commit");
+        }
+        let Some(head) = self.head_commit_id() else {
+            bail!("the repository has no branch head; cannot commit the working copy");
+        };
+        let leaf_id = self
+            .working_copy_commit_id()
+            .context("no working copy to commit")?;
+        let store = self.repo.store().clone();
+        // The leaf @ holds the full on-disk tree, so committing it on HEAD captures
+        // every uncommitted change as one commit (including any split chain).
+        let tree = store
+            .get_commit(&leaf_id)
+            .context("loading the working-copy commit")?
+            .tree();
+        let name = self.workspace.workspace_name().to_owned();
+
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.head_commit();
+        let heads = self.snapshot_heads();
+
+        let mut tx = self.repo.start_transaction();
+        let mut builder = tx
+            .repo_mut()
+            .new_commit(vec![head.clone()], tree)
+            .set_description(message);
+        if let Some(id) = identity {
+            let author = Signature {
+                name: id.author_name.clone(),
+                email: id.author_email.clone(),
+                timestamp: parse_timestamp(&id.author_time).context("author date")?,
+            };
+            let committer = Signature {
+                name: id.committer_name.clone(),
+                email: id.committer_email.clone(),
+                timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
+            };
+            builder = builder.set_author(author).set_committer(committer);
+        }
+        let created = block_on(builder.write()).context("writing the commit")?;
+        let created_id = created.id().clone();
+        let change_hex = created.change_id().hex();
+
+        // Start a fresh empty @ on the new commit; check_out abandons the old @
+        // (and any split chain above HEAD), so the working tree ends up clean.
+        block_on(tx.repo_mut().check_out(name, &created))
+            .context("starting a fresh working copy")?;
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.set_head_bookmark(tx.repo_mut(), created_id);
+
+        let subject = message.lines().next().unwrap_or("").trim();
+        let label = if subject.is_empty() {
+            "Commit working copy".to_string()
+        } else {
+            format!("Commit \"{subject}\"")
+        };
+        let desc = OpDescriptor::new(label, vec![change_hex]);
+        self.finish_mutation(
+            tx,
+            "commedit: commit working copy",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
     }
 
     /// Discard a working-copy entry (identified by its stable change id, or the

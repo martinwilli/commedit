@@ -12,8 +12,8 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use jj_lib::object_id::ObjectId as _;
 
 use crate::dto::{
-    CommitDto, ConflictedCommitDto, ConflictedPathDto, FileChangeDto, OpEntryDto, RefDto,
-    SaveResultDto, WorkingCopyEntryDto,
+    CommitDetailDto, CommitDto, ConflictedCommitDto, ConflictedPathDto, FileChangeDto, OpEntryDto,
+    RefDto, SaveResultDto, WorkingCopyEntryDto,
 };
 
 /// The fixed protocol reminder attached to every `Conflicts` result.
@@ -35,21 +35,23 @@ pub fn commit_dto(
     CommitDto {
         change_id: info.change_id_hex(),
         subject: info.subject.clone(),
-        description: info.description.clone(),
-        author_name: info.author_name.clone(),
-        author_email: info.author_email.clone(),
-        author_time: info.author_time.clone(),
-        committer_name: info.committer_name.clone(),
-        committer_email: info.committer_email.clone(),
-        committer_time: info.committer_time.clone(),
-        parent_shas: info
-            .parents
-            .iter()
-            .map(|p| p.hex())
-            .filter(|p| p != root_hex)
-            .collect(),
         is_merge: info.parents.len() >= 2,
         refs: refs.get(&sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
+        detail: Some(CommitDetailDto {
+            description: info.description.clone(),
+            author_name: info.author_name.clone(),
+            author_email: info.author_email.clone(),
+            author_time: info.author_time.clone(),
+            committer_name: info.committer_name.clone(),
+            committer_email: info.committer_email.clone(),
+            committer_time: info.committer_time.clone(),
+            parent_shas: info
+                .parents
+                .iter()
+                .map(|p| p.hex())
+                .filter(|p| p != root_hex)
+                .collect(),
+        }),
         sha,
     }
 }
@@ -65,15 +67,38 @@ fn ref_dto(d: &RefDecoration) -> RefDto {
     }
 }
 
+/// Trim trailing whitespace from a diff's context and header lines so the
+/// result renders as a clean YAML block scalar rather than an escaped one-line
+/// string (a lone-space blank context line collapses to an empty line). `+`/`-`
+/// lines are left byte-for-byte intact, so a whitespace-only edit — which lives
+/// on those lines — is never hidden; such a diff (and any with tabs) keeps the
+/// quoted form, which is the only lossless YAML rendering for it. Diffs are
+/// display-only here — no tool consumes one as a patch — so this never affects a
+/// rewrite, only how the change reads in a transcript.
+fn tidy_diff_for_display(diff: String) -> String {
+    let mut out = String::with_capacity(diff.len());
+    for (i, line) in diff.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.starts_with('+') || line.starts_with('-') {
+            out.push_str(line);
+        } else {
+            out.push_str(line.trim_end());
+        }
+    }
+    out
+}
+
 /// Render one engine [`FileChange`] for a response: a unified diff for text
 /// files, plus the full contents when `include_contents` asks for them.
 pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto {
     let diff = (!fc.is_binary).then(|| {
-        unified_diff(
+        tidy_diff_for_display(unified_diff(
             fc.old_text.as_deref().unwrap_or(""),
             fc.new_text.as_deref().unwrap_or(""),
             &fc.path,
-        )
+        ))
     });
     FileChangeDto {
         path: fc.path.clone(),
@@ -152,5 +177,31 @@ pub fn resolve_squash_mode(
             "unknown squash mode {other:?}: use \"fixup\", \"squash\" or \"amend\""
         )),
         None => Ok(parse_squash_mode(source_subject).unwrap_or(SquashMode::Fixup)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tidy_diff_collapses_blanks_but_preserves_change_lines() {
+        // A lone-space blank context line and a context line's trailing space go
+        // away; the `+`/`-` lines (where a whitespace edit would show) are kept.
+        let diff = " ctx  \n \n+added  \n-removed \n".to_string();
+        assert_eq!(tidy_diff_for_display(diff), " ctx\n\n+added  \n-removed \n");
+    }
+
+    #[test]
+    fn tidy_diff_renders_as_a_yaml_block_scalar() {
+        #[derive(serde::Serialize)]
+        struct W {
+            diff: String,
+        }
+        // Before tidying the lone-space blank context line forces serde_yaml to
+        // emit an escaped one-line string; after, it is a readable block scalar.
+        let diff = " fn main() {\n \n     ok\n".to_string();
+        let yaml = serde_yaml::to_string(&W { diff: tidy_diff_for_display(diff) }).unwrap();
+        assert!(yaml.contains("diff: |"), "expected a block scalar, got: {yaml:?}");
     }
 }

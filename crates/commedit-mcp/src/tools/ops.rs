@@ -3,7 +3,7 @@
 
 use commedit_engine::repo::Repo;
 use jj_lib::object_id::ObjectId as _;
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::op_entry_dto;
@@ -11,13 +11,14 @@ use crate::dto::{JumpToOperationReq, ListOperationsResp, ReloadResp, TimeTravelR
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::ensure_not_pending;
+use crate::wrapper::Yaml;
 
 #[tool_router(router = router_ops, vis = "pub")]
 impl CommeditServer {
     #[tool(
         description = "List this session's recorded operations (every landed mutation), oldest first, with the undo cursor. Index 0 is the session start; an entry's index is the state right after it — both are jump_to_operation targets."
     )]
-    pub async fn list_operations(&self) -> Result<Json<ListOperationsResp>, ErrorData> {
+    pub async fn list_operations(&self) -> Result<Yaml<ListOperationsResp>, ErrorData> {
         self.with_session(|repo, _| {
             Ok(ListOperationsResp {
                 ops: repo
@@ -33,13 +34,13 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
         description = "Step one recorded operation back, restoring that state to git and the working tree (uncommitted changes made since are reset but stay recoverable by redo)."
     )]
-    pub async fn undo(&self) -> Result<Json<TimeTravelResp>, ErrorData> {
+    pub async fn undo(&self) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(|repo, _| {
             ensure_not_pending(repo)?;
             if !repo.can_undo() {
@@ -51,11 +52,13 @@ impl CommeditServer {
             Ok(time_travel_resp(repo))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
-    #[tool(description = "Step one undone operation forward again.")]
-    pub async fn redo(&self) -> Result<Json<TimeTravelResp>, ErrorData> {
+    #[tool(
+        description = "Step one undone operation forward again."
+    )]
+    pub async fn redo(&self) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(|repo, _| {
             ensure_not_pending(repo)?;
             if !repo.can_redo() {
@@ -67,7 +70,7 @@ impl CommeditServer {
             Ok(time_travel_resp(repo))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
@@ -76,7 +79,7 @@ impl CommeditServer {
     pub async fn jump_to_operation(
         &self,
         Parameters(req): Parameters<JumpToOperationReq>,
-    ) -> Result<Json<TimeTravelResp>, ErrorData> {
+    ) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let max = repo.session_ops().len();
@@ -90,13 +93,13 @@ impl CommeditServer {
             Ok(time_travel_resp(repo))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
         description = "Re-open the repository to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This starts a fresh session in place: the trash, the operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself is untouched."
     )]
-    pub async fn reload_repo(&self) -> Result<Json<ReloadResp>, ErrorData> {
+    pub async fn reload_repo(&self) -> Result<Yaml<ReloadResp>, ErrorData> {
         let path = self.repo_path.clone();
         // Deliberately not pending-guarded: a held rewrite never touched git,
         // so dropping it with the session state is safe.
@@ -109,7 +112,7 @@ impl CommeditServer {
             Ok(ReloadResp { head_sha: repo.head_commit_id().map(|id| id.hex()) })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 }
 

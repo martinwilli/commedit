@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 // Shared response shapes
 
 /// One commit of the current branch's history.
+///
+/// A brief `list_history` (`brief: true`) returns only the identifying header
+/// — sha, change_id, subject, is_merge, refs — to keep long histories compact.
+/// The full listing (the default, and always for `show_commit` / `list_trash`)
+/// also carries the [`CommitDetailDto`] fields, flattened in alongside these.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
     /// Full commit id. Every mutation rewrites ids — address commits by their
@@ -21,6 +26,20 @@ pub struct CommitDto {
     pub change_id: String,
     /// First line of the commit message.
     pub subject: String,
+    /// Merge commits cannot be reordered, dropped, split or used as a squash
+    /// source (squashing *into* one is fine).
+    pub is_merge: bool,
+    /// Local branches and tags pointing at this commit.
+    pub refs: Vec<RefDto>,
+    /// Message body, identity and parents — present in a full listing, absent
+    /// in a brief one (call `show_commit` for any single commit's detail).
+    #[serde(flatten)]
+    pub detail: Option<CommitDetailDto>,
+}
+
+/// The verbose fields of a [`CommitDto`], omitted from a brief `list_history`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CommitDetailDto {
     /// Full commit message, including the subject line.
     pub description: String,
     pub author_name: String,
@@ -33,11 +52,6 @@ pub struct CommitDto {
     pub committer_time: String,
     /// Parent shas; empty for the root commit of the repository.
     pub parent_shas: Vec<String>,
-    /// Merge commits cannot be reordered, dropped, split or used as a squash
-    /// source (squashing *into* one is fine).
-    pub is_merge: bool,
-    /// Local branches and tags pointing at this commit.
-    pub refs: Vec<RefDto>,
 }
 
 /// A branch or tag decoration on a commit.
@@ -160,6 +174,10 @@ pub enum SaveResultDto {
 pub struct ListHistoryReq {
     /// Maximum number of commits to return, newest first. Omit for all.
     pub limit: Option<usize>,
+    /// Return only each commit's header (sha, change_id, subject, is_merge,
+    /// refs), dropping the message body, identity and parents — a compact
+    /// overview for long histories. Defaults to false (full detail).
+    pub brief: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -281,9 +299,11 @@ pub struct ReplaceFilesReq {
     /// so they chain across mutations without re-listing.
     pub commit: String,
     /// Files to write, each with its complete new content (a path the commit
-    /// doesn't have yet is added). Files cannot be *deleted* from a commit
-    /// this way.
+    /// doesn't have yet is added).
     pub files: Vec<FileContentDto>,
+    /// Paths to delete from the commit (a path the commit doesn't have is
+    /// ignored). At least one of `files`/`delete_paths` must be non-empty.
+    pub delete_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -295,6 +315,75 @@ pub struct SplitCommitReq {
     /// A new `fixup!` child commit receives the remainder, so both combined
     /// reproduce the original change.
     pub files: Vec<FileContentDto>,
+}
+
+/// Optional author/committer overrides for a newly created commit. Every
+/// omitted field defaults to the repository's git-configured identity at the
+/// current time. Flattened into the create/revert/commit-working-copy requests.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct IdentityFieldsDto {
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub author_time: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub committer_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreateCommitReq {
+    /// The full commit message (subject line + optional body).
+    pub message: String,
+    /// Files to put in the commit, each with its complete content, spliced onto
+    /// the parent's tree. Omit (with no `delete_paths`) for an empty commit.
+    #[serde(default)]
+    pub files: Vec<FileContentDto>,
+    /// Paths to delete relative to the parent (a path the parent lacks is
+    /// ignored).
+    pub delete_paths: Option<Vec<String>>,
+    /// The commit that becomes the new commit's parent — sha or change id, full
+    /// or a unique prefix, or the literal `root` for the very first position.
+    /// Omitted means the top of HEAD: the new commit becomes the branch tip
+    /// (uncommitted changes, if any, ride on top of it untouched).
+    pub new_parent: Option<String>,
+    /// When several lines converge on `new_parent` (a fork), the child the new
+    /// commit should be spliced above (same ref forms), as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertCommitReq {
+    /// The commit to revert — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Merge commits cannot be reverted.
+    pub commit: String,
+    /// Where to place the revert commit — the commit that becomes its parent
+    /// (same ref forms) or `root`. Omitted means the top of HEAD.
+    pub new_parent: Option<String>,
+    /// Disambiguates a fork, as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CherryPickCommitReq {
+    /// The commit to cherry-pick. A commit in the current branch history takes
+    /// a sha or change id, full or a unique prefix (>= 4 chars). A commit from
+    /// *outside* the history (e.g. on another branch) takes its full 40-char
+    /// sha — get it from `git log <branch>`; a prefix or change id only resolves
+    /// within the history. Merge commits cannot be cherry-picked.
+    pub commit: String,
+    /// Where to place the new commit — the commit that becomes its parent (sha
+    /// or change id, or `root`). Omitted means the top of HEAD.
+    pub new_parent: Option<String>,
+    /// Disambiguates a fork, as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -359,6 +448,15 @@ pub struct SquashWorkingCopyReq {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommitWorkingCopyReq {
+    /// The full commit message (subject line + optional body) for the new commit
+    /// holding the current uncommitted changes.
+    pub message: String,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DiscardWorkingCopyReq {
     /// Must be true. Discarded uncommitted changes cannot be recovered
     /// through this server — undo steps over the discard but restores only
@@ -392,15 +490,24 @@ pub struct ReadConflictResp {
     pub num_sides: usize,
 }
 
-/// One resolved file for `resolve_conflicts`.
+/// One resolved file for `resolve_conflicts` — either edited content, or a
+/// deletion.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ConflictFileEditDto {
     /// The conflicted path being resolved.
     pub path: String,
     /// The file's complete resolved content, all conflict markers removed.
-    pub text: String,
-    /// The `marker_len` `read_conflict` returned for this file.
-    pub marker_len: usize,
+    /// Required unless `delete` is true.
+    pub text: Option<String>,
+    /// The `marker_len` `read_conflict` returned for this file. Required
+    /// alongside `text`; omit when deleting.
+    pub marker_len: Option<usize>,
+    /// Resolve by deleting the path instead of supplying content — the way to
+    /// settle a modify/delete conflict (e.g. a revert that should remove a
+    /// file). Works for structural (resolvable=false) conflicts too, so it is
+    /// also the text route's escape hatch besides abort_rewrite. When true,
+    /// text/marker_len are ignored.
+    pub delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

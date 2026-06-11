@@ -9,10 +9,12 @@ use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::graph::compute_graph;
 use commedit_engine::history::{history, history_limited, CommitInfo, ReorderMove};
 use commedit_engine::repo::Repo;
-use jj_lib::backend::CommitId;
+use commedit_engine::rewrite::Identity;
+use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::ErrorData;
 
+use crate::dto::IdentityFieldsDto;
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 
@@ -254,11 +256,65 @@ pub fn find_conflicted(conflicts: &[ConflictedCommit], r: &str) -> Result<usize,
     })
 }
 
-/// What `plan_splice` is moving: a commit at a display index, or a trashed
-/// commit being grafted back.
+/// What `plan_splice` is moving: a commit at a display index, a trashed commit
+/// being grafted back, or a brand-new commit being inserted (no graph position).
 pub enum SpliceTarget {
     InHistory(usize),
     Trashed(CommitInfo),
+    New,
+}
+
+/// A placeholder [`CommitInfo`] for planning a brand-new commit's insertion. Its
+/// id is empty, so it equals no real commit and is no commit's parent or child —
+/// [`Repo::plan_restore_candidates`] then yields the lines crossing the gap with
+/// none of the own-line no-op cases (a new commit has no line to drop back onto).
+fn synthetic_new_commit() -> CommitInfo {
+    CommitInfo {
+        id: CommitId::new(Vec::new()),
+        change_id: ChangeId::new(Vec::new()),
+        subject: String::new(),
+        description: String::new(),
+        author_name: String::new(),
+        author_email: String::new(),
+        committer_name: String::new(),
+        committer_email: String::new(),
+        author_time: String::new(),
+        committer_time: String::new(),
+        parents: Vec::new(),
+    }
+}
+
+/// Resolve optional author/committer request fields to an engine [`Identity`]
+/// for a newly created commit, overlaying any supplied field on the repo's
+/// git-configured default (at "now"). `None` when nothing was supplied, so the
+/// engine applies jj's own defaults.
+pub fn new_commit_identity(repo: &Repo, fields: IdentityFieldsDto) -> Option<Identity> {
+    let IdentityFieldsDto {
+        author_name,
+        author_email,
+        author_time,
+        committer_name,
+        committer_email,
+        committer_time,
+    } = fields;
+    if author_name.is_none()
+        && author_email.is_none()
+        && author_time.is_none()
+        && committer_name.is_none()
+        && committer_email.is_none()
+        && committer_time.is_none()
+    {
+        return None;
+    }
+    let base = repo.default_identity();
+    Some(Identity {
+        author_name: author_name.unwrap_or(base.author_name),
+        author_email: author_email.unwrap_or(base.author_email),
+        author_time: author_time.unwrap_or(base.author_time),
+        committer_name: committer_name.unwrap_or(base.committer_name),
+        committer_email: committer_email.unwrap_or(base.committer_email),
+        committer_time: committer_time.unwrap_or(base.committer_time),
+    })
 }
 
 /// Resolve the agent-facing move semantics — "make `new_parent` the
@@ -311,6 +367,13 @@ pub fn plan_splice(
                 return Err(invalid("a commit cannot become its own parent"));
             }
             repo.plan_restore_candidates(commits, &layout, info, to)
+        }
+        SpliceTarget::New => {
+            // A brand-new commit has no graph position; plan it like a restore
+            // of a commit absent from the history (the engine computes the tip
+            // itself, so only new_parents/new_children of the result are used).
+            let synthetic = synthetic_new_commit();
+            repo.plan_restore_candidates(commits, &layout, &synthetic, to)
         }
     };
 

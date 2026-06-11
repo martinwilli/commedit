@@ -191,12 +191,12 @@ pub(crate) const READ_ONLY_HINT: &str = "Edit blocked — this change would brea
 pub(crate) const CONFLICT_LAYOUT_HINT: &str =
     "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
 
-/// Grouped bundles of the `build_ui` state handed to the peeled modules
-/// (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself
-/// refcounted), so the derived `Clone` is cheap. The bundles are assembled in
-/// `build_ui` by cloning its existing locals — no state is duplicated, both point
-/// at the same `Rc` — and handed to the modules as borrowed bundles, which clone
-/// out the individual handles their closures capture.
+// Grouped bundles of the `build_ui` state handed to the peeled modules
+// (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself
+// refcounted), so the derived `Clone` is cheap. The bundles are assembled in
+// `build_ui` by cloning its existing locals — no state is duplicated, both point
+// at the same `Rc` — and handed to the modules as borrowed bundles, which clone
+// out the individual handles their closures capture.
 
 /// The GTK widget handles a peeled module captures.
 #[derive(Clone)]

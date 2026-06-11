@@ -110,7 +110,7 @@ impl CommeditServer {
             let mut files: Vec<(String, FileResolution)> = Vec::with_capacity(req.files.len());
             for f in req.files {
                 if f.delete.unwrap_or(false) {
-                    if !conflicted_paths.iter().any(|p| *p == f.path) {
+                    if !conflicted_paths.contains(&f.path) {
                         return Err(invalid(format!(
                             "{} is not a conflicted path of this commit; cannot delete it. \
                              Its conflicted files are: {}",

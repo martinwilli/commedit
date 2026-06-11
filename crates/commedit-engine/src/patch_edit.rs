@@ -863,7 +863,7 @@ mod tests {
     fn line_index(patch: &str, predicate: impl Fn(&str) -> bool) -> usize {
         patch
             .split('\n')
-            .position(|l| predicate(l))
+            .position(predicate)
             .expect("line present")
     }
 

@@ -20,6 +20,7 @@ the code implements them and the non-obvious invariants to keep when changing it
 
 ```sh
 cargo build                      # build the workspace
+cargo clippy --workspace --all-targets  # lint; run before committing
 cargo test                       # all tests (engine unit + integration)
 cargo test -p commedit-engine    # engine only
 cargo test -p commedit-mcp       # MCP server only
@@ -30,6 +31,9 @@ cargo run -p commedit-mcp -- /path/to/repo  # the MCP server on stdio (defaults 
 ```
 
 The GTK crate needs system GTK4 / libsourceview5 development libraries present.
+
+Run `cargo clippy --workspace --all-targets` before committing and keep it
+warning-free; each commit should build and pass tests on its own.
 
 ## Architecture
 

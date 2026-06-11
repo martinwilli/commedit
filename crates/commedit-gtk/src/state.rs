@@ -29,6 +29,10 @@ pub(crate) const HISTORY_PAGE: usize = 64;
 /// hunk (the renderer rebuilds the buffer and the buttons themselves).
 pub(crate) type Renderer = Rc<dyn Fn()>;
 
+/// A one-shot action staged from a drag gesture and run at idle from `drag-end`
+/// (see `dragdrop::run_post_drag`); `None` between drags.
+pub(crate) type PostDrag = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
 /// Which list a drag started in, so the shared drop handlers can tell a reorder
 /// (history → history), a drop (history → trash), a restore (trash → history) and
 /// a working-copy fold (working copy → commit) apart. The carried value is just
@@ -191,12 +195,12 @@ pub(crate) const READ_ONLY_HINT: &str = "Edit blocked — this change would brea
 pub(crate) const CONFLICT_LAYOUT_HINT: &str =
     "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
 
-/// Grouped bundles of the `build_ui` state handed to the peeled modules
-/// (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself
-/// refcounted), so the derived `Clone` is cheap. The bundles are assembled in
-/// `build_ui` by cloning its existing locals — no state is duplicated, both point
-/// at the same `Rc` — and handed to the modules as borrowed bundles, which clone
-/// out the individual handles their closures capture.
+// Grouped bundles of the `build_ui` state handed to the peeled modules
+// (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself
+// refcounted), so the derived `Clone` is cheap. The bundles are assembled in
+// `build_ui` by cloning its existing locals — no state is duplicated, both point
+// at the same `Rc` — and handed to the modules as borrowed bundles, which clone
+// out the individual handles their closures capture.
 
 /// The GTK widget handles a peeled module captures.
 #[derive(Clone)]
@@ -241,7 +245,7 @@ pub(crate) struct DragState {
     pub(crate) drag_from: Rc<Cell<Option<usize>>>,
     pub(crate) drop_gap: Rc<Cell<Option<usize>>>,
     pub(crate) drop_onto: Rc<Cell<Option<usize>>>,
-    pub(crate) post_drag: Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
+    pub(crate) post_drag: PostDrag,
 }
 
 /// The late-bound cross-module callbacks.

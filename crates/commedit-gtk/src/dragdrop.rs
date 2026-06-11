@@ -7,7 +7,6 @@
 //! its closures capture — the same handles `build_ui` holds, so both share one
 //! source of truth.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use commedit_engine::conflict::SaveOutcome;
@@ -20,7 +19,7 @@ use gtk::{
 };
 
 use crate::rows::{lane_color, populate_trash};
-use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, Widgets};
+use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, PostDrag, Widgets};
 
 /// Install the drag-and-drop controllers on the history, trash and working-copy
 /// lists. See the module docs.
@@ -1006,9 +1005,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
 /// rows are alive for all of them. (Scheduling from `drag-end` rather than the
 /// drop handler matters too: an idle queued mid-gesture can fire between motion
 /// events, i.e. before the drag is over.)
-fn run_post_drag(post_drag: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>) {
+fn run_post_drag(post_drag: &PostDrag) {
     if let Some(action) = post_drag.borrow_mut().take() {
-        glib::idle_add_local_once(move || action());
+        glib::idle_add_local_once(action);
     }
 }
 

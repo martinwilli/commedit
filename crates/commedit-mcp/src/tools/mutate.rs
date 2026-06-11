@@ -432,7 +432,7 @@ impl CommeditServer {
             let root = repo.root_commit_id().hex();
             let dropped =
                 commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo), DetailFields::ALL);
-            let outcome = run_staged(repo, trash, PendingTrashOp::Push(info), |repo| {
+            let outcome = run_staged(repo, trash, PendingTrashOp::Push(Box::new(info)), |repo| {
                 repo.abandon_commit(&id)
             })?;
             Ok(DropCommitResp { result: save_result(repo, &outcome), dropped })
@@ -482,7 +482,7 @@ impl CommeditServer {
             let mv = plan_splice(
                 repo,
                 &commits,
-                SpliceTarget::Trashed(info.clone()),
+                SpliceTarget::Trashed(Box::new(info.clone())),
                 &req.new_parent,
                 req.child.as_deref(),
             )?;

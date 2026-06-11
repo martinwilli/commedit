@@ -306,6 +306,16 @@ pub(crate) fn branch_commits(commits: &[CommitInfo], head: &CommitId) -> HashSet
     reachable
 }
 
+/// The static graph context the splice planners share: the displayed commits,
+/// the branch head, the lane layout, and the virtual root commit.
+#[derive(Clone, Copy)]
+struct SpliceCtx<'a> {
+    commits: &'a [CommitInfo],
+    head: &'a CommitId,
+    layout: &'a GraphLayout,
+    root: &'a CommitId,
+}
+
 /// Enumerate the destination lines for splicing `target` into display gap `to`:
 /// one candidate per ancestry line crossing the boundary (the lane edges of
 /// [`GraphLayout::boundaries`]), plus — at the very bottom — a synthetic
@@ -319,15 +329,13 @@ pub(crate) fn branch_commits(commits: &[CommitInfo], head: &CommitId) -> HashSet
 /// `new_tip` is the pre-splice id of the commit that ends up as the branch
 /// head for every gap below the top.
 fn splice_candidates(
-    commits: &[CommitInfo],
-    head: &CommitId,
-    layout: &GraphLayout,
-    root: &CommitId,
+    ctx: &SpliceCtx,
     branch: &HashSet<CommitId>,
     target: &CommitId,
     new_tip: &CommitId,
     to: usize,
 ) -> Vec<ReorderCandidate> {
+    let SpliceCtx { commits, head, layout, root } = *ctx;
     let n = commits.len();
     if to == 0 {
         return vec![ReorderCandidate {
@@ -419,7 +427,8 @@ pub fn plan_reorder_candidates(
     } else {
         head.clone()
     };
-    splice_candidates(commits, head, layout, root, &branch, &dragged.id, &new_tip, to)
+    let ctx = SpliceCtx { commits, head, layout, root };
+    splice_candidates(&ctx, &branch, &dragged.id, &new_tip, to)
 }
 
 /// Plan grafting a trashed commit (one not currently in `commits`) back into
@@ -443,7 +452,8 @@ pub fn plan_restore_candidates(
         return Vec::new();
     }
     let branch = branch_commits(commits, head);
-    splice_candidates(commits, head, layout, root, &branch, &restored.id, head, to)
+    let ctx = SpliceCtx { commits, head, layout, root };
+    splice_candidates(&ctx, &branch, &restored.id, head, to)
 }
 
 /// The commit id of the display row `index`, if it can be dropped from history:

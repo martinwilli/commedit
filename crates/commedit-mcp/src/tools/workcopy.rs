@@ -77,7 +77,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Commit ALL uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Refuses when the tree is already clean. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
     )]
     pub async fn commit_working_copy(
         &self,

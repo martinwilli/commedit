@@ -10,10 +10,11 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::commit_dto;
+use crate::convert::{commit_dto, resolve_squash_mode};
 use crate::dto::{
     DropCommitReq, DropCommitResp, EditIdentityReq, EditMessageReq, FileContentDto,
     ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto, SplitCommitReq,
+    SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -228,6 +229,58 @@ impl CommeditServer {
                 repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
             })?;
             Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Fold one commit into another, anywhere in the graph (the source may also be a trashed commit). mode picks the message handling: fixup keeps the destination's, squash appends the source's body, amend replaces it — defaulting to the source's `fixup!`/`squash!`/`amend!` subject prefix, else fixup. A merge can be the destination but not the source."
+    )]
+    pub async fn squash_commit(
+        &self,
+        Parameters(req): Parameters<SquashCommitReq>,
+    ) -> Result<Json<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, trash| {
+            ensure_not_pending(repo)?;
+            let (_, commits) = full_history(repo)?;
+            let dest_idx = find_commit(&commits, &req.dest_sha).map_err(|_| {
+                invalid(format!(
+                    "dest_sha {} is not in the current branch history; call list_history \
+                     for fresh shas",
+                    req.dest_sha
+                ))
+            })?;
+
+            if let Ok(src_idx) = find_commit(&commits, &req.source_sha) {
+                let mode = resolve_squash_mode(req.mode.as_deref(), &commits[src_idx].subject)
+                    .map_err(invalid)?;
+                let (src, dest) = repo.plan_squash(&commits, src_idx, dest_idx).ok_or_else(|| {
+                    invalid(
+                        "cannot squash: the source must be a non-merge commit on the branch, \
+                         distinct from the destination",
+                    )
+                })?;
+                let outcome = repo.squash_into(&src, &dest, mode).map_err(internal)?;
+                Ok(save_result(repo, &outcome))
+            } else {
+                let info = find_trashed(trash, &req.source_sha).map_err(|_| {
+                    invalid(format!(
+                        "source {} is neither in the branch history nor in the trash",
+                        req.source_sha
+                    ))
+                })?;
+                let mode =
+                    resolve_squash_mode(req.mode.as_deref(), &info.subject).map_err(invalid)?;
+                let (src, dest) =
+                    repo.plan_squash_restore(&commits, &info, dest_idx).ok_or_else(|| {
+                        invalid("cannot squash the trashed commit onto itself or off-branch")
+                    })?;
+                let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {
+                    repo.squash_restore_into(&src, &dest, mode)
+                })?;
+                Ok(save_result(repo, &outcome))
+            }
         })
         .await
         .map(Json)

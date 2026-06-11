@@ -7,7 +7,7 @@ use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open
 use commedit_mcp::dto::{
     DropCommitReq, EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq,
     ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq,
+    SplitCommitReq, SquashCommitReq,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -602,6 +602,160 @@ async fn drop_refuses_merges_and_unknown_restores() {
             .await,
     );
     assert!(err.message.contains("trash"), "unexpected error: {}", err.message);
+}
+
+/// A repo for squash tests: "target" introduces a.txt, "follow-up" edits it
+/// (with a body in its message), "third" adds an unrelated file.
+fn squash_repo(dir: &std::path::Path) {
+    init_repo(
+        dir,
+        &[
+            ("a.txt", "one\n", "target"),
+            ("a.txt", "one\ntwo\n", "follow-up\n\nthe follow-up body"),
+            ("c.txt", "3\n", "third"),
+        ],
+    );
+}
+
+async fn squash(
+    server: &CommeditServer,
+    source: &str,
+    dest: &str,
+    mode: Option<&str>,
+) -> SaveResultDto {
+    server
+        .squash_commit(Parameters(SquashCommitReq {
+            source_sha: source.into(),
+            dest_sha: dest.into(),
+            mode: mode.map(str::to_string),
+        }))
+        .await
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+async fn squash_fixup_keeps_the_destinations_message() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let shas = shas(&server).await;
+    let result = squash(&server, &shas[1], &shas[2], None).await;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
+    assert_eq!(git(dir.path(), &["log", "-1", "--format=%B", "HEAD~1"]).trim(), "target");
+}
+
+#[tokio::test]
+async fn squash_mode_squash_appends_the_sources_body() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let shas = shas(&server).await;
+    clean_head(&squash(&server, &shas[1], &shas[2], Some("squash")).await);
+
+    let message = git(dir.path(), &["log", "-1", "--format=%B", "HEAD~1"]);
+    assert_eq!(message.trim(), "target\n\nfollow-up\n\nthe follow-up body");
+}
+
+#[tokio::test]
+async fn squash_mode_amend_replaces_the_destinations_message() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let shas = shas(&server).await;
+    clean_head(&squash(&server, &shas[1], &shas[2], Some("amend")).await);
+
+    let message = git(dir.path(), &["log", "-1", "--format=%B", "HEAD~1"]);
+    assert_eq!(message.trim(), "follow-up\n\nthe follow-up body");
+}
+
+#[tokio::test]
+async fn squash_defaults_to_the_sources_subject_prefix() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "one\n", "target"),
+            ("a.txt", "one\ntwo\n", "squash! target\n\nprefixed body"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    let shas = shas(&server).await;
+    clean_head(&squash(&server, &shas[0], &shas[1], None).await);
+
+    // The squash! prefix selected Squash mode; the prefix line is stripped.
+    let message = git(dir.path(), &["log", "-1", "--format=%B", "HEAD"]);
+    assert_eq!(message.trim(), "target\n\nprefixed body");
+}
+
+#[tokio::test]
+async fn squash_from_the_trash_restores_and_folds() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let listed = shas(&server).await;
+    let dropped = server
+        .drop_commit(Parameters(DropCommitReq { sha: listed[1].clone() }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&dropped.result);
+    assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
+
+    // Fold the trashed "follow-up" into "target".
+    let target = shas(&server).await[1].clone();
+    let result = squash(&server, &dropped.dropped.sha, &target, None).await;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
+    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+}
+
+#[tokio::test]
+async fn squash_rejects_a_merge_source_and_bad_modes() {
+    let dir = TempDir::new().unwrap();
+    init_merge_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
+    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
+
+    let err = expect_err(
+        server
+            .squash_commit(Parameters(SquashCommitReq {
+                source_sha: merge.sha.clone(),
+                dest_sha: base.sha.clone(),
+                mode: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("cannot squash"), "unexpected error: {}", err.message);
+
+    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+    let err = expect_err(
+        server
+            .squash_commit(Parameters(SquashCommitReq {
+                source_sha: main1.sha.clone(),
+                dest_sha: base.sha.clone(),
+                mode: Some("merge".into()),
+            }))
+            .await,
+    );
+    assert!(err.message.contains("unknown squash mode"), "unexpected error: {}", err.message);
 }
 
 #[tokio::test]

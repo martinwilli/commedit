@@ -1,13 +1,17 @@
 //! Tools over the uncommitted changes (the engine's working-copy commit `@`)
 //! and the session-wide review diff.
 
-use rmcp::handler::server::wrapper::Json;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{file_change_dto, wc_entry_dto};
-use crate::dto::{SessionDiffResp, WorkingCopyStatusResp};
-use crate::error::internal;
+use crate::dto::{
+    DiscardWorkingCopyReq, OkResp, SaveResultDto, SessionDiffResp, SquashWorkingCopyReq,
+    WorkingCopyStatusResp,
+};
+use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
+use crate::session::{ensure_not_pending, find_commit, full_history, save_result};
 
 #[tool_router(router = router_workcopy, vis = "pub")]
 impl CommeditServer {
@@ -41,6 +45,52 @@ impl CommeditServer {
                 .map(|fc| file_change_dto(fc, false))
                 .collect();
             Ok(SessionDiffResp { files })
+        })
+        .await
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite."
+    )]
+    pub async fn squash_working_copy(
+        &self,
+        Parameters(req): Parameters<SquashWorkingCopyReq>,
+    ) -> Result<Json<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            repo.snapshot_working_copy().map_err(internal)?;
+            if repo.working_copy_chain().is_empty() {
+                return Err(invalid("the working copy is clean — nothing to fold"));
+            }
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.dest_sha)?;
+            let outcome = repo
+                .squash_working_copy_into(None, &commits[idx].id)
+                .map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true. Recorded as a session operation, so undo can restore the changes during this session — but once the session ends they are unrecoverable."
+    )]
+    pub async fn discard_working_copy(
+        &self,
+        Parameters(req): Parameters<DiscardWorkingCopyReq>,
+    ) -> Result<Json<OkResp>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if !req.confirm {
+                return Err(invalid(
+                    "set confirm=true to discard the uncommitted changes; they are \
+                     recoverable via undo only while this session lives",
+                ));
+            }
+            repo.drop_working_copy(None).map_err(internal)?;
+            Ok(OkResp { ok: true })
         })
         .await
         .map(Json)

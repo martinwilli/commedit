@@ -929,8 +929,8 @@ pub fn render_conflict_snippets(
             });
         }
         // The shown window (its interior gaps, if any, are fully shown).
-        for k in w.top..w.bottom {
-            text_lines.push(lines[k].to_string());
+        for line in &lines[w.top..w.bottom] {
+            text_lines.push(line.to_string());
         }
         pieces.push(ConflictPiece::Shown {
             lines: w.bottom - w.top,

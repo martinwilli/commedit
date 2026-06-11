@@ -21,20 +21,24 @@
 //! diffs the tracked trees, so an untracked file (in neither tree) is never
 //! deleted. They survive a rewrite untouched.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use jj_lib::backend::{CommitId, Signature, TreeValue};
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher};
 use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::store::Store;
 use jj_lib::working_copy::{CheckoutStats, SnapshotOptions};
 
 use crate::conflict::{OpDescriptor, SaveOutcome};
+use crate::diff::{apply_patch, render_diff, select_groups, ContextExpansion};
 use crate::history::parse_timestamp;
 use crate::repo::Repo;
 use crate::rewrite::Identity;
@@ -77,6 +81,25 @@ pub struct WorkingCopyEntry {
     /// Whether this entry's tree is conflicted (a rewrite reapplied onto it
     /// clashed with the user's uncommitted changes).
     pub has_conflict: bool,
+}
+
+/// A subset of the uncommitted changes to commit, addressed in three tiers that
+/// **compose** in one call (a given path must appear in at most one tier):
+/// - `paths`: take the file whole, lifting its value from the leaf `@`
+///   (binary/executable-safe; a path missing on disk commits a deletion).
+/// - `hunks`: per file, the change-group hunks to keep — by *index* into the
+///   diff the agent read (the same numbering [`render_diff`] produces) — the rest
+///   reverting to HEAD.
+/// - `patches`: per file, an edited unified-diff patch applied to the file's HEAD
+///   content, for sub-hunk (`git add -p` → `e`) selection.
+///
+/// The `hunks`/`patches` tiers reconstruct relative to **HEAD**, i.e. against the
+/// cumulative `@`-vs-HEAD diff the agent saw. An all-empty selection commits
+/// nothing and is rejected.
+pub struct PartialSelection<'a> {
+    pub paths: &'a [String],
+    pub hunks: &'a [(String, Vec<usize>)],
+    pub patches: &'a [(String, String)],
 }
 
 impl Repo {
@@ -347,6 +370,183 @@ impl Repo {
             old_head,
             heads,
         )
+    }
+
+    /// Commit a **subset** of the uncommitted changes as a new commit on HEAD,
+    /// keeping the remainder uncommitted — the in-process equivalent of
+    /// `git add -p` + `git commit` (which jj's "snapshot the whole tree" model has
+    /// no concept of). Like [`Self::commit_working_copy`] this moves the branch tip
+    /// and exports through the shared `finish_mutation` tail, and always lands
+    /// clean (the new commit is a fresh tip with no real-history descendants to
+    /// rebase). Unlike it, the rebuilt `@` still holds the **full** on-disk tree,
+    /// so the working files stay byte-identical — only `git`'s notion of what is
+    /// committed vs. uncommitted moves. Refuses when the tree is clean, when HEAD
+    /// is detached/unborn, or when the selection turns out to commit nothing. See
+    /// [`PartialSelection`] for how the selection is addressed.
+    pub fn commit_working_copy_partial(
+        &mut self,
+        sel: PartialSelection<'_>,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("committing part of the working copy", || {
+            self.commit_working_copy_partial_inner(sel, message, identity)
+        })
+    }
+
+    fn commit_working_copy_partial_inner(
+        &mut self,
+        sel: PartialSelection<'_>,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
+        // turned out clean (nothing to commit).
+        self.snapshot_working_copy()?;
+        if self.working_copy_info().is_none() {
+            bail!("no uncommitted changes to commit");
+        }
+        let Some(head) = self.head_commit_id() else {
+            bail!("the repository has no branch head; cannot commit the working copy");
+        };
+        let leaf_id = self
+            .working_copy_commit_id()
+            .context("no working copy to commit")?;
+        let store = self.repo.store().clone();
+        // The leaf @ holds the full on-disk tree (collapsing any split chain); the
+        // remainder will ride on it, and HEAD's tree is the base we splice the
+        // selected subset onto.
+        let full_tree = store
+            .get_commit(&leaf_id)
+            .context("loading the working-copy commit")?
+            .tree();
+        let head_tree = store
+            .get_commit(&head)
+            .context("loading the branch head")?
+            .tree();
+
+        // Build the committed tree on top of HEAD from the selection.
+        let mut t_commit = head_tree.clone();
+        if !sel.paths.is_empty() {
+            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
+        }
+        // The hunks/patches tiers reconstruct text content relative to HEAD; gather
+        // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
+        let mut text_edits: Vec<(String, String)> = Vec::new();
+        for (path, indices) in sel.hunks {
+            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
+            let mut kept: BTreeSet<usize> = BTreeSet::new();
+            for &i in indices {
+                let hunk = rendered.hunks.get(i).ok_or_else(|| {
+                    anyhow!(
+                        "hunk index {i} is out of range for '{path}' (it has {} hunk(s))",
+                        rendered.hunks.len()
+                    )
+                })?;
+                kept.extend(hunk.first_group..=hunk.last_group);
+            }
+            text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
+        }
+        for (path, patch) in sel.patches {
+            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let content = apply_patch(&old_f, patch)
+                .with_context(|| format!("applying the patch for '{path}'"))?;
+            text_edits.push((path.clone(), content));
+        }
+        if !text_edits.is_empty() {
+            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
+        }
+
+        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
+        // unmodified path, an empty hunk set, or a patch that changes nothing.
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+
+        let name = self.workspace.workspace_name().to_owned();
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.head_commit();
+        let heads = self.snapshot_heads();
+
+        let mut tx = self.repo.start_transaction();
+        // C: the partial commit, holding only the selected subset, on HEAD.
+        let mut builder = tx
+            .repo_mut()
+            .new_commit(vec![head.clone()], t_commit)
+            .set_description(message);
+        if let Some(id) = identity {
+            let author = Signature {
+                name: id.author_name.clone(),
+                email: id.author_email.clone(),
+                timestamp: parse_timestamp(&id.author_time).context("author date")?,
+            };
+            let committer = Signature {
+                name: id.committer_name.clone(),
+                email: id.committer_email.clone(),
+                timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
+            };
+            builder = builder.set_author(author).set_committer(committer);
+        }
+        let created = block_on(builder.write()).context("writing the commit")?;
+        let created_id = created.id().clone();
+        let change_hex = created.change_id().hex();
+
+        // leaf': the remainder — the full on-disk tree as a child of C. We point @
+        // at it with `edit` (not `check_out`, which would spawn a *fresh empty* @):
+        // @ must *hold* the full tree so disk stays byte-identical and the
+        // unselected delta (leaf' vs C) remains the uncommitted changes.
+        let remainder = block_on(
+            tx.repo_mut()
+                .new_commit(vec![created_id.clone()], full_tree)
+                .write(),
+        )
+        .context("writing the working-copy remainder")?;
+        block_on(tx.repo_mut().edit(name, &remainder))
+            .context("pointing the working copy at the remainder")?;
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.set_head_bookmark(tx.repo_mut(), created_id);
+
+        let subject = message.lines().next().unwrap_or("").trim();
+        let label = if subject.is_empty() {
+            "Commit part of working copy".to_string()
+        } else {
+            format!("Commit \"{subject}\"")
+        };
+        let desc = OpDescriptor::new(label, vec![change_hex]);
+        self.finish_mutation(
+            tx,
+            "commedit: commit working copy (partial)",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
+    }
+
+    /// Read a path's HEAD-side (`old`) and leaf-side (`new`) UTF-8 text for the
+    /// hunk/patch tiers, which reconstruct relative to HEAD. An absent side is the
+    /// empty string (a file added on disk diffs from ""); a binary side on either
+    /// tree is rejected — such files are `paths`-tier only.
+    fn partial_file_text(
+        &self,
+        head_tree: &MergedTree,
+        full_tree: &MergedTree,
+        store: &Arc<Store>,
+        path: &str,
+    ) -> Result<(String, String)> {
+        let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
+        let read = |tree: &MergedTree| -> Result<(Option<String>, bool)> {
+            let value = block_on(tree.path_value(&repo_path)).context("reading path")?;
+            let resolved = value.into_resolved().ok().flatten();
+            crate::diff::read_text(store, &repo_path, resolved.as_ref())
+        };
+        let (old_opt, old_bin) = read(head_tree)?;
+        let (new_opt, new_bin) = read(full_tree)?;
+        if old_bin || new_bin {
+            bail!("'{path}' is binary; select it whole via `paths`, not by hunk or patch");
+        }
+        Ok((old_opt.unwrap_or_default(), new_opt.unwrap_or_default()))
     }
 
     /// Discard a working-copy entry (identified by its stable change id, or the

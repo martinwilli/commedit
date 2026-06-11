@@ -393,6 +393,9 @@ async fn commit_working_copy_commits_the_dirt() {
             .commit_working_copy(Parameters(CommitWorkingCopyReq {
                 message: "nope".into(),
                 identity: IdentityFieldsDto::default(),
+                paths: None,
+                hunks: None,
+                patches: None,
             }))
             .await,
     );
@@ -408,6 +411,9 @@ async fn commit_working_copy_commits_the_dirt() {
         .commit_working_copy(Parameters(CommitWorkingCopyReq {
             message: "local work".into(),
             identity: IdentityFieldsDto::default(),
+            paths: None,
+            hunks: None,
+            patches: None,
         }))
         .await
         .unwrap()

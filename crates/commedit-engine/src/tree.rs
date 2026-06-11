@@ -229,6 +229,33 @@ pub(crate) fn splice_files_into_tree(
     splice_edits_into_tree(base_tree, store, &edits)
 }
 
+/// Splice whole-file *values* for `paths` from `source` into `base_tree`,
+/// returning the written tree. Unlike [`splice_files_into_tree`] this copies each
+/// path's `TreeValue` verbatim — the executable bit, copy id and (binary)
+/// content ride inside the value rather than round-tripping through `String` — so
+/// it is the binary/exec-safe way to lift a file from one tree to another. A path
+/// absent in `source` is committed as a deletion. Used by the `paths` tier of
+/// [`Repo::commit_working_copy_partial`] to take a whole file from the leaf `@`.
+pub(crate) fn splice_paths_from_tree(
+    base_tree: MergedTree,
+    source: &MergedTree,
+    paths: &[String],
+) -> Result<MergedTree> {
+    let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
+        // `path_value` yields `Merge::absent()` for a path missing in `source`,
+        // which `set_or_remove` turns into a deletion.
+        let value = pollster::block_on(source.path_value(&repo_path)).context("reading path")?;
+        entries.push((repo_path, value));
+    }
+    let mut builder = MergedTreeBuilder::new(base_tree);
+    for (repo_path, value) in entries {
+        builder.set_or_remove(repo_path, value);
+    }
+    pollster::block_on(builder.write_tree()).context("writing tree")
+}
+
 /// Apply whole-file edits to `base_tree`, returning the written tree. Each
 /// written blob goes to `store` and is set into a single [`MergedTreeBuilder`]
 /// pass (so a multi-file save is one tree write); a [`FileEdit`] with no content

@@ -1,7 +1,7 @@
 //! Extract the per-file changes a commit introduces (vs. its parent), with text
 //! content for the history/hunk view.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -315,14 +315,14 @@ fn change_groups(segs: &[Seg]) -> Vec<(usize, usize)> {
     groups
 }
 
-/// Reconstruct `new` with the change groups in the inclusive range
-/// `[first_group, last_group]` reverted to `old`, leaving the other groups'
-/// changes intact. Group indexing matches [`render_diff`] / [`HunkInfo`], so a
-/// UI hunk's `first_group`/`last_group` selects exactly that hunk's content to
-/// drop. The result is newline-normalized like [`apply_patch`]'s output, so the
-/// rendered diff of `old` → result still reverse-applies. Out-of-range indices
-/// (or a file with no changes) return `new` unchanged (normalized).
-pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize) -> String {
+/// Reconstruct a file from `old` → `new`'s diff, deciding per change group which
+/// side to emit: `keep_new(g)` true emits the group's new side (the `+` lines,
+/// dropping the `-`), false emits its old side (the `-` lines, dropping the `+`);
+/// context is emitted verbatim. Group indexing matches [`render_diff`] /
+/// [`HunkInfo`]. The result is newline-normalized like [`apply_patch`]'s output,
+/// so the rendered diff of `old` → result still reverse-applies. Shared by
+/// [`revert_groups`] and [`select_groups`].
+fn reconstruct_groups(old: &str, new: &str, keep_new: impl Fn(usize) -> bool) -> String {
     let old_n = ensure_trailing_newline(old);
     let new_n = ensure_trailing_newline(new);
     let old_lines: Vec<&str> = old_n.lines().collect();
@@ -333,9 +333,7 @@ pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize
     let groups = change_groups(&segs);
 
     // Walk the segments, tracking which change group each changed segment belongs
-    // to. A reverted group emits its old side (the `-` lines, dropping the `+`);
-    // a kept group emits its new side (the `+` lines, dropping the `-`); context
-    // is emitted verbatim.
+    // to, and emit the side `keep_new` selects for that group.
     let mut out: Vec<&str> = Vec::with_capacity(segs.len());
     let mut g = 0usize;
     let mut i = 0usize;
@@ -348,10 +346,10 @@ pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize
         while g < groups.len() && i >= groups[g].1 {
             g += 1;
         }
-        let reverted = g < groups.len() && g >= first_group && g <= last_group;
-        match (segs[i].tag, reverted) {
-            (Tag::Del, true) => out.push(segs[i].text),
-            (Tag::Ins, false) => out.push(segs[i].text),
+        let keep = g < groups.len() && keep_new(g);
+        match (segs[i].tag, keep) {
+            (Tag::Ins, true) => out.push(segs[i].text),
+            (Tag::Del, false) => out.push(segs[i].text),
             _ => {}
         }
         i += 1;
@@ -362,6 +360,28 @@ pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize
     } else {
         format!("{}\n", out.join("\n"))
     }
+}
+
+/// Reconstruct `new` with the change groups in the inclusive range
+/// `[first_group, last_group]` reverted to `old`, leaving the other groups'
+/// changes intact. Group indexing matches [`render_diff`] / [`HunkInfo`], so a
+/// UI hunk's `first_group`/`last_group` selects exactly that hunk's content to
+/// drop. The result is newline-normalized like [`apply_patch`]'s output, so the
+/// rendered diff of `old` → result still reverse-applies. Out-of-range indices
+/// (or a file with no changes) return `new` unchanged (normalized).
+pub fn revert_groups(old: &str, new: &str, first_group: usize, last_group: usize) -> String {
+    // A group is *kept* (new side) unless it falls in the reverted range.
+    reconstruct_groups(old, new, |g| g < first_group || g > last_group)
+}
+
+/// Reconstruct a file that keeps only the change groups whose indices are in
+/// `kept` and reverts every other group to `old` — the dual of [`revert_groups`],
+/// generalized from one contiguous range to an arbitrary set. The partial
+/// working-copy commit uses it to materialize the content of a selected subset of
+/// a file's hunks (each hunk's `first_group..=last_group` is added to `kept`). An
+/// empty `kept` reverts everything (yields `old`, normalized).
+pub fn select_groups(old: &str, new: &str, kept: &BTreeSet<usize>) -> String {
+    reconstruct_groups(old, new, |g| kept.contains(&g))
 }
 
 /// Render a unified diff of `old` → `new` like [`unified_diff`], but with the
@@ -1187,10 +1207,10 @@ pub(crate) fn read_text(
 mod tests {
     use super::{
         apply_patch, parse_diff_lines, reconstruct_conflict_file, render_commit_diff,
-        render_conflict_snippets, render_diff, revert_groups, split_combined_patch, unified_diff,
-        ChangeKind, ContextExpansion, DiffLineKind, FileChange,
+        render_conflict_snippets, render_diff, revert_groups, select_groups, split_combined_patch,
+        unified_diff, ChangeKind, ContextExpansion, DiffLineKind, FileChange,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     /// Build a 20-line file and a copy with two far-apart single-line edits.
     fn two_change_file() -> (String, String) {
@@ -1318,6 +1338,41 @@ mod tests {
     fn revert_out_of_range_index_is_noop() {
         let (old, new) = two_change_file();
         assert_eq!(revert_groups(&old, &new, 9, 9), new);
+    }
+
+    #[test]
+    fn select_one_of_two_groups_drops_the_other() {
+        let (old, new) = two_change_file();
+        // Keep only group 1 (line 15): it takes the new content, group 0 reverts.
+        let kept: BTreeSet<usize> = [1].into_iter().collect();
+        let selected = select_groups(&old, &new, &kept);
+        assert!(selected.contains("\nl3\n"), "group 0 reverted to old");
+        assert!(selected.contains("\nL15\n"), "group 1 kept the new content");
+        // It still reverse-applies from old, just like revert_groups' output.
+        let rendered = render_diff(&old, &selected, "f", &ContextExpansion::default());
+        assert_eq!(rendered.hunks.len(), 1);
+        assert_eq!(apply_patch(&old, &rendered.text).unwrap(), selected);
+    }
+
+    #[test]
+    fn select_empty_set_reverts_everything() {
+        let (old, new) = two_change_file();
+        assert_eq!(select_groups(&old, &new, &BTreeSet::new()), old);
+    }
+
+    #[test]
+    fn select_all_groups_equals_new() {
+        let (old, new) = two_change_file();
+        let kept: BTreeSet<usize> = [0, 1].into_iter().collect();
+        assert_eq!(select_groups(&old, &new, &kept), new);
+    }
+
+    #[test]
+    fn select_is_the_dual_of_revert() {
+        // Selecting group g must equal reverting every group but g.
+        let (old, new) = two_change_file();
+        let kept: BTreeSet<usize> = [0].into_iter().collect();
+        assert_eq!(select_groups(&old, &new, &kept), revert_groups(&old, &new, 1, 1));
     }
 
     /// Concatenate the substrings a line's intra ranges select from its code.

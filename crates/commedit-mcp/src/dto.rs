@@ -105,12 +105,29 @@ pub struct FileChangeDto {
     /// Unified diff of the change (absent for binary files).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// The diff's hunks, numbered for partial selection (absent for binary files
+    /// or a file with no textual change). To commit only some of a file's
+    /// uncommitted hunks, pass these `index` values in `commit_working_copy.hunks`
+    /// — do NOT count `@@` markers yourself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkDto>>,
     /// Full content before the commit, when requested and text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_text: Option<String>,
     /// Full content after the commit, when requested and text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_text: Option<String>,
+}
+
+/// One hunk of a text file's diff, numbered so a partial commit_working_copy can
+/// select it by `index` without counting `@@` markers.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct HunkDto {
+    /// 0-based position of this hunk within the file's diff. Pass it in
+    /// `commit_working_copy.hunks[].hunks` to commit exactly this hunk.
+    pub index: usize,
+    /// The hunk's `@@ -a,b +c,d @@` header line, for orientation only.
+    pub header: String,
 }
 
 /// One entry of uncommitted changes (the working copy), shown above history.
@@ -563,10 +580,52 @@ pub struct SquashWorkingCopyReq {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CommitWorkingCopyReq {
     /// The full commit message (subject line + optional body) for the new commit
-    /// holding the current uncommitted changes.
+    /// holding the committed changes.
     pub message: String,
     #[serde(flatten)]
     pub identity: IdentityFieldsDto,
+    /// Optional partial selection: commit only *part* of the uncommitted changes
+    /// and leave the rest in the working tree (the in-process `git add -p`).
+    /// Omit `paths`, `hunks` and `patches` entirely to commit the whole working
+    /// copy (the default). The three tiers compose in one call, but a given file
+    /// path must appear in at most one of them.
+    ///
+    /// Whole files to commit, by repo-relative path: the file is taken entirely
+    /// (content + mode), and a path you deleted on disk commits the deletion.
+    /// This is the only tier that handles binary or executable files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Whole hunks to commit, per file. First read the file's numbered `hunks`
+    /// from show_commit on the working-copy entry, then list the `index` values to
+    /// keep; the unlisted hunks stay uncommitted. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkSelectionDto>>,
+    /// Sub-hunk selections, per file: an edited unified-diff patch (à la
+    /// `git add -p` → `e`) applied to the file's content at HEAD. Use when one
+    /// hunk must be split finer than whole-hunk granularity. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Vec<PatchSelectionDto>>,
+}
+
+/// Selects whole hunks of one file for a partial commit_working_copy.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HunkSelectionDto {
+    /// Repo-relative path of the file (forward-slash form).
+    pub path: String,
+    /// 0-based hunk indices to commit, taken from the file's `hunks` in
+    /// show_commit. Must list at least one.
+    pub hunks: Vec<usize>,
+}
+
+/// Selects a sub-hunk slice of one file for a partial commit_working_copy.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PatchSelectionDto {
+    /// Repo-relative path of the file (forward-slash form).
+    pub path: String,
+    /// A unified-diff patch — the `@@ … @@` hunk(s), no `diff --git`/`---`/`+++`
+    /// header needed — to apply to the file's content at HEAD. Context and `-`
+    /// lines must match HEAD exactly or the commit is rejected.
+    pub patch: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

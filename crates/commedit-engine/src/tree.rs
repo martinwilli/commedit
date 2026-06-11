@@ -2,6 +2,7 @@
 //! primitive behind hunk editing. Reuses the same rewrite/rebase/transparency
 //! pipeline as message editing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,51 @@ impl FileEdit {
     /// A delete edit: remove `path` from the tree (a no-op if it is absent).
     pub fn delete(path: String) -> Self {
         Self { path, content: None }
+    }
+}
+
+/// One targeted text replacement within a file of a commit: substitute `new`
+/// for `old`. The surgical counterpart to a whole-file [`FileEdit`].
+#[derive(Debug, Clone)]
+pub struct StrReplace {
+    /// Path relative to the repository root, forward-slash form.
+    pub path: String,
+    /// The exact text to find.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub all: bool,
+}
+
+/// A caller-fixable replacement failure: the fix is to amend `old`, so the MCP
+/// layer downcasts these onto an `invalid` response rather than `internal`.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplaceError {
+    #[error("{path}: `old` was not found")]
+    NotFound { path: String },
+    #[error(
+        "{path}: `old` matched {count} times; extend it with surrounding text \
+         to make it unique, or set replace_all"
+    )]
+    Ambiguous { path: String, count: usize },
+    #[error("{path}: not an editable text file in this commit (binary or absent)")]
+    NotText { path: String },
+}
+
+/// Apply a unique-by-default text replacement: substitute `new` for `old` in
+/// `text`. Requires exactly one occurrence of `old` unless `all` is set (then
+/// every occurrence is replaced). On failure returns the occurrence count
+/// (`0` = not found, `>1` = ambiguous) so each caller shapes its own error.
+/// The shared core of the `replace_in_file` / `replace_in_message` MCP tools;
+/// callers must pass a non-empty `old` (they report an empty one as a caller
+/// error, since `str::matches("")` would spuriously match everywhere).
+pub fn replace_checked(text: &str, old: &str, new: &str, all: bool) -> Result<String, usize> {
+    let count = text.matches(old).count();
+    match count {
+        1 => Ok(text.replacen(old, new, 1)),
+        n if all && n > 0 => Ok(text.replace(old, new)),
+        n => Err(n),
     }
 }
 
@@ -123,6 +169,48 @@ impl Repo {
             heads,
         )
     }
+
+    /// Apply targeted `old`→`new` text replacements across files of commit
+    /// `target` — the surgical counterpart to [`Repo::rewrite_files_edits`].
+    /// Each file's current content is read from `target`'s tree, the
+    /// replacement applied (unique unless `StrReplace::all`), and the result
+    /// spliced in via the same rewrite/rebase/export pipeline. Several edits
+    /// may target one path; they compose in order. A miss, an ambiguous match
+    /// or a non-text path returns a [`ReplaceError`] (downcastable for a clean
+    /// caller-facing message); descendants are rebased and may conflict.
+    pub fn replace_in_files(
+        &mut self,
+        target: &CommitId,
+        replaces: &[StrReplace],
+    ) -> Result<SaveOutcome> {
+        let commit = self
+            .repo
+            .store()
+            .get_commit(target)
+            .context("loading target commit")?;
+        let store = self.repo.store().clone();
+        let tree = commit.tree();
+        // Edited content per path, so repeated edits to one file compose.
+        let mut edited: BTreeMap<String, String> = BTreeMap::new();
+        for r in replaces {
+            let current = match edited.remove(&r.path) {
+                Some(text) => text,
+                None => read_path_text(&tree, &store, &r.path)?
+                    .ok_or_else(|| ReplaceError::NotText { path: r.path.clone() })?,
+            };
+            let next = replace_checked(&current, &r.old, &r.new, r.all).map_err(|count| {
+                if count == 0 {
+                    ReplaceError::NotFound { path: r.path.clone() }
+                } else {
+                    ReplaceError::Ambiguous { path: r.path.clone(), count }
+                }
+            })?;
+            edited.insert(r.path.clone(), next);
+        }
+        let edits: Vec<FileEdit> =
+            edited.into_iter().map(|(path, content)| FileEdit::write(path, content)).collect();
+        self.rewrite_files_edits(target, &edits)
+    }
 }
 
 /// Splice new content for several files into `base_tree`, returning the written
@@ -200,4 +288,43 @@ pub(crate) fn existing_file_meta(base_tree: &MergedTree, repo_path: &RepoPath) -
         }
     }
     (false, CopyId::placeholder())
+}
+
+/// Read a path's UTF-8 content from `tree` (reusing [`crate::diff::read_text`]).
+/// `None` when the path is absent or its content is binary — both are reported
+/// to the caller as a non-text replacement target. Err only on a real backend
+/// failure.
+fn read_path_text(tree: &MergedTree, store: &Arc<Store>, path: &str) -> Result<Option<String>> {
+    let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
+    let value = pollster::block_on(tree.path_value(&repo_path)).context("reading path")?;
+    let resolved = value.into_resolved().ok().flatten();
+    Ok(crate::diff::read_text(store, &repo_path, resolved.as_ref())?.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_checked;
+
+    #[test]
+    fn unique_match_is_replaced() {
+        assert_eq!(
+            replace_checked("the bulck form of edit", "bulck", "bulk", false).unwrap(),
+            "the bulk form of edit"
+        );
+    }
+
+    #[test]
+    fn missing_match_reports_zero() {
+        assert_eq!(replace_checked("nothing to see", "bulck", "bulk", false), Err(0));
+    }
+
+    #[test]
+    fn ambiguous_match_reports_the_count() {
+        assert_eq!(replace_checked("a a a", "a", "b", false), Err(3));
+    }
+
+    #[test]
+    fn replace_all_takes_every_occurrence() {
+        assert_eq!(replace_checked("a a a", "a", "b", true).unwrap(), "b b b");
+    }
 }

@@ -81,7 +81,14 @@ every rewrite automatically (working_copy_status shows them). Git state is \
 imported only at startup — after any out-of-band git operation (a commit, \
 branch switch, rebase made outside this server) call reload_repo before \
 continuing; it starts a fresh session in place, discarding the trash, the \
-operation log and any pending rewrite.";
+operation log and any pending rewrite.
+
+Reading results: every tool result is returned twice — as YAML text for \
+readability and as structured content (JSON). The structured content is the \
+authoritative data; rely on it for exact values. The YAML is a faithful but \
+display-oriented view: long multi-line strings such as diffs are reformatted \
+for legibility (a diff may appear as a literal block or as a list of lines), so \
+read precise file content, marker_len and the like from the structured content.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CommeditServer {

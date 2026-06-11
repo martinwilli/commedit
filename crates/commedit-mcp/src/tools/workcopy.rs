@@ -1,7 +1,7 @@
 //! Tools over the uncommitted changes (the engine's working-copy commit `@`)
 //! and the session-wide review diff.
 
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{file_change_dto, wc_entry_dto};
@@ -14,13 +14,15 @@ use crate::server::CommeditServer;
 use crate::session::{
     ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
 };
+use crate::wrapper::Yaml;
 
 #[tool_router(router = router_workcopy, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit."
+        description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit.",
+        output_schema = crate::wrapper::output_schema::<WorkingCopyStatusResp>()
     )]
-    pub async fn working_copy_status(&self) -> Result<Json<WorkingCopyStatusResp>, ErrorData> {
+    pub async fn working_copy_status(&self) -> Result<Yaml<WorkingCopyStatusResp>, ErrorData> {
         self.with_session(|repo, _| {
             // A fresh read wants the latest on-disk state folded in.
             repo.snapshot_working_copy().map_err(internal)?;
@@ -32,13 +34,14 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree)."
+        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree).",
+        output_schema = crate::wrapper::output_schema::<SessionDiffResp>()
     )]
-    pub async fn session_diff(&self) -> Result<Json<SessionDiffResp>, ErrorData> {
+    pub async fn session_diff(&self) -> Result<Yaml<SessionDiffResp>, ErrorData> {
         self.with_session(|repo, _| {
             let files = repo
                 .session_changes()
@@ -49,16 +52,17 @@ impl CommeditServer {
             Ok(SessionDiffResp { files })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite."
+        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite.",
+        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
     )]
     pub async fn squash_working_copy(
         &self,
         Parameters(req): Parameters<SquashWorkingCopyReq>,
-    ) -> Result<Json<SaveResultDto>, ErrorData> {
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             repo.snapshot_working_copy().map_err(internal)?;
@@ -73,16 +77,17 @@ impl CommeditServer {
             Ok(save_result(repo, &outcome))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit.",
+        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
     )]
     pub async fn commit_working_copy(
         &self,
         Parameters(req): Parameters<CommitWorkingCopyReq>,
-    ) -> Result<Json<SaveResultDto>, ErrorData> {
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             repo.snapshot_working_copy().map_err(internal)?;
@@ -96,16 +101,17 @@ impl CommeditServer {
             Ok(save_result(repo, &outcome))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true: this is the one action whose data this server cannot bring back (undo restores recorded states, none of which contain the discarded edits)."
+        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true: this is the one action whose data this server cannot bring back (undo restores recorded states, none of which contain the discarded edits).",
+        output_schema = crate::wrapper::output_schema::<OkResp>()
     )]
     pub async fn discard_working_copy(
         &self,
         Parameters(req): Parameters<DiscardWorkingCopyReq>,
-    ) -> Result<Json<OkResp>, ErrorData> {
+    ) -> Result<Yaml<OkResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             if !req.confirm {
@@ -118,6 +124,6 @@ impl CommeditServer {
             Ok(OkResp { ok: true })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 }

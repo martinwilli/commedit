@@ -3,7 +3,7 @@
 
 use commedit_engine::conflict::FileResolution;
 use jj_lib::object_id::ObjectId as _;
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::conflicted_commit_dto;
@@ -14,13 +14,15 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{find_conflicted, save_result};
+use crate::wrapper::Yaml;
 
 #[tool_router(router = router_conflict, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "Whether a conflicted rewrite is pending. While pending, git still shows the pre-rewrite history (git_head_sha) and the held rewrite's tip is jj_head_sha; no other mutation is allowed until the conflicts resolve or the rewrite is aborted."
+        description = "Whether a conflicted rewrite is pending. While pending, git still shows the pre-rewrite history (git_head_sha) and the held rewrite's tip is jj_head_sha; no other mutation is allowed until the conflicts resolve or the rewrite is aborted.",
+        output_schema = crate::wrapper::output_schema::<PendingStatusResp>()
     )]
-    pub async fn pending_status(&self) -> Result<Json<PendingStatusResp>, ErrorData> {
+    pub async fn pending_status(&self) -> Result<Yaml<PendingStatusResp>, ErrorData> {
         self.with_session(|repo, _| {
             Ok(PendingStatusResp {
                 pending: repo.is_pending(),
@@ -35,16 +37,17 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
+        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants.",
+        output_schema = crate::wrapper::output_schema::<ReadConflictResp>()
     )]
     pub async fn read_conflict(
         &self,
         Parameters(req): Parameters<ReadConflictReq>,
-    ) -> Result<Json<ReadConflictResp>, ErrorData> {
+    ) -> Result<Yaml<ReadConflictResp>, ErrorData> {
         self.with_session(move |repo, _| {
             let conflicts = repo
                 .pending_conflicts()
@@ -83,16 +86,17 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Apply resolved contents for one conflicted commit's files: either edited text (all markers removed, echoing its marker_len from read_conflict) or delete=true to remove the file. A deletion is how a modify/delete conflict settles (e.g. a revert that drops a file), and it also works on structural (resolvable=false) paths. Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git."
+        description = "Apply resolved contents for one conflicted commit's files: either edited text (all markers removed, echoing its marker_len from read_conflict) or delete=true to remove the file. A deletion is how a modify/delete conflict settles (e.g. a revert that drops a file), and it also works on structural (resolvable=false) paths. Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git.",
+        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
     )]
     pub async fn resolve_conflicts(
         &self,
         Parameters(req): Parameters<ResolveConflictsReq>,
-    ) -> Result<Json<SaveResultDto>, ErrorData> {
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, trash| {
             if !repo.is_pending() {
                 return Err(invalid("no conflicted rewrite is pending"));
@@ -136,13 +140,14 @@ impl CommeditServer {
             Ok(save_result(repo, &outcome))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place."
+        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place.",
+        output_schema = crate::wrapper::output_schema::<AbortResp>()
     )]
-    pub async fn abort_rewrite(&self) -> Result<Json<AbortResp>, ErrorData> {
+    pub async fn abort_rewrite(&self) -> Result<Yaml<AbortResp>, ErrorData> {
         self.with_session(|repo, trash| {
             if !repo.is_pending() {
                 return Err(invalid("no conflicted rewrite is pending"));
@@ -156,19 +161,20 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Re-check a pending rewrite and export it if its chain is already clean (e.g. after resolutions that auto-cleared the rest). A no-op returning clean when nothing is pending."
+        description = "Re-check a pending rewrite and export it if its chain is already clean (e.g. after resolutions that auto-cleared the rest). A no-op returning clean when nothing is pending.",
+        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
     )]
-    pub async fn finalize(&self) -> Result<Json<SaveResultDto>, ErrorData> {
+    pub async fn finalize(&self) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(|repo, trash| {
             let outcome = repo.finalize().map_err(internal)?;
             trash.settle(&outcome);
             Ok(save_result(repo, &outcome))
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 }

@@ -19,8 +19,8 @@ pub fn open_server(dir: &Path) -> CommeditServer {
     CommeditServer::new(Repo::open(dir).expect("opening the scratch repo"))
 }
 
-/// Unwrap a tool result's error side (`rmcp::Json` carries no `Debug`, so
-/// `unwrap_err` can't).
+/// Unwrap a tool result's error side (the `Yaml` result wrapper carries no
+/// `Debug`, so `unwrap_err` can't).
 pub fn expect_err<T>(result: Result<T, rmcp::ErrorData>) -> rmcp::ErrorData {
     match result {
         Ok(_) => panic!("expected the tool call to fail"),

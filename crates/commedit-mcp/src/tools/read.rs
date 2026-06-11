@@ -2,7 +2,7 @@
 
 use commedit_engine::diff::commit_changes;
 use jj_lib::object_id::ObjectId as _;
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{commit_dto, file_change_dto};
@@ -12,16 +12,18 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{limited_history, resolve_ref, RefEntry};
+use crate::wrapper::Yaml;
 
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing.",
+        output_schema = crate::wrapper::output_schema::<ListHistoryResp>()
     )]
     pub async fn list_history(
         &self,
         Parameters(req): Parameters<ListHistoryReq>,
-    ) -> Result<Json<ListHistoryResp>, ErrorData> {
+    ) -> Result<Yaml<ListHistoryResp>, ErrorData> {
         self.with_session(move |repo, trash| {
             let trash_count = trash.entries.len();
             let Some(_) = repo.head_commit_id() else {
@@ -54,16 +56,17 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content."
+        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content.",
+        output_schema = crate::wrapper::output_schema::<ShowCommitResp>()
     )]
     pub async fn show_commit(
         &self,
         Parameters(req): Parameters<ShowCommitReq>,
-    ) -> Result<Json<ShowCommitResp>, ErrorData> {
+    ) -> Result<Yaml<ShowCommitResp>, ErrorData> {
         self.with_session(move |repo, trash| {
             let (_, commits) = crate::session::full_history(repo)?;
             // One union in precedence order — history, working copy, trash —
@@ -94,13 +97,14 @@ impl CommeditServer {
             Ok(ShowCommitResp { commit: commit_dto(&info, &root, &refs), files })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 
     #[tool(
-        description = "List the commits dropped to the session trash. They stay restorable (restore_commit, or squash_commit with a trashed source) until the session ends."
+        description = "List the commits dropped to the session trash. They stay restorable (restore_commit, or squash_commit with a trashed source) until the session ends.",
+        output_schema = crate::wrapper::output_schema::<ListTrashResp>()
     )]
-    pub async fn list_trash(&self) -> Result<Json<ListTrashResp>, ErrorData> {
+    pub async fn list_trash(&self) -> Result<Yaml<ListTrashResp>, ErrorData> {
         self.with_session(|repo, trash| {
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
@@ -109,6 +113,6 @@ impl CommeditServer {
             })
         })
         .await
-        .map(Json)
+        .map(Yaml)
     }
 }

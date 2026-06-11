@@ -618,6 +618,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     review_button.set_tooltip_text(Some(
         "Review all content changes made this session (current tree vs. the session start)",
     ));
+    // The top-left "Reload" button: re-open the repository from disk to pick up
+    // changes made outside commedit — a fresh session in place, same as
+    // restarting the app.
+    let reload_button = Button::from_icon_name("view-refresh-symbolic");
+    reload_button.set_tooltip_text(Some(
+        "Reload the repository — pick up changes made outside commedit",
+    ));
+    header.pack_start(&reload_button);
     // pack_end fills right-to-left, so packing the history button first leaves
     // "Review" to its left: [ Review ][ ↺ ].
     header.pack_end(&history_button);
@@ -2148,6 +2156,61 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             });
             popover.popup();
+        }
+    });
+
+    // "Reload" (top-left header button): re-open the repository from disk so
+    // edits made outside commedit (a `git commit`, branch switch, …) show up —
+    // a fresh session in place, same as restarting the app. Session state
+    // (edit history, trash, a pending conflict, the split working-copy chain)
+    // is dropped, exactly as a restart would; `Repo::open` re-snapshots the
+    // working copy and collapses the chain to git's single-pile view.
+    reload_button.connect_clicked({
+        let repo = repo.clone();
+        let repo_path = repo_path.clone();
+        let exit_conflict_mode = exit_conflict_mode.clone();
+        let refresh = refresh.clone();
+        let show_status = show_status.clone();
+        let list = list.clone();
+        let trashed = trashed.clone();
+        let pending_trash_op = pending_trash_op.clone();
+        let trash_list = trash_list.clone();
+        let trash_scroll = trash_scroll.clone();
+        let history_limit = history_limit.clone();
+        let review_button = review_button.clone();
+        let render_review = render_review.clone();
+        move |_| {
+            // Open the new session before dropping the old one, so a failed
+            // reload leaves the current state untouched (concurrent sessions
+            // are supported, so the brief overlap is fine).
+            let reopened = match Repo::open(&repo_path) {
+                Ok(r) => r,
+                Err(err) => {
+                    show_status(&format!("Reload failed: {err:#}"));
+                    return;
+                }
+            };
+            *repo.borrow_mut() = reopened;
+            // The same post-rewrite reset a time-travel jump runs: the fresh
+            // session has no conflict in flight and an empty trash.
+            exit_conflict_mode();
+            pending_trash_op.borrow_mut().take();
+            trashed.borrow_mut().clear();
+            populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+            history_limit.set(HISTORY_PAGE);
+            // Re-fire `row-selected` (rows are reused) so the diff pane
+            // reloads the re-read content.
+            list.unselect_all();
+            refresh();
+            if list.selected_row().is_none() {
+                if let Some(row) = list.row_at_index(0) {
+                    list.select_row(Some(&row));
+                }
+            }
+            if review_button.is_active() {
+                render_review();
+            }
+            show_status("Repository reloaded");
         }
     });
 

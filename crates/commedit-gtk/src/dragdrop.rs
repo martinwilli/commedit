@@ -1008,7 +1008,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
 /// events, i.e. before the drag is over.)
 fn run_post_drag(post_drag: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>) {
     if let Some(action) = post_drag.borrow_mut().take() {
-        glib::idle_add_local_once(move || action());
+        glib::idle_add_local_once(action);
     }
 }
 

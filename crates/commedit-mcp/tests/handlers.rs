@@ -16,7 +16,7 @@ use tempfile::TempDir;
 /// The current history's shas, newest first.
 async fn shas(server: &CommeditServer) -> Vec<String> {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0
@@ -50,7 +50,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -58,6 +58,8 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     assert_eq!(subjects, ["third", "second", "first"]);
     assert_eq!(resp.head_sha.as_deref(), Some(resp.commits[0].sha.as_str()));
     assert!(!resp.has_more);
+    assert_eq!(resp.next_offset, None);
+    assert_eq!(resp.offset, 0);
     assert_eq!(resp.trash_count, 0);
 
     // The tip carries the checked-out branch decoration.
@@ -81,7 +83,7 @@ async fn list_history_honours_the_limit() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: Some(2), brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: Some(2), offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -100,7 +102,7 @@ async fn list_history_brief_drops_the_detail() {
     let server = open_server(dir.path());
 
     let brief = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(true) }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: Some(true) }))
         .await
         .unwrap()
         .0;
@@ -113,7 +115,7 @@ async fn list_history_brief_drops_the_detail() {
 
     // A full listing carries it.
     let full = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(false) }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: Some(false) }))
         .await
         .unwrap()
         .0;
@@ -132,7 +134,7 @@ async fn list_history_marks_merges() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -153,7 +155,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -295,7 +297,7 @@ async fn edit_identity_prefills_omitted_fields() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -322,7 +324,7 @@ async fn edit_identity_prefills_omitted_fields() {
     let show = git(dir.path(), &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"]);
     assert_eq!(show, "New Author|tester@example.com|Tester|tester@example.com");
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -471,7 +473,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -524,7 +526,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -589,7 +591,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].sha, target);
     let listing = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -621,7 +623,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -766,7 +768,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -849,7 +851,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -882,7 +884,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     clean_head(&result);
 
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;

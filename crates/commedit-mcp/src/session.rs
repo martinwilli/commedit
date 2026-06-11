@@ -97,13 +97,16 @@ pub fn full_history(repo: &Repo) -> Result<(CommitId, Vec<CommitInfo>), ErrorDat
     Ok((head, commits))
 }
 
-/// Like [`full_history`] but cut to `limit` commits, for `list_history`.
+/// Like [`full_history`] but skip `offset` and cut to `limit` commits, for
+/// `list_history`'s paging.
 pub fn limited_history(
     repo: &Repo,
+    offset: usize,
     limit: usize,
 ) -> Result<(CommitId, Vec<CommitInfo>, bool), ErrorData> {
     let head = head_commit(repo)?;
-    let (commits, has_more) = history_limited(&repo.repo, &head, limit).map_err(internal)?;
+    let (commits, has_more) =
+        history_limited(&repo.repo, &head, offset, limit).map_err(internal)?;
     Ok((head, commits, has_more))
 }
 

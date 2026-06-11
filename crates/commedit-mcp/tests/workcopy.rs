@@ -22,7 +22,7 @@ async fn uncommitted_changes_survive_a_rewrite() {
 
     // Rewrite the bottom commit's message — the dirty file must ride along.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -55,7 +55,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
 
     // A clean working copy has nothing to fold.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -130,7 +130,7 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
 
     // A rewrite leaves the untracked file untouched on disk.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -155,7 +155,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
 
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0;

@@ -172,8 +172,12 @@ pub enum SaveResultDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListHistoryReq {
-    /// Maximum number of commits to return, newest first. Omit for all.
+    /// Maximum number of commits to return, newest first. Omit for the default
+    /// (30). Raise it (or page with `offset`) to see deeper history.
     pub limit: Option<usize>,
+    /// 0-based index of the first commit to return, newest first. Omit to start
+    /// at HEAD. Pass the previous response's `next_offset` to get the next page.
+    pub offset: Option<usize>,
     /// Return only each commit's header (sha, change_id, subject, is_merge,
     /// refs), dropping the message body, identity and parents — a compact
     /// overview for long histories. Defaults to false (full detail).
@@ -186,8 +190,12 @@ pub struct ListHistoryResp {
     pub head_sha: Option<String>,
     /// Ancestors of HEAD, newest first (like `git log`).
     pub commits: Vec<CommitDto>,
-    /// True when `limit` cut the walk short.
+    /// True when the limit cut the walk short — more commits remain below.
     pub has_more: bool,
+    /// The offset this page started at (0 unless paged).
+    pub offset: usize,
+    /// Offset to pass next to continue paging, or null at the end of history.
+    pub next_offset: Option<usize>,
     /// Number of dropped commits currently in the session trash.
     pub trash_count: usize,
 }

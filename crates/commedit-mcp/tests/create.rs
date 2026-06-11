@@ -54,7 +54,7 @@ fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
 
 async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
         .await
         .unwrap()
         .0

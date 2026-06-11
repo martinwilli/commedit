@@ -326,7 +326,7 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                     let mut limit = HISTORY_PAGE;
                     loop {
                         let (page, has_more) =
-                            history_limited(&r.repo, &head, limit).unwrap_or_default();
+                            history_limited(&r.repo, &head, 0, limit).unwrap_or_default();
                         let shown: HashSet<String> =
                             page.iter().map(|c| c.change_id_hex()).collect();
                         if !has_more || branch_conflicts.iter().all(|ch| shown.contains(ch)) {

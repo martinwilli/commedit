@@ -17,6 +17,29 @@ use jj_lib::store::Store;
 use crate::conflict::SaveOutcome;
 use crate::repo::Repo;
 
+/// A whole-file edit for splicing into a tree: write `content`, or delete the
+/// path when `content` is `None`. Shared by [`Repo::rewrite_files`],
+/// [`Repo::create_commit`] and [`Repo::revert_commit`].
+#[derive(Debug, Clone)]
+pub struct FileEdit {
+    /// Path relative to the repository root, forward-slash form.
+    pub path: String,
+    /// The file's complete new content, or `None` to delete the path.
+    pub content: Option<String>,
+}
+
+impl FileEdit {
+    /// A write edit: set `path` to `content`.
+    pub fn write(path: String, content: String) -> Self {
+        Self { path, content: Some(content) }
+    }
+
+    /// A delete edit: remove `path` from the tree (a no-op if it is absent).
+    pub fn delete(path: String) -> Self {
+        Self { path, content: None }
+    }
+}
+
 impl Repo {
     /// Replace the content of `path` in commit `target` with `new_content`,
     /// rebase descendants onto the rewritten commit, and export to git — all in
@@ -31,25 +54,41 @@ impl Repo {
         self.rewrite_files(target, &[(path.to_string(), new_content.to_string())])
     }
 
-    /// Replace the content of several files in commit `target` at once, splicing
-    /// every blob into the commit's tree in one [`MergedTreeBuilder`] pass and one
-    /// transaction (so a single Save touching many files is one rewrite). Each
-    /// file's executable bit and copy id are preserved. `files` is `(path,
-    /// content)` pairs.
+    /// Replace the content of several files in commit `target` at once, in one
+    /// transaction. A write-only convenience over [`Repo::rewrite_files_edits`]
+    /// for the `(path, content)` callers; each file's executable bit and copy id
+    /// are preserved.
     pub fn rewrite_files(
         &mut self,
         target: &CommitId,
         files: &[(String, String)],
     ) -> Result<SaveOutcome> {
+        let edits: Vec<FileEdit> = files
+            .iter()
+            .map(|(path, content)| FileEdit::write(path.clone(), content.clone()))
+            .collect();
+        self.rewrite_files_edits(target, &edits)
+    }
+
+    /// Apply several whole-file edits to commit `target` at once, splicing every
+    /// blob (or deletion) into the commit's tree in one [`MergedTreeBuilder`] pass
+    /// and one transaction (so a single Save touching many files is one rewrite).
+    /// Each written file's executable bit and copy id are preserved; a [`FileEdit`]
+    /// with no content removes the path. Descendants are rebased and may conflict.
+    pub fn rewrite_files_edits(
+        &mut self,
+        target: &CommitId,
+        edits: &[FileEdit],
+    ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("editing the file", || {
-            self.rewrite_files_inner(target, files)
+            self.rewrite_files_inner(target, edits)
         })
     }
 
     fn rewrite_files_inner(
         &mut self,
         target: &CommitId,
-        files: &[(String, String)],
+        edits: &[FileEdit],
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -62,7 +101,7 @@ impl Repo {
             .get_commit(target)
             .context("loading target commit")?;
         let store = self.repo.store().clone();
-        let new_tree = splice_files_into_tree(commit.tree(), &store, files)?;
+        let new_tree = splice_edits_into_tree(commit.tree(), &store, edits)?;
         let desc = self.op_desc_for("Edit files of", target);
 
         let mut tx = self.repo.start_transaction();
@@ -87,30 +126,54 @@ impl Repo {
 }
 
 /// Splice new content for several files into `base_tree`, returning the written
-/// tree. Each file's blob is written to `store` and set into a single
-/// [`MergedTreeBuilder`] pass; each file's executable bit and copy id are preserved
-/// from `base_tree`. Shared by [`Repo::rewrite_files`] and [`Repo::split_commit`].
+/// tree. A write-only thin wrapper over [`splice_edits_into_tree`] for the
+/// `(path, content)` callers ([`Repo::split_commit`] and the spurious-conflict
+/// rebuild in [`crate::conflict`]).
 pub(crate) fn splice_files_into_tree(
     base_tree: MergedTree,
     store: &Arc<Store>,
     files: &[(String, String)],
 ) -> Result<MergedTree> {
+    let edits: Vec<FileEdit> = files
+        .iter()
+        .map(|(path, content)| FileEdit::write(path.clone(), content.clone()))
+        .collect();
+    splice_edits_into_tree(base_tree, store, &edits)
+}
+
+/// Apply whole-file edits to `base_tree`, returning the written tree. Each
+/// written blob goes to `store` and is set into a single [`MergedTreeBuilder`]
+/// pass (so a multi-file save is one tree write); a [`FileEdit`] with no content
+/// removes the path. A written file's executable bit and copy id are preserved
+/// from `base_tree`. Shared by [`Repo::rewrite_files`], [`Repo::create_commit`]
+/// and [`Repo::revert_commit`].
+pub(crate) fn splice_edits_into_tree(
+    base_tree: MergedTree,
+    store: &Arc<Store>,
+    edits: &[FileEdit],
+) -> Result<MergedTree> {
     // Write each new blob and gather the spliced (path, value) pairs up front,
     // while `base_tree` is still borrowable for the metadata lookups; then move
     // it into the builder.
-    let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(files.len());
-    for (path, content) in files {
-        let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
-        let (executable, copy_id) = existing_file_meta(&base_tree, &repo_path);
-        let mut reader: &[u8] = content.as_bytes();
-        let file_id = pollster::block_on(store.write_file(&repo_path, &mut reader))
-            .context("writing file blob")?;
-        let value = TreeValue::File {
-            id: file_id,
-            executable,
-            copy_id,
+    let mut entries: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let repo_path = RepoPathBuf::from_internal_string(&edit.path).context("invalid path")?;
+        let value = match &edit.content {
+            Some(content) => {
+                let (executable, copy_id) = existing_file_meta(&base_tree, &repo_path);
+                let mut reader: &[u8] = content.as_bytes();
+                let file_id = pollster::block_on(store.write_file(&repo_path, &mut reader))
+                    .context("writing file blob")?;
+                Merge::normal(TreeValue::File {
+                    id: file_id,
+                    executable,
+                    copy_id,
+                })
+            }
+            // An absent value removes the path (a no-op if it isn't there).
+            None => Merge::absent(),
         };
-        entries.push((repo_path, Merge::normal(value)));
+        entries.push((repo_path, value));
     }
     let mut builder = MergedTreeBuilder::new(base_tree);
     for (repo_path, value) in entries {

@@ -308,6 +308,7 @@ async fn replace_files_rewrites_contents_across_descendants() {
                 FileContentDto { path: "a.txt".into(), content: "ONE\n".into() },
                 FileContentDto { path: "new.txt".into(), content: "added\n".into() },
             ],
+            delete_paths: None,
         }))
         .await
         .unwrap()
@@ -331,7 +332,7 @@ async fn replace_files_requires_files() {
     let sha = shas(&server).await[0].clone();
     let err = expect_err(
         server
-            .replace_files(Parameters(ReplaceFilesReq { commit: sha, files: vec![] }))
+            .replace_files(Parameters(ReplaceFilesReq { commit: sha, files: vec![], delete_paths: None }))
             .await,
     );
     assert!(err.message.contains("files"), "unexpected error: {}", err.message);

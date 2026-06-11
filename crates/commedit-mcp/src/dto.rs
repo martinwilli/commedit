@@ -281,9 +281,11 @@ pub struct ReplaceFilesReq {
     /// so they chain across mutations without re-listing.
     pub commit: String,
     /// Files to write, each with its complete new content (a path the commit
-    /// doesn't have yet is added). Files cannot be *deleted* from a commit
-    /// this way.
+    /// doesn't have yet is added).
     pub files: Vec<FileContentDto>,
+    /// Paths to delete from the commit (a path the commit doesn't have is
+    /// ignored). At least one of `files`/`delete_paths` must be non-empty.
+    pub delete_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -295,6 +297,58 @@ pub struct SplitCommitReq {
     /// A new `fixup!` child commit receives the remainder, so both combined
     /// reproduce the original change.
     pub files: Vec<FileContentDto>,
+}
+
+/// Optional author/committer overrides for a newly created commit. Every
+/// omitted field defaults to the repository's git-configured identity at the
+/// current time. Flattened into the create/revert/commit-working-copy requests.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct IdentityFieldsDto {
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub author_time: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub committer_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreateCommitReq {
+    /// The full commit message (subject line + optional body).
+    pub message: String,
+    /// Files to put in the commit, each with its complete content, spliced onto
+    /// the parent's tree. Omit (with no `delete_paths`) for an empty commit.
+    #[serde(default)]
+    pub files: Vec<FileContentDto>,
+    /// Paths to delete relative to the parent (a path the parent lacks is
+    /// ignored).
+    pub delete_paths: Option<Vec<String>>,
+    /// The commit that becomes the new commit's parent — sha or change id, full
+    /// or a unique prefix, or the literal `root` for the very first position.
+    /// Omitted means the top of HEAD: the new commit becomes the branch tip
+    /// (uncommitted changes, if any, ride on top of it untouched).
+    pub new_parent: Option<String>,
+    /// When several lines converge on `new_parent` (a fork), the child the new
+    /// commit should be spliced above (same ref forms), as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertCommitReq {
+    /// The commit to revert — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Merge commits cannot be reverted.
+    pub commit: String,
+    /// Where to place the revert commit — the commit that becomes its parent
+    /// (same ref forms) or `root`. Omitted means the top of HEAD.
+    pub new_parent: Option<String>,
+    /// Disambiguates a fork, as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -356,6 +410,15 @@ pub struct SquashWorkingCopyReq {
     /// The commit the uncommitted changes should be folded into — sha or
     /// change id, full or a unique prefix.
     pub dest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommitWorkingCopyReq {
+    /// The full commit message (subject line + optional body) for the new commit
+    /// holding the current uncommitted changes.
+    pub message: String,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

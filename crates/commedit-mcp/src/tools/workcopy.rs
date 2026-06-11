@@ -6,12 +6,14 @@ use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{file_change_dto, wc_entry_dto};
 use crate::dto::{
-    DiscardWorkingCopyReq, OkResp, SaveResultDto, SessionDiffResp, SquashWorkingCopyReq,
-    WorkingCopyStatusResp,
+    CommitWorkingCopyReq, DiscardWorkingCopyReq, OkResp, SaveResultDto, SessionDiffResp,
+    SquashWorkingCopyReq, WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::{ensure_not_pending, find_commit, full_history, save_result};
+use crate::session::{
+    ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
+};
 
 #[tool_router(router = router_workcopy, vis = "pub")]
 impl CommeditServer {
@@ -67,6 +69,29 @@ impl CommeditServer {
             let idx = find_commit(&commits, &req.dest)?;
             let outcome = repo
                 .squash_working_copy_into(None, &commits[idx].id)
+                .map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Commit ALL uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Refuses when the tree is already clean. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
+    )]
+    pub async fn commit_working_copy(
+        &self,
+        Parameters(req): Parameters<CommitWorkingCopyReq>,
+    ) -> Result<Json<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            repo.snapshot_working_copy().map_err(internal)?;
+            if repo.working_copy_chain().is_empty() {
+                return Err(invalid("the working copy is clean — nothing to commit"));
+            }
+            let identity = new_commit_identity(repo, req.identity);
+            let outcome = repo
+                .commit_working_copy(&req.message, identity.as_ref())
                 .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })

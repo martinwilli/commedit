@@ -44,6 +44,7 @@ const INSTRUCTIONS: &str = "\
 commedit edits the history of the checked-out git branch in place: any commit \
 reachable from HEAD can be edited (message, identity, file contents), split, \
 reordered, dropped or squashed, and its descendants are rebased automatically. \
+New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
 
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
@@ -60,6 +61,13 @@ each resolvable file, remove all markers, resolve_conflicts echoing each \
 file's marker_len); fixing the earliest often auto-clears descendants. \
 abort_rewrite discards the held rewrite (and is the only way out of a \
 structural, resolvable=false conflict). No other mutation runs while pending.
+
+Creating commits: create_commit makes a new commit from given file contents \
+(empty for an empty commit) and inserts it — on top of HEAD by default, or under \
+any commit / at root via new_parent. revert_commit inserts the inverse of a \
+commit (like git revert). commit_working_copy turns the current uncommitted \
+changes into a commit on top of HEAD (like git commit -a). A mid-history insert \
+or revert may report conflicts like any rewrite.
 
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).

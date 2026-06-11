@@ -38,6 +38,7 @@ async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
         .replace_files(Parameters(ReplaceFilesReq {
             commit: a.sha.clone(),
             files: vec![FileContentDto { path: "f.txt".into(), content: "1\nX\n3\n".into() }],
+            delete_paths: None,
         }))
         .await
         .unwrap()

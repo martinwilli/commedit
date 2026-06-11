@@ -211,6 +211,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
         .replace_files(Parameters(ReplaceFilesReq {
             commit: a.sha.clone(),
             files: vec![FileContentDto { path: "f.txt".into(), content: "1\nX\n3\n".into() }],
+            delete_paths: None,
         }))
         .await
         .unwrap()

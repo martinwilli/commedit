@@ -517,6 +517,10 @@ surplus rows.
 
 ## Conventions
 
+- When planning a change, consider whether it should also extend `README.md`
+  (the user-facing pitch + conceptual model) and this `CLAUDE.md` (implementation
+  notes + invariants), and fold those doc updates into the plan — a feature or
+  invariant change usually needs both kept in sync.
 - Engine integration tests build scratch git repos via `tests/common/mod.rs`
   (`init_repo`, `git`, `git_log_subjects`) and assert against plain `git`.
 - The engine never shells out to `git` for *rewrites* (that's jj-lib); it only uses

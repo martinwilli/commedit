@@ -42,8 +42,36 @@ impl CommeditServer {
 /// The agent's manual, served as the MCP `instructions` field.
 const INSTRUCTIONS: &str = "\
 commedit edits the history of the checked-out git branch in place: any commit \
-reachable from HEAD can be edited, and its descendants are rebased \
-automatically. The repository stays a plain git repo throughout.";
+reachable from HEAD can be edited (message, identity, file contents), split, \
+reordered, dropped or squashed, and its descendants are rebased automatically. \
+The repository stays a plain git repo throughout — no jj state is left behind.
+
+Addressing: commits are addressed by full sha. Every mutation rewrites the \
+target and its descendants, so shas change constantly — call list_history for \
+fresh shas rather than reusing earlier ones. The change_id is the stable \
+identity of a logical commit across rewrites.
+
+Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
+held back IN FULL — git history, HEAD and the working tree stay untouched \
+until it settles. Resolve the OLDEST conflicted commit first (read_conflict \
+each resolvable file, remove all markers, resolve_conflicts echoing each \
+file's marker_len); fixing the earliest often auto-clears descendants. \
+abort_rewrite discards the held rewrite (and is the only way out of a \
+structural, resolvable=false conflict). No other mutation runs while pending.
+
+Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
+grafted back (restore_commit) or folded into a commit (squash_commit).
+
+Safety net: every landed mutation is a recorded operation — undo/redo step \
+them, jump_to_operation 0 rolls the whole session back to its start. The one \
+unrecoverable action is discard_working_copy.
+
+Uncommitted changes in the working tree are first-class: they ride through \
+every rewrite automatically (working_copy_status shows them). Git state is \
+imported only at startup — after any out-of-band git operation (a commit, \
+branch switch, rebase made outside this server) call reload_repo before \
+continuing; it starts a fresh session in place, discarding the trash, the \
+operation log and any pending rewrite.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CommeditServer {

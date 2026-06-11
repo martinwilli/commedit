@@ -54,7 +54,7 @@ fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
 
 async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0
@@ -166,7 +166,7 @@ async fn create_commit_at_root_becomes_the_first_commit() {
     let hist = history(&server).await;
     let root = hist.commits.last().unwrap();
     assert_eq!(root.subject, "root-commit");
-    assert!(root.detail.as_ref().unwrap().parent_shas.is_empty());
+    assert!(root.detail.parent_shas.as_ref().unwrap().is_empty());
     assert_eq!(git(dir.path(), &["show", "HEAD:r.txt"]), "r");
 }
 
@@ -485,7 +485,7 @@ async fn cherry_pick_resolves_an_in_history_change_id_and_places_it() {
     let hist = history(&server).await;
     let root = hist.commits.last().unwrap();
     assert_eq!(root.subject, "add b");
-    assert!(root.detail.as_ref().unwrap().parent_shas.is_empty());
+    assert!(root.detail.parent_shas.as_ref().unwrap().is_empty());
     assert_eq!(git(dir.path(), &["show", &format!("{}:b.txt", root.sha)]), "two");
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }

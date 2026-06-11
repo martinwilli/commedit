@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 /// One commit of the current branch's history.
 ///
-/// A brief `list_history` (`brief: true`) returns only the identifying header
-/// — sha, change_id, subject, is_merge, refs — to keep long histories compact.
-/// The full listing (the default, and always for `show_commit` / `list_trash`)
-/// also carries the [`CommitDetailDto`] fields, flattened in alongside these.
+/// The identifying header — sha, change_id, subject, is_merge, refs — is always
+/// present. The verbose [`CommitDetailDto`] fields (message body, identity,
+/// parents) are flattened in alongside; each appears only when `list_history`'s
+/// `fields` selects it (all of them by default, none for a header-only
+/// overview). `show_commit` and `list_trash` always include them all.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
     /// Full commit id. Every mutation rewrites ids — address commits by their
@@ -31,27 +32,53 @@ pub struct CommitDto {
     pub is_merge: bool,
     /// Local branches and tags pointing at this commit.
     pub refs: Vec<RefDto>,
-    /// Message body, identity and parents — present in a full listing, absent
-    /// in a brief one (call `show_commit` for any single commit's detail).
+    /// The verbose fields, each present only when selected (see `CommitField`).
     #[serde(flatten)]
-    pub detail: Option<CommitDetailDto>,
+    pub detail: CommitDetailDto,
 }
 
-/// The verbose fields of a [`CommitDto`], omitted from a brief `list_history`.
+/// The verbose fields of a [`CommitDto`]. Each is present only when
+/// `list_history`'s `fields` selects the matching [`CommitField`] (all of them
+/// for `show_commit` / `list_trash`); an unselected field is omitted entirely.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDetailDto {
     /// Full commit message, including the subject line.
-    pub description: String,
-    pub author_name: String,
-    pub author_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
     /// `YYYY-MM-DD HH:MM:SS ±HHMM`.
-    pub author_time: String,
-    pub committer_name: String,
-    pub committer_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_email: Option<String>,
     /// `YYYY-MM-DD HH:MM:SS ±HHMM`.
-    pub committer_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_time: Option<String>,
     /// Parent shas; empty for the root commit of the repository.
-    pub parent_shas: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_shas: Option<Vec<String>>,
+}
+
+/// A selectable verbose field of a listed commit — the [`CommitDetailDto`] set.
+/// `list_history`'s `fields` names which of these to include per commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitField {
+    /// The full commit message (subject + body) — usually the largest field.
+    Description,
+    AuthorName,
+    AuthorEmail,
+    AuthorTime,
+    CommitterName,
+    CommitterEmail,
+    CommitterTime,
+    /// The parent shas.
+    Parents,
 }
 
 /// A branch or tag decoration on a commit.
@@ -178,10 +205,14 @@ pub struct ListHistoryReq {
     /// 0-based index of the first commit to return, newest first. Omit to start
     /// at HEAD. Pass the previous response's `next_offset` to get the next page.
     pub offset: Option<usize>,
-    /// Return only each commit's header (sha, change_id, subject, is_merge,
-    /// refs), dropping the message body, identity and parents — a compact
-    /// overview for long histories. Defaults to false (full detail).
-    pub brief: Option<bool>,
+    /// Which verbose fields to include per commit, on top of the always-present
+    /// header (sha, change_id, subject, is_merge, refs). Omit for ALL of them
+    /// (full detail); pass an explicit subset to save tokens — e.g.
+    /// `["author_time", "committer_time"]` when re-dating, `["description"]` to
+    /// scan messages, or `[]` for a header-only overview. Selectable:
+    /// description, author_name, author_email, author_time, committer_name,
+    /// committer_email, committer_time, parents.
+    pub fields: Option<Vec<CommitField>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

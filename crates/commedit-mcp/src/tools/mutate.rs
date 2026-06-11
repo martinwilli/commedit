@@ -12,7 +12,7 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::{commit_dto, resolve_squash_mode};
+use crate::convert::{commit_dto, resolve_squash_mode, DetailFields};
 use crate::dto::{
     CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditCommitsReq,
     EditIdentityReq, EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq,
@@ -351,7 +351,8 @@ impl CommeditServer {
             })?;
             let info = commits[idx].clone();
             let root = repo.root_commit_id().hex();
-            let dropped = commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo));
+            let dropped =
+                commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo), DetailFields::ALL);
             let outcome = run_staged(repo, trash, PendingTrashOp::Push(info), |repo| {
                 repo.abandon_commit(&id)
             })?;

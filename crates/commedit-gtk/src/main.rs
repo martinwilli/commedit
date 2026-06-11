@@ -50,6 +50,17 @@ mod conflict;
 use crate::conflict::*;
 mod dragdrop;
 
+/// The conflict pane's late-bound "expand hidden lines" action, invoked by buffer
+/// line; `None` until the conflict renderer (defined below it) binds it.
+type ConflictExpand = Rc<RefCell<Option<Rc<dyn Fn(usize)>>>>;
+
+/// Pushes freshly rendered diff text (with its derived hunk/file state) into the
+/// buffer; the `bool` picks a full `set_text` (fresh load) over an in-place `splice`.
+type ApplyDiffText = Rc<dyn Fn(String, Vec<HunkInfo>, Vec<CombinedFile>, bool)>;
+
+/// Sets the diff view's tab width for the file path now at the top of the view.
+type ApplyTabWidth = Rc<dyn Fn(Option<&str>)>;
+
 /// The [`DiffCue`] a click/hover at buffer `(line, col)` lands on, if it falls on
 /// one of the diff view's inline pills. `line_text` is that line's text; `col` is
 /// a character offset. The single hit test shared by the click gesture (which
@@ -240,7 +251,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // (it walks the freed widget). So a drop only *stages* its work here; the drag
     // source runs it from `drag-end`, once the gesture — and GTK's DnD bookkeeping
     // — is fully torn down.
-    let post_drag: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
+    let post_drag: PostDrag = Rc::new(RefCell::new(None));
     // Whether the diff pane is showing a normal diff or a conflict to resolve.
     let pane_mode: Rc<RefCell<PaneMode>> = Rc::new(RefCell::new(PaneMode::Diff));
     // Per-file state of the combined conflict-snippet buffer for the selected
@@ -806,8 +817,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // The conflict pane's "expand hidden lines" action, late-bound (it needs the
     // conflict renderer defined below). The expand-click gesture invokes it by
     // buffer line, mirroring the diff renderer.
-    let conflict_expand_cell: Rc<RefCell<Option<Rc<dyn Fn(usize)>>>> =
-        Rc::new(RefCell::new(None));
+    let conflict_expand_cell: ConflictExpand = Rc::new(RefCell::new(None));
     // Push `new_text` (built by `build_diff_buffer_text`) into the buffer and
     // refresh the derived state + highlighting. `replace` chooses how the text
     // lands: a full `set_text` (used for a fresh load, where resetting the scroll
@@ -815,7 +825,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // where the scroll must stay put). The cue is handled by a GestureClick on
     // the view, not an embedded widget — removing a real widget on the next
     // render crashes GTK.
-    let apply_diff_text: Rc<dyn Fn(String, Vec<HunkInfo>, Vec<CombinedFile>, bool)> = {
+    let apply_diff_text: ApplyDiffText = {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
@@ -1042,7 +1052,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // time, so this is re-applied whenever the file at the top of the view changes
     // (both navigation entry points below funnel through `scroll_to_file` /
     // `scroll_to_conflict_file`).
-    let apply_tab_width: Rc<dyn Fn(Option<&str>)> = {
+    let apply_tab_width: ApplyTabWidth = {
         let file_view = file_view.clone();
         let tab_resolver = tab_resolver.clone();
         Rc::new(move |path: Option<&str>| {

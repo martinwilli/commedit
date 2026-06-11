@@ -2,6 +2,7 @@
 //! (`#[tool_router(router = ...)]`), combined in `server.rs`.
 
 pub mod conflict;
+pub mod mutate;
 pub mod ops;
 pub mod read;
 pub mod workcopy;

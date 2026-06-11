@@ -110,6 +110,15 @@ fn head_commit(repo: &Repo) -> Result<CommitId, ErrorData> {
     })
 }
 
+/// A mutation outcome as the response DTO, with the (possibly moved) branch
+/// tip read back after the save.
+pub fn save_result(
+    repo: &Repo,
+    outcome: &SaveOutcome,
+) -> crate::dto::SaveResultDto {
+    crate::convert::save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()))
+}
+
 /// The display index of `sha` in the (newest-first) history.
 pub fn find_commit(commits: &[CommitInfo], sha: &str) -> Result<usize, ErrorData> {
     commits.iter().position(|c| c.id_hex() == sha).ok_or_else(|| {

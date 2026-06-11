@@ -3,10 +3,37 @@
 
 mod common;
 
-use common::{expect_err, git, init_merge_repo, init_repo, open_server};
-use commedit_mcp::dto::{ListHistoryReq, ShowCommitReq};
+use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
+use commedit_mcp::dto::{
+    EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq, ReplaceFilesReq,
+    SaveResultDto, ShowCommitReq, SplitCommitReq,
+};
+use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
+
+/// The current history's shas, newest first.
+async fn shas(server: &CommeditServer) -> Vec<String> {
+    server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .iter()
+        .map(|c| c.sha.clone())
+        .collect()
+}
+
+/// Unwrap a clean save, returning the new head sha.
+fn clean_head(result: &SaveResultDto) -> String {
+    match result {
+        SaveResultDto::Clean { head_sha } => head_sha.clone().expect("clean save has a head"),
+        SaveResultDto::Conflicts { commits, .. } => {
+            panic!("expected a clean save, got conflicts in {commits:?}")
+        }
+    }
+}
 
 #[tokio::test]
 async fn list_history_returns_the_branch_commits_with_refs() {
@@ -193,4 +220,178 @@ async fn session_diff_and_operations_start_empty() {
 
     // An untouched session shows a clean git status.
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn edit_message_rewrites_any_commit_and_exports_to_git() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    // Edit the middle commit, not just the tip.
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            sha: target,
+            message: "second, edited\n\nwith a body".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let head = clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "second, edited", "first"]);
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    git(dir.path(), &["fsck", "--strict"]);
+}
+
+#[tokio::test]
+async fn edit_identity_prefills_omitted_fields() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let target = &history.commits[0];
+    let committer_time = target.committer_time.clone();
+
+    let result = server
+        .edit_identity(Parameters(EditIdentityReq {
+            sha: target.sha.clone(),
+            author_name: Some("New Author".into()),
+            author_email: None,
+            author_time: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    // The author name changed; everything else was prefilled from the commit,
+    // including the committer timestamp (not re-stamped to "now").
+    let show = git(dir.path(), &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"]);
+    assert_eq!(show, "New Author|tester@example.com|Tester|tester@example.com");
+    let listed = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(listed.commits[0].committer_time, committer_time);
+}
+
+#[tokio::test]
+async fn replace_files_rewrites_contents_across_descendants() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "one\n", "first"), ("b.txt", "two\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .replace_files(Parameters(ReplaceFilesReq {
+            sha: target,
+            files: vec![
+                FileContentDto { path: "a.txt".into(), content: "ONE\n".into() },
+                FileContentDto { path: "new.txt".into(), content: "added\n".into() },
+            ],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "ONE");
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:new.txt"]), "added");
+    // The descendant rebased onto the edited tree; the worktree follows.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "ONE\n");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn replace_files_requires_files() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    let sha = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_files(Parameters(ReplaceFilesReq { sha, files: vec![] }))
+            .await,
+    );
+    assert!(err.message.contains("files"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "one\n", "first"),
+            ("a.txt", "one\ntwo\nthree\n", "second"),
+            ("b.txt", "x\n", "third"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // Keep only part of "second"'s change; the rest moves to a fixup child.
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .split_commit(Parameters(SplitCommitReq {
+            sha: target,
+            files: vec![FileContentDto { path: "a.txt".into(), content: "one\ntwo\n".into() }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["third", "fixup! second", "second", "first"]
+    );
+    // The split halves combined reproduce the original content.
+    assert_eq!(git(dir.path(), &["show", "HEAD~2:a.txt"]), "one\ntwo");
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo\nthree");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn mutations_reject_a_stale_sha() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let stale = shas(&server).await[0].clone();
+    server
+        .edit_message(Parameters(EditMessageReq { sha: stale.clone(), message: "new".into() }))
+        .await
+        .unwrap();
+
+    // The pre-rewrite sha is gone from the branch now.
+    let err = expect_err(
+        server
+            .edit_message(Parameters(EditMessageReq { sha: stale, message: "again".into() }))
+            .await,
+    );
+    assert!(
+        err.message.contains("list_history"),
+        "the error should point at re-listing: {}",
+        err.message
+    );
 }

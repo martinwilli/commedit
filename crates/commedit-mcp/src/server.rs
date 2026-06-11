@@ -26,6 +26,7 @@ impl CommeditServer {
             repo: Arc::new(Mutex::new(repo)),
             trash: Arc::new(Mutex::new(TrashState::default())),
             tool_router: Self::router_read()
+                + Self::router_mutate()
                 + Self::router_workcopy()
                 + Self::router_conflict()
                 + Self::router_ops(),

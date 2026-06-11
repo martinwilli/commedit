@@ -124,10 +124,19 @@ pub struct OpEntryDto {
     pub affected_change_ids: Vec<String>,
 }
 
+/// Mark a tagged-enum schema as an object at the root: every variant
+/// serializes to an object, and the MCP spec requires `outputSchema` (and any
+/// type rmcp embeds in one) to carry a root `"type": "object"`, which schemars
+/// omits on its `oneOf` rendering.
+fn tagged_enum_is_an_object(schema: &mut schemars::Schema) {
+    schema.ensure_object().insert("type".into(), "object".into());
+}
+
 /// Outcome of a mutation: either the rewrite is clean and exported to git, or
 /// it is held back with conflicts to resolve.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[schemars(transform = tagged_enum_is_an_object)]
 pub enum SaveResultDto {
     /// The rewrite landed: git refs, HEAD and the working tree are updated.
     Clean {
@@ -264,8 +273,9 @@ pub struct FileContentDto {
 pub struct ReplaceFilesReq {
     /// Sha of the commit to edit, from `list_history`.
     pub sha: String,
-    /// Files to replace, each with its complete new content. Files cannot be
-    /// added to or deleted from a commit this way, only changed.
+    /// Files to write, each with its complete new content (a path the commit
+    /// doesn't have yet is added). Files cannot be *deleted* from a commit
+    /// this way.
     pub files: Vec<FileContentDto>,
 }
 
@@ -287,7 +297,6 @@ pub struct DropCommitReq {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DropCommitResp {
-    #[serde(flatten)]
     pub result: SaveResultDto,
     /// The dropped commit, now in the session trash. Its `parent_shas` say
     /// where it sat — useful when restoring it later.

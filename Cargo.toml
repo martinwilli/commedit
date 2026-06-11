@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/commedit-engine",
     "crates/commedit-gtk",
+    "crates/commedit-mcp",
 ]
 
 [workspace.package]

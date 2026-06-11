@@ -22,20 +22,41 @@ the code implements them and the non-obvious invariants to keep when changing it
 cargo build                      # build the workspace
 cargo test                       # all tests (engine unit + integration)
 cargo test -p commedit-engine    # engine only
+cargo test -p commedit-mcp       # MCP server only
 cargo test --test rewrite        # one integration test binary (each tests/*.rs is its own)
 cargo test plan_reorder          # tests matching a name
 cargo run -- /path/to/repo       # launch the GTK app against a repo (defaults to ".")
+cargo run -p commedit-mcp -- /path/to/repo  # the MCP server on stdio (defaults to ".")
 ```
 
 The GTK crate needs system GTK4 / libsourceview5 development libraries present.
 
 ## Architecture
 
-Two crates, split so the rewrite logic carries **no GTK dependency** and is
+Three crates, split so the rewrite logic carries **no GTK dependency** and is
 unit-testable headless:
 
 - **`commedit-engine`** — all repository logic. Built on `jj-lib` (jujutsu).
 - **`commedit-gtk`** — the UI (binary `commedit`). Depends on the engine.
+- **`commedit-mcp`** — an MCP stdio server over the engine (binary
+  `commedit-mcp`), the agent frontend. A lib + thin bin so tool handlers are
+  integration-tested by calling them directly (`tests/*.rs`, scratch repos via
+  a copy of the engine's `tests/common`). One process = one session: a
+  launch-per-repo `Repo` in `Arc<Mutex<_>>`, every tool body on
+  `spawn_blocking` with the lock taken inside. Tools live in `tools/{read,
+  mutate,workcopy,conflict,ops}.rs` (one named rmcp router each, combined in
+  `server.rs`) and delegate addressing/planning to `session.rs` — sha→index
+  against a fresh `history()` read, the session trash with its staged
+  push/remove (applied only when a rewrite settles `Clean`), and `plan_splice`,
+  which maps the agent semantics "make P the parent" (or `"root"`) onto the
+  graph planner's gap-above-P candidates and asks for `child_sha` at a fork.
+  Responses are DTOs in `dto.rs` (`convert.rs` maps engine types; **no jj-lib
+  type crosses**; field doc comments are the schema descriptions agents read);
+  mutations return the status-tagged `SaveResultDto`, whose schema needs the
+  explicit root `"type": "object"` MCP requires. Mutations are refused while a
+  conflicted rewrite is pending — the conflict tools (change-id-keyed) or
+  `abort_rewrite` settle it first — and `reload_repo` re-opens the repo in
+  place (fresh session) to pick up out-of-band git changes.
 
 ### The jj-over-git "transparency" model (the central idea)
 

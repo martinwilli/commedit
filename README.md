@@ -124,6 +124,45 @@ cargo test                  # run the engine and integration tests
 cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 ```
 
+## Use from AI agents (MCP)
+
+The same engine is also exposed as an [MCP](https://modelcontextprotocol.io)
+server, `commedit-mcp`, so an AI agent can edit history the way the GTK app
+does: edit any commit's message, identity or file contents, split, reorder,
+drop, restore and squash commits, fold uncommitted changes in, walk the
+conflict-resolution loop, and undo any of it — all while the repository stays a
+plain git repo and conflicted rewrites are held back from git until they
+resolve or abort.
+
+Nobody runs the server by hand: the MCP client spawns the stdio process when a
+session starts and kills it when the session ends. The server takes the
+repository path as its only argument, defaulting to the current directory (and,
+like `git`, walking up to the enclosing repository), so one global registration
+serves every repo with a fresh per-repo, per-session instance:
+
+```sh
+cargo install --path crates/commedit-mcp              # puts commedit-mcp on PATH
+claude mcp add --scope user commedit -- commedit-mcp  # register in Claude Code
+```
+
+Use `--scope project` instead to write a shareable `.mcp.json` for one project,
+or pass an explicit path (`commedit-mcp /path/to/repo`) for other MCP hosts and
+out-of-tree setups. In a directory with no git repository above it the server
+exits non-zero and the client shows the connection as failed — harmless, by
+design (comm(ed)it never creates repositories).
+
+The tool surface mirrors the app: read tools (`list_history`, `show_commit`,
+`working_copy_status`, `session_diff`), mutations (`edit_message`,
+`edit_identity`, `replace_files`, `split_commit`, `reorder_commit`,
+`drop_commit`, `restore_commit`, `squash_commit`, `squash_working_copy`), the
+conflict loop (`pending_status`, `read_conflict`, `resolve_conflicts`,
+`abort_rewrite`), and the session safety net (`list_operations`, `undo`,
+`redo`, `jump_to_operation`, `reload_repo`). One server process is one editing
+session: dropped commits stay restorable from a session trash, every landed
+mutation is an undo point, and `jump_to_operation 0` rolls everything back to
+how the session started. Git state is imported at startup, so after an
+out-of-band git operation the agent calls `reload_repo` to re-sync.
+
 ## Keyboard shortcuts
 
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.

@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "commedit-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "commedit-gtk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "commedit-engine",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "commedit-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "commedit-engine",

@@ -6,8 +6,8 @@ mod common;
 
 use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use commedit_mcp::dto::{
-    ConflictFileEditDto, EditMessageReq, FileContentDto, ListHistoryReq, ReadConflictReq,
-    ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
+    ConflictFileEditDto, DropCommitReq, EditMessageReq, FileContentDto, ListHistoryReq,
+    ReadConflictReq, ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -187,6 +187,86 @@ async fn abort_rewrite_restores_the_original_history() {
         .0;
     assert!(matches!(clean, SaveResultDto::Clean { .. }));
     assert_eq!(git_log_subjects(dir.path()), ["B, edited", "A", "base"]);
+}
+
+#[tokio::test]
+async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
+    let dir = TempDir::new().unwrap();
+    conflicting_repo(dir.path());
+    let server = open_server(dir.path());
+
+    // Dropping "A" leaves "B"'s same-line edit dangling: a true conflict.
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
+    let resp = server
+        .drop_commit(Parameters(DropCommitReq { sha: a.sha.clone() }))
+        .await
+        .unwrap()
+        .0;
+    let SaveResultDto::Conflicts { commits, .. } = resp.result else {
+        panic!("expected the drop to conflict");
+    };
+    assert_eq!(resp.dropped.subject, "A");
+
+    // While pending, the trash push is only staged — not visible yet.
+    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+
+    // Resolving the conflict settles the drop; now the trash has it.
+    let oldest = &commits[0];
+    let file = server
+        .read_conflict(Parameters(ReadConflictReq {
+            change_id: oldest.change_id.clone(),
+            path: oldest.files[0].path.clone(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let result = server
+        .resolve_conflicts(Parameters(ResolveConflictsReq {
+            change_id: oldest.change_id.clone(),
+            files: vec![ConflictFileEditDto {
+                path: oldest.files[0].path.clone(),
+                text: "1\nB\n3\n".into(),
+                marker_len: file.marker_len,
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    let trash = server.list_trash().await.unwrap().0;
+    assert_eq!(trash.commits.len(), 1);
+    assert_eq!(trash.commits[0].subject, "A");
+    assert_eq!(git_log_subjects(dir.path()), ["B", "base"]);
+}
+
+#[tokio::test]
+async fn an_aborted_drop_leaves_the_trash_untouched() {
+    let dir = TempDir::new().unwrap();
+    conflicting_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
+    let resp = server
+        .drop_commit(Parameters(DropCommitReq { sha: a.sha.clone() }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(resp.result, SaveResultDto::Conflicts { .. }));
+
+    server.abort_rewrite().await.unwrap();
+    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
 }
 
 #[tokio::test]

@@ -5,8 +5,9 @@ mod common;
 
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
-    EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq, ReplaceFilesReq,
-    SaveResultDto, ShowCommitReq, SplitCommitReq,
+    DropCommitReq, EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq,
+    ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
+    SplitCommitReq,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -369,6 +370,238 @@ async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
     assert_eq!(git(dir.path(), &["show", "HEAD~2:a.txt"]), "one\ntwo");
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo\nthree");
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn reorder_moves_a_commit_under_a_new_parent() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    // Move "third" below "second": its parent becomes "first".
+    let shas = shas(&server).await;
+    let result = server
+        .reorder_commit(Parameters(ReorderCommitReq {
+            sha: shas[0].clone(),
+            new_parent_sha: shas[2].clone(),
+            child_sha: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "third", "first"]);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn reorder_to_root_makes_a_commit_the_first() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    let top = shas(&server).await[0].clone();
+    let result = server
+        .reorder_commit(Parameters(ReorderCommitReq {
+            sha: top,
+            new_parent_sha: "root".into(),
+            child_sha: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first", "third"]);
+    // "third" really is the new root commit.
+    let bottom = git(dir.path(), &["rev-list", "--max-parents=0", "HEAD"]);
+    assert_eq!(git(dir.path(), &["log", "-1", "--format=%s", &bottom]), "third");
+}
+
+#[tokio::test]
+async fn reorder_rejects_noop_self_and_merge_moves() {
+    let dir = TempDir::new().unwrap();
+    init_merge_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
+    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
+    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+
+    let err = expect_err(
+        server
+            .reorder_commit(Parameters(ReorderCommitReq {
+                sha: merge.sha.clone(),
+                new_parent_sha: base.sha.clone(),
+                child_sha: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+
+    let err = expect_err(
+        server
+            .reorder_commit(Parameters(ReorderCommitReq {
+                sha: main1.sha.clone(),
+                new_parent_sha: main1.sha.clone(),
+                child_sha: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("own parent"), "unexpected error: {}", err.message);
+
+    let err = expect_err(
+        server
+            .reorder_commit(Parameters(ReorderCommitReq {
+                sha: main1.sha.clone(),
+                new_parent_sha: base.sha.clone(),
+                child_sha: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("already a child"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn an_ambiguous_fork_reorder_needs_child_sha() {
+    let dir = TempDir::new().unwrap();
+    init_merge_repo(dir.path());
+    // A commit on top of the merge, to be moved down under "base".
+    std::fs::write(dir.path().join("d.txt"), "top\n").unwrap();
+    git(dir.path(), &["add", "d.txt"]);
+    git(dir.path(), &["commit", "-qm", "top"]);
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let top = history.commits.iter().find(|c| c.subject == "top").unwrap();
+    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
+    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+
+    // Two lines (main-1's and side-1's) converge on "base": ambiguous.
+    let err = expect_err(
+        server
+            .reorder_commit(Parameters(ReorderCommitReq {
+                sha: top.sha.clone(),
+                new_parent_sha: base.sha.clone(),
+                child_sha: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("child_sha"), "unexpected error: {}", err.message);
+    assert!(err.message.contains("main-1") && err.message.contains("side-1"));
+
+    // Disambiguated: splice between base and main-1.
+    let result = server
+        .reorder_commit(Parameters(ReorderCommitReq {
+            sha: top.sha.clone(),
+            new_parent_sha: base.sha.clone(),
+            child_sha: Some(main1.sha.clone()),
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    // "top" now sits between base and main-1 on the first-parent line.
+    assert_eq!(
+        git(dir.path(), &["log", "--first-parent", "--format=%s", "HEAD"]),
+        "merge\nmain-1\ntop\nbase"
+    );
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn drop_then_restore_round_trips_through_the_trash() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let resp = server
+        .drop_commit(Parameters(DropCommitReq { sha: target.clone() }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&resp.result);
+    assert_eq!(resp.dropped.subject, "second");
+    assert_eq!(git_log_subjects(dir.path()), ["third", "first"]);
+
+    // It sits in the trash, counted by list_history.
+    let trash = server.list_trash().await.unwrap().0;
+    assert_eq!(trash.commits.len(), 1);
+    assert_eq!(trash.commits[0].sha, target);
+    let listing = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(listing.trash_count, 1);
+
+    // Restore it where it came from: on top of "first".
+    let first = shas(&server).await[1].clone();
+    let result = server
+        .restore_commit(Parameters(RestoreCommitReq {
+            sha: target,
+            new_parent_sha: first,
+            child_sha: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "second", "first"]);
+    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    git(dir.path(), &["fsck", "--no-progress"]);
+}
+
+#[tokio::test]
+async fn drop_refuses_merges_and_unknown_restores() {
+    let dir = TempDir::new().unwrap();
+    init_merge_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
+    let err = expect_err(
+        server.drop_commit(Parameters(DropCommitReq { sha: merge.sha.clone() })).await,
+    );
+    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+
+    let err = expect_err(
+        server
+            .restore_commit(Parameters(RestoreCommitReq {
+                sha: merge.sha.clone(),
+                new_parent_sha: "root".into(),
+                child_sha: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("trash"), "unexpected error: {}", err.message);
 }
 
 #[tokio::test]

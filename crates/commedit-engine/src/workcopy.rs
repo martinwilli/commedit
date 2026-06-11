@@ -64,6 +64,10 @@ pub struct WorkingCopyEntry {
     pub info: crate::history::CommitInfo,
     /// Number of files this entry changes relative to its own parent.
     pub changed_files: usize,
+    /// The changed files' paths (relative, forward-slash form), in the order
+    /// [`crate::diff::commit_changes`] lists them. Length equals
+    /// [`Self::changed_files`]; the UI shows a couple of basenames from it.
+    pub file_names: Vec<String>,
     /// Whether this entry's tree is conflicted (a rewrite reapplied onto it
     /// clashed with the user's uncommitted changes).
     pub has_conflict: bool,
@@ -400,17 +404,18 @@ impl Repo {
             let Ok(commit) = self.repo.store().get_commit(&id) else {
                 continue;
             };
-            let changed_files = crate::diff::commit_changes(&self.repo, &id)
-                .map(|c| c.len())
-                .unwrap_or(0);
-            if changed_files == 0 {
+            let file_names: Vec<String> = crate::diff::commit_changes(&self.repo, &id)
+                .map(|c| c.into_iter().map(|f| f.path).collect())
+                .unwrap_or_default();
+            if file_names.is_empty() {
                 continue;
             }
             let mut info = crate::history::CommitInfo::from_commit(&commit);
             info.subject = "Uncommitted changes".to_string();
             out.push(WorkingCopyEntry {
                 info,
-                changed_files,
+                changed_files: file_names.len(),
+                file_names,
                 has_conflict: commit.has_conflict(),
             });
         }

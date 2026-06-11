@@ -443,10 +443,26 @@ pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &
     populate_rows(list, commits, false, &HashSet::new(), &BTreeMap::new(), None);
 }
 
+/// Summarize an entry's changed files as up to two basenames plus a count of the
+/// rest, e.g. "main.rs", "main.rs, lib.rs" or "main.rs, lib.rs (+3 more)".
+fn summarize_files(names: &[String]) -> String {
+    let basenames: Vec<&str> = names
+        .iter()
+        .take(2)
+        .map(|p| p.rsplit('/').next().unwrap_or(p))
+        .collect();
+    let mut summary = basenames.join(", ");
+    let more = names.len().saturating_sub(2);
+    if more > 0 {
+        summary.push_str(&format!(" (+{more} more)"));
+    }
+    summary
+}
+
 /// Fill the working-copy list with one summary row per uncommitted entry (newest
 /// first, the leaf `@` first), reusing rows and hiding the surplus — the same
 /// drag-safe pattern as [`populate_rows`]. Each row is a single label, e.g.
-/// "✏ Uncommitted changes — 2 files" (or "⚠ … conflicts in N files").
+/// "✏ Uncommitted changes — main.rs, lib.rs (+3 more)" (or "⚠ … conflicts in …").
 pub(crate) fn populate_wc(list: &ListBox, entries: &[WorkingCopyEntry]) {
     for (i, entry) in entries.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -463,12 +479,11 @@ pub(crate) fn populate_wc(list: &ListBox, entries: &[WorkingCopyEntry]) {
             row
         });
         row.set_visible(true);
-        let n = entry.changed_files;
-        let s = if n == 1 { "" } else { "s" };
+        let files = summarize_files(&entry.file_names);
         let text = if entry.has_conflict {
-            format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {n} file{s}")
+            format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {files}")
         } else {
-            format!("\u{270E} Uncommitted changes \u{2014} {n} file{s}")
+            format!("\u{270E} Uncommitted changes \u{2014} {files}")
         };
         if let Some(label) = row.child().and_downcast::<Label>() {
             label.set_text(&text);

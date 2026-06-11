@@ -19,8 +19,8 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
-    ensure_not_pending, find_commit, find_trashed, full_history, plan_splice, save_result,
-    PendingTrashOp, SpliceTarget, TrashState,
+    ensure_not_pending, find_commit, find_trashed, full_history, lookup_ref, plan_splice,
+    resolve_ref, save_result, PendingTrashOp, RefEntry, SpliceTarget, TrashState,
 };
 
 /// Run a mutation whose trash effect is staged: on an engine error the staged
@@ -244,15 +244,21 @@ impl CommeditServer {
         self.with_session(move |repo, trash| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let dest_idx = find_commit(&commits, &req.dest).map_err(|_| {
+            let dest_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
+            let dest_idx = resolve_ref(&req.dest, dest_entries.collect(), || {
                 invalid(format!(
-                    "dest {} is not in the current branch history; call list_history \
-                     for fresh shas",
+                    "dest {} is not in the current branch history; use a ref from \
+                     list_history",
                     req.dest
                 ))
             })?;
 
-            if let Ok(src_idx) = find_commit(&commits, &req.source) {
+            // History first, then the trash — so after a drop + undo, where
+            // the identical commit sits in both, the ref means the live one.
+            // An ambiguity *inside* the history errors immediately rather
+            // than falling through to the trash.
+            let src_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
+            if let Some(src_idx) = lookup_ref(&req.source, src_entries.collect())? {
                 let mode = resolve_squash_mode(req.mode.as_deref(), &commits[src_idx].subject)
                     .map_err(invalid)?;
                 let (src, dest) = repo.plan_squash(&commits, src_idx, dest_idx).ok_or_else(|| {
@@ -264,9 +270,11 @@ impl CommeditServer {
                 let outcome = repo.squash_into(&src, &dest, mode).map_err(internal)?;
                 Ok(save_result(repo, &outcome))
             } else {
-                let info = find_trashed(trash, &req.source).map_err(|_| {
+                let trash_entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone()));
+                let info = resolve_ref(&req.source, trash_entries.collect(), || {
                     invalid(format!(
-                        "source {} is neither in the branch history nor in the trash",
+                        "source {} is neither in the branch history nor in the trash \
+                         (see list_history / list_trash)",
                         req.source
                     ))
                 })?;

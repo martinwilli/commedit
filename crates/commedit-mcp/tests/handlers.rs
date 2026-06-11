@@ -144,7 +144,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
 }
 
 #[tokio::test]
-async fn show_commit_rejects_an_unknown_sha() {
+async fn show_commit_rejects_an_unknown_ref() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
     let server = open_server(dir.path());
@@ -759,7 +759,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
 }
 
 #[tokio::test]
-async fn mutations_reject_a_stale_sha() {
+async fn mutations_reject_a_stale_ref() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second")]);
     let server = open_server(dir.path());
@@ -781,4 +781,146 @@ async fn mutations_reject_a_stale_sha() {
         "the error should point at re-listing: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn a_sha_prefix_addresses_a_commit() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            commit: target[..8].to_string(),
+            message: "first, by prefix".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first, by prefix"]);
+}
+
+#[tokio::test]
+async fn a_change_id_chains_mutations_without_relisting() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let change_id = history.commits[1].change_id.clone();
+
+    // Two mutations by the same change id, no list_history in between: the
+    // first rewrite churns the sha, the change id still addresses the commit.
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            commit: change_id.clone(),
+            message: "first, chained".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+    let result = server
+        .edit_identity(Parameters(EditIdentityReq {
+            commit: change_id.clone(),
+            author_name: Some("Chained Author".into()),
+            author_email: None,
+            author_time: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    let listed = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(listed.commits[1].subject, "first, chained");
+    assert_eq!(listed.commits[1].author_name, "Chained Author");
+    assert_eq!(listed.commits[1].change_id, change_id);
+}
+
+#[tokio::test]
+async fn a_too_short_ref_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    let err = expect_err(
+        server
+            .edit_message(Parameters(EditMessageReq { commit: "abc".into(), message: "x".into() }))
+            .await,
+    );
+    assert!(err.message.contains("too short"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn squash_prefers_a_history_match_over_the_trash() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    // Drop "follow-up", then undo: the identical commit now sits in the
+    // history *and* (stale) in the trash under the same ids.
+    let listed = shas(&server).await;
+    let dropped = server
+        .drop_commit(Parameters(DropCommitReq { commit: listed[1].clone() }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&dropped.result);
+    server.undo().await.unwrap();
+    assert_eq!(git_log_subjects(dir.path()), ["third", "follow-up", "target"]);
+    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+
+    // The duplicated ref resolves to the history commit: a plain in-history
+    // squash that leaves the stale trash entry alone.
+    let target = shas(&server).await[2].clone();
+    let result = squash(&server, &dropped.dropped.sha, &target, None).await;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
+    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+}
+
+#[tokio::test]
+async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let dropped = server
+        .drop_commit(Parameters(DropCommitReq { commit: target }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&dropped.result);
+
+    let shown = server
+        .show_commit(Parameters(ShowCommitReq {
+            commit: dropped.dropped.change_id[..8].to_string(),
+            include_contents: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(shown.commit.subject, "second");
+    assert_eq!(shown.files[0].path, "b.txt");
 }

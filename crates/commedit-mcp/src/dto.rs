@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 /// One commit of the current branch's history.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
-    /// Full commit id. Every mutation rewrites ids — re-list history instead of
-    /// reusing shas across mutations.
+    /// Full commit id. Every mutation rewrites ids — address commits by their
+    /// change_id instead of reusing shas across mutations.
     pub sha: String,
     /// jj change id: stable across rewrites, identifies the logical commit
-    /// while its sha churns.
+    /// while its sha churns — the preferred ref for chaining mutations.
     pub change_id: String,
     /// First line of the commit message.
     pub subject: String,
@@ -176,8 +176,9 @@ pub struct ListHistoryResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShowCommitReq {
-    /// The commit to show, from `list_history`, `working_copy_status` (an
-    /// uncommitted entry) or `list_trash`.
+    /// The commit to show — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive — from the history, the working copy
+    /// (an uncommitted entry) or the trash.
     pub commit: String,
     /// Also return each text file's full old/new content, not just the diff.
     pub include_contents: Option<bool>,
@@ -239,7 +240,9 @@ pub struct PendingStatusResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditMessageReq {
-    /// The commit to edit, from `list_history`.
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
+    /// so they chain across mutations without re-listing.
     pub commit: String,
     /// The new full commit message (subject line + body).
     pub message: String,
@@ -247,7 +250,9 @@ pub struct EditMessageReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditIdentityReq {
-    /// The commit to edit, from `list_history`.
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
+    /// so they chain across mutations without re-listing.
     pub commit: String,
     /// New author name; omitted fields keep their current value.
     pub author_name: Option<String>,
@@ -271,7 +276,9 @@ pub struct FileContentDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceFilesReq {
-    /// The commit to edit, from `list_history`.
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
+    /// so they chain across mutations without re-listing.
     pub commit: String,
     /// Files to write, each with its complete new content (a path the commit
     /// doesn't have yet is added). Files cannot be *deleted* from a commit
@@ -281,7 +288,8 @@ pub struct ReplaceFilesReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SplitCommitReq {
-    /// The commit to split, from `list_history`.
+    /// The commit to split — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive.
     pub commit: String,
     /// The content the commit should keep, per file (like `replace_files`).
     /// A new `fixup!` child commit receives the remainder, so both combined
@@ -291,7 +299,8 @@ pub struct SplitCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DropCommitReq {
-    /// The commit to drop, from `list_history`.
+    /// The commit to drop — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive.
     pub commit: String,
 }
 
@@ -305,22 +314,24 @@ pub struct DropCommitResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReorderCommitReq {
-    /// The commit to move, from `list_history`.
+    /// The commit to move — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive.
     pub commit: String,
-    /// The commit that should become its parent, or the literal string
-    /// `root` to make it the repository's first commit.
+    /// The commit that should become its parent (same ref forms), or the
+    /// literal string `root` to make it the repository's first commit.
     pub new_parent: String,
-    /// When several lines converge on the new parent (a fork), the
-    /// child the moved commit should be spliced under. Usually omitted; an
-    /// ambiguous move fails with the available choices.
+    /// When several lines converge on the new parent (a fork), the child the
+    /// moved commit should be spliced under (same ref forms). Usually
+    /// omitted; an ambiguous move fails listing the choices.
     pub child: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RestoreCommitReq {
-    /// The trashed commit to graft back, from `list_trash`.
+    /// The trashed commit to graft back (see `list_trash`) — sha or change
+    /// id, full or a unique prefix (>= 4 chars), case-insensitive.
     pub commit: String,
-    /// The commit that should become its parent, or `root`.
+    /// The commit that should become its parent (same ref forms), or `root`.
     pub new_parent: String,
     /// Disambiguates a fork, as in `reorder_commit`.
     pub child: Option<String>,
@@ -328,9 +339,11 @@ pub struct RestoreCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SquashCommitReq {
-    /// The commit to fold (from `list_history` or `list_trash`).
+    /// The commit to fold, from the history or the trash — sha or change id,
+    /// full or a unique prefix. A ref present in both resolves to the
+    /// history commit.
     pub source: String,
-    /// The commit to fold it into.
+    /// The commit to fold it into (same ref forms).
     pub dest: String,
     /// `fixup` (keep destination's message), `squash` (append source's body)
     /// or `amend` (replace with source's body). Defaults to what the source's
@@ -340,7 +353,8 @@ pub struct SquashCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SquashWorkingCopyReq {
-    /// The commit the uncommitted changes should be folded into.
+    /// The commit the uncommitted changes should be folded into — sha or
+    /// change id, full or a unique prefix.
     pub dest: String,
 }
 
@@ -360,7 +374,8 @@ pub struct OkResp {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadConflictReq {
     /// The conflicted commit (from the mutation's `conflicts` response or
-    /// `pending_status`).
+    /// `pending_status`) — change id or current sha, full or a unique
+    /// prefix. Prefer the change id: shas churn on every resolution step.
     pub commit: String,
     /// The conflicted path to read.
     pub path: String,
@@ -390,7 +405,9 @@ pub struct ConflictFileEditDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictsReq {
-    /// The conflicted commit being resolved.
+    /// The conflicted commit being resolved — change id or current sha, full
+    /// or a unique prefix. Prefer the change id: shas churn on every
+    /// resolution step.
     pub commit: String,
     /// The resolved files (any subset of the commit's conflicted files).
     pub files: Vec<ConflictFileEditDto>,

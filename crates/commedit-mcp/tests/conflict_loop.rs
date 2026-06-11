@@ -278,3 +278,43 @@ async fn finalize_is_a_clean_noop_without_a_pending_rewrite() {
     let result = server.finalize().await.unwrap().0;
     assert!(matches!(result, SaveResultDto::Clean { .. }));
 }
+
+#[tokio::test]
+async fn conflicts_resolve_by_sha_or_prefix() {
+    let dir = TempDir::new().unwrap();
+    conflicting_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let mut result = conflicting_edit(&server).await;
+    let mut steps = 0;
+    while let SaveResultDto::Conflicts { commits, .. } = result {
+        let oldest = &commits[0];
+
+        // Read by the commit's current sha, resolve by a change-id prefix.
+        let file = server
+            .read_conflict(Parameters(ReadConflictReq {
+                commit: oldest.sha.clone(),
+                path: oldest.files[0].path.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        result = server
+            .resolve_conflicts(Parameters(ResolveConflictsReq {
+                commit: oldest.change_id[..8].to_string(),
+                files: vec![ConflictFileEditDto {
+                    path: oldest.files[0].path.clone(),
+                    text: "1\nR\n3\n".into(),
+                    marker_len: file.marker_len,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+
+    assert!(!server.pending_status().await.unwrap().0.pending);
+    assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
+}

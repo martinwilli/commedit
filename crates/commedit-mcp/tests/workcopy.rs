@@ -146,3 +146,28 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
         "keep me\n"
     );
 }
+
+#[tokio::test]
+async fn squash_working_copy_accepts_a_change_id_prefix() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let result = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            dest: history.commits[1].change_id[..8].to_string(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nfolded");
+    assert!(server.working_copy_status().await.unwrap().0.clean);
+}

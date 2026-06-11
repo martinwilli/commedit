@@ -9,7 +9,10 @@
 //!
 //! jj skips `.git`/`.jj` while snapshotting (its `RESERVED_DIR_NAMES`), and
 //! honours the repo's in-tree `.gitignore`s plus `.git/info/exclude`, so neither
-//! jj's own metadata nor ignored files leak into `@`.
+//! jj's own metadata nor ignored files leak into `@`. The one exception mirrors
+//! git: a file already tracked is snapshotted even when an ignore rule covers it
+//! (e.g. a force-added `m4/.keep` under an ignored `m4/`) — see the
+//! `force_tracking_matcher` in [`Repo::snapshot_working_copy`].
 //!
 //! Files git considers **untracked** (present on disk but in no commit) are
 //! deliberately *excluded* from `@`: we never auto-track new files, so they
@@ -23,7 +26,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher, NothingMatcher};
+use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher};
 use jj_lib::merge::{Merge, MergedTreeValue};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
@@ -96,13 +99,20 @@ impl Repo {
         // leaving files absent from it — git's untracked files — out of `@`.
         let tracked = self.tracked_paths_matcher()?;
         let base_ignores = self.base_ignores()?;
-        let nothing = NothingMatcher;
         let options = SnapshotOptions {
             base_ignores,
             progress: None,
             start_tracking_matcher: tracked.as_ref(),
-            // Never force-track ignored or oversized files.
-            force_tracking_matcher: &nothing,
+            // Force-track exactly the files git already tracks. git's ignore
+            // rules never apply to files already in the index, so a tracked file
+            // inside a `.gitignore`d directory (e.g. a `.keep` under an ignored
+            // `m4/`) must still be snapshotted into `@`. Without this jj would
+            // skip the ignored directory — our throwaway workspace's tree state
+            // starts empty, so there's nothing for jj's "visit only tracked
+            // files" path to find — and the file would surface as a phantom
+            // (deleted) uncommitted change. New, untracked files aren't in this
+            // set, so they stay excluded from `@` as before.
+            force_tracking_matcher: tracked.as_ref(),
             max_new_file_size: u64::MAX,
         };
 

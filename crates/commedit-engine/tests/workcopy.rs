@@ -449,3 +449,46 @@ fn dropping_one_split_chain_entry_discards_only_its_slice() {
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn tracked_file_in_ignored_directory_is_not_a_phantom_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A")]);
+
+    // A common pattern: ignore a directory's generated contents but force-track a
+    // `.keep` so the directory exists in history. git keeps tracking `m4/.keep`
+    // even though `m4/` is ignored, because ignore rules never apply to files
+    // already in the index.
+    std::fs::write(dir.join(".gitignore"), "m4/\n").unwrap();
+    common::git(dir, &["add", ".gitignore"]);
+    std::fs::create_dir(dir.join("m4")).unwrap();
+    std::fs::write(dir.join("m4/.keep"), "").unwrap();
+    common::git(dir, &["add", "-f", "m4/.keep"]);
+    common::git(dir, &["commit", "-q", "-m", "keep m4"]);
+
+    // An actually-ignored, untracked file in the same directory: it must stay
+    // excluded from @ (the untracked-files rule), so widening the snapshot to see
+    // the tracked `.keep` doesn't drag the ignored siblings in.
+    std::fs::write(dir.join("m4/generated.m4"), "noise\n").unwrap();
+
+    let repo = Repo::open(dir).expect("open");
+
+    // Nothing changed on disk relative to HEAD, so the working copy is clean —
+    // `m4/.keep` must not surface as a (phantom, deleted) uncommitted change just
+    // because it lives inside an ignored directory.
+    assert!(
+        repo.working_copy_info().is_none(),
+        "tracked file in an ignored directory must not show as an uncommitted change"
+    );
+    assert!(repo.working_copy_chain().is_empty());
+
+    // git agrees the tree is clean — the generated file is ignored (`m4/`), so
+    // plain `git status` is empty; commedit must match that, not over-report.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    assert_eq!(
+        common::git(dir, &["status", "--porcelain", "--ignored"]),
+        "!! m4/generated.m4",
+        "the ignored sibling stays ignored — widening the snapshot didn't track it"
+    );
+}

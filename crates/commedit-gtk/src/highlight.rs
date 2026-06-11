@@ -110,6 +110,11 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
     add("meta", &|t| t.set_foreground(Some("#6e7781")));
     add("add-word", &|t| t.set_background(Some("#abf2bc")));
     add("del-word", &|t| t.set_background(Some("#ffc0bd")));
+    // Trailing whitespace on added lines — a saturated red so the otherwise
+    // invisible space/tab run reads as a block to fix. Added after the word
+    // backgrounds so its character background outranks them (GTK tag priority
+    // follows tag-table insertion order).
+    add("trailing-ws", &|t| t.set_background(Some("#ff6b6b")));
     // Conflict-resolution pane: "our" side, "their" side, and the marker lines.
     add("ours-line", &|t| t.set_paragraph_background(Some("#e6ffec")));
     add("theirs-line", &|t| t.set_paragraph_background(Some("#ddf4ff")));
@@ -274,6 +279,20 @@ pub(crate) fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, p
                 for &(s, e) in &line.intra {
                     let cs = prefix + code[..s].chars().count();
                     let ce = prefix + code[..e].chars().count();
+                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &tag);
+                }
+            }
+        }
+
+        // Flag trailing whitespace on added lines: like `git diff --check` we
+        // only warn on `+` lines (the content actually being written). Paint
+        // just the trailing space/tab run so the invisible characters surface.
+        if line.kind == DiffLineKind::Added {
+            let trimmed = code.trim_end_matches([' ', '\t']);
+            if trimmed.len() < code.len() {
+                if let Some(tag) = buffer.tag_table().lookup("trailing-ws") {
+                    let cs = prefix + trimmed.chars().count();
+                    let ce = prefix + code.chars().count();
                     apply_cols(buffer, li as i32, cs as i32, ce as i32, &tag);
                 }
             }

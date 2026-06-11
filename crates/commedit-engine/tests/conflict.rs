@@ -80,7 +80,7 @@ fn conflicting_repo(dir: &std::path::Path) {
 /// Plan and perform "drag A (display row 1) to the top".
 fn reorder_a_to_top(repo: &mut Repo) -> SaveOutcome {
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let mv = common::plan_reorder_single(&repo, &commits, 1, 0);
+    let mv = common::plan_reorder_single(repo, &commits, 1, 0);
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("reorder")
 }

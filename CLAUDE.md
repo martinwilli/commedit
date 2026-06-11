@@ -59,7 +59,16 @@ unit-testable headless:
   `dto.rs` (`convert.rs` maps engine types; **no jj-lib type crosses**; field
   doc comments are the schema descriptions agents read); mutations return the
   status-tagged `SaveResultDto`, whose schema needs the explicit root
-  `"type": "object"` MCP requires. Mutations are refused while a conflicted
+  `"type": "object"` MCP requires. Every result is wrapped in `Yaml<T>`
+  (`wrapper.rs`) — serialized as a single human-readable YAML text block with
+  **no** `structured_content`/`outputSchema` (a client that gets structured
+  content hides the text block); strings YAML can't render as a literal block
+  (diffs with tabs, whitespace-only edits) become a line-sequence instead. The
+  tool surface is a **superset** of the GTK app:
+  `create_commit`/`revert_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
+  the surgical `replace_in_file`/`replace_in_message`, `commit_working_copy`
+  (+ partial) and the conflict `finalize` have no UI counterpart. Mutations are
+  refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
   preferred) or `abort_rewrite` settle it first — and `reload_repo` re-opens
   the repo in place (fresh session) to pick up out-of-band git changes.
@@ -124,7 +133,12 @@ op-log").
 
 - `rewrite_message` / `rewrite_identity` — message + author/committer edits. Run
   identity **last** in a multi-part save: it overrides jj's habit of re-stamping
-  the committer to "now".
+  the committer to "now". `rewrite_batch` (`BatchEdit`s; the MCP `edit_commits`
+  tool, no GTK surface) applies many message/identity edits in **one** transaction
+  with a single rebase: it orders targets ancestors-first, re-parents each onto its
+  just-rewritten ancestors, and excludes them from the descendant committer
+  re-stamp — so a whole parent→child range re-dates correctly and it's
+  O(targets+descendants), not the O(n²) of looping the single-commit calls.
 - `reorder_commit` (`rewrite.rs`) + `plan_reorder_candidates` (`history.rs`) —
   drag-to-reorder, anywhere in the merge graph. Planning is pure and runs on the
   graph's lane layout (`graph.rs`): a display gap is crossed by one ancestry line
@@ -147,6 +161,26 @@ op-log").
   children rebase onto its parent), and restore offers the same per-line candidates
   as reorder. The abandoned commit object lingers in the ODB (kept reachable so a
   later restore can graft it back). Restore reuses the `reorder_commit` body.
+- `create_commit` / `revert_commit` / `cherry_pick_commit` (`create.rs`; MCP-only,
+  no GTK surface) — synthesize a brand-new commit and splice it into the graph at a
+  `(new_parent_ids, new_child_ids)` slot, the same slot a reorder/restore plan
+  resolves: a fresh commit is structurally a "restore" of one that was never in
+  history, so all three share the `insert_new_commit` body and opt into the
+  `Restore` forward-rebuild spurious-resolve. `create_commit` builds the tree from
+  `FileEdit`s on the parent (empty → an empty commit); `revert_commit` from a 3-way
+  merge applying a commit's **inverse** diff (its parent's tree as "theirs", git
+  `revert` style); `cherry_pick_commit` the mirror with the forward diff — and its
+  `target` may be **any** commit in the shared ODB, even one off the current branch,
+  since only its trees are read (the source is never touched; it keeps the source
+  author + a `(cherry picked from …)` trailer). Merge commits can't be
+  reverted/cherry-picked (no single parent to diff). A top-gap insert (empty
+  `new_child_ids`) splices beneath the working-copy chain like reorder, so
+  uncommitted changes ride on top.
+- `replace_in_files` (`tree.rs`; MCP `replace_in_file` / `replace_in_message`,
+  no GTK surface) — the surgical counterpart to `rewrite_files`: targeted
+  `old`→`new` text replacements (unique unless `all`) read from the target's tree,
+  applied in order, spliced through the same rewrite/rebase/export pipeline. A miss
+  or ambiguous match returns a downcastable `ReplaceError`.
 - `squash_into` (`squash.rs`) + `plan_squash` / `squash_recommendations` — drag
   one commit *onto* another to fold it in, across the whole graph. Built on
   jj-lib's native `squash_commits`: the source's changes apply to the target's tree
@@ -182,13 +216,23 @@ op-log").
   stays byte-identical; the result is a *chain* of uncommitted entries.
   `squash_working_copy_into` snapshots, resolves the entry, and delegates to
   `squash_into(.., Fixup)`.
-- `drop_working_copy` (`workcopy.rs`) — the trashbin's drop for an *uncommitted*
-  entry: snapshot, resolve by change id, `record_abandoned_commit` +
-  `rebase_descendants`, commit the tx **directly** and re-materialize (same
-  git-untouched path). Abandoning the leaf `@` makes jj recreate an empty `@`;
-  abandoning an intermediate split-chain entry rebases the deeper entries onto its
-  parent. Unlike a dropped *commit* it's **not** restorable (no git object to graft
-  back), so the UI neither lists it in the trash nor offers to drag it back.
+- `drop_working_copy` (`workcopy.rs`; the MCP `discard_working_copy` tool) — the
+  trashbin's drop for an *uncommitted* entry: snapshot, resolve by change id,
+  `record_abandoned_commit` + `rebase_descendants`, commit the tx **directly** and
+  re-materialize (same git-untouched path). Abandoning the leaf `@` makes jj
+  recreate an empty `@`; abandoning an intermediate split-chain entry rebases the
+  deeper entries onto its parent. Unlike a dropped *commit* it's **not** restorable
+  (no git object to graft back), so the UI neither lists it in the trash nor offers
+  to drag it back.
+- `commit_working_copy` / `commit_working_copy_partial` (`workcopy.rs`; MCP-only,
+  no GTK surface) — crystallize the uncommitted changes into a real commit on HEAD
+  and start a fresh empty `@`, like `git commit -a`. Unlike the working-copy-direct
+  ops above this **moves the branch tip**, so it runs through `finish_mutation`
+  (always Clean — a fresh tip has no descendants). The *partial* variant commits
+  only a selected subset (`PartialSelection`, the `git add -p` jj's whole-tree
+  snapshot has no concept of) yet rebuilds `@` holding the **full** disk tree, so
+  the remainder stays uncommitted and the files stay byte-identical;
+  `select_groups` picks the kept hunks.
 
 ### Working-copy preservation (`workcopy.rs`)
 
@@ -299,11 +343,17 @@ file with Git 2-way markers (jj's diff3 base section stripped);
 `resolve_conflicts(change_hex, &[(path, text, marker_len)])` parses each edit back,
 splices the resolved tree, re-rebases and re-settles — returning `Clean` (and
 auto-exporting) once the last conflict is gone (`resolve_conflict` is the single-file
-wrapper). `abort()` rolls jj back to the captured pre-rewrite `Operation`;
-`jj_head_commit_id()` exposes the pending (not-yet-exported) tip so the UI can show
-the chain being resolved. Resolve **oldest-first**: fixing the earliest conflict
-often auto-clears its descendants on rebase. Non-file (structural) conflicts can't be
-resolved as text — flagged `resolvable: false`, the only escape is `abort`.
+wrapper). The richer `resolve_conflicts_ext` takes a `FileResolution` per path —
+`Content(text)` or `Delete`, which splices `Merge::absent()` to remove the path (the
+clean fix for a modify/delete conflict); the text-only `resolve_conflicts` is a
+`Content`-only wrapper, so the GTK frontend is untouched and `Delete` reaches the
+engine only via the MCP `resolve_conflicts` tool. `abort()` rolls jj back to the
+captured pre-rewrite `Operation`; `jj_head_commit_id()` exposes the pending
+(not-yet-exported) tip so the UI can show the chain being resolved. Resolve
+**oldest-first**: fixing the earliest conflict often auto-clears its descendants on
+rebase. Non-file (structural) conflicts can't be resolved as text — flagged
+`resolvable: false`, so in the GTK pane `abort` is the only escape, though a
+`Delete` settles them too.
 
 The conflict pane shows **all** of the selected commit's conflicted files at once, as
 **snippets** (`render_conflict_snippets`) — each file's `<<< … >>>` blocks with
@@ -378,7 +428,10 @@ buffer always still applies as a patch. Three pure, GTK-free modules:
   / `HunkInfo`), classify lines (`classify_line` / `DiffLineKind`), and apply an
   edited patch back (`apply_patch`). `revert_groups(old, new, first, last)` rebuilds
   `new` with one hunk's change groups dropped back to `old`, backing the *revert
-  hunk* / *revert file* cues. `render_commit_diff` lays **all** of a commit's files
+  hunk* / *revert file* cues; its dual `select_groups(old, new, kept)` rebuilds `new`
+  keeping only the named change groups (the rest reverted to `old`), backing the MCP
+  partial working-copy commit (`commit_working_copy_partial`). `render_commit_diff`
+  lays **all** of a commit's files
   into one buffer (separated by `diff --git` lines; per-file placement in
   `CombinedFile`) and `split_combined_patch` cuts the edited buffer back per file;
   `rewrite_files` (`tree.rs`) splices several files' new content into the tree in one

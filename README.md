@@ -128,10 +128,11 @@ cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 
 The same engine is also exposed as an [MCP](https://modelcontextprotocol.io)
 server, `commedit-mcp`, so an AI agent can edit history the way the GTK app
-does: edit any commit's message, identity or file contents, split, reorder,
-drop, restore and squash commits, fold uncommitted changes in, walk the
-conflict-resolution loop, and undo any of it — all while the repository stays a
-plain git repo and conflicted rewrites are held back from git until they
+does — and then some: edit any commit's message, identity or file contents,
+split, reorder, drop, restore and squash commits, create new commits and revert
+or cherry-pick existing ones, fold uncommitted changes in or commit them, walk
+the conflict-resolution loop, and undo any of it — all while the repository
+stays a plain git repo and conflicted rewrites are held back from git until they
 resolve or abort. Every tool addresses commits flexibly — by sha or by jj's
 stable change id, full or a unique prefix — so an agent can chain mutations by
 change id without re-listing the history as shas churn.
@@ -153,11 +154,14 @@ out-of-tree setups. In a directory with no git repository above it the server
 exits non-zero and the client shows the connection as failed — harmless, by
 design (comm(ed)it never creates repositories).
 
-The tool surface mirrors the app: read tools (`list_history`, `show_commit`,
-`working_copy_status`, `session_diff`), mutations (`edit_message`,
-`edit_identity`, `replace_files`, `split_commit`, `reorder_commit`,
-`drop_commit`, `restore_commit`, `squash_commit`, `squash_working_copy`), the
-conflict loop (`pending_status`, `read_conflict`, `resolve_conflicts`,
+The tool surface covers everything the app does and adds a few agent-only tools:
+read tools (`list_history`, `show_commit`, `working_copy_status`,
+`session_diff`), mutations (`edit_message`, `edit_identity`, `edit_commits`,
+`replace_files`, `replace_in_file`, `replace_in_message`, `split_commit`,
+`create_commit`, `revert_commit`, `cherry_pick_commit`, `reorder_commit`,
+`drop_commit`, `restore_commit`, `squash_commit`, `commit_working_copy`,
+`discard_working_copy`, `squash_working_copy`), the conflict loop
+(`pending_status`, `read_conflict`, `resolve_conflicts`, `finalize`,
 `abort_rewrite`), and the session safety net (`list_operations`, `undo`,
 `redo`, `jump_to_operation`, `reload_repo`). One server process is one editing
 session: dropped commits stay restorable from a session trash, every landed

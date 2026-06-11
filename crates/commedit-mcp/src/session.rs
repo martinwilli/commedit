@@ -34,7 +34,7 @@ pub struct TrashState {
 /// A trash mutation waiting for its rewrite to settle clean.
 pub enum PendingTrashOp {
     /// `drop_commit`: push the dropped commit into the trash.
-    Push(CommitInfo),
+    Push(Box<CommitInfo>),
     /// `restore_commit` / squash-from-trash: remove the re-used commit.
     Remove(CommitId),
 }
@@ -47,7 +47,7 @@ impl TrashState {
             return;
         }
         match self.staged.take() {
-            Some(PendingTrashOp::Push(info)) => self.entries.push(info),
+            Some(PendingTrashOp::Push(info)) => self.entries.push(*info),
             Some(PendingTrashOp::Remove(id)) => self.entries.retain(|c| c.id != id),
             None => {}
         }
@@ -263,7 +263,7 @@ pub fn find_conflicted(conflicts: &[ConflictedCommit], r: &str) -> Result<usize,
 /// being grafted back, or a brand-new commit being inserted (no graph position).
 pub enum SpliceTarget {
     InHistory(usize),
-    Trashed(CommitInfo),
+    Trashed(Box<CommitInfo>),
     New,
 }
 

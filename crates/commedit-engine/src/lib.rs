@@ -4,6 +4,7 @@
 //! dependency so it can be unit-tested headless against scratch git repos.
 
 pub mod conflict;
+pub mod create;
 pub mod diff;
 pub mod graph;
 pub mod history;

@@ -1,8 +1,10 @@
 //! Create brand-new commits and insert them into history.
 //!
 //! [`Repo::create_commit`] synthesizes a commit from given file contents;
-//! [`Repo::revert_commit`] from the inverse of an existing commit's diff. Both
-//! splice the new commit into the graph the same way [`Repo::restore_commit`]
+//! [`Repo::revert_commit`] from the inverse of an existing commit's diff;
+//! [`Repo::cherry_pick_commit`] from the forward diff of any commit in the
+//! shared object store (even one off the current branch). All three splice the
+//! new commit into the graph the same way [`Repo::restore_commit`]
 //! grafts a trashed commit back — a fresh commit is structurally a "restore" of
 //! one that was never in the history. The shared [`Repo::insert_new_commit`]
 //! mirrors `splice_commit_inner`: create the commit, `move_commits` it between
@@ -22,7 +24,7 @@ use jj_lib::rewrite::{
 };
 
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
-use crate::history::parse_timestamp;
+use crate::history::{format_timestamp, parse_timestamp};
 use crate::repo::Repo;
 use crate::rewrite::Identity;
 use crate::tree::{splice_edits_into_tree, FileEdit};
@@ -152,8 +154,102 @@ impl Repo {
         )
     }
 
-    /// Shared body of [`Self::create_commit`]/[`Self::revert_commit`]: write a new
-    /// commit holding `tree`, splice it between `new_parent_ids`/`new_child_ids`,
+    /// Create a commit that re-applies `target`'s change (its forward diff
+    /// applied onto the insertion parent's tree, like `git cherry-pick`) and
+    /// splice it in at the slot given by `new_parent_ids`/`new_child_ids` (see
+    /// [`Self::create_commit`]). `target` may be *any* commit in the shared
+    /// object store — including one on another branch, not reachable from HEAD —
+    /// since only its trees are read and a brand-new commit is written: the
+    /// source commit and its branch are never touched. A merge commit cannot be
+    /// cherry-picked (no single parent to diff against). `identity` overrides
+    /// both signatures outright; `None` follows git's rule — preserve `target`'s
+    /// author, stamp a fresh committer. Exported to git in one transaction; the
+    /// pick may itself conflict where the insertion point diverged from
+    /// `target`'s parent.
+    pub fn cherry_pick_commit(
+        &mut self,
+        target: &CommitId,
+        new_parent_ids: Vec<CommitId>,
+        new_child_ids: Vec<CommitId>,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("cherry-picking the commit", || {
+            self.cherry_pick_commit_inner(target, new_parent_ids, new_child_ids, identity)
+        })
+    }
+
+    fn cherry_pick_commit_inner(
+        &mut self,
+        target: &CommitId,
+        new_parent_ids: Vec<CommitId>,
+        new_child_ids: Vec<CommitId>,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        let store = self.repo.store().clone();
+        let commit = store
+            .get_commit(target)
+            .context("loading the commit to cherry-pick")?;
+        if commit.parent_ids().len() != 1 {
+            bail!("cannot cherry-pick a merge commit");
+        }
+        let picked_parent = store
+            .get_commit(&commit.parent_ids()[0])
+            .context("loading the picked commit's parent")?;
+        let insert_parent = store
+            .get_commit(&new_parent_ids[0])
+            .context("loading the parent commit")?;
+        // Apply `target`'s diff onto the insertion parent's tree as a 3-way
+        // merge — the mirror of `revert_commit_inner` with base and "theirs"
+        // swapped: base = target's parent's tree (the before state), "theirs" =
+        // target's tree (its change), "ours" = the insertion parent's tree.
+        // Paths target left alone stay as ours; paths it changed take its new
+        // content; an overlap conflicts.
+        let tree = pollster::block_on(MergedTree::merge(Merge::from_vec(vec![
+            (insert_parent.tree(), "cherry-pick destination".to_string()),
+            (picked_parent.tree(), "before the picked commit".to_string()),
+            (commit.tree(), "the picked commit".to_string()),
+        ])))
+        .context("computing the cherry-picked tree")?;
+
+        // Keep the source message, with git's `-x` provenance trailer.
+        let subject = commit.description().lines().next().unwrap_or("").trim();
+        let message = format!(
+            "{}\n\n(cherry picked from commit {})\n",
+            commit.description().trim_end(),
+            target.hex()
+        );
+        let label = format!("Cherry-pick \"{subject}\"");
+
+        // Default to git's identity rule: preserve the source author, but stamp
+        // a fresh committer (the repo's configured user at "now"). An explicit
+        // override replaces both, like create/revert.
+        let preserved;
+        let identity = match identity {
+            Some(id) => id,
+            None => {
+                let author = commit.author();
+                let mut base = self.default_identity();
+                base.author_name = author.name.clone();
+                base.author_email = author.email.clone();
+                base.author_time = format_timestamp(&author.timestamp);
+                preserved = base;
+                &preserved
+            }
+        };
+
+        self.insert_new_commit(
+            new_parent_ids,
+            new_child_ids,
+            tree,
+            &message,
+            Some(identity),
+            label,
+        )
+    }
+
+    /// Shared body of [`Self::create_commit`]/[`Self::revert_commit`]/
+    /// [`Self::cherry_pick_commit`]: write a new commit holding `tree`, splice it
+    /// between `new_parent_ids`/`new_child_ids`,
     /// rebase descendants, point the branch at the resulting tip, and export — all
     /// in one transaction. See the module docs for the splice/working-copy story.
     #[allow(clippy::too_many_arguments)]

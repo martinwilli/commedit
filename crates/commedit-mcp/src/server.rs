@@ -60,7 +60,14 @@ full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
 rewrite the target and its descendants, so shas change constantly; the \
 change_id is stable across rewrites — address commits by change_id to chain \
 mutations without re-listing history. An ambiguous prefix fails listing its \
-matches; list_history shows both ids.
+matches; list_history shows both ids. To save tokens, list_history returns \
+those ids already abbreviated to the shortest repo-unique prefix (>= 8 chars) — \
+pass them straight back as refs rather than echoing full 40/32-char ids.
+
+Bulk & paging: to edit many commits at once (e.g. re-date or reword a range), \
+prefer edit_commits — it applies every message/identity edit in ONE transaction \
+with a single rebase, atomically. list_history returns 30 commits by default; \
+page deeper with its offset / next_offset rather than requesting a huge limit.
 
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use commedit_engine::history::IdAbbrev;
-use commedit_engine::rewrite::Identity;
+use commedit_engine::rewrite::{BatchEdit, Identity};
 use commedit_engine::tree::FileEdit;
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
@@ -14,9 +14,9 @@ use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{commit_dto, resolve_squash_mode};
 use crate::dto::{
-    CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditIdentityReq,
-    EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq,
-    RevertCommitReq, SaveResultDto, SplitCommitReq, SquashCommitReq,
+    CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditCommitsReq,
+    EditIdentityReq, EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq,
+    RestoreCommitReq, RevertCommitReq, SaveResultDto, SplitCommitReq, SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -121,6 +121,66 @@ impl CommeditServer {
                     .unwrap_or_else(|| c.committer_time.clone()),
             };
             let outcome = repo.rewrite_identity(&c.id, &identity).map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Edit several commits' messages and/or identities in ONE transaction with a single rebase — the bulk form of edit_message/edit_identity. Each entry sets a new message and/or identity for its commit (omitted identity fields keep their value; the committer timestamp is pinned, not re-stamped). Applied atomically and ancestors-first, so re-dating a whole parent→child range stays correct; if the rebase conflicts the whole batch is held back like any mutation. Prefer this over many single edits when re-dating or rewording a range. A commit may appear at most once."
+    )]
+    pub async fn edit_commits(
+        &self,
+        Parameters(req): Parameters<EditCommitsReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.edits.is_empty() {
+                return Err(invalid("edits must not be empty"));
+            }
+            let (_, commits) = full_history(repo)?;
+            let mut batch = Vec::with_capacity(req.edits.len());
+            for e in req.edits {
+                let idx = find_commit(&commits, &e.commit)?;
+                let c = &commits[idx];
+                let has_identity = e.author_name.is_some()
+                    || e.author_email.is_some()
+                    || e.author_time.is_some()
+                    || e.committer_name.is_some()
+                    || e.committer_email.is_some()
+                    || e.committer_time.is_some();
+                if e.message.is_none() && !has_identity {
+                    return Err(invalid(format!(
+                        "edit for {} changes nothing: set message or an identity field",
+                        e.commit
+                    )));
+                }
+                let identity = if has_identity {
+                    Some(Identity {
+                        author_name: e.author_name.unwrap_or_else(|| c.author_name.clone()),
+                        author_email: e.author_email.unwrap_or_else(|| c.author_email.clone()),
+                        author_time: e.author_time.unwrap_or_else(|| c.author_time.clone()),
+                        committer_name: e
+                            .committer_name
+                            .unwrap_or_else(|| c.committer_name.clone()),
+                        committer_email: e
+                            .committer_email
+                            .unwrap_or_else(|| c.committer_email.clone()),
+                        committer_time: e
+                            .committer_time
+                            .unwrap_or_else(|| c.committer_time.clone()),
+                    })
+                } else {
+                    None
+                };
+                batch.push(BatchEdit {
+                    target: c.id.clone(),
+                    message: e.message,
+                    identity,
+                });
+            }
+            let outcome = repo.rewrite_batch(batch).map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await

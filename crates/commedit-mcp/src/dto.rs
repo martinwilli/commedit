@@ -293,6 +293,36 @@ pub struct EditIdentityReq {
     pub committer_time: Option<String>,
 }
 
+/// One commit's edit within an `edit_commits` batch. At least one of `message`
+/// or an identity field must be set; omitted identity fields keep their current
+/// value. Like `edit_identity`, the committer timestamp is pinned, not re-stamped.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommitEditDto {
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites.
+    pub commit: String,
+    /// New full commit message (subject + body). Omit to leave the message.
+    pub message: Option<String>,
+    /// New author name; omitted fields keep their current value.
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub author_time: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub committer_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EditCommitsReq {
+    /// The per-commit edits, applied together in ONE transaction with a single
+    /// rebase. Prefer this over many edit_identity/edit_message calls for bulk
+    /// changes: it's atomic (a conflict holds the whole batch back) and avoids
+    /// re-stamping committers across the cascade. A commit may appear only once.
+    pub edits: Vec<CommitEditDto>,
+}
+
 /// A whole-file replacement within a commit.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FileContentDto {

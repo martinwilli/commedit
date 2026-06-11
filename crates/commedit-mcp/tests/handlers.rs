@@ -5,9 +5,9 @@ mod common;
 
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
-    DropCommitReq, EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq,
-    ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq, SquashCommitReq,
+    CommitEditDto, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq, FileContentDto,
+    ListHistoryReq, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto,
+    ShowCommitReq, SplitCommitReq, SquashCommitReq,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -333,6 +333,103 @@ async fn edit_identity_prefills_omitted_fields() {
         .unwrap()
         .0;
     assert_eq!(listed.commits[0].detail.as_ref().unwrap().committer_time, committer_time);
+}
+
+#[tokio::test]
+async fn edit_commits_batches_message_and_identity_in_one_pass() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    // Address by the (abbreviated) change_ids the listing returns — proving they
+    // round-trip back as refs.
+    let hist = server
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
+        .await
+        .unwrap()
+        .0;
+    let id = |i: usize| hist.commits[i].change_id.clone(); // [third, second, first]
+
+    let dated = |commit: String, t: &str| CommitEditDto {
+        commit,
+        message: None,
+        author_name: None,
+        author_email: None,
+        author_time: Some(t.into()),
+        committer_name: None,
+        committer_email: None,
+        committer_time: Some(t.into()),
+    };
+
+    // One batch: re-date a parent ("first") and its child ("second"), and reword
+    // the tip ("third") — all in a single transaction / rebase.
+    let result = server
+        .edit_commits(Parameters(EditCommitsReq {
+            edits: vec![
+                dated(id(2), "2026-06-11 18:00:00 +0200"),
+                dated(id(1), "2026-06-11 18:30:00 +0200"),
+                CommitEditDto {
+                    commit: id(0),
+                    message: Some("third (edited)".into()),
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                },
+            ],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third (edited)", "second", "first"]);
+    let listed = server
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, brief: None }))
+        .await
+        .unwrap()
+        .0;
+    let detail = |i: usize| listed.commits[i].detail.clone().unwrap();
+    // The child's committer is the pinned value, not re-stamped to "now".
+    assert_eq!(detail(1).author_time, "2026-06-11 18:30:00 +0200");
+    assert_eq!(detail(1).committer_time, "2026-06-11 18:30:00 +0200");
+    assert_eq!(detail(2).author_time, "2026-06-11 18:00:00 +0200");
+    assert_eq!(detail(2).committer_time, "2026-06-11 18:00:00 +0200");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn edit_commits_rejects_empty_and_noop_batches() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let empty = expect_err(server.edit_commits(Parameters(EditCommitsReq { edits: vec![] })).await);
+    assert!(empty.message.contains("must not be empty"), "{}", empty.message);
+
+    let target = shas(&server).await[0].clone();
+    let noop = expect_err(
+        server
+            .edit_commits(Parameters(EditCommitsReq {
+                edits: vec![CommitEditDto {
+                    commit: target,
+                    message: None,
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                }],
+            }))
+            .await,
+    );
+    assert!(noop.message.contains("changes nothing"), "{}", noop.message);
 }
 
 #[tokio::test]

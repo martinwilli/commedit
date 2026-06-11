@@ -1,6 +1,7 @@
 //! The MCP server type: shared session state, router assembly and the
 //! `ServerHandler` implementation with the agent-facing instructions.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use commedit_engine::repo::Repo;
@@ -17,14 +18,18 @@ use crate::session::TrashState;
 pub struct CommeditServer {
     pub(crate) repo: Arc<Mutex<Repo>>,
     pub(crate) trash: Arc<Mutex<TrashState>>,
+    /// The resolved repository root, kept to re-open the repo on `reload_repo`.
+    pub(crate) repo_path: PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
 impl CommeditServer {
     pub fn new(repo: Repo) -> Self {
+        let repo_path = repo.workspace_root().to_path_buf();
         Self {
             repo: Arc::new(Mutex::new(repo)),
             trash: Arc::new(Mutex::new(TrashState::default())),
+            repo_path,
             tool_router: Self::router_read()
                 + Self::router_mutate()
                 + Self::router_workcopy()

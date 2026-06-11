@@ -346,9 +346,9 @@ pub struct SquashWorkingCopyReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DiscardWorkingCopyReq {
-    /// Must be true. The discard is recorded as a session operation (undo can
-    /// bring the changes back while this session lives), but once the session
-    /// ends they are gone for good.
+    /// Must be true. Discarded uncommitted changes cannot be recovered
+    /// through this server — undo steps over the discard but restores only
+    /// previously recorded states, which never contain them.
     pub confirm: bool,
 }
 

@@ -75,7 +75,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true. Recorded as a session operation, so undo can restore the changes during this session — but once the session ends they are unrecoverable."
+        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true: this is the one action whose data this server cannot bring back (undo restores recorded states, none of which contain the discarded edits)."
     )]
     pub async fn discard_working_copy(
         &self,
@@ -85,8 +85,8 @@ impl CommeditServer {
             ensure_not_pending(repo)?;
             if !req.confirm {
                 return Err(invalid(
-                    "set confirm=true to discard the uncommitted changes; they are \
-                     recoverable via undo only while this session lives",
+                    "set confirm=true to discard the uncommitted changes; they cannot \
+                     be recovered afterwards",
                 ));
             }
             repo.drop_working_copy(None).map_err(internal)?;

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use commedit_engine::conflict::{ConflictedCommit, ConflictedPath, SaveOutcome};
 use commedit_engine::diff::{ChangeKind, FileChange};
-use commedit_engine::history::CommitInfo;
+use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::SquashMode;
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_mcp::convert::{
@@ -42,7 +42,7 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
         vec![RefDecoration { name: "main".into(), kind: RefKind::Branch, current: true }],
     );
 
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &refs);
+    let dto = commit_dto(&ci(3, &[2]), &root_hex, &refs, &IdAbbrev::full());
     assert_eq!(dto.sha, CommitId::new(vec![3]).hex());
     assert_eq!(dto.change_id, ChangeId::new(vec![3]).hex());
     assert_eq!(dto.subject, "subject 3");
@@ -54,11 +54,11 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
     assert!(dto.refs[0].current);
 
     // The oldest commit's parent is the virtual root: not a real commit.
-    let oldest = commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new());
+    let oldest = commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new(), &IdAbbrev::full());
     assert!(oldest.detail.as_ref().unwrap().parent_shas.is_empty());
     assert!(oldest.refs.is_empty());
 
-    let merge = commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new());
+    let merge = commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full());
     assert!(merge.is_merge);
     assert_eq!(merge.detail.as_ref().unwrap().parent_shas.len(), 2);
 }

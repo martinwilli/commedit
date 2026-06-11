@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use commedit_engine::conflict::{ConflictedCommit, OpEntry, SaveOutcome};
 use commedit_engine::diff::{unified_diff, ChangeKind, FileChange};
-use commedit_engine::history::CommitInfo;
+use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_engine::workcopy::WorkingCopyEntry;
@@ -25,18 +25,21 @@ way out. No other mutation is allowed until status is clean.";
 
 /// A commit row plus its ref decorations as one response object. `root` is the
 /// virtual root commit's id — a parent pointing at it is omitted, so the
-/// repository's first commit reports no parents.
+/// repository's first commit reports no parents. Emitted shas and change_ids are
+/// abbreviated via `abbrev` (shortest repo-unique prefix); the ref-decoration
+/// lookup and root filter stay keyed on the *full* sha.
 pub fn commit_dto(
     info: &CommitInfo,
     root_hex: &str,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
+    abbrev: &IdAbbrev,
 ) -> CommitDto {
-    let sha = info.id_hex();
+    let full_sha = info.id_hex();
     CommitDto {
-        change_id: info.change_id_hex(),
+        change_id: abbrev.change(&info.change_id),
         subject: info.subject.clone(),
         is_merge: info.parents.len() >= 2,
-        refs: refs.get(&sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
+        refs: refs.get(&full_sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
         detail: Some(CommitDetailDto {
             description: info.description.clone(),
             author_name: info.author_name.clone(),
@@ -48,11 +51,11 @@ pub fn commit_dto(
             parent_shas: info
                 .parents
                 .iter()
-                .map(|p| p.hex())
-                .filter(|p| p != root_hex)
+                .filter(|p| p.hex() != root_hex)
+                .map(|p| abbrev.commit(p))
                 .collect(),
         }),
-        sha,
+        sha: abbrev.commit(&info.id),
     }
 }
 

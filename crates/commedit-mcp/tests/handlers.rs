@@ -56,7 +56,11 @@ async fn list_history_returns_the_branch_commits_with_refs() {
         .0;
     let subjects: Vec<&str> = resp.commits.iter().map(|c| c.subject.as_str()).collect();
     assert_eq!(subjects, ["third", "second", "first"]);
-    assert_eq!(resp.head_sha.as_deref(), Some(resp.commits[0].sha.as_str()));
+    // Emitted shas are abbreviated (>= 8 chars); head_sha stays full, so the
+    // tip's abbreviated sha is a prefix of it.
+    let head = resp.head_sha.as_deref().unwrap();
+    let tip = resp.commits[0].sha.as_str();
+    assert!(tip.len() >= 8 && head.starts_with(tip), "tip {tip} prefixes head {head}");
     assert!(!resp.has_more);
     assert_eq!(resp.next_offset, None);
     assert_eq!(resp.offset, 0);

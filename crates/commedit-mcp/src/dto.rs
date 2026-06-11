@@ -188,7 +188,9 @@ pub struct ListHistoryReq {
 pub struct ListHistoryResp {
     /// The branch tip, or null on a detached/unborn HEAD.
     pub head_sha: Option<String>,
-    /// Ancestors of HEAD, newest first (like `git log`).
+    /// Ancestors of HEAD, newest first (like `git log`). Shas and change_ids are
+    /// abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them
+    /// straight back to any tool as a commit ref.
     pub commits: Vec<CommitDto>,
     /// True when the limit cut the walk short — more commits remain below.
     pub has_more: bool,

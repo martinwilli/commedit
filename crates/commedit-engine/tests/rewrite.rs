@@ -4,7 +4,7 @@
 mod common;
 
 use commedit_engine::conflict::SaveOutcome;
-use commedit_engine::history::{history, history_limited};
+use commedit_engine::history::{history, history_limited, IdAbbrev};
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::{BatchEdit, Identity};
 use jj_lib::object_id::ObjectId as _;
@@ -131,6 +131,31 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
 
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn id_abbrev_emits_floored_unique_prefixes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+
+    let abbrev = IdAbbrev::new(&repo.repo);
+    for c in &commits {
+        let sha = abbrev.commit(&c.id);
+        let change = abbrev.change(&c.change_id);
+        // A true, floored prefix that never exceeds the full id.
+        assert!(c.id.hex().starts_with(&sha), "{sha} prefixes {}", c.id.hex());
+        assert!(c.change_id.hex().starts_with(&change), "{change} prefixes {}", c.change_id.hex());
+        assert!(sha.len() >= IdAbbrev::MIN && sha.len() <= c.id.hex().len());
+        assert!(change.len() >= IdAbbrev::MIN && change.len() <= c.change_id.hex().len());
+    }
+
+    // The no-op abbreviator returns full ids unchanged.
+    let full = IdAbbrev::full();
+    assert_eq!(full.commit(&commits[0].id), commits[0].id.hex());
+    assert_eq!(full.change(&commits[0].change_id), commits[0].change_id.hex());
 }
 
 #[test]

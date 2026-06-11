@@ -149,6 +149,72 @@ pub fn history_limited(
     Ok((commits, has_more))
 }
 
+/// Git-style shortest-unique-prefix abbreviator for one read of a repo. Holds the
+/// repo so each call computes the shortest prefix that is unique *across the whole
+/// visible index* — so an abbreviated id stays unique within any subset of it
+/// (e.g. the branch history `lookup_ref` resolves against), and thus round-trips
+/// straight back as a commit ref.
+///
+/// Lengths are floored at [`Self::MIN`]: jj's per-namespace shortest length could
+/// otherwise let an abbreviated change id prefix-collide with some unrelated
+/// commit's sha in `lookup_ref`'s OR-of-namespaces match. The floor makes that
+/// negligible; the worst case is a recoverable "ambiguous ref" the caller retries
+/// with a longer id. These are *display* hints — full ids still resolve exactly.
+pub struct IdAbbrev<'a> {
+    repo: Option<&'a ReadonlyRepo>,
+}
+
+impl<'a> IdAbbrev<'a> {
+    /// Floor on an emitted prefix length, in hex chars.
+    pub const MIN: usize = 8;
+
+    /// Abbreviate against `repo`'s index.
+    pub fn new(repo: &'a ReadonlyRepo) -> Self {
+        Self { repo: Some(repo) }
+    }
+
+    /// A no-op abbreviator that returns full ids — for contexts without a repo
+    /// (e.g. pure unit tests of the DTO conversions).
+    pub fn full() -> Self {
+        Self { repo: None }
+    }
+
+    /// Abbreviate a commit id to its shortest repo-unique prefix, floored at
+    /// [`Self::MIN`]. Hex is ASCII, so byte slicing is char slicing.
+    pub fn commit(&self, id: &CommitId) -> String {
+        let full = id.hex();
+        match self.repo {
+            None => full,
+            Some(repo) => {
+                let n = repo
+                    .index()
+                    .shortest_unique_commit_id_prefix_len(id)
+                    .unwrap_or(full.len())
+                    .max(Self::MIN)
+                    .min(full.len());
+                full[..n].to_string()
+            }
+        }
+    }
+
+    /// Abbreviate a change id to its shortest repo-unique prefix, floored at
+    /// [`Self::MIN`].
+    pub fn change(&self, id: &ChangeId) -> String {
+        let full = id.hex();
+        match self.repo {
+            None => full,
+            Some(repo) => {
+                let n = repo
+                    .shortest_unique_change_id_prefix_len(id)
+                    .unwrap_or(full.len())
+                    .max(Self::MIN)
+                    .min(full.len());
+                full[..n].to_string()
+            }
+        }
+    }
+}
+
 /// The commits reachable from `head` but not from `base` — the range rewritten
 /// since `base`, newest first (the jj `base..head` revset).
 ///

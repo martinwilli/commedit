@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use commedit_engine::history::IdAbbrev;
 use commedit_engine::rewrite::Identity;
 use commedit_engine::tree::FileEdit;
 use jj_lib::object_id::ObjectId as _;
@@ -290,7 +291,7 @@ impl CommeditServer {
             })?;
             let info = commits[idx].clone();
             let root = repo.root_commit_id().hex();
-            let dropped = commit_dto(&info, &root, &BTreeMap::new());
+            let dropped = commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo));
             let outcome = run_staged(repo, trash, PendingTrashOp::Push(info), |repo| {
                 repo.abandon_commit(&id)
             })?;

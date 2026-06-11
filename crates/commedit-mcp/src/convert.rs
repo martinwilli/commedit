@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use commedit_engine::conflict::{ConflictedCommit, OpEntry, SaveOutcome};
-use commedit_engine::diff::{unified_diff, ChangeKind, FileChange};
+use commedit_engine::diff::{render_diff, unified_diff, ChangeKind, ContextExpansion, FileChange};
 use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use commedit_engine::transparency::{RefDecoration, RefKind};
@@ -13,7 +13,7 @@ use jj_lib::object_id::ObjectId as _;
 
 use crate::dto::{
     CommitDetailDto, CommitDto, CommitField, ConflictedCommitDto, ConflictedPathDto, FileChangeDto,
-    OpEntryDto, RefDto, SaveResultDto, WorkingCopyEntryDto,
+    HunkDto, OpEntryDto, RefDto, SaveResultDto, WorkingCopyEntryDto,
 };
 
 /// Which verbose [`CommitDetailDto`] fields a `commit_dto` should populate.
@@ -157,13 +157,29 @@ fn tidy_diff_for_display(diff: String) -> String {
 /// Render one engine [`FileChange`] for a response: a unified diff for text
 /// files, plus the full contents when `include_contents` asks for them.
 pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto {
-    let diff = (!fc.is_binary).then(|| {
-        tidy_diff_for_display(unified_diff(
-            fc.old_text.as_deref().unwrap_or(""),
-            fc.new_text.as_deref().unwrap_or(""),
-            &fc.path,
-        ))
-    });
+    let (old, new) = (
+        fc.old_text.as_deref().unwrap_or(""),
+        fc.new_text.as_deref().unwrap_or(""),
+    );
+    let diff = (!fc.is_binary).then(|| tidy_diff_for_display(unified_diff(old, new, &fc.path)));
+    // Number the diff's hunks so an agent can select them for a partial
+    // commit_working_copy. render_diff with the default expansion produces the
+    // same hunks the `diff` field shows; we keep only their headers + index.
+    let hunks = (!fc.is_binary)
+        .then(|| {
+            let rendered = render_diff(old, new, &fc.path, &ContextExpansion::default());
+            let lines: Vec<&str> = rendered.text.lines().collect();
+            rendered
+                .hunks
+                .iter()
+                .enumerate()
+                .map(|(index, h)| HunkDto {
+                    index,
+                    header: lines.get(h.header_line).copied().unwrap_or("").to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|hs| !hs.is_empty());
     FileChangeDto {
         path: fc.path.clone(),
         kind: match fc.kind {
@@ -175,6 +191,7 @@ pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto
         is_binary: fc.is_binary,
         conflicted_base: fc.conflicted_base,
         diff,
+        hunks,
         old_text: include_contents.then(|| fc.old_text.clone()).flatten(),
         new_text: include_contents.then(|| fc.new_text.clone()).flatten(),
     }

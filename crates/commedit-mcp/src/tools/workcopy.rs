@@ -1,6 +1,9 @@
 //! Tools over the uncommitted changes (the engine's working-copy commit `@`)
 //! and the session-wide review diff.
 
+use std::collections::HashSet;
+
+use commedit_engine::workcopy::PartialSelection;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
@@ -78,7 +81,9 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). \
+\
+Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the in-process `git add -p`), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to commit everything. Refuses when there is nothing tracked to commit, or when the selection commits nothing. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
     )]
     pub async fn commit_working_copy(
         &self,
@@ -91,9 +96,62 @@ impl CommeditServer {
                 return Err(invalid("the working copy is clean — nothing to commit"));
             }
             let identity = new_commit_identity(repo, req.identity);
-            let outcome = repo
-                .commit_working_copy(&req.message, identity.as_ref())
-                .map_err(internal)?;
+
+            // A partial commit is requested when any selection tier is present.
+            let partial = req.paths.is_some() || req.hunks.is_some() || req.patches.is_some();
+            let outcome = if partial {
+                let paths = req.paths.unwrap_or_default();
+                let hunks: Vec<(String, Vec<usize>)> = req
+                    .hunks
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|h| (h.path, h.hunks))
+                    .collect();
+                let patches: Vec<(String, String)> = req
+                    .patches
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (p.path, p.patch))
+                    .collect();
+
+                for (path, indices) in &hunks {
+                    if indices.is_empty() {
+                        return Err(invalid(format!(
+                            "'{path}' is listed in `hunks` but selects no hunk indices"
+                        )));
+                    }
+                }
+                if paths.is_empty() && hunks.is_empty() && patches.is_empty() {
+                    return Err(invalid(
+                        "a partial commit needs at least one path, hunk or patch; omit \
+                         paths/hunks/patches entirely to commit the whole working copy",
+                    ));
+                }
+                // A path may appear in at most one tier.
+                let mut seen = HashSet::new();
+                for path in paths
+                    .iter()
+                    .chain(hunks.iter().map(|(p, _)| p))
+                    .chain(patches.iter().map(|(p, _)| p))
+                {
+                    if !seen.insert(path.as_str()) {
+                        return Err(invalid(format!(
+                            "path '{path}' is selected in more than one tier; list it once"
+                        )));
+                    }
+                }
+
+                let sel = PartialSelection {
+                    paths: &paths,
+                    hunks: &hunks,
+                    patches: &patches,
+                };
+                repo.commit_working_copy_partial(sel, &req.message, identity.as_ref())
+                    .map_err(internal)?
+            } else {
+                repo.commit_working_copy(&req.message, identity.as_ref())
+                    .map_err(internal)?
+            };
             Ok(save_result(repo, &outcome))
         })
         .await

@@ -1,10 +1,11 @@
 //! Session state and shared plumbing of the tool handlers: the blocking-work
-//! wrapper, sha addressing against a fresh history read, the session trash,
-//! and the reorder/restore splice planner.
+//! wrapper, commit-ref addressing against a fresh history read, the session
+//! trash, and the reorder/restore splice planner.
 
+use std::collections::HashSet;
 use std::sync::PoisonError;
 
-use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::graph::compute_graph;
 use commedit_engine::history::{history, history_limited, CommitInfo, ReorderMove};
 use commedit_engine::repo::Repo;
@@ -119,24 +120,138 @@ pub fn save_result(
     crate::convert::save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()))
 }
 
-/// The display index of `sha` in the (newest-first) history.
-pub fn find_commit(commits: &[CommitInfo], sha: &str) -> Result<usize, ErrorData> {
-    commits.iter().position(|c| c.id_hex() == sha).ok_or_else(|| {
+/// One commit a flexible ref can resolve to: its two full lowercase-hex
+/// identities, a subject for ambiguity listings, and the caller's payload.
+pub struct RefEntry<T> {
+    pub sha: String,
+    pub change_id: String,
+    pub subject: String,
+    pub value: T,
+}
+
+impl<T> RefEntry<T> {
+    pub fn of(c: &CommitInfo, value: T) -> Self {
+        Self {
+            sha: c.id_hex(),
+            change_id: c.change_id_hex(),
+            subject: c.subject.clone(),
+            value,
+        }
+    }
+}
+
+/// Resolve a flexible commit ref — full sha (40 hex), full change id
+/// (32 hex), or a case-insensitive unique prefix (>= 4 chars) of either —
+/// against `entries`. `Ok(None)` means no match (the caller words the
+/// contextual not-found error); `Err` means too short or ambiguous, where
+/// typing-more-characters is the fix the message suggests.
+pub fn lookup_ref<T>(input: &str, mut entries: Vec<RefEntry<T>>) -> Result<Option<T>, ErrorData> {
+    let needle = input.to_ascii_lowercase();
+    // Non-hex junk can never match; let the caller's contextual not-found
+    // error name it (checked before the length rule, so junk isn't reported
+    // as "too short").
+    if needle.is_empty() || !needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    if needle.len() < 4 {
+        return Err(invalid(format!(
+            "commit ref \"{input}\" is too short: use at least 4 characters of a sha or \
+             change id"
+        )));
+    }
+
+    // The same commit can be listed twice (history and trash both hold it
+    // after a drop + undo); keep the first occurrence — caller order is
+    // precedence — so the duplicate can never make a ref ambiguous.
+    let mut seen = HashSet::new();
+    entries.retain(|e| seen.insert(e.sha.clone()));
+
+    // A full-length id resolves exactly within its own namespace, so a full
+    // change id that happens to prefix some sha never reads as ambiguous.
+    let exact: Vec<usize> = match needle.len() {
+        40 => index_of(&entries, |e| e.sha == needle),
+        32 => index_of(&entries, |e| e.change_id == needle),
+        _ => Vec::new(),
+    };
+    let matches = if exact.is_empty() {
+        // The per-entry `||` makes a prefix matching one commit via *both*
+        // its ids a single match.
+        index_of(&entries, |e| {
+            e.sha.starts_with(&needle) || e.change_id.starts_with(&needle)
+        })
+    } else {
+        exact
+    };
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [idx] => Ok(Some(entries.swap_remove(*idx).value)),
+        _ => {
+            let listed: Vec<String> = matches
+                .iter()
+                .map(|&i| format!("{} ({})", entries[i].sha, entries[i].subject))
+                .collect();
+            Err(invalid(format!(
+                "commit ref \"{input}\" is ambiguous; it matches: {} — use more characters \
+                 or a full sha/change id",
+                listed.join(", ")
+            )))
+        }
+    }
+}
+
+fn index_of<T>(entries: &[RefEntry<T>], pred: impl Fn(&RefEntry<T>) -> bool) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| pred(e))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// [`lookup_ref`] with a caller-supplied not-found error.
+pub fn resolve_ref<T>(
+    input: &str,
+    entries: Vec<RefEntry<T>>,
+    not_found: impl FnOnce() -> ErrorData,
+) -> Result<T, ErrorData> {
+    lookup_ref(input, entries)?.ok_or_else(not_found)
+}
+
+/// The display index of commit ref `r` in the (newest-first) history.
+pub fn find_commit(commits: &[CommitInfo], r: &str) -> Result<usize, ErrorData> {
+    let entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i)).collect();
+    resolve_ref(r, entries, || {
         invalid(format!(
-            "commit {sha} is not in the current branch history; shas change after every \
-             mutation — call list_history for fresh ones"
+            "commit {r} is not in the current branch history; shas change after every \
+             mutation — use the stable change_id, or call list_history for fresh refs"
         ))
     })
 }
 
-/// The trash entry with id `sha`.
-pub fn find_trashed(trash: &TrashState, sha: &str) -> Result<CommitInfo, ErrorData> {
-    trash
-        .entries
+/// The trash entry commit ref `r` resolves to.
+pub fn find_trashed(trash: &TrashState, r: &str) -> Result<CommitInfo, ErrorData> {
+    let entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone())).collect();
+    resolve_ref(r, entries, || {
+        invalid(format!("commit {r} is not in the session trash (see list_trash)"))
+    })
+}
+
+/// The index of the pending conflicted commit ref `r` resolves to.
+pub fn find_conflicted(conflicts: &[ConflictedCommit], r: &str) -> Result<usize, ErrorData> {
+    let entries = conflicts
         .iter()
-        .find(|c| c.id_hex() == sha)
-        .cloned()
-        .ok_or_else(|| invalid(format!("commit {sha} is not in the session trash (see list_trash)")))
+        .enumerate()
+        .map(|(i, c)| RefEntry {
+            sha: c.commit_id.hex(),
+            change_id: c.change_id_hex(),
+            subject: c.subject.clone(),
+            value: i,
+        })
+        .collect();
+    resolve_ref(r, entries, || {
+        invalid(format!("{r} does not match a pending conflicted commit (see pending_status)"))
+    })
 }
 
 /// What `plan_splice` is moving: a commit at a display index, or a trashed
@@ -146,7 +261,7 @@ pub enum SpliceTarget {
     Trashed(CommitInfo),
 }
 
-/// Resolve the agent-facing move semantics — "make `new_parent_sha` the
+/// Resolve the agent-facing move semantics — "make `new_parent` the
 /// parent of the moved commit" (`"root"` = make it the repository's first
 /// commit) — to the one concrete splice the graph planner offers, or a precise
 /// error naming the alternatives.
@@ -154,8 +269,8 @@ pub fn plan_splice(
     repo: &Repo,
     commits: &[CommitInfo],
     target: SpliceTarget,
-    new_parent_sha: &str,
-    child_sha: Option<&str>,
+    new_parent: &str,
+    child: Option<&str>,
 ) -> Result<ReorderMove, ErrorData> {
     let layout = compute_graph(commits, &repo.root_commit_id());
 
@@ -163,13 +278,13 @@ pub fn plan_splice(
     // between display rows i-1 and i, so the gap whose lower neighbor is the
     // parent P at index i is gap i; "root" is the synthetic gap below the
     // oldest row (commits.len()).
-    let (to, parent_id) = if new_parent_sha == "root" {
+    let (to, parent_id) = if new_parent == "root" {
         (commits.len(), repo.root_commit_id())
     } else {
-        let idx = find_commit(commits, new_parent_sha)
+        let idx = find_commit(commits, new_parent)
             .map_err(|_| invalid(format!(
-                "new_parent_sha {new_parent_sha} is not in the current branch history; \
-                 use a sha from list_history or the literal \"root\""
+                "new_parent {new_parent} is not in the current branch history; \
+                 use a ref from list_history or the literal \"root\""
             )))?;
         (idx, commits[idx].id.clone())
     };
@@ -185,7 +300,7 @@ pub fn plan_splice(
             }
             if moved.parents[0] == parent_id {
                 return Err(invalid(format!(
-                    "commit {} is already a child of {new_parent_sha}",
+                    "commit {} is already a child of {new_parent}",
                     moved.id_hex()
                 )));
             }
@@ -213,12 +328,12 @@ pub fn plan_splice(
                 .collect();
             if offered.is_empty() {
                 Err(invalid(format!(
-                    "no way to splice the commit under {new_parent_sha}: the move is a no-op \
+                    "no way to splice the commit under {new_parent}: the move is a no-op \
                      or the target is not reachable from the branch head"
                 )))
             } else {
                 Err(invalid(format!(
-                    "no ancestry line at that position leads to parent {new_parent_sha}; \
+                    "no ancestry line at that position leads to parent {new_parent}; \
                      the gap's candidate parents are: {}",
                     offered.join(", ")
                 )))
@@ -228,16 +343,18 @@ pub fn plan_splice(
         _ => {
             // A fork: several child lines converge on the parent. The caller
             // picks which child the moved commit goes under.
-            if let Some(child) = child_sha {
-                let child_id = CommitId::try_from_hex(child)
-                    .ok_or_else(|| invalid(format!("invalid child_sha {child:?}")))?;
+            if let Some(child) = child {
+                // Every candidate child is a history commit (the only
+                // childless candidate is the top gap, never named here), so
+                // the ref resolves against the history slice.
+                let child_id = commits[find_commit(commits, child)?].id.clone();
                 matching
                     .into_iter()
                     .find(|mv| mv.new_children.contains(&child_id))
                     .ok_or_else(|| {
                         invalid(format!(
-                            "child_sha {child} is not a child on any line converging on \
-                             {new_parent_sha}"
+                            "child {child} is not a child on any line converging on \
+                             {new_parent}"
                         ))
                     })
             } else {
@@ -253,7 +370,7 @@ pub fn plan_splice(
                     })
                     .collect();
                 Err(invalid(format!(
-                    "several lines converge on {new_parent_sha}; pass child_sha to pick which \
+                    "several lines converge on {new_parent}; pass child to pick which \
                      child the commit goes under: {}",
                     choices.join(" | ")
                 )))
@@ -266,5 +383,94 @@ fn describe_commit(commits: &[CommitInfo], id: &CommitId) -> String {
     match commits.iter().find(|c| c.id == *id) {
         Some(c) => format!("{} ({})", c.id_hex(), c.subject),
         None => id.hex(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lookup_ref, RefEntry};
+
+    fn entry(sha: &str, change_id: &str, tag: u32) -> RefEntry<u32> {
+        RefEntry {
+            sha: sha.into(),
+            change_id: change_id.into(),
+            subject: format!("subject-{tag}"),
+            value: tag,
+        }
+    }
+
+    fn sha(prefix: &str) -> String {
+        format!("{prefix}{}", "0".repeat(40 - prefix.len()))
+    }
+
+    fn cid(prefix: &str) -> String {
+        format!("{prefix}{}", "f".repeat(32 - prefix.len()))
+    }
+
+    #[test]
+    fn a_full_sha_matches_exactly() {
+        let entries = vec![entry(&sha("aa"), &cid("11"), 1), entry(&sha("bb"), &cid("22"), 2)];
+        assert_eq!(lookup_ref(&sha("aa"), entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_full_change_id_beats_a_colliding_sha_prefix() {
+        // Entry 2's sha starts with entry 1's full change id: the 32-hex
+        // input must resolve in the change-id namespace, not ambiguously.
+        let full_cid = cid("11");
+        let colliding_sha = format!("{full_cid}{}", "0".repeat(8));
+        let entries = vec![entry(&sha("aa"), &full_cid, 1), entry(&colliding_sha, &cid("22"), 2)];
+        assert_eq!(lookup_ref(&full_cid, entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_prefix_matches_in_either_namespace() {
+        let entries = vec![entry(&sha("abcd12"), &cid("9911"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
+        let entries = vec![entry(&sha("abcd12"), &cid("9911"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        assert_eq!(lookup_ref("9911", entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_prefix_hitting_both_ids_of_one_commit_is_a_single_match() {
+        let entries = vec![entry(&sha("abcd12"), &cid("abcd34"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_shared_prefix_is_ambiguous_and_lists_the_matches() {
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1), entry(&sha("abcd34"), &cid("2222"), 2)];
+        let err = lookup_ref("abcd", entries).unwrap_err();
+        assert!(err.message.contains("ambiguous"), "message: {}", err.message);
+        assert!(err.message.contains("subject-1") && err.message.contains("subject-2"));
+    }
+
+    #[test]
+    fn input_is_case_insensitive() {
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1)];
+        assert_eq!(lookup_ref("ABCD12", entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_short_hex_ref_is_rejected() {
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1)];
+        let err = lookup_ref("abc", entries).unwrap_err();
+        assert!(err.message.contains("too short"), "message: {}", err.message);
+    }
+
+    #[test]
+    fn non_hex_input_is_not_found_rather_than_too_short() {
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1)];
+        assert_eq!(lookup_ref("no", entries).unwrap(), None);
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1)];
+        assert_eq!(lookup_ref("not-a-ref", entries).unwrap(), None);
+    }
+
+    #[test]
+    fn a_duplicate_sha_dedupes_to_the_first_entry() {
+        // The same commit listed twice (history first, trash second) must
+        // resolve to the first occurrence, never read as ambiguous.
+        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1), entry(&sha("abcd12"), &cid("1111"), 2)];
+        assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
     }
 }

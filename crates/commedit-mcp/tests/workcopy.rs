@@ -28,7 +28,7 @@ async fn uncommitted_changes_survive_a_rewrite() {
         .0;
     let result = server
         .edit_message(Parameters(EditMessageReq {
-            sha: history.commits[1].sha.clone(),
+            commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
         .await
@@ -63,7 +63,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     let err = expect_err(
         server
             .squash_working_copy(Parameters(SquashWorkingCopyReq {
-                dest_sha: first.sha.clone(),
+                dest: first.sha.clone(),
             }))
             .await,
     );
@@ -72,7 +72,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     // Fold a dirty a.txt into the bottom commit ("first" introduced a.txt).
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let result = server
-        .squash_working_copy(Parameters(SquashWorkingCopyReq { dest_sha: first.sha }))
+        .squash_working_copy(Parameters(SquashWorkingCopyReq { dest: first.sha }))
         .await
         .unwrap()
         .0;
@@ -136,7 +136,7 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
         .0;
     server
         .edit_message(Parameters(EditMessageReq {
-            sha: history.commits[1].sha.clone(),
+            commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
         .await
@@ -145,4 +145,29 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
         std::fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
         "keep me\n"
     );
+}
+
+#[tokio::test]
+async fn squash_working_copy_accepts_a_change_id_prefix() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let result = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            dest: history.commits[1].change_id[..8].to_string(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nfolded");
+    assert!(server.working_copy_status().await.unwrap().0.clean);
 }

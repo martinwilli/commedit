@@ -122,7 +122,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     let sha = history.commits[0].sha.clone();
 
     let resp = server
-        .show_commit(Parameters(ShowCommitReq { sha: sha.clone(), include_contents: None }))
+        .show_commit(Parameters(ShowCommitReq { commit: sha.clone(), include_contents: None }))
         .await
         .unwrap()
         .0;
@@ -135,7 +135,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     assert!(file.old_text.is_none() && file.new_text.is_none());
 
     let with = server
-        .show_commit(Parameters(ShowCommitReq { sha, include_contents: Some(true) }))
+        .show_commit(Parameters(ShowCommitReq { commit: sha, include_contents: Some(true) }))
         .await
         .unwrap()
         .0;
@@ -144,7 +144,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
 }
 
 #[tokio::test]
-async fn show_commit_rejects_an_unknown_sha() {
+async fn show_commit_rejects_an_unknown_ref() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
     let server = open_server(dir.path());
@@ -152,7 +152,7 @@ async fn show_commit_rejects_an_unknown_sha() {
     let err = expect_err(
         server
             .show_commit(Parameters(ShowCommitReq {
-                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
                 include_contents: None,
             }))
             .await,
@@ -191,7 +191,7 @@ async fn working_copy_status_reflects_dirty_tracked_files() {
     // The entry's sha reads as a commit: its diff is the uncommitted change.
     let shown = server
         .show_commit(Parameters(ShowCommitReq {
-            sha: dirty.entries[0].sha.clone(),
+            commit: dirty.entries[0].sha.clone(),
             include_contents: None,
         }))
         .await
@@ -236,7 +236,7 @@ async fn edit_message_rewrites_any_commit_and_exports_to_git() {
     let target = shas(&server).await[1].clone();
     let result = server
         .edit_message(Parameters(EditMessageReq {
-            sha: target,
+            commit: target,
             message: "second, edited\n\nwith a body".into(),
         }))
         .await
@@ -266,7 +266,7 @@ async fn edit_identity_prefills_omitted_fields() {
 
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
-            sha: target.sha.clone(),
+            commit: target.sha.clone(),
             author_name: Some("New Author".into()),
             author_email: None,
             author_time: None,
@@ -303,7 +303,7 @@ async fn replace_files_rewrites_contents_across_descendants() {
     let target = shas(&server).await[1].clone();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
-            sha: target,
+            commit: target,
             files: vec![
                 FileContentDto { path: "a.txt".into(), content: "ONE\n".into() },
                 FileContentDto { path: "new.txt".into(), content: "added\n".into() },
@@ -331,7 +331,7 @@ async fn replace_files_requires_files() {
     let sha = shas(&server).await[0].clone();
     let err = expect_err(
         server
-            .replace_files(Parameters(ReplaceFilesReq { sha, files: vec![] }))
+            .replace_files(Parameters(ReplaceFilesReq { commit: sha, files: vec![] }))
             .await,
     );
     assert!(err.message.contains("files"), "unexpected error: {}", err.message);
@@ -354,7 +354,7 @@ async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
     let target = shas(&server).await[1].clone();
     let result = server
         .split_commit(Parameters(SplitCommitReq {
-            sha: target,
+            commit: target,
             files: vec![FileContentDto { path: "a.txt".into(), content: "one\ntwo\n".into() }],
         }))
         .await
@@ -385,9 +385,9 @@ async fn reorder_moves_a_commit_under_a_new_parent() {
     let shas = shas(&server).await;
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
-            sha: shas[0].clone(),
-            new_parent_sha: shas[2].clone(),
-            child_sha: None,
+            commit: shas[0].clone(),
+            new_parent: shas[2].clone(),
+            child: None,
         }))
         .await
         .unwrap()
@@ -410,9 +410,9 @@ async fn reorder_to_root_makes_a_commit_the_first() {
     let top = shas(&server).await[0].clone();
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
-            sha: top,
-            new_parent_sha: "root".into(),
-            child_sha: None,
+            commit: top,
+            new_parent: "root".into(),
+            child: None,
         }))
         .await
         .unwrap()
@@ -443,9 +443,9 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
-                sha: merge.sha.clone(),
-                new_parent_sha: base.sha.clone(),
-                child_sha: None,
+                commit: merge.sha.clone(),
+                new_parent: base.sha.clone(),
+                child: None,
             }))
             .await,
     );
@@ -454,9 +454,9 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
-                sha: main1.sha.clone(),
-                new_parent_sha: main1.sha.clone(),
-                child_sha: None,
+                commit: main1.sha.clone(),
+                new_parent: main1.sha.clone(),
+                child: None,
             }))
             .await,
     );
@@ -465,9 +465,9 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
-                sha: main1.sha.clone(),
-                new_parent_sha: base.sha.clone(),
-                child_sha: None,
+                commit: main1.sha.clone(),
+                new_parent: base.sha.clone(),
+                child: None,
             }))
             .await,
     );
@@ -497,21 +497,21 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
-                sha: top.sha.clone(),
-                new_parent_sha: base.sha.clone(),
-                child_sha: None,
+                commit: top.sha.clone(),
+                new_parent: base.sha.clone(),
+                child: None,
             }))
             .await,
     );
-    assert!(err.message.contains("child_sha"), "unexpected error: {}", err.message);
+    assert!(err.message.contains("child to pick"), "unexpected error: {}", err.message);
     assert!(err.message.contains("main-1") && err.message.contains("side-1"));
 
     // Disambiguated: splice between base and main-1.
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
-            sha: top.sha.clone(),
-            new_parent_sha: base.sha.clone(),
-            child_sha: Some(main1.sha.clone()),
+            commit: top.sha.clone(),
+            new_parent: base.sha.clone(),
+            child: Some(main1.sha.clone()),
         }))
         .await
         .unwrap()
@@ -537,7 +537,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
 
     let target = shas(&server).await[1].clone();
     let resp = server
-        .drop_commit(Parameters(DropCommitReq { sha: target.clone() }))
+        .drop_commit(Parameters(DropCommitReq { commit: target.clone() }))
         .await
         .unwrap()
         .0;
@@ -560,9 +560,9 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     let first = shas(&server).await[1].clone();
     let result = server
         .restore_commit(Parameters(RestoreCommitReq {
-            sha: target,
-            new_parent_sha: first,
-            child_sha: None,
+            commit: target,
+            new_parent: first,
+            child: None,
         }))
         .await
         .unwrap()
@@ -588,16 +588,16 @@ async fn drop_refuses_merges_and_unknown_restores() {
         .0;
     let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
     let err = expect_err(
-        server.drop_commit(Parameters(DropCommitReq { sha: merge.sha.clone() })).await,
+        server.drop_commit(Parameters(DropCommitReq { commit: merge.sha.clone() })).await,
     );
     assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
 
     let err = expect_err(
         server
             .restore_commit(Parameters(RestoreCommitReq {
-                sha: merge.sha.clone(),
-                new_parent_sha: "root".into(),
-                child_sha: None,
+                commit: merge.sha.clone(),
+                new_parent: "root".into(),
+                child: None,
             }))
             .await,
     );
@@ -625,8 +625,8 @@ async fn squash(
 ) -> SaveResultDto {
     server
         .squash_commit(Parameters(SquashCommitReq {
-            source_sha: source.into(),
-            dest_sha: dest.into(),
+            source: source.into(),
+            dest: dest.into(),
             mode: mode.map(str::to_string),
         }))
         .await
@@ -703,7 +703,7 @@ async fn squash_from_the_trash_restores_and_folds() {
 
     let listed = shas(&server).await;
     let dropped = server
-        .drop_commit(Parameters(DropCommitReq { sha: listed[1].clone() }))
+        .drop_commit(Parameters(DropCommitReq { commit: listed[1].clone() }))
         .await
         .unwrap()
         .0;
@@ -737,8 +737,8 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let err = expect_err(
         server
             .squash_commit(Parameters(SquashCommitReq {
-                source_sha: merge.sha.clone(),
-                dest_sha: base.sha.clone(),
+                source: merge.sha.clone(),
+                dest: base.sha.clone(),
                 mode: None,
             }))
             .await,
@@ -749,8 +749,8 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let err = expect_err(
         server
             .squash_commit(Parameters(SquashCommitReq {
-                source_sha: main1.sha.clone(),
-                dest_sha: base.sha.clone(),
+                source: main1.sha.clone(),
+                dest: base.sha.clone(),
                 mode: Some("merge".into()),
             }))
             .await,
@@ -759,21 +759,21 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
 }
 
 #[tokio::test]
-async fn mutations_reject_a_stale_sha() {
+async fn mutations_reject_a_stale_ref() {
     let dir = TempDir::new().unwrap();
     init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second")]);
     let server = open_server(dir.path());
 
     let stale = shas(&server).await[0].clone();
     server
-        .edit_message(Parameters(EditMessageReq { sha: stale.clone(), message: "new".into() }))
+        .edit_message(Parameters(EditMessageReq { commit: stale.clone(), message: "new".into() }))
         .await
         .unwrap();
 
     // The pre-rewrite sha is gone from the branch now.
     let err = expect_err(
         server
-            .edit_message(Parameters(EditMessageReq { sha: stale, message: "again".into() }))
+            .edit_message(Parameters(EditMessageReq { commit: stale, message: "again".into() }))
             .await,
     );
     assert!(
@@ -781,4 +781,146 @@ async fn mutations_reject_a_stale_sha() {
         "the error should point at re-listing: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn a_sha_prefix_addresses_a_commit() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            commit: target[..8].to_string(),
+            message: "first, by prefix".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first, by prefix"]);
+}
+
+#[tokio::test]
+async fn a_change_id_chains_mutations_without_relisting() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let history = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    let change_id = history.commits[1].change_id.clone();
+
+    // Two mutations by the same change id, no list_history in between: the
+    // first rewrite churns the sha, the change id still addresses the commit.
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            commit: change_id.clone(),
+            message: "first, chained".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+    let result = server
+        .edit_identity(Parameters(EditIdentityReq {
+            commit: change_id.clone(),
+            author_name: Some("Chained Author".into()),
+            author_email: None,
+            author_time: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    let listed = server
+        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(listed.commits[1].subject, "first, chained");
+    assert_eq!(listed.commits[1].author_name, "Chained Author");
+    assert_eq!(listed.commits[1].change_id, change_id);
+}
+
+#[tokio::test]
+async fn a_too_short_ref_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    let err = expect_err(
+        server
+            .edit_message(Parameters(EditMessageReq { commit: "abc".into(), message: "x".into() }))
+            .await,
+    );
+    assert!(err.message.contains("too short"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn squash_prefers_a_history_match_over_the_trash() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path());
+    let server = open_server(dir.path());
+
+    // Drop "follow-up", then undo: the identical commit now sits in the
+    // history *and* (stale) in the trash under the same ids.
+    let listed = shas(&server).await;
+    let dropped = server
+        .drop_commit(Parameters(DropCommitReq { commit: listed[1].clone() }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&dropped.result);
+    server.undo().await.unwrap();
+    assert_eq!(git_log_subjects(dir.path()), ["third", "follow-up", "target"]);
+    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+
+    // The duplicated ref resolves to the history commit: a plain in-history
+    // squash that leaves the stale trash entry alone.
+    let target = shas(&server).await[2].clone();
+    let result = squash(&server, &dropped.dropped.sha, &target, None).await;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
+    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+}
+
+#[tokio::test]
+async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let dropped = server
+        .drop_commit(Parameters(DropCommitReq { commit: target }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&dropped.result);
+
+    let shown = server
+        .show_commit(Parameters(ShowCommitReq {
+            commit: dropped.dropped.change_id[..8].to_string(),
+            include_contents: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(shown.commit.subject, "second");
+    assert_eq!(shown.files[0].path, "b.txt");
 }

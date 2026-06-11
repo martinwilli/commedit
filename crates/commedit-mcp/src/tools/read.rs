@@ -11,12 +11,12 @@ use crate::dto::{
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::limited_history;
+use crate::session::{limited_history, resolve_ref, RefEntry};
 
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation — re-list instead of reusing them."
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
     )]
     pub async fn list_history(
         &self,
@@ -48,7 +48,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history sha, a working-copy entry sha (the uncommitted diff) or a trashed commit's sha. Set include_contents to also get each text file's full old/new content."
+        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content."
     )]
     pub async fn show_commit(
         &self,
@@ -56,25 +56,23 @@ impl CommeditServer {
     ) -> Result<Json<ShowCommitResp>, ErrorData> {
         self.with_session(move |repo, trash| {
             let (_, commits) = crate::session::full_history(repo)?;
-            let info = commits
-                .iter()
-                .find(|c| c.id_hex() == req.sha)
-                .cloned()
-                .or_else(|| {
-                    repo.working_copy_chain()
-                        .into_iter()
-                        .map(|e| e.info)
-                        .find(|i| i.id_hex() == req.sha)
-                })
-                .or_else(|| trash.entries.iter().find(|c| c.id_hex() == req.sha).cloned())
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "commit {} not found in the branch history, the working copy or the \
-                         trash; shas change after every mutation — call list_history for \
-                         fresh ones",
-                        req.sha
-                    ))
-                })?;
+            // One union in precedence order — history, working copy, trash —
+            // so a ref present in several sets resolves to the history commit.
+            let mut entries: Vec<RefEntry<_>> =
+                commits.iter().map(|c| RefEntry::of(c, c.clone())).collect();
+            entries.extend(
+                repo.working_copy_chain()
+                    .into_iter()
+                    .map(|e| RefEntry::of(&e.info, e.info.clone())),
+            );
+            entries.extend(trash.entries.iter().map(|c| RefEntry::of(c, c.clone())));
+            let info = resolve_ref(&req.commit, entries, || {
+                invalid(format!(
+                    "commit {} not found in the branch history, the working copy or the \
+                     trash; use the stable change_id or call list_history for fresh refs",
+                    req.commit
+                ))
+            })?;
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
             let include = req.include_contents.unwrap_or(false);

@@ -46,10 +46,12 @@ reachable from HEAD can be edited (message, identity, file contents), split, \
 reordered, dropped or squashed, and its descendants are rebased automatically. \
 The repository stays a plain git repo throughout — no jj state is left behind.
 
-Addressing: commits are addressed by full sha. Every mutation rewrites the \
-target and its descendants, so shas change constantly — call list_history for \
-fresh shas rather than reusing earlier ones. The change_id is the stable \
-identity of a logical commit across rewrites.
+Addressing: every tool that takes a commit accepts its sha or its change_id, \
+full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
+rewrite the target and its descendants, so shas change constantly; the \
+change_id is stable across rewrites — address commits by change_id to chain \
+mutations without re-listing history. An ambiguous prefix fails listing its \
+matches; list_history shows both ids.
 
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \

@@ -19,8 +19,8 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
-    ensure_not_pending, find_commit, find_trashed, full_history, plan_splice, save_result,
-    PendingTrashOp, SpliceTarget, TrashState,
+    ensure_not_pending, find_commit, find_trashed, full_history, lookup_ref, plan_splice,
+    resolve_ref, save_result, PendingTrashOp, RefEntry, SpliceTarget, TrashState,
 };
 
 /// Run a mutation whose trash effect is staged: on an engine error the staged
@@ -70,7 +70,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let outcome = repo
                 .rewrite_message(&commits[idx].id, &req.message)
                 .map_err(internal)?;
@@ -90,7 +90,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let c = &commits[idx];
             let identity = Identity {
                 author_name: req.author_name.unwrap_or_else(|| c.author_name.clone()),
@@ -123,7 +123,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let files = file_pairs(req.files)?;
             let outcome = repo.rewrite_files(&commits[idx].id, &files).map_err(internal)?;
             Ok(save_result(repo, &outcome))
@@ -142,7 +142,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let files = file_pairs(req.files)?;
             let outcome = repo.split_commit(&commits[idx].id, &files).map_err(internal)?;
             Ok(save_result(repo, &outcome))
@@ -161,7 +161,7 @@ impl CommeditServer {
         self.with_session(move |repo, trash| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let id = repo.plan_drop(&commits, idx).ok_or_else(|| {
                 invalid(
                     "this commit cannot be dropped: merge commits and the branch's only \
@@ -181,7 +181,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Move a commit to another place in the history: new_parent_sha names the commit that becomes its parent (or `root` for the very first position). A true rebase — commits that don't commute report conflicts. Merge commits cannot be moved."
+        description = "Move a commit to another place in the history: new_parent names the commit that becomes its parent (or `root` for the very first position). A true rebase — commits that don't commute report conflicts. Merge commits cannot be moved."
     )]
     pub async fn reorder_commit(
         &self,
@@ -190,13 +190,13 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.sha)?;
+            let idx = find_commit(&commits, &req.commit)?;
             let mv = plan_splice(
                 repo,
                 &commits,
                 SpliceTarget::InHistory(idx),
-                &req.new_parent_sha,
-                req.child_sha.as_deref(),
+                &req.new_parent,
+                req.child.as_deref(),
             )?;
             let outcome = repo
                 .reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
@@ -208,7 +208,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Graft a trashed commit (see list_trash) back into the history, like reorder_commit: new_parent_sha names the commit that becomes its parent (or `root`). On success it leaves the trash."
+        description = "Graft a trashed commit (see list_trash) back into the history, like reorder_commit: new_parent names the commit that becomes its parent (or `root`). On success it leaves the trash."
     )]
     pub async fn restore_commit(
         &self,
@@ -216,14 +216,14 @@ impl CommeditServer {
     ) -> Result<Json<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, trash| {
             ensure_not_pending(repo)?;
-            let info = find_trashed(trash, &req.sha)?;
+            let info = find_trashed(trash, &req.commit)?;
             let (_, commits) = full_history(repo)?;
             let mv = plan_splice(
                 repo,
                 &commits,
                 SpliceTarget::Trashed(info.clone()),
-                &req.new_parent_sha,
-                req.child_sha.as_deref(),
+                &req.new_parent,
+                req.child.as_deref(),
             )?;
             let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {
                 repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
@@ -244,15 +244,21 @@ impl CommeditServer {
         self.with_session(move |repo, trash| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
-            let dest_idx = find_commit(&commits, &req.dest_sha).map_err(|_| {
+            let dest_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
+            let dest_idx = resolve_ref(&req.dest, dest_entries.collect(), || {
                 invalid(format!(
-                    "dest_sha {} is not in the current branch history; call list_history \
-                     for fresh shas",
-                    req.dest_sha
+                    "dest {} is not in the current branch history; use a ref from \
+                     list_history",
+                    req.dest
                 ))
             })?;
 
-            if let Ok(src_idx) = find_commit(&commits, &req.source_sha) {
+            // History first, then the trash — so after a drop + undo, where
+            // the identical commit sits in both, the ref means the live one.
+            // An ambiguity *inside* the history errors immediately rather
+            // than falling through to the trash.
+            let src_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
+            if let Some(src_idx) = lookup_ref(&req.source, src_entries.collect())? {
                 let mode = resolve_squash_mode(req.mode.as_deref(), &commits[src_idx].subject)
                     .map_err(invalid)?;
                 let (src, dest) = repo.plan_squash(&commits, src_idx, dest_idx).ok_or_else(|| {
@@ -264,10 +270,12 @@ impl CommeditServer {
                 let outcome = repo.squash_into(&src, &dest, mode).map_err(internal)?;
                 Ok(save_result(repo, &outcome))
             } else {
-                let info = find_trashed(trash, &req.source_sha).map_err(|_| {
+                let trash_entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone()));
+                let info = resolve_ref(&req.source, trash_entries.collect(), || {
                     invalid(format!(
-                        "source {} is neither in the branch history nor in the trash",
-                        req.source_sha
+                        "source {} is neither in the branch history nor in the trash \
+                         (see list_history / list_trash)",
+                        req.source
                     ))
                 })?;
                 let mode =

@@ -12,7 +12,7 @@ use crate::dto::{
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::save_result;
+use crate::session::{find_conflicted, save_result};
 
 #[tool_router(router = router_conflict, vis = "pub")]
 impl CommeditServer {
@@ -38,7 +38,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by its change_id (shas churn on every resolution step). Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
+        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
     )]
     pub async fn read_conflict(
         &self,
@@ -48,15 +48,8 @@ impl CommeditServer {
             let conflicts = repo
                 .pending_conflicts()
                 .ok_or_else(|| invalid("no conflicted rewrite is pending"))?;
-            let commit = conflicts
-                .iter()
-                .find(|c| c.change_id_hex() == req.change_id)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "change {} is not conflicted (see pending_status)",
-                        req.change_id
-                    ))
-                })?;
+            let commit = &conflicts[find_conflicted(conflicts, &req.commit)?];
+            let change_hex = commit.change_id_hex();
             let path = commit
                 .files
                 .iter()
@@ -65,7 +58,7 @@ impl CommeditServer {
                     invalid(format!(
                         "{} is not a conflicted path of change {}; its conflicted files are: {}",
                         req.path,
-                        req.change_id,
+                        change_hex,
                         commit
                             .files
                             .iter()
@@ -81,7 +74,7 @@ impl CommeditServer {
                     req.path
                 )));
             }
-            let file = repo.read_conflict(&req.change_id, &req.path).map_err(internal)?;
+            let file = repo.read_conflict(&change_hex, &req.path).map_err(internal)?;
             Ok(ReadConflictResp {
                 text: file.text,
                 marker_len: file.marker_len,
@@ -106,13 +99,16 @@ impl CommeditServer {
             if req.files.is_empty() {
                 return Err(invalid("files must not be empty"));
             }
+            let conflicts = repo.pending_conflicts().unwrap_or(&[]);
+            let change_hex =
+                conflicts[find_conflicted(conflicts, &req.commit)?].change_id_hex();
             let files: Vec<(String, String, usize)> = req
                 .files
                 .into_iter()
                 .map(|f| (f.path, f.text, f.marker_len))
                 .collect();
             let outcome = repo
-                .resolve_conflicts(&req.change_id, &files)
+                .resolve_conflicts(&change_hex, &files)
                 .map_err(internal)?;
             trash.settle(&outcome);
             Ok(save_result(repo, &outcome))

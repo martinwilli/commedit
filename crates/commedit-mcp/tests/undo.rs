@@ -19,7 +19,7 @@ async fn edit_tip_message(server: &commedit_mcp::server::CommeditServer, message
         .0;
     let result = server
         .edit_message(Parameters(EditMessageReq {
-            sha: history.commits[0].sha.clone(),
+            commit: history.commits[0].sha.clone(),
             message: message.into(),
         }))
         .await
@@ -114,7 +114,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
         .unwrap()
         .0;
     let dropped = server
-        .drop_commit(Parameters(DropCommitReq { sha: history.commits[1].sha.clone() }))
+        .drop_commit(Parameters(DropCommitReq { commit: history.commits[1].sha.clone() }))
         .await
         .unwrap()
         .0;
@@ -137,9 +137,9 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
     let err = expect_err(
         server
             .restore_commit(Parameters(RestoreCommitReq {
-                sha: dropped.dropped.sha.clone(),
-                new_parent_sha: bottom,
-                child_sha: None,
+                commit: dropped.dropped.sha.clone(),
+                new_parent: bottom,
+                child: None,
             }))
             .await,
     );
@@ -160,7 +160,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
         .unwrap()
         .0;
     server
-        .drop_commit(Parameters(DropCommitReq { sha: history.commits[1].sha.clone() }))
+        .drop_commit(Parameters(DropCommitReq { commit: history.commits[1].sha.clone() }))
         .await
         .unwrap();
     assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
@@ -209,7 +209,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
-            sha: a.sha.clone(),
+            commit: a.sha.clone(),
             files: vec![FileContentDto { path: "f.txt".into(), content: "1\nX\n3\n".into() }],
         }))
         .await

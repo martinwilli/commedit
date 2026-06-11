@@ -23,19 +23,15 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    let path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
-    let path = PathBuf::from(path);
+    let path = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_string()));
 
     // Repo::open does blocking git/jj work; keep it off the async runtime.
-    let repo = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || commedit_engine::repo::Repo::open(&path))
-            .await
-            .context("opening repository")??
-    };
+    let repo = tokio::task::spawn_blocking(move || commedit_engine::repo::Repo::open(&path))
+        .await
+        .context("opening repository")??;
     tracing::info!(root = %repo.workspace_root().display(), "repository opened");
 
-    let server = commedit_mcp::server::CommeditServer::new(repo, path);
+    let server = commedit_mcp::server::CommeditServer::new(repo);
     let service = server.serve(stdio()).await.context("starting MCP server")?;
     service.waiting().await.context("serving MCP")?;
     Ok(())

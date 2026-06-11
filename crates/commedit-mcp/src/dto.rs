@@ -27,8 +27,8 @@ pub struct CommitDto {
     pub change_id: String,
     /// First line of the commit message.
     pub subject: String,
-    /// Merge commits cannot be reordered, dropped, split or used as a squash
-    /// source (squashing *into* one is fine).
+    /// Merge commits cannot be reordered, dropped, split, reverted,
+    /// cherry-picked or used as a squash source (squashing *into* one is fine).
     pub is_merge: bool,
     /// Local branches and tags pointing at this commit.
     pub refs: Vec<RefDto>,

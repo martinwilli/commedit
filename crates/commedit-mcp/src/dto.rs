@@ -523,8 +523,15 @@ pub struct DropCommitReq {
     pub commit: String,
 }
 
+/// The result of `drop_commit`. The mutation outcome's `status` and fields are
+/// flattened to the top level — uniform with every other mutation's bare
+/// `SaveResultDto` — and `dropped` rides alongside as an extra sibling.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DropCommitResp {
+    /// The mutation outcome, flattened in: `status` (`clean`/`conflicts`) and
+    /// its fields sit at this object's top level, exactly as the other
+    /// mutations return them.
+    #[serde(flatten)]
     pub result: SaveResultDto,
     /// The dropped commit, now in the session trash. Its `parent_shas` say
     /// where it sat — useful when restoring it later.
@@ -718,4 +725,41 @@ pub struct TimeTravelResp {
 pub struct ReloadResp {
     /// The branch tip after the fresh import.
     pub head_sha: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_commit_resp_flattens_status_to_the_top_level() {
+        // drop_commit must report its outcome like every other mutation —
+        // `status` at the top level — with `dropped` as an extra sibling, not a
+        // result nested under `result`.
+        let resp = DropCommitResp {
+            result: SaveResultDto::Clean { head_sha: Some("abc123".into()) },
+            dropped: CommitDto {
+                sha: "def456".into(),
+                change_id: "zzzz".into(),
+                subject: "dropped one".into(),
+                is_merge: false,
+                refs: Vec::new(),
+                detail: CommitDetailDto {
+                    description: None,
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                    parent_shas: None,
+                },
+            },
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "clean");
+        assert_eq!(v["head_sha"], "abc123");
+        assert!(v.get("result").is_none(), "status must not stay nested under `result`");
+        assert_eq!(v["dropped"]["sha"], "def456");
+    }
 }

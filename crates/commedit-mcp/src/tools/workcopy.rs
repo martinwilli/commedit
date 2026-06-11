@@ -64,7 +64,7 @@ impl CommeditServer {
                 return Err(invalid("the working copy is clean — nothing to fold"));
             }
             let (_, commits) = full_history(repo)?;
-            let idx = find_commit(&commits, &req.dest_sha)?;
+            let idx = find_commit(&commits, &req.dest)?;
             let outcome = repo
                 .squash_working_copy_into(None, &commits[idx].id)
                 .map_err(internal)?;

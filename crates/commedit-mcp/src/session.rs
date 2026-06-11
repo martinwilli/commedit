@@ -146,7 +146,7 @@ pub enum SpliceTarget {
     Trashed(CommitInfo),
 }
 
-/// Resolve the agent-facing move semantics — "make `new_parent_sha` the
+/// Resolve the agent-facing move semantics — "make `new_parent` the
 /// parent of the moved commit" (`"root"` = make it the repository's first
 /// commit) — to the one concrete splice the graph planner offers, or a precise
 /// error naming the alternatives.
@@ -154,8 +154,8 @@ pub fn plan_splice(
     repo: &Repo,
     commits: &[CommitInfo],
     target: SpliceTarget,
-    new_parent_sha: &str,
-    child_sha: Option<&str>,
+    new_parent: &str,
+    child: Option<&str>,
 ) -> Result<ReorderMove, ErrorData> {
     let layout = compute_graph(commits, &repo.root_commit_id());
 
@@ -163,13 +163,13 @@ pub fn plan_splice(
     // between display rows i-1 and i, so the gap whose lower neighbor is the
     // parent P at index i is gap i; "root" is the synthetic gap below the
     // oldest row (commits.len()).
-    let (to, parent_id) = if new_parent_sha == "root" {
+    let (to, parent_id) = if new_parent == "root" {
         (commits.len(), repo.root_commit_id())
     } else {
-        let idx = find_commit(commits, new_parent_sha)
+        let idx = find_commit(commits, new_parent)
             .map_err(|_| invalid(format!(
-                "new_parent_sha {new_parent_sha} is not in the current branch history; \
-                 use a sha from list_history or the literal \"root\""
+                "new_parent {new_parent} is not in the current branch history; \
+                 use a ref from list_history or the literal \"root\""
             )))?;
         (idx, commits[idx].id.clone())
     };
@@ -185,7 +185,7 @@ pub fn plan_splice(
             }
             if moved.parents[0] == parent_id {
                 return Err(invalid(format!(
-                    "commit {} is already a child of {new_parent_sha}",
+                    "commit {} is already a child of {new_parent}",
                     moved.id_hex()
                 )));
             }
@@ -213,12 +213,12 @@ pub fn plan_splice(
                 .collect();
             if offered.is_empty() {
                 Err(invalid(format!(
-                    "no way to splice the commit under {new_parent_sha}: the move is a no-op \
+                    "no way to splice the commit under {new_parent}: the move is a no-op \
                      or the target is not reachable from the branch head"
                 )))
             } else {
                 Err(invalid(format!(
-                    "no ancestry line at that position leads to parent {new_parent_sha}; \
+                    "no ancestry line at that position leads to parent {new_parent}; \
                      the gap's candidate parents are: {}",
                     offered.join(", ")
                 )))
@@ -228,16 +228,16 @@ pub fn plan_splice(
         _ => {
             // A fork: several child lines converge on the parent. The caller
             // picks which child the moved commit goes under.
-            if let Some(child) = child_sha {
+            if let Some(child) = child {
                 let child_id = CommitId::try_from_hex(child)
-                    .ok_or_else(|| invalid(format!("invalid child_sha {child:?}")))?;
+                    .ok_or_else(|| invalid(format!("invalid child {child:?}")))?;
                 matching
                     .into_iter()
                     .find(|mv| mv.new_children.contains(&child_id))
                     .ok_or_else(|| {
                         invalid(format!(
-                            "child_sha {child} is not a child on any line converging on \
-                             {new_parent_sha}"
+                            "child {child} is not a child on any line converging on \
+                             {new_parent}"
                         ))
                     })
             } else {
@@ -253,7 +253,7 @@ pub fn plan_splice(
                     })
                     .collect();
                 Err(invalid(format!(
-                    "several lines converge on {new_parent_sha}; pass child_sha to pick which \
+                    "several lines converge on {new_parent}; pass child to pick which \
                      child the commit goes under: {}",
                     choices.join(" | ")
                 )))

@@ -28,7 +28,7 @@ async fn uncommitted_changes_survive_a_rewrite() {
         .0;
     let result = server
         .edit_message(Parameters(EditMessageReq {
-            sha: history.commits[1].sha.clone(),
+            commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
         .await
@@ -63,7 +63,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     let err = expect_err(
         server
             .squash_working_copy(Parameters(SquashWorkingCopyReq {
-                dest_sha: first.sha.clone(),
+                dest: first.sha.clone(),
             }))
             .await,
     );
@@ -72,7 +72,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     // Fold a dirty a.txt into the bottom commit ("first" introduced a.txt).
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let result = server
-        .squash_working_copy(Parameters(SquashWorkingCopyReq { dest_sha: first.sha }))
+        .squash_working_copy(Parameters(SquashWorkingCopyReq { dest: first.sha }))
         .await
         .unwrap()
         .0;
@@ -136,7 +136,7 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
         .0;
     server
         .edit_message(Parameters(EditMessageReq {
-            sha: history.commits[1].sha.clone(),
+            commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
         .await

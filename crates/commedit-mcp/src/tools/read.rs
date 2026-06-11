@@ -58,21 +58,21 @@ impl CommeditServer {
             let (_, commits) = crate::session::full_history(repo)?;
             let info = commits
                 .iter()
-                .find(|c| c.id_hex() == req.sha)
+                .find(|c| c.id_hex() == req.commit)
                 .cloned()
                 .or_else(|| {
                     repo.working_copy_chain()
                         .into_iter()
                         .map(|e| e.info)
-                        .find(|i| i.id_hex() == req.sha)
+                        .find(|i| i.id_hex() == req.commit)
                 })
-                .or_else(|| trash.entries.iter().find(|c| c.id_hex() == req.sha).cloned())
+                .or_else(|| trash.entries.iter().find(|c| c.id_hex() == req.commit).cloned())
                 .ok_or_else(|| {
                     invalid(format!(
                         "commit {} not found in the branch history, the working copy or the \
                          trash; shas change after every mutation — call list_history for \
                          fresh ones",
-                        req.sha
+                        req.commit
                     ))
                 })?;
             let refs = repo.commit_refs();

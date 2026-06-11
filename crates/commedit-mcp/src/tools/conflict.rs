@@ -50,11 +50,11 @@ impl CommeditServer {
                 .ok_or_else(|| invalid("no conflicted rewrite is pending"))?;
             let commit = conflicts
                 .iter()
-                .find(|c| c.change_id_hex() == req.change_id)
+                .find(|c| c.change_id_hex() == req.commit)
                 .ok_or_else(|| {
                     invalid(format!(
                         "change {} is not conflicted (see pending_status)",
-                        req.change_id
+                        req.commit
                     ))
                 })?;
             let path = commit
@@ -65,7 +65,7 @@ impl CommeditServer {
                     invalid(format!(
                         "{} is not a conflicted path of change {}; its conflicted files are: {}",
                         req.path,
-                        req.change_id,
+                        req.commit,
                         commit
                             .files
                             .iter()
@@ -81,7 +81,7 @@ impl CommeditServer {
                     req.path
                 )));
             }
-            let file = repo.read_conflict(&req.change_id, &req.path).map_err(internal)?;
+            let file = repo.read_conflict(&req.commit, &req.path).map_err(internal)?;
             Ok(ReadConflictResp {
                 text: file.text,
                 marker_len: file.marker_len,
@@ -112,7 +112,7 @@ impl CommeditServer {
                 .map(|f| (f.path, f.text, f.marker_len))
                 .collect();
             let outcome = repo
-                .resolve_conflicts(&req.change_id, &files)
+                .resolve_conflicts(&req.commit, &files)
                 .map_err(internal)?;
             trash.settle(&outcome);
             Ok(save_result(repo, &outcome))

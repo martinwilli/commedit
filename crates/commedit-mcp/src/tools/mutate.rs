@@ -107,19 +107,14 @@ impl CommeditServer {
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
             let c = &commits[idx];
+            let id = req.identity;
             let identity = Identity {
-                author_name: req.author_name.unwrap_or_else(|| c.author_name.clone()),
-                author_email: req.author_email.unwrap_or_else(|| c.author_email.clone()),
-                author_time: req.author_time.unwrap_or_else(|| c.author_time.clone()),
-                committer_name: req
-                    .committer_name
-                    .unwrap_or_else(|| c.committer_name.clone()),
-                committer_email: req
-                    .committer_email
-                    .unwrap_or_else(|| c.committer_email.clone()),
-                committer_time: req
-                    .committer_time
-                    .unwrap_or_else(|| c.committer_time.clone()),
+                author_name: id.author_name.unwrap_or_else(|| c.author_name.clone()),
+                author_email: id.author_email.unwrap_or_else(|| c.author_email.clone()),
+                author_time: id.author_time.unwrap_or_else(|| c.author_time.clone()),
+                committer_name: id.committer_name.unwrap_or_else(|| c.committer_name.clone()),
+                committer_email: id.committer_email.unwrap_or_else(|| c.committer_email.clone()),
+                committer_time: id.committer_time.unwrap_or_else(|| c.committer_time.clone()),
             };
             let outcome = repo.rewrite_identity(&c.id, &identity).map_err(internal)?;
             Ok(save_result(repo, &outcome))
@@ -145,12 +140,13 @@ impl CommeditServer {
             for e in req.edits {
                 let idx = find_commit(&commits, &e.commit)?;
                 let c = &commits[idx];
-                let has_identity = e.author_name.is_some()
-                    || e.author_email.is_some()
-                    || e.author_time.is_some()
-                    || e.committer_name.is_some()
-                    || e.committer_email.is_some()
-                    || e.committer_time.is_some();
+                let id = e.identity;
+                let has_identity = id.author_name.is_some()
+                    || id.author_email.is_some()
+                    || id.author_time.is_some()
+                    || id.committer_name.is_some()
+                    || id.committer_email.is_some()
+                    || id.committer_time.is_some();
                 if e.message.is_none() && !has_identity {
                     return Err(invalid(format!(
                         "edit for {} changes nothing: set message or an identity field",
@@ -159,18 +155,12 @@ impl CommeditServer {
                 }
                 let identity = if has_identity {
                     Some(Identity {
-                        author_name: e.author_name.unwrap_or_else(|| c.author_name.clone()),
-                        author_email: e.author_email.unwrap_or_else(|| c.author_email.clone()),
-                        author_time: e.author_time.unwrap_or_else(|| c.author_time.clone()),
-                        committer_name: e
-                            .committer_name
-                            .unwrap_or_else(|| c.committer_name.clone()),
-                        committer_email: e
-                            .committer_email
-                            .unwrap_or_else(|| c.committer_email.clone()),
-                        committer_time: e
-                            .committer_time
-                            .unwrap_or_else(|| c.committer_time.clone()),
+                        author_name: id.author_name.unwrap_or_else(|| c.author_name.clone()),
+                        author_email: id.author_email.unwrap_or_else(|| c.author_email.clone()),
+                        author_time: id.author_time.unwrap_or_else(|| c.author_time.clone()),
+                        committer_name: id.committer_name.unwrap_or_else(|| c.committer_name.clone()),
+                        committer_email: id.committer_email.unwrap_or_else(|| c.committer_email.clone()),
+                        committer_time: id.committer_time.unwrap_or_else(|| c.committer_time.clone()),
                     })
                 } else {
                     None

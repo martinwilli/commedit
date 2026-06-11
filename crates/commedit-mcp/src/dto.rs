@@ -330,15 +330,9 @@ pub struct EditIdentityReq {
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
     pub commit: String,
-    /// New author name; omitted fields keep their current value.
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub author_time: Option<String>,
-    pub committer_name: Option<String>,
-    pub committer_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub committer_time: Option<String>,
+    /// New author/committer fields; omitted fields keep their current value.
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 /// One commit's edit within an `edit_commits` batch. At least one of `message`
@@ -351,15 +345,9 @@ pub struct CommitEditDto {
     pub commit: String,
     /// New full commit message (subject + body). Omit to leave the message.
     pub message: Option<String>,
-    /// New author name; omitted fields keep their current value.
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub author_time: Option<String>,
-    pub committer_name: Option<String>,
-    pub committer_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub committer_time: Option<String>,
+    /// New author/committer fields; omitted fields keep their current value.
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -447,9 +435,11 @@ pub struct SplitCommitReq {
     pub files: Vec<FileContentDto>,
 }
 
-/// Optional author/committer overrides for a newly created commit. Every
-/// omitted field defaults to the repository's git-configured identity at the
-/// current time. Flattened into the create/revert/commit-working-copy requests.
+/// Optional author/committer fields (name, email, date), flattened into the
+/// requests that take an identity. How an *omitted* field is treated is
+/// tool-specific: a new-commit tool (create/revert/cherry_pick/commit_working_copy)
+/// fills it from the repository's git-configured identity at "now"; an edit tool
+/// (edit_identity/edit_commits) keeps the commit's current value.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct IdentityFieldsDto {
     pub author_name: Option<String>,

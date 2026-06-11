@@ -3,9 +3,11 @@
 
 mod common;
 
+use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::{history, history_limited};
 use commedit_engine::repo::Repo;
-use commedit_engine::rewrite::Identity;
+use commedit_engine::rewrite::{BatchEdit, Identity};
+use jj_lib::object_id::ObjectId as _;
 
 #[test]
 fn history_limited_pages_newest_first_and_flags_more() {
@@ -121,6 +123,88 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
     assert_eq!(fields[4], "grace@example.com");
     assert_eq!(fields[5], "2026-06-06 09:00:00 +0000");
 
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn batch_redates_a_parent_and_child_without_restamping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let by = |s: &str| {
+        commits
+            .iter()
+            .find(|c| c.subject == s)
+            .unwrap_or_else(|| panic!("{s} commit present"))
+    };
+    let dated = |a: &str, c: &str| Identity {
+        author_name: "Ada".into(),
+        author_email: "ada@example.com".into(),
+        author_time: a.into(),
+        committer_name: "Ada".into(),
+        committer_email: "ada@example.com".into(),
+        committer_time: c.into(),
+    };
+
+    // Re-date a parent ("first") AND its child ("second"), plus reword "third".
+    // Fed out of topological order to prove the engine sorts ancestors-first.
+    let edits = vec![
+        BatchEdit {
+            target: by("second").id.clone(),
+            message: None,
+            identity: Some(dated("2026-06-11 18:30:00 +0200", "2026-06-11 18:30:00 +0200")),
+        },
+        BatchEdit {
+            target: by("third").id.clone(),
+            message: Some("third (edited)".into()),
+            identity: None,
+        },
+        BatchEdit {
+            target: by("first").id.clone(),
+            message: None,
+            identity: Some(dated("2026-06-11 18:00:00 +0200", "2026-06-11 18:05:00 +0200")),
+        },
+    ];
+    // A pure message/identity batch changes no trees, so the rebase is always
+    // clean — nothing here can conflict.
+    let outcome = repo.rewrite_batch(edits).expect("batch");
+    assert!(matches!(outcome, SaveOutcome::Clean), "batch landed clean");
+
+    // The engine's post-rewrite view: every pinned date stuck. Crucially the
+    // child's committer is the requested value, NOT a re-stamp to "now" — that's
+    // the property the per-commit loop could only get by editing ancestors first.
+    let after = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let a = |s: &str| {
+        after
+            .iter()
+            .find(|c| c.subject == s)
+            .unwrap_or_else(|| panic!("{s} commit present after"))
+    };
+    assert_eq!(a("first").author_time, "2026-06-11 18:00:00 +0200");
+    assert_eq!(a("first").committer_time, "2026-06-11 18:05:00 +0200");
+    assert_eq!(a("second").author_time, "2026-06-11 18:30:00 +0200");
+    assert_eq!(a("second").committer_time, "2026-06-11 18:30:00 +0200");
+
+    // Plain git agrees on the child's pinned committer date (the tripwire), and
+    // sees the reworded tip with descendants intact.
+    let child_sha = a("second").id.hex();
+    let cd = common::git(
+        dir,
+        &["show", "-s", "--format=%cd", "--date=format:%Y-%m-%d %H:%M:%S %z", &child_sha],
+    );
+    assert_eq!(cd, "2026-06-11 18:30:00 +0200");
+    assert_eq!(common::git_log_subjects(dir), vec!["third (edited)", "second", "first"]);
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }

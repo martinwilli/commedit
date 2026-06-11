@@ -9,7 +9,7 @@ use commedit_engine::diff::{
 use gtk::prelude::*;
 use gtk::TextTag;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::Theme;
+use syntect::highlighting::{Style, Theme};
 use syntect::parsing::SyntaxSet;
 
 use crate::conflict::conflict_header_path;
@@ -252,21 +252,7 @@ pub(crate) fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, p
             _ => continue,
         };
         if let Ok(spans) = spans {
-            let mut byte = 0usize;
-            for (style, piece) in spans {
-                if byte >= code.len() {
-                    break;
-                }
-                let plen = piece.len().min(code.len() - byte); // clip the trailing '\n'
-                if plen > 0 {
-                    let cs = prefix + code[..byte].chars().count();
-                    let ce = prefix + code[..byte + plen].chars().count();
-                    let fg = style.foreground;
-                    let hex = format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b);
-                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &fg_tag(buffer, &hex));
-                }
-                byte += plen;
-            }
+            apply_code_spans(buffer, li as i32, prefix, code, &spans);
         }
 
         if !line.intra.is_empty() {
@@ -284,18 +270,110 @@ pub(crate) fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, p
             }
         }
 
-        // Flag trailing whitespace on added lines: like `git diff --check` we
-        // only warn on `+` lines (the content actually being written). Paint
-        // just the trailing space/tab run so the invisible characters surface.
         if line.kind == DiffLineKind::Added {
-            let trimmed = code.trim_end_matches([' ', '\t']);
-            if trimmed.len() < code.len() {
-                if let Some(tag) = buffer.tag_table().lookup("trailing-ws") {
-                    let cs = prefix + trimmed.chars().count();
-                    let ce = prefix + code.chars().count();
-                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &tag);
-                }
+            apply_trailing_ws(buffer, li as i32, prefix, code);
+        }
+    }
+}
+
+/// Re-highlight a single diff line in place — its background, a fresh
+/// single-line syntect pass, and the trailing-whitespace flag — leaving the rest
+/// of the buffer's tags untouched. This is the instant-feedback path for an
+/// in-place edit to an existing line (the `EditPlan::Allow` keystroke the
+/// firewall lets through, which otherwise only repaints via the debounced full
+/// [`highlight_diff`] and so trails the typing). It deliberately skips the
+/// removed/added intra-line word diff (needs the paired line) and uses fresh
+/// per-line parser state (no multi-line constructs); the debounced full pass
+/// then corrects both. `path` only picks the syntect language — the viewport's
+/// file, close enough for one line.
+pub(crate) fn highlight_diff_line(
+    buffer: &sourceview5::Buffer,
+    li: i32,
+    path: Option<&str>,
+    ps: &SyntaxSet,
+    theme: &Theme,
+) {
+    let Some(start) = buffer.iter_at_line(li) else {
+        return;
+    };
+    let end = buffer
+        .iter_at_line(li + 1)
+        .unwrap_or_else(|| buffer.end_iter());
+    let line = buffer.text(&start, &end, false).to_string();
+    let raw = line.strip_suffix('\n').unwrap_or(&line);
+    buffer.remove_all_tags(&start, &end);
+
+    let kind = parse_diff_lines(raw)
+        .first()
+        .map_or(DiffLineKind::Context, |l| l.kind);
+    if let Some(name) = line_bg_tag(kind) {
+        apply_line_tag(buffer, li, name);
+    }
+    match kind {
+        DiffLineKind::Hunk => {
+            paint_diff_pills(buffer, li, raw);
+            return;
+        }
+        DiffLineKind::Meta => {
+            if raw.starts_with("diff --git ") {
+                paint_diff_pills(buffer, li, raw);
             }
+            return;
+        }
+        DiffLineKind::Header => return,
+        _ => {}
+    }
+
+    let syntax = path
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|ext| ps.find_syntax_by_extension(ext))
+        })
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    let prefix = if raw.is_empty() { 0 } else { 1 };
+    let code = &raw[prefix..];
+    let owned = format!("{code}\n");
+    if let Ok(spans) = HighlightLines::new(syntax, theme).highlight_line(&owned, ps) {
+        apply_code_spans(buffer, li, prefix, code, &spans);
+    }
+    if kind == DiffLineKind::Added {
+        apply_trailing_ws(buffer, li, prefix, code);
+    }
+}
+
+/// Paint a `highlight_line` result as syntect foreground-color tags over the
+/// code portion (`code`, past the `prefix`-wide diff marker) of buffer line `li`.
+/// Shared by the full and single-line diff highlighters.
+fn apply_code_spans(buffer: &sourceview5::Buffer, li: i32, prefix: usize, code: &str, spans: &[(Style, &str)]) {
+    let mut byte = 0usize;
+    for (style, piece) in spans {
+        if byte >= code.len() {
+            break;
+        }
+        let plen = piece.len().min(code.len() - byte); // clip the trailing '\n'
+        if plen > 0 {
+            let cs = prefix + code[..byte].chars().count();
+            let ce = prefix + code[..byte + plen].chars().count();
+            let fg = style.foreground;
+            let hex = format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b);
+            apply_cols(buffer, li, cs as i32, ce as i32, &fg_tag(buffer, &hex));
+        }
+        byte += plen;
+    }
+}
+
+/// Flag the trailing space/tab run on an added line's `code` (past the
+/// `prefix`-wide marker), if any — like `git diff --check`, only `+` lines (the
+/// content actually written) get this, so the invisible characters surface.
+fn apply_trailing_ws(buffer: &sourceview5::Buffer, li: i32, prefix: usize, code: &str) {
+    let trimmed = code.trim_end_matches([' ', '\t']);
+    if trimmed.len() < code.len() {
+        if let Some(tag) = buffer.tag_table().lookup("trailing-ws") {
+            let cs = prefix + trimmed.chars().count();
+            let ce = prefix + code.chars().count();
+            apply_cols(buffer, li, cs as i32, ce as i32, &tag);
         }
     }
 }

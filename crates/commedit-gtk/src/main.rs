@@ -780,6 +780,26 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Instant, line-local re-highlight of one buffer line — the responsive path
+    // for an in-place keystroke the firewall lets through (`EditPlan::Allow`),
+    // which otherwise only repaints via the 60ms debounced full pass and so
+    // trails the typing. Diff pane only; the debounced pass still fixes anything
+    // needing cross-line state.
+    let highlight_line: Rc<dyn Fn(i32)> = {
+        let file_buffer = file_buffer.clone();
+        let current_file = current_file.clone();
+        let syntax_set = syntax_set.clone();
+        let theme = theme.clone();
+        let pane_mode = pane_mode.clone();
+        Rc::new(move |li: i32| {
+            if pane_mode.borrow().is_conflict() {
+                return;
+            }
+            let path = current_file.borrow().clone();
+            highlight_diff_line(&file_buffer, li, path.as_deref(), &syntax_set, &theme);
+        })
+    };
+
     // Hunks of the diff currently in the buffer, so an expand click can hit-test
     // the cue it lands on and re-render that hunk's widened context.
     let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1081,10 +1101,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     file_buffer.connect_changed({
         let collapse = collapse.clone();
         let highlight = highlight.clone();
+        let highlight_line = highlight_line.clone();
         let highlight_gen = highlight_gen.clone();
         let editing = editing.clone();
         let update_split_sensitivity = update_split_sensitivity.clone();
-        move |_| {
+        move |buffer| {
             // Track Split-button sensitivity on every change, including programmatic
             // renders (a load leaves an unedited diff -> insensitive).
             update_split_sensitivity();
@@ -1093,6 +1114,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if editing.get() {
                 return;
             }
+            // Repaint the edited line now so its colors and trailing-whitespace
+            // flag track the keystroke; the debounced full pass below then fixes
+            // cross-line state (multi-line syntax, the intra-line word diff).
+            highlight_line(buffer.iter_at_offset(buffer.cursor_position()).line());
             let mine = {
                 let mut g = highlight_gen.borrow_mut();
                 *g = g.wrapping_add(1);

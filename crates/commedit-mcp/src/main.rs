@@ -5,8 +5,6 @@
 //! the GTK app via the engine's `find_git_root`). The MCP client owns the
 //! process lifecycle — one server instance is one editing session.
 
-mod server;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -37,7 +35,7 @@ async fn main() -> Result<()> {
     };
     tracing::info!(root = %repo.workspace_root().display(), "repository opened");
 
-    let server = server::CommeditServer::new(repo, path);
+    let server = commedit_mcp::server::CommeditServer::new(repo, path);
     let service = server.serve(stdio()).await.context("starting MCP server")?;
     service.waiting().await.context("serving MCP")?;
     Ok(())

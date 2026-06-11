@@ -13,9 +13,9 @@ use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::{commit_dto, resolve_squash_mode};
 use crate::dto::{
-    CreateCommitReq, DropCommitReq, DropCommitResp, EditIdentityReq, EditMessageReq,
-    FileContentDto, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, RevertCommitReq,
-    SaveResultDto, SplitCommitReq, SquashCommitReq,
+    CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditIdentityReq,
+    EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq,
+    RevertCommitReq, SaveResultDto, SplitCommitReq, SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -228,6 +228,42 @@ impl CommeditServer {
             let identity = new_commit_identity(repo, req.identity);
             let outcome = repo
                 .revert_commit(&target, mv.new_parents, mv.new_children, identity.as_ref())
+                .map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Create a commit that re-applies another commit's change (its forward diff, like `git cherry-pick`) and insert it into history. The source may live OUTSIDE the current branch — pass a commit on another branch by its full sha (from `git log <branch>`); its branch is never touched. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where the copy goes. By default the source's author is preserved and the committer is stamped afresh (git's `cherry-pick -x`, recording a provenance trailer). The pick may conflict where the insertion point diverged from the source. Merge commits cannot be cherry-picked."
+    )]
+    pub async fn cherry_pick_commit(
+        &self,
+        Parameters(req): Parameters<CherryPickCommitReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            let (head, commits) = full_history(repo)?;
+            // Resolve in-history refs (sha/change id/prefix) as usual; fall back
+            // to a direct ODB load for a full sha that names a commit off the
+            // branch. Keep find_commit's error otherwise, so an ambiguous or
+            // too-short in-history prefix still reports precisely.
+            let target = match find_commit(&commits, &req.commit) {
+                Ok(idx) => commits[idx].id.clone(),
+                Err(e) => repo.lookup_commit_in_store(&req.commit).ok_or(e)?,
+            };
+            let new_parent = req.new_parent.unwrap_or_else(|| head.hex());
+            let mv = plan_splice(
+                repo,
+                &commits,
+                SpliceTarget::New,
+                &new_parent,
+                req.child.as_deref(),
+            )?;
+            let identity = new_commit_identity(repo, req.identity);
+            let outcome = repo
+                .cherry_pick_commit(&target, mv.new_parents, mv.new_children, identity.as_ref())
                 .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })

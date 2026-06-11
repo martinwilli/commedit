@@ -5,8 +5,9 @@
 mod common;
 
 use commedit_mcp::dto::{
-    CommitWorkingCopyReq, ConflictFileEditDto, CreateCommitReq, FileContentDto, IdentityFieldsDto,
-    ListHistoryReq, ReplaceFilesReq, ResolveConflictsReq, RevertCommitReq, SaveResultDto,
+    CherryPickCommitReq, CommitWorkingCopyReq, ConflictFileEditDto, CreateCommitReq,
+    FileContentDto, IdentityFieldsDto, ListHistoryReq, ReadConflictReq, ReplaceFilesReq,
+    ResolveConflictsReq, RevertCommitReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_repo, open_server};
@@ -35,6 +36,16 @@ fn create(message: &str, files: &[(&str, &str)], new_parent: Option<&str>) -> Cr
             })
             .collect(),
         delete_paths: None,
+        new_parent: new_parent.map(str::to_string),
+        child: None,
+        identity: IdentityFieldsDto::default(),
+    }
+}
+
+/// A `CherryPickCommitReq` with everything but the named fields defaulted.
+fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
+    CherryPickCommitReq {
+        commit: commit.into(),
         new_parent: new_parent.map(str::to_string),
         child: None,
         identity: IdentityFieldsDto::default(),
@@ -411,6 +422,151 @@ async fn commit_working_copy_commits_the_dirt() {
     // The working tree ends up clean.
     assert!(server.working_copy_status().await.unwrap().0.clean);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn cherry_pick_copies_a_commit_from_another_branch() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
+    // A sibling branch carries a commit main never saw.
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.path().join("f.txt"), "feat\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    git(dir.path(), &["commit", "-q", "-m", "feature work"]);
+    let picked = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["checkout", "-q", "main"]);
+
+    let server = open_server(dir.path());
+    // The session imports only main: the feature commit is off-history.
+    assert_eq!(history(&server).await.commits.len(), 1);
+
+    let result = server
+        .cherry_pick_commit(Parameters(pick(&picked, None)))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    // The change is replayed onto main, keeping the source subject and author.
+    assert_eq!(git_log_subjects(dir.path()), ["feature work", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "feat");
+    assert_eq!(git(dir.path(), &["show", "-s", "--format=%an", "HEAD"]), "Tester");
+    // The provenance trailer records the source (git `cherry-pick -x` style).
+    let body = git(dir.path(), &["show", "-s", "--format=%b", "HEAD"]);
+    assert!(
+        body.contains(&format!("cherry picked from commit {picked}")),
+        "missing provenance trailer: {body}"
+    );
+    // The source branch is left exactly where it was — only main moved.
+    assert_eq!(git(dir.path(), &["rev-parse", "feature"]), picked);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    git(dir.path(), &["fsck", "--no-progress"]);
+}
+
+#[tokio::test]
+async fn cherry_pick_resolves_an_in_history_change_id_and_places_it() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "one\n", "add a"), ("b.txt", "two\n", "add b")],
+    );
+    let server = open_server(dir.path());
+
+    // Pick "add b" (which adds b.txt) by change id and drop a copy at the root.
+    let add_b = history(&server).await.commits[0].change_id.clone();
+    let result = server
+        .cherry_pick_commit(Parameters(pick(&add_b, Some("root"))))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    // The copy becomes the repository's first commit, with b.txt in its tree.
+    let hist = history(&server).await;
+    let root = hist.commits.last().unwrap();
+    assert_eq!(root.subject, "add b");
+    assert!(root.detail.as_ref().unwrap().parent_shas.is_empty());
+    assert_eq!(git(dir.path(), &["show", &format!("{}:b.txt", root.sha)]), "two");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn cherry_pick_refuses_a_merge() {
+    let dir = TempDir::new().unwrap();
+    common::init_merge_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let merge = history(&server).await.commits[0].change_id.clone();
+    let err = expect_err(
+        server
+            .cherry_pick_commit(Parameters(pick(&merge, None)))
+            .await,
+    );
+    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("x.txt", "base\n", "first")]);
+    // feature edits x.txt one way…
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.path().join("x.txt"), "feature\n").unwrap();
+    git(dir.path(), &["add", "x.txt"]);
+    git(dir.path(), &["commit", "-q", "-m", "feature edit"]);
+    let picked = git(dir.path(), &["rev-parse", "HEAD"]);
+    // …main edits the same line another way, so the pick can't apply cleanly.
+    git(dir.path(), &["checkout", "-q", "main"]);
+    std::fs::write(dir.path().join("x.txt"), "mainline\n").unwrap();
+    git(dir.path(), &["add", "x.txt"]);
+    git(dir.path(), &["commit", "-q", "-m", "main edit"]);
+    let head_before = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let server = open_server(dir.path());
+    let result = server
+        .cherry_pick_commit(Parameters(pick(&picked, None)))
+        .await
+        .unwrap()
+        .0;
+    let SaveResultDto::Conflicts { commits, .. } = result else {
+        panic!("the overlapping pick should conflict");
+    };
+
+    // Held back in full — git history and the tree are untouched.
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git_log_subjects(dir.path()), ["main edit", "first"]);
+
+    // Resolving to the picked content settles it and exports.
+    let oldest = &commits[0];
+    let file = server
+        .read_conflict(Parameters(ReadConflictReq {
+            commit: oldest.change_id.clone(),
+            path: oldest.files[0].path.clone(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let result = server
+        .resolve_conflicts(Parameters(ResolveConflictsReq {
+            commit: oldest.change_id.clone(),
+            files: vec![ConflictFileEditDto {
+                path: oldest.files[0].path.clone(),
+                text: Some("feature\n".into()),
+                marker_len: Some(file.marker_len),
+                delete: None,
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+    assert_eq!(git(dir.path(), &["show", "HEAD:x.txt"]), "feature");
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["feature edit", "main edit", "first"]
+    );
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    git(dir.path(), &["fsck", "--no-progress"]);
 }
 
 #[tokio::test]

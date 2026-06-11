@@ -370,6 +370,23 @@ pub struct RevertCommitReq {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CherryPickCommitReq {
+    /// The commit to cherry-pick. A commit in the current branch history takes
+    /// a sha or change id, full or a unique prefix (>= 4 chars). A commit from
+    /// *outside* the history (e.g. on another branch) takes its full 40-char
+    /// sha — get it from `git log <branch>`; a prefix or change id only resolves
+    /// within the history. Merge commits cannot be cherry-picked.
+    pub commit: String,
+    /// Where to place the new commit — the commit that becomes its parent (sha
+    /// or change id, or `root`). Omitted means the top of HEAD.
+    pub new_parent: Option<String>,
+    /// Disambiguates a fork, as in `reorder_commit`.
+    pub child: Option<String>,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DropCommitReq {
     /// The commit to drop — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.

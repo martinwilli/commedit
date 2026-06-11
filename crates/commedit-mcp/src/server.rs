@@ -73,9 +73,11 @@ structural, resolvable=false conflict). No other mutation runs while pending.
 Creating commits: create_commit makes a new commit from given file contents \
 (empty for an empty commit) and inserts it — on top of HEAD by default, or under \
 any commit / at root via new_parent. revert_commit inserts the inverse of a \
-commit (like git revert). commit_working_copy turns the current uncommitted \
-changes into a commit on top of HEAD (like git commit -a). A mid-history insert \
-or revert may report conflicts like any rewrite.
+commit (like git revert). cherry_pick_commit copies a commit's change in (like \
+git cherry-pick) — the source may be off the current branch, named by its full \
+sha. commit_working_copy turns the current uncommitted changes into a commit on \
+top of HEAD (like git commit -a). A mid-history insert, revert or pick may \
+report conflicts like any rewrite.
 
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).

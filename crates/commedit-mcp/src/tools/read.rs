@@ -16,7 +16,7 @@ use crate::session::{limited_history, resolve_ref, RefEntry};
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
     )]
     pub async fn list_history(
         &self,
@@ -36,9 +36,19 @@ impl CommeditServer {
                 limited_history(repo, req.limit.unwrap_or(usize::MAX))?;
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
+            let brief = req.brief.unwrap_or(false);
             Ok(ListHistoryResp {
                 head_sha: Some(head.hex()),
-                commits: commits.iter().map(|c| commit_dto(c, &root, &refs)).collect(),
+                commits: commits
+                    .iter()
+                    .map(|c| {
+                        let mut dto = commit_dto(c, &root, &refs);
+                        if brief {
+                            dto.detail = None;
+                        }
+                        dto
+                    })
+                    .collect(),
                 has_more,
                 trash_count,
             })

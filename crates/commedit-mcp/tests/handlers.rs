@@ -16,7 +16,7 @@ use tempfile::TempDir;
 /// The current history's shas, newest first.
 async fn shas(server: &CommeditServer) -> Vec<String> {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0
@@ -50,7 +50,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -64,8 +64,11 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     let tip_refs = &resp.commits[0].refs;
     assert!(tip_refs.iter().any(|r| r.name == "main" && r.kind == "branch" && r.current));
     // The oldest commit has no parents (the virtual root is filtered).
-    assert!(resp.commits[2].parent_shas.is_empty());
-    assert_eq!(resp.commits[0].parent_shas, vec![resp.commits[1].sha.clone()]);
+    assert!(resp.commits[2].detail.as_ref().unwrap().parent_shas.is_empty());
+    assert_eq!(
+        resp.commits[0].detail.as_ref().unwrap().parent_shas,
+        vec![resp.commits[1].sha.clone()]
+    );
 }
 
 #[tokio::test]
@@ -78,7 +81,7 @@ async fn list_history_honours_the_limit() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: Some(2) }))
+        .list_history(Parameters(ListHistoryReq { limit: Some(2), brief: None }))
         .await
         .unwrap()
         .0;
@@ -88,20 +91,55 @@ async fn list_history_honours_the_limit() {
 }
 
 #[tokio::test]
+async fn list_history_brief_drops_the_detail() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first\n\nwith a long body line"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let brief = server
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(true) }))
+        .await
+        .unwrap()
+        .0;
+    // The header is still there to identify and act on the commit...
+    assert_eq!(brief.commits[0].subject, "second");
+    assert!(!brief.commits[0].sha.is_empty());
+    assert!(!brief.commits[0].change_id.is_empty());
+    // ...but the verbose detail (message body, identity, parents) is omitted.
+    assert!(brief.commits.iter().all(|c| c.detail.is_none()));
+
+    // A full listing carries it.
+    let full = server
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(false) }))
+        .await
+        .unwrap()
+        .0;
+    let detail = full.commits[1].detail.as_ref().expect("full listing has detail");
+    assert!(
+        detail.description.contains("with a long body line"),
+        "full detail carries the message body: {}",
+        detail.description
+    );
+}
+
+#[tokio::test]
 async fn list_history_marks_merges() {
     let dir = TempDir::new().unwrap();
     init_merge_repo(dir.path());
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
     let merge = &resp.commits[0];
     assert_eq!(merge.subject, "merge");
     assert!(merge.is_merge);
-    assert_eq!(merge.parent_shas.len(), 2);
+    assert_eq!(merge.detail.as_ref().unwrap().parent_shas.len(), 2);
     assert!(resp.commits[1..].iter().all(|c| !c.is_merge));
 }
 
@@ -115,7 +153,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -257,12 +295,12 @@ async fn edit_identity_prefills_omitted_fields() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
     let target = &history.commits[0];
-    let committer_time = target.committer_time.clone();
+    let committer_time = target.detail.as_ref().unwrap().committer_time.clone();
 
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
@@ -284,11 +322,11 @@ async fn edit_identity_prefills_omitted_fields() {
     let show = git(dir.path(), &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"]);
     assert_eq!(show, "New Author|tester@example.com|Tester|tester@example.com");
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
-    assert_eq!(listed.commits[0].committer_time, committer_time);
+    assert_eq!(listed.commits[0].detail.as_ref().unwrap().committer_time, committer_time);
 }
 
 #[tokio::test]
@@ -433,7 +471,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -486,7 +524,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -551,7 +589,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].sha, target);
     let listing = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -583,7 +621,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -728,7 +766,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -811,7 +849,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -844,12 +882,12 @@ async fn a_change_id_chains_mutations_without_relisting() {
     clean_head(&result);
 
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
     assert_eq!(listed.commits[1].subject, "first, chained");
-    assert_eq!(listed.commits[1].author_name, "Chained Author");
+    assert_eq!(listed.commits[1].detail.as_ref().unwrap().author_name, "Chained Author");
     assert_eq!(listed.commits[1].change_id, change_id);
 }
 

@@ -43,7 +43,7 @@ fn create(message: &str, files: &[(&str, &str)], new_parent: Option<&str>) -> Cr
 
 async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0
@@ -155,7 +155,7 @@ async fn create_commit_at_root_becomes_the_first_commit() {
     let hist = history(&server).await;
     let root = hist.commits.last().unwrap();
     assert_eq!(root.subject, "root-commit");
-    assert!(root.parent_shas.is_empty());
+    assert!(root.detail.as_ref().unwrap().parent_shas.is_empty());
     assert_eq!(git(dir.path(), &["show", "HEAD:r.txt"]), "r");
 }
 

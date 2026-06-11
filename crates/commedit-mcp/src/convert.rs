@@ -12,8 +12,8 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use jj_lib::object_id::ObjectId as _;
 
 use crate::dto::{
-    CommitDto, ConflictedCommitDto, ConflictedPathDto, FileChangeDto, OpEntryDto, RefDto,
-    SaveResultDto, WorkingCopyEntryDto,
+    CommitDetailDto, CommitDto, ConflictedCommitDto, ConflictedPathDto, FileChangeDto, OpEntryDto,
+    RefDto, SaveResultDto, WorkingCopyEntryDto,
 };
 
 /// The fixed protocol reminder attached to every `Conflicts` result.
@@ -35,21 +35,23 @@ pub fn commit_dto(
     CommitDto {
         change_id: info.change_id_hex(),
         subject: info.subject.clone(),
-        description: info.description.clone(),
-        author_name: info.author_name.clone(),
-        author_email: info.author_email.clone(),
-        author_time: info.author_time.clone(),
-        committer_name: info.committer_name.clone(),
-        committer_email: info.committer_email.clone(),
-        committer_time: info.committer_time.clone(),
-        parent_shas: info
-            .parents
-            .iter()
-            .map(|p| p.hex())
-            .filter(|p| p != root_hex)
-            .collect(),
         is_merge: info.parents.len() >= 2,
         refs: refs.get(&sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
+        detail: Some(CommitDetailDto {
+            description: info.description.clone(),
+            author_name: info.author_name.clone(),
+            author_email: info.author_email.clone(),
+            author_time: info.author_time.clone(),
+            committer_name: info.committer_name.clone(),
+            committer_email: info.committer_email.clone(),
+            committer_time: info.committer_time.clone(),
+            parent_shas: info
+                .parents
+                .iter()
+                .map(|p| p.hex())
+                .filter(|p| p != root_hex)
+                .collect(),
+        }),
         sha,
     }
 }

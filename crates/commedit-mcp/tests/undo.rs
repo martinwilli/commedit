@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 async fn edit_tip_message(server: &commedit_mcp::server::CommeditServer, message: &str) {
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -109,7 +109,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -127,7 +127,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
 
     // Restoring the stale entry fails with a clean error; git is untouched.
     let bottom = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0
@@ -155,7 +155,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
 
     // Session state to be discarded: an op and a trash entry.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -175,7 +175,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
 
     // The fresh import sees the external commit; trash and ops are reset.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;
@@ -202,7 +202,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
 
     // A conflicting edit leaves a pending rewrite.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
         .await
         .unwrap()
         .0;

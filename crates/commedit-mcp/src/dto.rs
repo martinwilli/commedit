@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 // Shared response shapes
 
 /// One commit of the current branch's history.
+///
+/// A brief `list_history` (`brief: true`) returns only the identifying header
+/// — sha, change_id, subject, is_merge, refs — to keep long histories compact.
+/// The full listing (the default, and always for `show_commit` / `list_trash`)
+/// also carries the [`CommitDetailDto`] fields, flattened in alongside these.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
     /// Full commit id. Every mutation rewrites ids — address commits by their
@@ -21,6 +26,20 @@ pub struct CommitDto {
     pub change_id: String,
     /// First line of the commit message.
     pub subject: String,
+    /// Merge commits cannot be reordered, dropped, split or used as a squash
+    /// source (squashing *into* one is fine).
+    pub is_merge: bool,
+    /// Local branches and tags pointing at this commit.
+    pub refs: Vec<RefDto>,
+    /// Message body, identity and parents — present in a full listing, absent
+    /// in a brief one (call `show_commit` for any single commit's detail).
+    #[serde(flatten)]
+    pub detail: Option<CommitDetailDto>,
+}
+
+/// The verbose fields of a [`CommitDto`], omitted from a brief `list_history`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CommitDetailDto {
     /// Full commit message, including the subject line.
     pub description: String,
     pub author_name: String,
@@ -33,11 +52,6 @@ pub struct CommitDto {
     pub committer_time: String,
     /// Parent shas; empty for the root commit of the repository.
     pub parent_shas: Vec<String>,
-    /// Merge commits cannot be reordered, dropped, split or used as a squash
-    /// source (squashing *into* one is fine).
-    pub is_merge: bool,
-    /// Local branches and tags pointing at this commit.
-    pub refs: Vec<RefDto>,
 }
 
 /// A branch or tag decoration on a commit.
@@ -160,6 +174,10 @@ pub enum SaveResultDto {
 pub struct ListHistoryReq {
     /// Maximum number of commits to return, newest first. Omit for all.
     pub limit: Option<usize>,
+    /// Return only each commit's header (sha, change_id, subject, is_merge,
+    /// refs), dropping the message body, identity and parents — a compact
+    /// overview for long histories. Defaults to false (full detail).
+    pub brief: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

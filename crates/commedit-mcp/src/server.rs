@@ -72,6 +72,13 @@ list_history returns every verbose field by default; pass its `fields` to fetch 
 only the ones you need (e.g. just the timestamps before a re-date, or `[]` for a \
 header-only overview) to keep responses small.
 
+Surgical edits: for a small change to a long message or file, prefer \
+replace_in_message / replace_in_file — they take an exact `old`→`new` \
+substitution (unique match unless replace_all) instead of the whole text, so \
+the untouched content can't drift and the call stays small. Make `old` long \
+enough to match exactly once; an ambiguous or missing match is rejected. \
+edit_message / replace_files remain for wholesale rewrites.
+
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \
 until it settles. Resolve the OLDEST conflicted commit first (read_conflict \

@@ -377,6 +377,48 @@ pub struct ReplaceFilesReq {
     pub delete_paths: Option<Vec<String>>,
 }
 
+/// One targeted text replacement within a file (no patch format, no line
+/// numbers): find `old`, substitute `new`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct StrReplaceDto {
+    /// Path relative to the repository root, forward-slash form.
+    pub path: String,
+    /// The exact text to find. Must occur exactly once in the file's current
+    /// content unless `replace_all` is set — include enough surrounding text
+    /// to make it unique. The untouched content is never resent, so it can't
+    /// drift.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReplaceInFileReq {
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
+    /// so they chain across mutations without re-listing.
+    pub commit: String,
+    /// The replacements, applied in order; several may target the same file.
+    pub edits: Vec<StrReplaceDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReplaceInMessageReq {
+    /// The commit whose message to edit — sha or change id, full or a unique
+    /// prefix (>= 4 chars), case-insensitive. Change ids are stable across
+    /// rewrites.
+    pub commit: String,
+    /// The exact text to find in the message. Must occur exactly once unless
+    /// `replace_all` is set.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SplitCommitReq {
     /// The commit to split — sha or change id, full or a unique prefix

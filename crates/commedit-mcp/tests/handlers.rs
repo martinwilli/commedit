@@ -6,8 +6,9 @@ mod common;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
     CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
-    FileContentDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq,
-    SaveResultDto, ShowCommitReq, SplitCommitReq, SquashCommitReq,
+    FileContentDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq, ReplaceInFileReq,
+    ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq, SplitCommitReq,
+    SquashCommitReq, StrReplaceDto,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -499,6 +500,107 @@ async fn replace_files_requires_files() {
             .await,
     );
     assert!(err.message.contains("files"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn replace_in_file_rewrites_a_unique_match_across_descendants() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "the bulck form\n", "first"), ("b.txt", "two\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .replace_in_file(Parameters(ReplaceInFileReq {
+            commit: target,
+            edits: vec![StrReplaceDto {
+                path: "a.txt".into(),
+                old: "bulck".into(),
+                new: "bulk".into(),
+                replace_all: None,
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "the bulk form");
+    // The descendant rebased onto the edited tree; the worktree follows.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "the bulk form\n");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn replace_in_file_rejects_an_ambiguous_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "a\na\n", "first")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_in_file(Parameters(ReplaceInFileReq {
+                commit: target,
+                edits: vec![StrReplaceDto {
+                    path: "a.txt".into(),
+                    old: "a".into(),
+                    new: "b".into(),
+                    replace_all: None,
+                }],
+            }))
+            .await,
+    );
+    // The ambiguity message comes only from the ReplaceError→invalid path.
+    assert!(err.message.contains("matched 2 times"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn replace_in_message_fixes_a_typo() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "the bulck form"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .replace_in_message(Parameters(ReplaceInMessageReq {
+            commit: target,
+            old: "bulck".into(),
+            new: "bulk".into(),
+            replace_all: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "the bulk form"]);
+}
+
+#[tokio::test]
+async fn replace_in_message_rejects_a_missing_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_in_message(Parameters(ReplaceInMessageReq {
+                commit: target,
+                old: "nope".into(),
+                new: "x".into(),
+                replace_all: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("not found"), "unexpected error: {}", err.message);
 }
 
 #[tokio::test]

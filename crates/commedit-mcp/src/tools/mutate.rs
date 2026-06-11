@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use commedit_engine::history::IdAbbrev;
 use commedit_engine::rewrite::{BatchEdit, Identity};
-use commedit_engine::tree::FileEdit;
+use commedit_engine::tree::{replace_checked, FileEdit, ReplaceError, StrReplace};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
@@ -16,7 +16,8 @@ use crate::convert::{commit_dto, resolve_squash_mode, DetailFields};
 use crate::dto::{
     CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditCommitsReq,
     EditIdentityReq, EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq,
-    RestoreCommitReq, RevertCommitReq, SaveResultDto, SplitCommitReq, SquashCommitReq,
+    ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, RevertCommitReq, SaveResultDto,
+    SplitCommitReq, SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -203,6 +204,84 @@ impl CommeditServer {
                 return Err(invalid("files and delete_paths must not both be empty"));
             }
             let outcome = repo.rewrite_files_edits(&commits[idx].id, &edits).map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Make targeted text replacements inside a commit's files: each edit finds `old` and substitutes `new`, requiring a unique match unless replace_all is set. The surgical alternative to replace_files — send only the delta, not the whole file, so untouched content can't drift and the response stays small. Several edits may target one file (applied in order). Descendants are rebased and may report conflicts."
+    )]
+    pub async fn replace_in_file(
+        &self,
+        Parameters(req): Parameters<ReplaceInFileReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.edits.is_empty() {
+                return Err(invalid("edits must not be empty"));
+            }
+            for e in &req.edits {
+                if e.old.is_empty() {
+                    return Err(invalid(format!("the edit for {} has an empty `old`", e.path)));
+                }
+            }
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.commit)?;
+            let replaces: Vec<StrReplace> = req
+                .edits
+                .into_iter()
+                .map(|e| StrReplace {
+                    path: e.path,
+                    old: e.old,
+                    new: e.new,
+                    all: e.replace_all.unwrap_or(false),
+                })
+                .collect();
+            // A miss / ambiguous match / non-text path is the caller's mistake
+            // (fixable by amending `old`), so report it as invalid, not internal.
+            let outcome = repo
+                .replace_in_files(&commits[idx].id, &replaces)
+                .map_err(|e| match e.downcast::<ReplaceError>() {
+                    Ok(re) => invalid(re.to_string()),
+                    Err(e) => internal(e),
+                })?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Replace text in a commit's message: find `old` and substitute `new`, requiring a unique match unless replace_all is set. The surgical alternative to edit_message — fix a typo or rename a term without resending the whole message. Descendants are rebased; the commit's sha changes."
+    )]
+    pub async fn replace_in_message(
+        &self,
+        Parameters(req): Parameters<ReplaceInMessageReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.old.is_empty() {
+                return Err(invalid("`old` must not be empty"));
+            }
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.commit)?;
+            let edited = replace_checked(
+                &commits[idx].description,
+                &req.old,
+                &req.new,
+                req.replace_all.unwrap_or(false),
+            )
+            .map_err(|count| {
+                invalid(match count {
+                    0 => "`old` was not found in the message".to_string(),
+                    n => format!(
+                        "`old` matched {n} times in the message; make it unique or set replace_all"
+                    ),
+                })
+            })?;
+            let outcome = repo.rewrite_message(&commits[idx].id, &edited).map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await

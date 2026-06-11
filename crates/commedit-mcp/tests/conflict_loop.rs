@@ -29,7 +29,7 @@ fn conflicting_repo(dir: &std::path::Path) {
 /// Rewrite commit "A"'s content so the descendant "B" no longer applies.
 async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -199,7 +199,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
 
     // Dropping "A" leaves "B"'s same-line edit dangling: a true conflict.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -255,7 +255,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;

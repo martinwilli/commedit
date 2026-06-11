@@ -3,9 +3,11 @@
 
 mod common;
 
-use commedit_engine::history::{history, history_limited};
+use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::history::{history, history_limited, IdAbbrev};
 use commedit_engine::repo::Repo;
-use commedit_engine::rewrite::Identity;
+use commedit_engine::rewrite::{BatchEdit, Identity};
+use jj_lib::object_id::ObjectId as _;
 
 #[test]
 fn history_limited_pages_newest_first_and_flags_more() {
@@ -25,14 +27,20 @@ fn history_limited_pages_newest_first_and_flags_more() {
     let head = repo.head_commit_id().expect("head");
 
     // A short page returns the newest commits and reports more below it.
-    let (page, has_more) = history_limited(&repo.repo, &head, 2).expect("history");
+    let (page, has_more) = history_limited(&repo.repo, &head, 0, 2).expect("history");
     assert!(has_more);
     let subjects: Vec<&str> = page.iter().map(|c| c.subject.as_str()).collect();
     assert_eq!(subjects, vec!["fourth", "third"]);
 
+    // An offset skips the newest entries and continues from there.
+    let (page, has_more) = history_limited(&repo.repo, &head, 2, 2).expect("history");
+    assert!(!has_more);
+    let subjects: Vec<&str> = page.iter().map(|c| c.subject.as_str()).collect();
+    assert_eq!(subjects, vec!["second", "first"]);
+
     // A limit at or above the history length loads everything and flags no more,
     // matching the unbounded walk.
-    let (all, has_more) = history_limited(&repo.repo, &head, 10).expect("history");
+    let (all, has_more) = history_limited(&repo.repo, &head, 0, 10).expect("history");
     assert!(!has_more);
     assert_eq!(all.len(), history(&repo.repo, &head).unwrap().len());
 }
@@ -121,6 +129,113 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
     assert_eq!(fields[4], "grace@example.com");
     assert_eq!(fields[5], "2026-06-06 09:00:00 +0000");
 
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn id_abbrev_emits_floored_unique_prefixes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+
+    let abbrev = IdAbbrev::new(&repo.repo);
+    for c in &commits {
+        let sha = abbrev.commit(&c.id);
+        let change = abbrev.change(&c.change_id);
+        // A true, floored prefix that never exceeds the full id.
+        assert!(c.id.hex().starts_with(&sha), "{sha} prefixes {}", c.id.hex());
+        assert!(c.change_id.hex().starts_with(&change), "{change} prefixes {}", c.change_id.hex());
+        assert!(sha.len() >= IdAbbrev::MIN && sha.len() <= c.id.hex().len());
+        assert!(change.len() >= IdAbbrev::MIN && change.len() <= c.change_id.hex().len());
+    }
+
+    // The no-op abbreviator returns full ids unchanged.
+    let full = IdAbbrev::full();
+    assert_eq!(full.commit(&commits[0].id), commits[0].id.hex());
+    assert_eq!(full.change(&commits[0].change_id), commits[0].change_id.hex());
+}
+
+#[test]
+fn batch_redates_a_parent_and_child_without_restamping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let by = |s: &str| {
+        commits
+            .iter()
+            .find(|c| c.subject == s)
+            .unwrap_or_else(|| panic!("{s} commit present"))
+    };
+    let dated = |a: &str, c: &str| Identity {
+        author_name: "Ada".into(),
+        author_email: "ada@example.com".into(),
+        author_time: a.into(),
+        committer_name: "Ada".into(),
+        committer_email: "ada@example.com".into(),
+        committer_time: c.into(),
+    };
+
+    // Re-date a parent ("first") AND its child ("second"), plus reword "third".
+    // Fed out of topological order to prove the engine sorts ancestors-first.
+    let edits = vec![
+        BatchEdit {
+            target: by("second").id.clone(),
+            message: None,
+            identity: Some(dated("2026-06-11 18:30:00 +0200", "2026-06-11 18:30:00 +0200")),
+        },
+        BatchEdit {
+            target: by("third").id.clone(),
+            message: Some("third (edited)".into()),
+            identity: None,
+        },
+        BatchEdit {
+            target: by("first").id.clone(),
+            message: None,
+            identity: Some(dated("2026-06-11 18:00:00 +0200", "2026-06-11 18:05:00 +0200")),
+        },
+    ];
+    // A pure message/identity batch changes no trees, so the rebase is always
+    // clean — nothing here can conflict.
+    let outcome = repo.rewrite_batch(edits).expect("batch");
+    assert!(matches!(outcome, SaveOutcome::Clean), "batch landed clean");
+
+    // The engine's post-rewrite view: every pinned date stuck. Crucially the
+    // child's committer is the requested value, NOT a re-stamp to "now" — that's
+    // the property the per-commit loop could only get by editing ancestors first.
+    let after = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let a = |s: &str| {
+        after
+            .iter()
+            .find(|c| c.subject == s)
+            .unwrap_or_else(|| panic!("{s} commit present after"))
+    };
+    assert_eq!(a("first").author_time, "2026-06-11 18:00:00 +0200");
+    assert_eq!(a("first").committer_time, "2026-06-11 18:05:00 +0200");
+    assert_eq!(a("second").author_time, "2026-06-11 18:30:00 +0200");
+    assert_eq!(a("second").committer_time, "2026-06-11 18:30:00 +0200");
+
+    // Plain git agrees on the child's pinned committer date (the tripwire), and
+    // sees the reworded tip with descendants intact.
+    let child_sha = a("second").id.hex();
+    let cd = common::git(
+        dir,
+        &["show", "-s", "--format=%cd", "--date=format:%Y-%m-%d %H:%M:%S %z", &child_sha],
+    );
+    assert_eq!(cd, "2026-06-11 18:30:00 +0200");
+    assert_eq!(common::git_log_subjects(dir), vec!["third (edited)", "second", "first"]);
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }

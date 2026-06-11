@@ -1,11 +1,17 @@
 //! Read-only tools over the history and the session trash.
 
 use commedit_engine::diff::commit_changes;
+use commedit_engine::history::IdAbbrev;
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::{commit_dto, file_change_dto};
+use crate::convert::{commit_dto, file_change_dto, DetailFields};
+
+/// Default `list_history` page size when the caller gives no `limit`. Bounds the
+/// response so an unbounded walk can't blow the tool's token budget; deeper
+/// history is reachable via `limit` or `offset` paging.
+const DEFAULT_HISTORY_LIMIT: usize = 30;
 use crate::dto::{
     ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp,
 };
@@ -17,7 +23,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Returns up to `limit` commits (default 30) from `offset`; when `has_more`, page on with the returned `next_offset`. Each commit always carries its header (sha, change_id, subject, is_merge, refs); use `fields` to pick which verbose fields (message, identity, parents) come with it — omit for all of them, pass a subset (e.g. just the timestamps when re-dating) or `[]` for a header-only overview, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas/change_ids are abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them straight back as a commit ref; shas change on every mutation while the change_id is stable, so prefer change ids over re-listing."
     )]
     pub async fn list_history(
         &self,
@@ -30,27 +36,28 @@ impl CommeditServer {
                     head_sha: None,
                     commits: Vec::new(),
                     has_more: false,
+                    offset: 0,
+                    next_offset: None,
                     trash_count,
                 });
             };
+            let offset = req.offset.unwrap_or(0);
             let (head, commits, has_more) =
-                limited_history(repo, req.limit.unwrap_or(usize::MAX))?;
+                limited_history(repo, offset, req.limit.unwrap_or(DEFAULT_HISTORY_LIMIT))?;
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
-            let brief = req.brief.unwrap_or(false);
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let fields = DetailFields::from_request(req.fields.as_deref());
+            let next_offset = has_more.then_some(offset + commits.len());
             Ok(ListHistoryResp {
                 head_sha: Some(head.hex()),
                 commits: commits
                     .iter()
-                    .map(|c| {
-                        let mut dto = commit_dto(c, &root, &refs);
-                        if brief {
-                            dto.detail = None;
-                        }
-                        dto
-                    })
+                    .map(|c| commit_dto(c, &root, &refs, &abbrev, fields))
                     .collect(),
                 has_more,
+                offset,
+                next_offset,
                 trash_count,
             })
         })
@@ -86,13 +93,17 @@ impl CommeditServer {
             })?;
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
             let include = req.include_contents.unwrap_or(false);
             let files = commit_changes(&repo.repo, &info.id)
                 .map_err(internal)?
                 .iter()
                 .map(|fc| file_change_dto(fc, include))
                 .collect();
-            Ok(ShowCommitResp { commit: commit_dto(&info, &root, &refs), files })
+            Ok(ShowCommitResp {
+                commit: commit_dto(&info, &root, &refs, &abbrev, DetailFields::ALL),
+                files,
+            })
         })
         .await
         .map(Yaml)
@@ -105,8 +116,13 @@ impl CommeditServer {
         self.with_session(|repo, trash| {
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
             Ok(ListTrashResp {
-                commits: trash.entries.iter().map(|c| commit_dto(c, &root, &refs)).collect(),
+                commits: trash
+                    .entries
+                    .iter()
+                    .map(|c| commit_dto(c, &root, &refs, &abbrev, DetailFields::ALL))
+                    .collect(),
             })
         })
         .await

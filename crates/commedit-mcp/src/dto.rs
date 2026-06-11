@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 /// One commit of the current branch's history.
 ///
-/// A brief `list_history` (`brief: true`) returns only the identifying header
-/// — sha, change_id, subject, is_merge, refs — to keep long histories compact.
-/// The full listing (the default, and always for `show_commit` / `list_trash`)
-/// also carries the [`CommitDetailDto`] fields, flattened in alongside these.
+/// The identifying header — sha, change_id, subject, is_merge, refs — is always
+/// present. The verbose [`CommitDetailDto`] fields (message body, identity,
+/// parents) are flattened in alongside; each appears only when `list_history`'s
+/// `fields` selects it (all of them by default, none for a header-only
+/// overview). `show_commit` and `list_trash` always include them all.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
     /// Full commit id. Every mutation rewrites ids — address commits by their
@@ -31,27 +32,53 @@ pub struct CommitDto {
     pub is_merge: bool,
     /// Local branches and tags pointing at this commit.
     pub refs: Vec<RefDto>,
-    /// Message body, identity and parents — present in a full listing, absent
-    /// in a brief one (call `show_commit` for any single commit's detail).
+    /// The verbose fields, each present only when selected (see `CommitField`).
     #[serde(flatten)]
-    pub detail: Option<CommitDetailDto>,
+    pub detail: CommitDetailDto,
 }
 
-/// The verbose fields of a [`CommitDto`], omitted from a brief `list_history`.
+/// The verbose fields of a [`CommitDto`]. Each is present only when
+/// `list_history`'s `fields` selects the matching [`CommitField`] (all of them
+/// for `show_commit` / `list_trash`); an unselected field is omitted entirely.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDetailDto {
     /// Full commit message, including the subject line.
-    pub description: String,
-    pub author_name: String,
-    pub author_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
     /// `YYYY-MM-DD HH:MM:SS ±HHMM`.
-    pub author_time: String,
-    pub committer_name: String,
-    pub committer_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_email: Option<String>,
     /// `YYYY-MM-DD HH:MM:SS ±HHMM`.
-    pub committer_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_time: Option<String>,
     /// Parent shas; empty for the root commit of the repository.
-    pub parent_shas: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_shas: Option<Vec<String>>,
+}
+
+/// A selectable verbose field of a listed commit — the [`CommitDetailDto`] set.
+/// `list_history`'s `fields` names which of these to include per commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitField {
+    /// The full commit message (subject + body) — usually the largest field.
+    Description,
+    AuthorName,
+    AuthorEmail,
+    AuthorTime,
+    CommitterName,
+    CommitterEmail,
+    CommitterTime,
+    /// The parent shas.
+    Parents,
 }
 
 /// A branch or tag decoration on a commit.
@@ -172,22 +199,36 @@ pub enum SaveResultDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListHistoryReq {
-    /// Maximum number of commits to return, newest first. Omit for all.
+    /// Maximum number of commits to return, newest first. Omit for the default
+    /// (30). Raise it (or page with `offset`) to see deeper history.
     pub limit: Option<usize>,
-    /// Return only each commit's header (sha, change_id, subject, is_merge,
-    /// refs), dropping the message body, identity and parents — a compact
-    /// overview for long histories. Defaults to false (full detail).
-    pub brief: Option<bool>,
+    /// 0-based index of the first commit to return, newest first. Omit to start
+    /// at HEAD. Pass the previous response's `next_offset` to get the next page.
+    pub offset: Option<usize>,
+    /// Which verbose fields to include per commit, on top of the always-present
+    /// header (sha, change_id, subject, is_merge, refs). Omit for ALL of them
+    /// (full detail); pass an explicit subset to save tokens — e.g.
+    /// `["author_time", "committer_time"]` when re-dating, `["description"]` to
+    /// scan messages, or `[]` for a header-only overview. Selectable:
+    /// description, author_name, author_email, author_time, committer_name,
+    /// committer_email, committer_time, parents.
+    pub fields: Option<Vec<CommitField>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListHistoryResp {
     /// The branch tip, or null on a detached/unborn HEAD.
     pub head_sha: Option<String>,
-    /// Ancestors of HEAD, newest first (like `git log`).
+    /// Ancestors of HEAD, newest first (like `git log`). Shas and change_ids are
+    /// abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them
+    /// straight back to any tool as a commit ref.
     pub commits: Vec<CommitDto>,
-    /// True when `limit` cut the walk short.
+    /// True when the limit cut the walk short — more commits remain below.
     pub has_more: bool,
+    /// The offset this page started at (0 unless paged).
+    pub offset: usize,
+    /// Offset to pass next to continue paging, or null at the end of history.
+    pub next_offset: Option<usize>,
     /// Number of dropped commits currently in the session trash.
     pub trash_count: usize,
 }
@@ -283,6 +324,36 @@ pub struct EditIdentityReq {
     pub committer_time: Option<String>,
 }
 
+/// One commit's edit within an `edit_commits` batch. At least one of `message`
+/// or an identity field must be set; omitted identity fields keep their current
+/// value. Like `edit_identity`, the committer timestamp is pinned, not re-stamped.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommitEditDto {
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites.
+    pub commit: String,
+    /// New full commit message (subject + body). Omit to leave the message.
+    pub message: Option<String>,
+    /// New author name; omitted fields keep their current value.
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub author_time: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
+    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
+    pub committer_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EditCommitsReq {
+    /// The per-commit edits, applied together in ONE transaction with a single
+    /// rebase. Prefer this over many edit_identity/edit_message calls for bulk
+    /// changes: it's atomic (a conflict holds the whole batch back) and avoids
+    /// re-stamping committers across the cascade. A commit may appear only once.
+    pub edits: Vec<CommitEditDto>,
+}
+
 /// A whole-file replacement within a commit.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FileContentDto {
@@ -304,6 +375,48 @@ pub struct ReplaceFilesReq {
     /// Paths to delete from the commit (a path the commit doesn't have is
     /// ignored). At least one of `files`/`delete_paths` must be non-empty.
     pub delete_paths: Option<Vec<String>>,
+}
+
+/// One targeted text replacement within a file (no patch format, no line
+/// numbers): find `old`, substitute `new`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct StrReplaceDto {
+    /// Path relative to the repository root, forward-slash form.
+    pub path: String,
+    /// The exact text to find. Must occur exactly once in the file's current
+    /// content unless `replace_all` is set — include enough surrounding text
+    /// to make it unique. The untouched content is never resent, so it can't
+    /// drift.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReplaceInFileReq {
+    /// The commit to edit — sha or change id, full or a unique prefix
+    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
+    /// so they chain across mutations without re-listing.
+    pub commit: String,
+    /// The replacements, applied in order; several may target the same file.
+    pub edits: Vec<StrReplaceDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReplaceInMessageReq {
+    /// The commit whose message to edit — sha or change id, full or a unique
+    /// prefix (>= 4 chars), case-insensitive. Change ids are stable across
+    /// rewrites.
+    pub commit: String,
+    /// The exact text to find in the message. Must occur exactly once unless
+    /// `replace_all` is set.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

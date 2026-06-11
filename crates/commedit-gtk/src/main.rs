@@ -1871,7 +1871,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let (loaded, has_more) = {
                 let r = repo.borrow();
                 match r.head_commit_id() {
-                    Some(head) => history_limited(&r.repo, &head, history_limit.get())
+                    Some(head) => history_limited(&r.repo, &head, 0, history_limit.get())
                         .unwrap_or_default(),
                     None => (Vec::new(), false),
                 }

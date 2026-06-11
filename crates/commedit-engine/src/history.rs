@@ -99,17 +99,19 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
 /// `git_head()` (which lags behind a rewrite until re-imported) keeps the view
 /// current without resurfacing stale, pre-rewrite commits.
 pub fn history(repo: &ReadonlyRepo, head: &CommitId) -> Result<Vec<CommitInfo>> {
-    Ok(history_limited(repo, head, usize::MAX)?.0)
+    Ok(history_limited(repo, head, 0, usize::MAX)?.0)
 }
 
-/// Like [`history`], but stop after `limit` commits. Returns the loaded prefix
-/// (newest first) together with a flag that is `true` when more commits remain
-/// below it — i.e. the walk was cut short by the limit rather than reaching the
-/// root. The revset iterates newest-first lazily, so the cost is `O(limit)`, not
-/// `O(history length)`: this is what lets the UI page a deep history in chunks.
+/// Like [`history`], but skip the first `offset` commits (newest first) and stop
+/// after `limit` more. Returns the loaded window together with a flag that is
+/// `true` when more commits remain below it — i.e. the walk was cut short by the
+/// limit rather than reaching the root. The revset iterates newest-first lazily,
+/// so the cost is `O(offset + limit)`, not `O(history length)`: this is what lets
+/// the UI (and the MCP server) page a deep history in chunks.
 pub fn history_limited(
     repo: &ReadonlyRepo,
     head: &CommitId,
+    offset: usize,
     limit: usize,
 ) -> Result<(Vec<CommitInfo>, bool)> {
     let symbol_resolver =
@@ -126,10 +128,15 @@ pub fn history_limited(
     let root = store.root_commit_id().clone();
     let mut commits = Vec::new();
     let mut has_more = false;
+    let mut skipped = 0usize;
     let mut ids = revset.commit_change_ids();
     while let Some(entry) = pollster::block_on(ids.next()) {
         let (id, _change_id) = entry.context("iterating history")?;
         if id == root {
+            continue;
+        }
+        if skipped < offset {
+            skipped += 1;
             continue;
         }
         if commits.len() >= limit {
@@ -140,6 +147,72 @@ pub fn history_limited(
         commits.push(CommitInfo::from_commit(&commit));
     }
     Ok((commits, has_more))
+}
+
+/// Git-style shortest-unique-prefix abbreviator for one read of a repo. Holds the
+/// repo so each call computes the shortest prefix that is unique *across the whole
+/// visible index* — so an abbreviated id stays unique within any subset of it
+/// (e.g. the branch history `lookup_ref` resolves against), and thus round-trips
+/// straight back as a commit ref.
+///
+/// Lengths are floored at [`Self::MIN`]: jj's per-namespace shortest length could
+/// otherwise let an abbreviated change id prefix-collide with some unrelated
+/// commit's sha in `lookup_ref`'s OR-of-namespaces match. The floor makes that
+/// negligible; the worst case is a recoverable "ambiguous ref" the caller retries
+/// with a longer id. These are *display* hints — full ids still resolve exactly.
+pub struct IdAbbrev<'a> {
+    repo: Option<&'a ReadonlyRepo>,
+}
+
+impl<'a> IdAbbrev<'a> {
+    /// Floor on an emitted prefix length, in hex chars.
+    pub const MIN: usize = 8;
+
+    /// Abbreviate against `repo`'s index.
+    pub fn new(repo: &'a ReadonlyRepo) -> Self {
+        Self { repo: Some(repo) }
+    }
+
+    /// A no-op abbreviator that returns full ids — for contexts without a repo
+    /// (e.g. pure unit tests of the DTO conversions).
+    pub fn full() -> Self {
+        Self { repo: None }
+    }
+
+    /// Abbreviate a commit id to its shortest repo-unique prefix, floored at
+    /// [`Self::MIN`]. Hex is ASCII, so byte slicing is char slicing.
+    pub fn commit(&self, id: &CommitId) -> String {
+        let full = id.hex();
+        match self.repo {
+            None => full,
+            Some(repo) => {
+                let n = repo
+                    .index()
+                    .shortest_unique_commit_id_prefix_len(id)
+                    .unwrap_or(full.len())
+                    .max(Self::MIN)
+                    .min(full.len());
+                full[..n].to_string()
+            }
+        }
+    }
+
+    /// Abbreviate a change id to its shortest repo-unique prefix, floored at
+    /// [`Self::MIN`].
+    pub fn change(&self, id: &ChangeId) -> String {
+        let full = id.hex();
+        match self.repo {
+            None => full,
+            Some(repo) => {
+                let n = repo
+                    .shortest_unique_change_id_prefix_len(id)
+                    .unwrap_or(full.len())
+                    .max(Self::MIN)
+                    .min(full.len());
+                full[..n].to_string()
+            }
+        }
+    }
 }
 
 /// The commits reachable from `head` but not from `base` — the range rewritten

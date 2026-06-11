@@ -5,16 +5,75 @@ use std::collections::BTreeMap;
 
 use commedit_engine::conflict::{ConflictedCommit, OpEntry, SaveOutcome};
 use commedit_engine::diff::{unified_diff, ChangeKind, FileChange};
-use commedit_engine::history::CommitInfo;
+use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_engine::workcopy::WorkingCopyEntry;
 use jj_lib::object_id::ObjectId as _;
 
 use crate::dto::{
-    CommitDetailDto, CommitDto, ConflictedCommitDto, ConflictedPathDto, FileChangeDto, OpEntryDto,
-    RefDto, SaveResultDto, WorkingCopyEntryDto,
+    CommitDetailDto, CommitDto, CommitField, ConflictedCommitDto, ConflictedPathDto, FileChangeDto,
+    OpEntryDto, RefDto, SaveResultDto, WorkingCopyEntryDto,
 };
+
+/// Which verbose [`CommitDetailDto`] fields a `commit_dto` should populate.
+/// `ALL` is the full listing `show_commit` / `list_trash` always emit;
+/// `list_history` derives one from the request's `fields`.
+#[derive(Clone, Copy)]
+pub struct DetailFields {
+    pub description: bool,
+    pub author_name: bool,
+    pub author_email: bool,
+    pub author_time: bool,
+    pub committer_name: bool,
+    pub committer_email: bool,
+    pub committer_time: bool,
+    pub parents: bool,
+}
+
+impl DetailFields {
+    pub const ALL: Self = Self {
+        description: true,
+        author_name: true,
+        author_email: true,
+        author_time: true,
+        committer_name: true,
+        committer_email: true,
+        committer_time: true,
+        parents: true,
+    };
+    pub const NONE: Self = Self {
+        description: false,
+        author_name: false,
+        author_email: false,
+        author_time: false,
+        committer_name: false,
+        committer_email: false,
+        committer_time: false,
+        parents: false,
+    };
+
+    /// Build a selection from a `list_history` request's `fields`: an absent
+    /// list selects everything (full detail), an explicit list selects exactly
+    /// the named fields (so `[]` yields a header-only row).
+    pub fn from_request(fields: Option<&[CommitField]>) -> Self {
+        let Some(fields) = fields else { return Self::ALL };
+        let mut sel = Self::NONE;
+        for f in fields {
+            match f {
+                CommitField::Description => sel.description = true,
+                CommitField::AuthorName => sel.author_name = true,
+                CommitField::AuthorEmail => sel.author_email = true,
+                CommitField::AuthorTime => sel.author_time = true,
+                CommitField::CommitterName => sel.committer_name = true,
+                CommitField::CommitterEmail => sel.committer_email = true,
+                CommitField::CommitterTime => sel.committer_time = true,
+                CommitField::Parents => sel.parents = true,
+            }
+        }
+        sel
+    }
+}
 
 /// The fixed protocol reminder attached to every `Conflicts` result.
 pub const CONFLICT_GUIDANCE: &str = "History is untouched in git until this resolves. \
@@ -25,34 +84,39 @@ way out. No other mutation is allowed until status is clean.";
 
 /// A commit row plus its ref decorations as one response object. `root` is the
 /// virtual root commit's id — a parent pointing at it is omitted, so the
-/// repository's first commit reports no parents.
+/// repository's first commit reports no parents. Emitted shas and change_ids are
+/// abbreviated via `abbrev` (shortest repo-unique prefix); the ref-decoration
+/// lookup and root filter stay keyed on the *full* sha.
 pub fn commit_dto(
     info: &CommitInfo,
     root_hex: &str,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
+    abbrev: &IdAbbrev,
+    fields: DetailFields,
 ) -> CommitDto {
-    let sha = info.id_hex();
+    let full_sha = info.id_hex();
     CommitDto {
-        change_id: info.change_id_hex(),
+        change_id: abbrev.change(&info.change_id),
         subject: info.subject.clone(),
         is_merge: info.parents.len() >= 2,
-        refs: refs.get(&sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
-        detail: Some(CommitDetailDto {
-            description: info.description.clone(),
-            author_name: info.author_name.clone(),
-            author_email: info.author_email.clone(),
-            author_time: info.author_time.clone(),
-            committer_name: info.committer_name.clone(),
-            committer_email: info.committer_email.clone(),
-            committer_time: info.committer_time.clone(),
-            parent_shas: info
-                .parents
-                .iter()
-                .map(|p| p.hex())
-                .filter(|p| p != root_hex)
-                .collect(),
-        }),
-        sha,
+        refs: refs.get(&full_sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
+        detail: CommitDetailDto {
+            description: fields.description.then(|| info.description.clone()),
+            author_name: fields.author_name.then(|| info.author_name.clone()),
+            author_email: fields.author_email.then(|| info.author_email.clone()),
+            author_time: fields.author_time.then(|| info.author_time.clone()),
+            committer_name: fields.committer_name.then(|| info.committer_name.clone()),
+            committer_email: fields.committer_email.then(|| info.committer_email.clone()),
+            committer_time: fields.committer_time.then(|| info.committer_time.clone()),
+            parent_shas: fields.parents.then(|| {
+                info.parents
+                    .iter()
+                    .filter(|p| p.hex() != root_hex)
+                    .map(|p| abbrev.commit(p))
+                    .collect()
+            }),
+        },
+        sha: abbrev.commit(&info.id),
     }
 }
 

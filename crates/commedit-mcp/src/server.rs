@@ -60,7 +60,24 @@ full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
 rewrite the target and its descendants, so shas change constantly; the \
 change_id is stable across rewrites — address commits by change_id to chain \
 mutations without re-listing history. An ambiguous prefix fails listing its \
-matches; list_history shows both ids.
+matches; list_history shows both ids. To save tokens, list_history returns \
+those ids already abbreviated to the shortest repo-unique prefix (>= 8 chars) — \
+pass them straight back as refs rather than echoing full 40/32-char ids.
+
+Bulk & paging: to edit many commits at once (e.g. re-date or reword a range), \
+prefer edit_commits — it applies every message/identity edit in ONE transaction \
+with a single rebase, atomically. list_history returns 30 commits by default; \
+page deeper with its offset / next_offset rather than requesting a huge limit. \
+list_history returns every verbose field by default; pass its `fields` to fetch \
+only the ones you need (e.g. just the timestamps before a re-date, or `[]` for a \
+header-only overview) to keep responses small.
+
+Surgical edits: for a small change to a long message or file, prefer \
+replace_in_message / replace_in_file — they take an exact `old`→`new` \
+substitution (unique match unless replace_all) instead of the whole text, so \
+the untouched content can't drift and the call stays small. Make `old` long \
+enough to match exactly once; an ambiguous or missing match is rejected. \
+edit_message / replace_files remain for wholesale rewrites.
 
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \

@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 
 use commedit_engine::conflict::{ConflictedCommit, ConflictedPath, SaveOutcome};
 use commedit_engine::diff::{ChangeKind, FileChange};
-use commedit_engine::history::CommitInfo;
+use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::SquashMode;
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_mcp::convert::{
     commit_dto, conflicted_commit_dto, file_change_dto, resolve_squash_mode, save_result_dto,
-    CONFLICT_GUIDANCE,
+    DetailFields, CONFLICT_GUIDANCE,
 };
-use commedit_mcp::dto::SaveResultDto;
+use commedit_mcp::dto::{CommitField, SaveResultDto};
 use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo_path::RepoPath;
@@ -42,11 +42,11 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
         vec![RefDecoration { name: "main".into(), kind: RefKind::Branch, current: true }],
     );
 
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &refs);
+    let dto = commit_dto(&ci(3, &[2]), &root_hex, &refs, &IdAbbrev::full(), DetailFields::ALL);
     assert_eq!(dto.sha, CommitId::new(vec![3]).hex());
     assert_eq!(dto.change_id, ChangeId::new(vec![3]).hex());
     assert_eq!(dto.subject, "subject 3");
-    assert_eq!(dto.detail.as_ref().unwrap().parent_shas, vec![CommitId::new(vec![2]).hex()]);
+    assert_eq!(dto.detail.parent_shas.unwrap(), vec![CommitId::new(vec![2]).hex()]);
     assert!(!dto.is_merge);
     assert_eq!(dto.refs.len(), 1);
     assert_eq!(dto.refs[0].name, "main");
@@ -54,13 +54,44 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
     assert!(dto.refs[0].current);
 
     // The oldest commit's parent is the virtual root: not a real commit.
-    let oldest = commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new());
-    assert!(oldest.detail.as_ref().unwrap().parent_shas.is_empty());
+    let oldest =
+        commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), DetailFields::ALL);
+    assert!(oldest.detail.parent_shas.unwrap().is_empty());
     assert!(oldest.refs.is_empty());
 
-    let merge = commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new());
+    let merge =
+        commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), DetailFields::ALL);
     assert!(merge.is_merge);
-    assert_eq!(merge.detail.as_ref().unwrap().parent_shas.len(), 2);
+    assert_eq!(merge.detail.parent_shas.unwrap().len(), 2);
+}
+
+#[test]
+fn commit_dto_includes_only_the_selected_fields() {
+    let root_hex = CommitId::new(vec![0]).hex();
+
+    // A header-only row: every verbose field omitted.
+    let none = DetailFields::from_request(Some(&[]));
+    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), none);
+    let d = &dto.detail;
+    assert!(d.description.is_none() && d.author_time.is_none() && d.parent_shas.is_none());
+    // The header is still populated.
+    assert_eq!(dto.subject, "subject 3");
+
+    // An explicit subset includes exactly those fields.
+    let times = DetailFields::from_request(Some(&[
+        CommitField::AuthorTime,
+        CommitField::CommitterTime,
+    ]));
+    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), times);
+    let d = &dto.detail;
+    assert_eq!(d.author_time.as_deref(), Some("2026-01-01 10:00:00 +0100"));
+    assert_eq!(d.committer_time.as_deref(), Some("2026-01-02 10:00:00 +0100"));
+    assert!(d.description.is_none() && d.author_name.is_none() && d.parent_shas.is_none());
+
+    // An absent list (the `None` request) selects everything.
+    let all = DetailFields::from_request(None);
+    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), all);
+    assert!(dto.detail.description.is_some() && dto.detail.parent_shas.is_some());
 }
 
 #[test]

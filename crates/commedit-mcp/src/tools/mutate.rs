@@ -5,17 +5,19 @@
 
 use std::collections::BTreeMap;
 
-use commedit_engine::rewrite::Identity;
-use commedit_engine::tree::FileEdit;
+use commedit_engine::history::IdAbbrev;
+use commedit_engine::rewrite::{BatchEdit, Identity};
+use commedit_engine::tree::{replace_checked, FileEdit, ReplaceError, StrReplace};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::{commit_dto, resolve_squash_mode};
+use crate::convert::{commit_dto, resolve_squash_mode, DetailFields};
 use crate::dto::{
-    CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditIdentityReq,
-    EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq,
-    RevertCommitReq, SaveResultDto, SplitCommitReq, SquashCommitReq,
+    CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditCommitsReq,
+    EditIdentityReq, EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq,
+    ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, RevertCommitReq, SaveResultDto,
+    SplitCommitReq, SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -127,6 +129,66 @@ impl CommeditServer {
     }
 
     #[tool(
+        description = "Edit several commits' messages and/or identities in ONE transaction with a single rebase — the bulk form of edit_message/edit_identity. Each entry sets a new message and/or identity for its commit (omitted identity fields keep their value; the committer timestamp is pinned, not re-stamped). Applied atomically and ancestors-first, so re-dating a whole parent→child range stays correct; if the rebase conflicts the whole batch is held back like any mutation. Prefer this over many single edits when re-dating or rewording a range. A commit may appear at most once."
+    )]
+    pub async fn edit_commits(
+        &self,
+        Parameters(req): Parameters<EditCommitsReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.edits.is_empty() {
+                return Err(invalid("edits must not be empty"));
+            }
+            let (_, commits) = full_history(repo)?;
+            let mut batch = Vec::with_capacity(req.edits.len());
+            for e in req.edits {
+                let idx = find_commit(&commits, &e.commit)?;
+                let c = &commits[idx];
+                let has_identity = e.author_name.is_some()
+                    || e.author_email.is_some()
+                    || e.author_time.is_some()
+                    || e.committer_name.is_some()
+                    || e.committer_email.is_some()
+                    || e.committer_time.is_some();
+                if e.message.is_none() && !has_identity {
+                    return Err(invalid(format!(
+                        "edit for {} changes nothing: set message or an identity field",
+                        e.commit
+                    )));
+                }
+                let identity = if has_identity {
+                    Some(Identity {
+                        author_name: e.author_name.unwrap_or_else(|| c.author_name.clone()),
+                        author_email: e.author_email.unwrap_or_else(|| c.author_email.clone()),
+                        author_time: e.author_time.unwrap_or_else(|| c.author_time.clone()),
+                        committer_name: e
+                            .committer_name
+                            .unwrap_or_else(|| c.committer_name.clone()),
+                        committer_email: e
+                            .committer_email
+                            .unwrap_or_else(|| c.committer_email.clone()),
+                        committer_time: e
+                            .committer_time
+                            .unwrap_or_else(|| c.committer_time.clone()),
+                    })
+                } else {
+                    None
+                };
+                batch.push(BatchEdit {
+                    target: c.id.clone(),
+                    message: e.message,
+                    identity,
+                });
+            }
+            let outcome = repo.rewrite_batch(batch).map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
         description = "Replace file contents inside a commit (whole-file replacement, no patch format). A path in `files` the commit doesn't have is added; `delete_paths` removes files. Descendants are rebased onto the edited tree and may report conflicts."
     )]
     pub async fn replace_files(
@@ -142,6 +204,84 @@ impl CommeditServer {
                 return Err(invalid("files and delete_paths must not both be empty"));
             }
             let outcome = repo.rewrite_files_edits(&commits[idx].id, &edits).map_err(internal)?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Make targeted text replacements inside a commit's files: each edit finds `old` and substitutes `new`, requiring a unique match unless replace_all is set. The surgical alternative to replace_files — send only the delta, not the whole file, so untouched content can't drift and the response stays small. Several edits may target one file (applied in order). Descendants are rebased and may report conflicts."
+    )]
+    pub async fn replace_in_file(
+        &self,
+        Parameters(req): Parameters<ReplaceInFileReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.edits.is_empty() {
+                return Err(invalid("edits must not be empty"));
+            }
+            for e in &req.edits {
+                if e.old.is_empty() {
+                    return Err(invalid(format!("the edit for {} has an empty `old`", e.path)));
+                }
+            }
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.commit)?;
+            let replaces: Vec<StrReplace> = req
+                .edits
+                .into_iter()
+                .map(|e| StrReplace {
+                    path: e.path,
+                    old: e.old,
+                    new: e.new,
+                    all: e.replace_all.unwrap_or(false),
+                })
+                .collect();
+            // A miss / ambiguous match / non-text path is the caller's mistake
+            // (fixable by amending `old`), so report it as invalid, not internal.
+            let outcome = repo
+                .replace_in_files(&commits[idx].id, &replaces)
+                .map_err(|e| match e.downcast::<ReplaceError>() {
+                    Ok(re) => invalid(re.to_string()),
+                    Err(e) => internal(e),
+                })?;
+            Ok(save_result(repo, &outcome))
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Replace text in a commit's message: find `old` and substitute `new`, requiring a unique match unless replace_all is set. The surgical alternative to edit_message — fix a typo or rename a term without resending the whole message. Descendants are rebased; the commit's sha changes."
+    )]
+    pub async fn replace_in_message(
+        &self,
+        Parameters(req): Parameters<ReplaceInMessageReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            if req.old.is_empty() {
+                return Err(invalid("`old` must not be empty"));
+            }
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.commit)?;
+            let edited = replace_checked(
+                &commits[idx].description,
+                &req.old,
+                &req.new,
+                req.replace_all.unwrap_or(false),
+            )
+            .map_err(|count| {
+                invalid(match count {
+                    0 => "`old` was not found in the message".to_string(),
+                    n => format!(
+                        "`old` matched {n} times in the message; make it unique or set replace_all"
+                    ),
+                })
+            })?;
+            let outcome = repo.rewrite_message(&commits[idx].id, &edited).map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await
@@ -290,7 +430,8 @@ impl CommeditServer {
             })?;
             let info = commits[idx].clone();
             let root = repo.root_commit_id().hex();
-            let dropped = commit_dto(&info, &root, &BTreeMap::new());
+            let dropped =
+                commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo), DetailFields::ALL);
             let outcome = run_staged(repo, trash, PendingTrashOp::Push(info), |repo| {
                 repo.abandon_commit(&id)
             })?;

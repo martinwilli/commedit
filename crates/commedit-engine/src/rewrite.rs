@@ -2,8 +2,12 @@
 //! "implicit amend + auto-rebase" core. Message editing is implemented here;
 //! tree/hunk editing reuses the same transaction shape.
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Context, Result};
 use jj_lib::backend::{CommitId, Signature};
+use jj_lib::commit::Commit;
+use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{
     move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RebasedCommit,
@@ -27,6 +31,15 @@ pub struct Identity {
     pub committer_name: String,
     pub committer_email: String,
     pub committer_time: String,
+}
+
+/// One commit's edit within a [`Repo::rewrite_batch`]: a new message and/or a new
+/// identity for `target`. At least one of the two must be set.
+#[derive(Debug, Clone)]
+pub struct BatchEdit {
+    pub target: CommitId,
+    pub message: Option<String>,
+    pub identity: Option<Identity>,
 }
 
 impl Repo {
@@ -124,6 +137,130 @@ impl Repo {
             old_head,
             heads,
         )
+    }
+
+    /// Apply several message/identity edits in ONE transaction with a single
+    /// rebase pass, then export to git. Unlike calling the single-commit methods
+    /// in a loop (each of which rebases the whole tail and re-stamps every
+    /// descendant's committer to "now"), this rewrites all targets together: a
+    /// commit explicitly rewritten here is excluded from the descendant re-stamp
+    /// pass, so its pinned committer survives even when its own parent is edited
+    /// in the same batch. That makes it O(targets + descendants), not O(n²), and
+    /// lets a whole parent→child range be re-dated correctly at once.
+    ///
+    /// Edits are applied ancestors-first and each rewritten commit is re-parented
+    /// onto its (possibly just-rewritten) ancestors, so an edited child lands on
+    /// its edited parent rather than orphaning onto the stale one. Identity, when
+    /// given, is fully resolved by the caller (omitted fields already merged).
+    pub fn rewrite_batch(&mut self, edits: Vec<BatchEdit>) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("editing commits", || self.rewrite_batch_inner(edits))
+    }
+
+    fn rewrite_batch_inner(&mut self, edits: Vec<BatchEdit>) -> Result<SaveOutcome> {
+        if edits.is_empty() {
+            bail!("no edits given");
+        }
+
+        // Validate, parse and load everything before opening the transaction, so a
+        // bad ref / date / duplicate fails fast and leaves jj untouched.
+        struct Prepared {
+            commit: Commit,
+            message: Option<String>,
+            signatures: Option<(Signature, Signature)>,
+        }
+        let store = self.repo.store().clone();
+        let mut seen = HashSet::new();
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(edits.len());
+        for edit in &edits {
+            if !seen.insert(edit.target.clone()) {
+                bail!("commit {} appears more than once in the batch", edit.target.hex());
+            }
+            if edit.message.is_none() && edit.identity.is_none() {
+                bail!("edit for {} changes neither message nor identity", edit.target.hex());
+            }
+            let commit = store.get_commit(&edit.target).context("loading target commit")?;
+            let signatures = match &edit.identity {
+                Some(id) => {
+                    let author = Signature {
+                        name: id.author_name.clone(),
+                        email: id.author_email.clone(),
+                        timestamp: parse_timestamp(&id.author_time).context("author date")?,
+                    };
+                    let committer = Signature {
+                        name: id.committer_name.clone(),
+                        email: id.committer_email.clone(),
+                        timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
+                    };
+                    Some((author, committer))
+                }
+                None => None,
+            };
+            prepared.push(Prepared {
+                commit,
+                message: edit.message.clone(),
+                signatures,
+            });
+        }
+
+        // Order ancestors-first: sort by the count of in-batch ancestors. A strict
+        // ancestor has fewer in-batch ancestors than its descendant, so this is a
+        // valid topological order over the subset (ties among unrelated commits
+        // don't matter). Load-bearing: `new_parents` below only finds a rewritten
+        // ancestor once that ancestor has itself been written.
+        let ids: Vec<CommitId> = prepared.iter().map(|p| p.commit.id().clone()).collect();
+        let index = self.repo.index();
+        let mut anc_count = vec![0usize; prepared.len()];
+        for i in 0..ids.len() {
+            for j in 0..ids.len() {
+                if i != j
+                    && index
+                        .is_ancestor(&ids[j], &ids[i])
+                        .context("checking commit ancestry")?
+                {
+                    anc_count[i] += 1;
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..prepared.len()).collect();
+        order.sort_by_key(|&i| anc_count[i]);
+
+        let affected: Vec<String> = prepared.iter().map(|p| p.commit.change_id().hex()).collect();
+        let label = format!(
+            "Edit {} commit{}",
+            prepared.len(),
+            if prepared.len() == 1 { "" } else { "s" }
+        );
+        let desc = OpDescriptor::new(label, affected);
+
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.head_commit();
+        let heads = self.snapshot_heads();
+
+        let mut tx = self.repo.start_transaction();
+        for &i in &order {
+            let p = &prepared[i];
+            // Re-point onto rewritten ancestors (a no-op when none moved), so an
+            // edited child follows its edited parent instead of orphaning.
+            let new_parents = tx.repo().new_parents(p.commit.parent_ids());
+            let mut builder = tx
+                .repo_mut()
+                .rewrite_commit(&p.commit)
+                .set_parents(new_parents);
+            if let Some(message) = &p.message {
+                builder = builder.set_description(message);
+            }
+            if let Some((author, committer)) = &p.signatures {
+                builder = builder.set_author(author.clone()).set_committer(committer.clone());
+            }
+            pollster::block_on(builder.write()).context("writing rewritten commit")?;
+        }
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        // Plain finish: message/identity edits don't preserve a net change set, so
+        // a genuine conflict goes to the manual flow like the single-commit edits.
+        self.finish_mutation(tx, "commedit: edit commits", desc, pre_op, old_head, heads)
     }
 
     /// All destination lines for dragging the commit at display index `from` to

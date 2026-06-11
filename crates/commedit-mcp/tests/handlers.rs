@@ -5,9 +5,10 @@ mod common;
 
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
-    DropCommitReq, EditIdentityReq, EditMessageReq, FileContentDto, ListHistoryReq,
-    ReorderCommitReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq, SquashCommitReq,
+    CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
+    FileContentDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq, ReplaceInFileReq,
+    ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq, SplitCommitReq,
+    SquashCommitReq, StrReplaceDto,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -16,7 +17,7 @@ use tempfile::TempDir;
 /// The current history's shas, newest first.
 async fn shas(server: &CommeditServer) -> Vec<String> {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0
@@ -50,23 +51,29 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
     let subjects: Vec<&str> = resp.commits.iter().map(|c| c.subject.as_str()).collect();
     assert_eq!(subjects, ["third", "second", "first"]);
-    assert_eq!(resp.head_sha.as_deref(), Some(resp.commits[0].sha.as_str()));
+    // Emitted shas are abbreviated (>= 8 chars); head_sha stays full, so the
+    // tip's abbreviated sha is a prefix of it.
+    let head = resp.head_sha.as_deref().unwrap();
+    let tip = resp.commits[0].sha.as_str();
+    assert!(tip.len() >= 8 && head.starts_with(tip), "tip {tip} prefixes head {head}");
     assert!(!resp.has_more);
+    assert_eq!(resp.next_offset, None);
+    assert_eq!(resp.offset, 0);
     assert_eq!(resp.trash_count, 0);
 
     // The tip carries the checked-out branch decoration.
     let tip_refs = &resp.commits[0].refs;
     assert!(tip_refs.iter().any(|r| r.name == "main" && r.kind == "branch" && r.current));
     // The oldest commit has no parents (the virtual root is filtered).
-    assert!(resp.commits[2].detail.as_ref().unwrap().parent_shas.is_empty());
+    assert!(resp.commits[2].detail.parent_shas.as_ref().unwrap().is_empty());
     assert_eq!(
-        resp.commits[0].detail.as_ref().unwrap().parent_shas,
+        resp.commits[0].detail.parent_shas.clone().unwrap(),
         vec![resp.commits[1].sha.clone()]
     );
 }
@@ -81,7 +88,7 @@ async fn list_history_honours_the_limit() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: Some(2), brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: Some(2), offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -91,7 +98,7 @@ async fn list_history_honours_the_limit() {
 }
 
 #[tokio::test]
-async fn list_history_brief_drops_the_detail() {
+async fn list_history_fields_selects_the_verbose_detail() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
@@ -99,29 +106,51 @@ async fn list_history_brief_drops_the_detail() {
     );
     let server = open_server(dir.path());
 
-    let brief = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(true) }))
+    // `fields: []` keeps only the header — every verbose field is omitted.
+    let header = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+        }))
         .await
         .unwrap()
         .0;
-    // The header is still there to identify and act on the commit...
-    assert_eq!(brief.commits[0].subject, "second");
-    assert!(!brief.commits[0].sha.is_empty());
-    assert!(!brief.commits[0].change_id.is_empty());
-    // ...but the verbose detail (message body, identity, parents) is omitted.
-    assert!(brief.commits.iter().all(|c| c.detail.is_none()));
+    assert_eq!(header.commits[0].subject, "second");
+    assert!(!header.commits[0].sha.is_empty());
+    assert!(!header.commits[0].change_id.is_empty());
+    assert!(header.commits.iter().all(|c| {
+        let d = &c.detail;
+        d.description.is_none()
+            && d.author_time.is_none()
+            && d.committer_time.is_none()
+            && d.parent_shas.is_none()
+    }));
 
-    // A full listing carries it.
-    let full = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: Some(false) }))
+    // An explicit subset includes exactly those fields and nothing else.
+    let subset = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![CommitField::AuthorTime, CommitField::CommitterTime]),
+        }))
         .await
         .unwrap()
         .0;
-    let detail = full.commits[1].detail.as_ref().expect("full listing has detail");
+    let d = &subset.commits[1].detail;
+    assert!(d.author_time.is_some() && d.committer_time.is_some());
+    assert!(d.description.is_none() && d.author_name.is_none() && d.parent_shas.is_none());
+
+    // Omitting `fields` carries the full detail, including the message body.
+    let full = server
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .await
+        .unwrap()
+        .0;
+    let description = full.commits[1].detail.description.as_ref().expect("full listing has detail");
     assert!(
-        detail.description.contains("with a long body line"),
-        "full detail carries the message body: {}",
-        detail.description
+        description.contains("with a long body line"),
+        "full detail carries the message body: {description}"
     );
 }
 
@@ -132,14 +161,14 @@ async fn list_history_marks_merges() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
     let merge = &resp.commits[0];
     assert_eq!(merge.subject, "merge");
     assert!(merge.is_merge);
-    assert_eq!(merge.detail.as_ref().unwrap().parent_shas.len(), 2);
+    assert_eq!(merge.detail.parent_shas.as_ref().unwrap().len(), 2);
     assert!(resp.commits[1..].iter().all(|c| !c.is_merge));
 }
 
@@ -153,7 +182,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -295,12 +324,12 @@ async fn edit_identity_prefills_omitted_fields() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
     let target = &history.commits[0];
-    let committer_time = target.detail.as_ref().unwrap().committer_time.clone();
+    let committer_time = target.detail.committer_time.clone().unwrap();
 
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
@@ -322,11 +351,108 @@ async fn edit_identity_prefills_omitted_fields() {
     let show = git(dir.path(), &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"]);
     assert_eq!(show, "New Author|tester@example.com|Tester|tester@example.com");
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
-    assert_eq!(listed.commits[0].detail.as_ref().unwrap().committer_time, committer_time);
+    assert_eq!(listed.commits[0].detail.committer_time.clone().unwrap(), committer_time);
+}
+
+#[tokio::test]
+async fn edit_commits_batches_message_and_identity_in_one_pass() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+    );
+    let server = open_server(dir.path());
+
+    // Address by the (abbreviated) change_ids the listing returns — proving they
+    // round-trip back as refs.
+    let hist = server
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .await
+        .unwrap()
+        .0;
+    let id = |i: usize| hist.commits[i].change_id.clone(); // [third, second, first]
+
+    let dated = |commit: String, t: &str| CommitEditDto {
+        commit,
+        message: None,
+        author_name: None,
+        author_email: None,
+        author_time: Some(t.into()),
+        committer_name: None,
+        committer_email: None,
+        committer_time: Some(t.into()),
+    };
+
+    // One batch: re-date a parent ("first") and its child ("second"), and reword
+    // the tip ("third") — all in a single transaction / rebase.
+    let result = server
+        .edit_commits(Parameters(EditCommitsReq {
+            edits: vec![
+                dated(id(2), "2026-06-11 18:00:00 +0200"),
+                dated(id(1), "2026-06-11 18:30:00 +0200"),
+                CommitEditDto {
+                    commit: id(0),
+                    message: Some("third (edited)".into()),
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                },
+            ],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["third (edited)", "second", "first"]);
+    let listed = server
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .await
+        .unwrap()
+        .0;
+    let detail = |i: usize| listed.commits[i].detail.clone();
+    // The child's committer is the pinned value, not re-stamped to "now".
+    assert_eq!(detail(1).author_time.unwrap(), "2026-06-11 18:30:00 +0200");
+    assert_eq!(detail(1).committer_time.unwrap(), "2026-06-11 18:30:00 +0200");
+    assert_eq!(detail(2).author_time.unwrap(), "2026-06-11 18:00:00 +0200");
+    assert_eq!(detail(2).committer_time.unwrap(), "2026-06-11 18:00:00 +0200");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn edit_commits_rejects_empty_and_noop_batches() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    let server = open_server(dir.path());
+
+    let empty = expect_err(server.edit_commits(Parameters(EditCommitsReq { edits: vec![] })).await);
+    assert!(empty.message.contains("must not be empty"), "{}", empty.message);
+
+    let target = shas(&server).await[0].clone();
+    let noop = expect_err(
+        server
+            .edit_commits(Parameters(EditCommitsReq {
+                edits: vec![CommitEditDto {
+                    commit: target,
+                    message: None,
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                }],
+            }))
+            .await,
+    );
+    assert!(noop.message.contains("changes nothing"), "{}", noop.message);
 }
 
 #[tokio::test]
@@ -374,6 +500,107 @@ async fn replace_files_requires_files() {
             .await,
     );
     assert!(err.message.contains("files"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn replace_in_file_rewrites_a_unique_match_across_descendants() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "the bulck form\n", "first"), ("b.txt", "two\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .replace_in_file(Parameters(ReplaceInFileReq {
+            commit: target,
+            edits: vec![StrReplaceDto {
+                path: "a.txt".into(),
+                old: "bulck".into(),
+                new: "bulk".into(),
+                replace_all: None,
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "the bulk form");
+    // The descendant rebased onto the edited tree; the worktree follows.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "the bulk form\n");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn replace_in_file_rejects_an_ambiguous_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "a\na\n", "first")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_in_file(Parameters(ReplaceInFileReq {
+                commit: target,
+                edits: vec![StrReplaceDto {
+                    path: "a.txt".into(),
+                    old: "a".into(),
+                    new: "b".into(),
+                    replace_all: None,
+                }],
+            }))
+            .await,
+    );
+    // The ambiguity message comes only from the ReplaceError→invalid path.
+    assert!(err.message.contains("matched 2 times"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn replace_in_message_fixes_a_typo() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "the bulck form"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .replace_in_message(Parameters(ReplaceInMessageReq {
+            commit: target,
+            old: "bulck".into(),
+            new: "bulk".into(),
+            replace_all: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    assert_eq!(git_log_subjects(dir.path()), ["second", "the bulk form"]);
+}
+
+#[tokio::test]
+async fn replace_in_message_rejects_a_missing_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_in_message(Parameters(ReplaceInMessageReq {
+                commit: target,
+                old: "nope".into(),
+                new: "x".into(),
+                replace_all: None,
+            }))
+            .await,
+    );
+    assert!(err.message.contains("not found"), "unexpected error: {}", err.message);
 }
 
 #[tokio::test]
@@ -471,7 +698,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -524,7 +751,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -589,7 +816,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].sha, target);
     let listing = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -621,7 +848,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -766,7 +993,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -849,7 +1076,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
@@ -882,12 +1109,12 @@ async fn a_change_id_chains_mutations_without_relisting() {
     clean_head(&result);
 
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, brief: None }))
+        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
         .await
         .unwrap()
         .0;
     assert_eq!(listed.commits[1].subject, "first, chained");
-    assert_eq!(listed.commits[1].detail.as_ref().unwrap().author_name, "Chained Author");
+    assert_eq!(listed.commits[1].detail.author_name.as_deref().unwrap(), "Chained Author");
     assert_eq!(listed.commits[1].change_id, change_id);
 }
 

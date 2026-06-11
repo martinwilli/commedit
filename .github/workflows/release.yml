@@ -30,6 +30,8 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: commedit-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            asset: commedit-linux-aarch64.tar.gz
           - os: macos-latest
             asset: commedit-macos-aarch64.tar.gz
     steps:

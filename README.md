@@ -76,8 +76,8 @@ an interactive-rebase session.
 
 ## Installing a binary release
 
-Pre-built binaries for Linux (x86-64) and macOS (Apple Silicon) are attached to
-each [GitHub release](../../releases). They are **dynamically linked** against
+Pre-built binaries for Linux (x86-64 and AArch64) and macOS (Apple Silicon) are
+attached to each [GitHub release](../../releases). They are **dynamically linked** against
 your system GTK, so they are not self-contained — you need a few runtime
 dependencies installed first:
 
@@ -96,7 +96,7 @@ xattr -dr com.apple.quarantine commedit   # the binary is unsigned; clear Gateke
 
 # Debian / Ubuntu (24.04+; 22.04 ships GTK 4.6, too old)
 sudo apt install git libgtk-4-1 libgtksourceview-5-0
-tar -xzf commedit-linux-x86_64.tar.gz
+tar -xzf commedit-linux-x86_64.tar.gz   # or commedit-linux-aarch64.tar.gz on ARM64
 ./commedit /path/to/repo
 ```
 

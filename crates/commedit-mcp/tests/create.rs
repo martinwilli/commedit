@@ -311,6 +311,8 @@ async fn revert_commit_refuses_a_merge() {
         "unexpected error: {}",
         err.message
     );
+    // A refused input is reported as invalid params, not an internal error.
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
 #[tokio::test]

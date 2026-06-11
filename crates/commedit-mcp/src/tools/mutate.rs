@@ -211,7 +211,11 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
-            let target = commits[find_commit(&commits, &req.commit)?].id.clone();
+            let idx = find_commit(&commits, &req.commit)?;
+            if commits[idx].parents.len() > 1 {
+                return Err(invalid("cannot revert a merge commit"));
+            }
+            let target = commits[idx].id.clone();
             let new_parent = req.new_parent.unwrap_or_else(|| head.hex());
             let mv = plan_splice(
                 repo,

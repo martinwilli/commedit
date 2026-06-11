@@ -45,18 +45,20 @@ unit-testable headless:
   launch-per-repo `Repo` in `Arc<Mutex<_>>`, every tool body on
   `spawn_blocking` with the lock taken inside. Tools live in `tools/{read,
   mutate,workcopy,conflict,ops}.rs` (one named rmcp router each, combined in
-  `server.rs`) and delegate addressing/planning to `session.rs` — sha→index
-  against a fresh `history()` read, the session trash with its staged
-  push/remove (applied only when a rewrite settles `Clean`), and `plan_splice`,
-  which maps the agent semantics "make P the parent" (or `"root"`) onto the
-  graph planner's gap-above-P candidates and asks for `child_sha` at a fork.
-  Responses are DTOs in `dto.rs` (`convert.rs` maps engine types; **no jj-lib
-  type crosses**; field doc comments are the schema descriptions agents read);
-  mutations return the status-tagged `SaveResultDto`, whose schema needs the
-  explicit root `"type": "object"` MCP requires. Mutations are refused while a
-  conflicted rewrite is pending — the conflict tools (change-id-keyed) or
-  `abort_rewrite` settle it first — and `reload_repo` re-opens the repo in
-  place (fresh session) to pick up out-of-band git changes.
+  `server.rs`) and delegate addressing/planning to `session.rs` — commit-ref
+  resolution (sha / change id / unique ≥ 4-char prefix, `lookup_ref` deduping
+  duplicates to the first entry so history beats the trash) against a fresh
+  `history()` read, the session trash with its staged push/remove (applied
+  only when a rewrite settles `Clean`), and `plan_splice`, which maps the
+  agent semantics "make P the parent" (or `"root"`) onto the graph planner's
+  gap-above-P candidates and asks for `child` at a fork. Responses are DTOs in
+  `dto.rs` (`convert.rs` maps engine types; **no jj-lib type crosses**; field
+  doc comments are the schema descriptions agents read); mutations return the
+  status-tagged `SaveResultDto`, whose schema needs the explicit root
+  `"type": "object"` MCP requires. Mutations are refused while a conflicted
+  rewrite is pending — the conflict tools (commit-ref-keyed, change id
+  preferred) or `abort_rewrite` settle it first — and `reload_repo` re-opens
+  the repo in place (fresh session) to pick up out-of-band git changes.
 
 ### The jj-over-git "transparency" model (the central idea)
 

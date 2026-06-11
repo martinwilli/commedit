@@ -132,7 +132,9 @@ does: edit any commit's message, identity or file contents, split, reorder,
 drop, restore and squash commits, fold uncommitted changes in, walk the
 conflict-resolution loop, and undo any of it — all while the repository stays a
 plain git repo and conflicted rewrites are held back from git until they
-resolve or abort.
+resolve or abort. Every tool addresses commits flexibly — by sha or by jj's
+stable change id, full or a unique prefix — so an agent can chain mutations by
+change id without re-listing the history as shas churn.
 
 Nobody runs the server by hand: the MCP client spawns the stdio process when a
 session starts and kills it when the session ends. The server takes the

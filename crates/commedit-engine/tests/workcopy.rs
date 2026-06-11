@@ -4,8 +4,12 @@
 
 mod common;
 
+use std::path::Path;
+
+use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
+use commedit_engine::workcopy::PartialSelection;
 
 fn subject_id(repo: &Repo, subject: &str) -> commedit_engine::history::CommitInfo {
     history(&repo.repo, &repo.head_commit_id().expect("head"))
@@ -283,8 +287,6 @@ fn working_copy_info_is_some_only_when_dirty() {
 
 #[test]
 fn overlapping_edit_defers_as_a_conflict_then_resolves() {
-    use commedit_engine::conflict::SaveOutcome;
-
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     common::init_repo(
@@ -491,4 +493,263 @@ fn tracked_file_in_ignored_directory_is_not_a_phantom_change() {
         "!! m4/generated.m4",
         "the ignored sibling stays ignored — widening the snapshot didn't track it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Partial working-copy commit (commit_working_copy_partial)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_commit_paths_tier_commits_only_listed_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Edit two tracked files; commit only a.txt whole.
+    std::fs::write(dir.join("a.txt"), "a\nedit-a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nedit-b\n").unwrap();
+
+    let paths = vec!["a.txt".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let outcome = repo
+        .commit_working_copy_partial(sel, "commit a only", None)
+        .expect("partial commit");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // The new commit holds the edited a.txt and the *original* b.txt.
+    assert_eq!(common::git_log_subjects(dir), ["commit a only", "second", "first"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nedit-a");
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b");
+
+    // Disk is byte-identical for both files — only b.txt's edit stays uncommitted.
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nedit-a\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nedit-b\n");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+
+    // One remaining chain entry (the remainder); transparency holds.
+    assert_eq!(repo.working_copy_chain().len(), 1);
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_commit_hunks_tier_commits_only_the_selected_hunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let base: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+    common::init_repo(dir, &[("f.txt", &base, "first")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two far-apart edits → two independent hunks (3 lines of context can't bridge
+    // a 13-line gap), so hunk 0 is the line-3 change and hunk 1 the line-17 change.
+    let edited: String = (1..=20)
+        .map(|n| match n {
+            3 => "L3\n".to_string(),
+            17 => "L17\n".to_string(),
+            _ => format!("l{n}\n"),
+        })
+        .collect();
+    std::fs::write(dir.join("f.txt"), &edited).unwrap();
+
+    let hunks = vec![("f.txt".to_string(), vec![0usize])];
+    let sel = PartialSelection { paths: &[], hunks: &hunks, patches: &[] };
+    let outcome = repo
+        .commit_working_copy_partial(sel, "first hunk", None)
+        .expect("partial commit");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // Committed content keeps hunk 0 (L3) but reverts hunk 1 (l17 stays original).
+    let committed = common::git(dir, &["show", "HEAD:f.txt"]);
+    assert!(committed.contains("\nL3\n"), "hunk 0 committed, got: {committed}");
+    assert!(committed.contains("\nl17\n"), "hunk 1 not committed, got: {committed}");
+
+    // Disk is unchanged (both edits present); the remainder is hunk 1.
+    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), edited);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M f.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_commit_patches_tier_commits_a_sub_hunk_and_rejects_a_corrupt_patch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("f.txt", "1\n2\n3\n", "first")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Add two lines on disk; an edited patch (à la `git add -p` → e) commits only
+    // the `+A` line, leaving `+B` uncommitted.
+    std::fs::write(dir.join("f.txt"), "1\n2\nA\nB\n3\n").unwrap();
+    let patch = "@@ -2,2 +2,3 @@\n 2\n+A\n 3\n";
+    let patches = vec![("f.txt".to_string(), patch.to_string())];
+    let sel = PartialSelection { paths: &[], hunks: &[], patches: &patches };
+    repo.commit_working_copy_partial(sel, "add A only", None)
+        .expect("partial commit");
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\n2\nA\n3");
+    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "1\n2\nA\nB\n3\n");
+
+    // A patch whose context doesn't match the file is rejected, not mis-applied.
+    let bad = vec![("f.txt".to_string(), "@@ -1,1 +1,2 @@\n NOPE\n+X\n".to_string())];
+    let sel = PartialSelection { paths: &[], hunks: &[], patches: &bad };
+    assert!(repo.commit_working_copy_partial(sel, "bad", None).is_err());
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_commit_of_everything_matches_commit_working_copy() {
+    // Two identical repos edited the same way: one whole-commits, the other
+    // partial-commits every changed path. The resulting trees must be identical.
+    let edit = |dir: &Path| {
+        common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+        std::fs::write(dir.join("a.txt"), "a\nx\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\ny\n").unwrap();
+    };
+
+    let whole_tmp = tempfile::tempdir().unwrap();
+    let whole = whole_tmp.path();
+    edit(whole);
+    Repo::open(whole)
+        .expect("open")
+        .commit_working_copy("all", None)
+        .expect("commit wc");
+
+    let part_tmp = tempfile::tempdir().unwrap();
+    let part = part_tmp.path();
+    edit(part);
+    let mut prepo = Repo::open(part).expect("open");
+    let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    prepo
+        .commit_working_copy_partial(sel, "all", None)
+        .expect("partial commit");
+
+    assert_eq!(
+        common::git(whole, &["rev-parse", "HEAD^{tree}"]),
+        common::git(part, &["rev-parse", "HEAD^{tree}"]),
+        "selecting every path equals committing the whole working copy"
+    );
+    // The remainder is empty, so the partial side's tree is clean again.
+    assert!(prepo.working_copy_info().is_none());
+    assert_eq!(common::git(part, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn partial_commit_with_an_empty_selection_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Edit a.txt, but select the *unmodified* b.txt → the commit would be empty.
+    std::fs::write(dir.join("a.txt"), "a\nedit\n").unwrap();
+    let paths = vec!["b.txt".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let err = repo
+        .commit_working_copy_partial(sel, "nope", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("commits nothing"), "got: {err}");
+
+    // History untouched and a.txt's edit is still uncommitted.
+    assert_eq!(common::git_log_subjects(dir), ["second", "first"]);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
+}
+
+#[test]
+fn partial_commit_paths_tier_commits_a_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Delete a.txt on disk and edit b.txt; commit only the deletion.
+    std::fs::remove_file(dir.join("a.txt")).unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nedit\n").unwrap();
+    let paths = vec!["a.txt".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    repo.commit_working_copy_partial(sel, "drop a", None)
+        .expect("partial commit");
+
+    // a.txt is gone from HEAD; b.txt is still original there.
+    assert!(common::git(dir, &["ls-tree", "--name-only", "HEAD"])
+        .lines()
+        .all(|l| l != "a.txt"));
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b");
+    // Disk: a.txt stays deleted, b.txt's edit remains uncommitted.
+    assert!(!dir.join("a.txt").exists());
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_commit_value_splice_preserves_exec_bit_and_rejects_binary_text_tiers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("keep.txt", "k\n", "first")]);
+    // Commit an executable script and a binary file.
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("data.bin"), [0u8, 159, 146, 150]).unwrap();
+    common::git(dir, &["add", "run.sh", "data.bin"]);
+    common::git(dir, &["commit", "-q", "-m", "tools"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    // Edit the script's content (mode kept) and the binary's bytes.
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\necho bye\n").unwrap();
+    std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("data.bin"), [1u8, 2, 159, 3]).unwrap();
+
+    // The binary can't be addressed by hunk (or patch) — text tiers reject it.
+    let hunks = vec![("data.bin".to_string(), vec![0usize])];
+    let sel = PartialSelection { paths: &[], hunks: &hunks, patches: &[] };
+    let err = repo.commit_working_copy_partial(sel, "x", None).unwrap_err();
+    assert!(err.to_string().contains("binary"), "got: {err}");
+
+    // The executable commits whole via the paths tier, keeping its 100755 mode.
+    let paths = vec!["run.sh".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    repo.commit_working_copy_partial(sel, "update script", None)
+        .expect("partial commit");
+    assert_eq!(common::git(dir, &["show", "HEAD:run.sh"]), "#!/bin/sh\necho bye");
+    assert!(
+        common::git(dir, &["ls-tree", "HEAD", "run.sh"]).starts_with("100755"),
+        "the executable bit is preserved by the value-splice"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_commit_collapses_a_split_working_copy_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two uncommitted edits peeled into a two-entry chain.
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    repo.split_working_copy(None, &[("b.txt".to_string(), "b\n".to_string())])
+        .expect("split");
+    assert_eq!(repo.working_copy_chain().len(), 2);
+
+    // A partial commit reads the leaf's full tree, collapsing the chain; the
+    // remainder is a single entry.
+    let paths = vec!["a.txt".to_string()];
+    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let outcome = repo
+        .commit_working_copy_partial(sel, "commit a", None)
+        .expect("partial commit");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nAA");
+    assert_eq!(repo.working_copy_chain().len(), 1, "chain collapsed to the remainder");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]),
+        ""
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
 }

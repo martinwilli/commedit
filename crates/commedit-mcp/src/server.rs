@@ -99,12 +99,15 @@ report conflicts like any rewrite.
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).
 
-Safety net: every landed mutation is a recorded operation — undo/redo step \
-them, jump_to_operation 0 rolls the whole session back to its start. The one \
-unrecoverable action is discard_working_copy.
+Safety net: every landed mutation is a recorded operation — list_operations \
+lists them, undo/redo step the cursor, jump_to_operation travels to any (0 \
+rolls the whole session back to its start). The one unrecoverable action is \
+discard_working_copy.
 
 Uncommitted changes in the working tree are first-class: they ride through \
-every rewrite automatically (working_copy_status shows them). Git state is \
+every rewrite automatically (working_copy_status shows them; session_diff \
+shows everything this session changed, committed and uncommitted, against the \
+session-start tree). Git state is \
 imported only at startup — after any out-of-band git operation (a commit, \
 branch switch, rebase made outside this server) call reload_repo before \
 continuing; it starts a fresh session in place, discarding the trash, the \

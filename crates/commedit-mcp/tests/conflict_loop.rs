@@ -273,16 +273,6 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
 }
 
 #[tokio::test]
-async fn finalize_is_a_clean_noop_without_a_pending_rewrite() {
-    let dir = TempDir::new().unwrap();
-    conflicting_repo(dir.path());
-    let server = open_server(dir.path());
-
-    let result = server.finalize().await.unwrap().0;
-    assert!(matches!(result, SaveResultDto::Clean { .. }));
-}
-
-#[tokio::test]
 async fn conflicts_resolve_by_sha_or_prefix() {
     let dir = TempDir::new().unwrap();
     conflicting_repo(dir.path());

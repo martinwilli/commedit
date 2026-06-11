@@ -6,9 +6,9 @@ mod common;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
     CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
-    FileContentDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq, ReplaceInFileReq,
-    ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq, SplitCommitReq,
-    SquashCommitReq, StrReplaceDto,
+    FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq,
+    ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
+    SplitCommitReq, SquashCommitReq, StrReplaceDto,
 };
 use commedit_mcp::server::CommeditServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -334,12 +334,10 @@ async fn edit_identity_prefills_omitted_fields() {
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
             commit: target.sha.clone(),
-            author_name: Some("New Author".into()),
-            author_email: None,
-            author_time: None,
-            committer_name: None,
-            committer_email: None,
-            committer_time: None,
+            identity: IdentityFieldsDto {
+                author_name: Some("New Author".into()),
+                ..Default::default()
+            },
         }))
         .await
         .unwrap()
@@ -379,12 +377,11 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
     let dated = |commit: String, t: &str| CommitEditDto {
         commit,
         message: None,
-        author_name: None,
-        author_email: None,
-        author_time: Some(t.into()),
-        committer_name: None,
-        committer_email: None,
-        committer_time: Some(t.into()),
+        identity: IdentityFieldsDto {
+            author_time: Some(t.into()),
+            committer_time: Some(t.into()),
+            ..Default::default()
+        },
     };
 
     // One batch: re-date a parent ("first") and its child ("second"), and reword
@@ -397,12 +394,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
                 CommitEditDto {
                     commit: id(0),
                     message: Some("third (edited)".into()),
-                    author_name: None,
-                    author_email: None,
-                    author_time: None,
-                    committer_name: None,
-                    committer_email: None,
-                    committer_time: None,
+                    identity: IdentityFieldsDto::default(),
                 },
             ],
         }))
@@ -442,12 +434,7 @@ async fn edit_commits_rejects_empty_and_noop_batches() {
                 edits: vec![CommitEditDto {
                     commit: target,
                     message: None,
-                    author_name: None,
-                    author_email: None,
-                    author_time: None,
-                    committer_name: None,
-                    committer_email: None,
-                    committer_time: None,
+                    identity: IdentityFieldsDto::default(),
                 }],
             }))
             .await,
@@ -1096,12 +1083,10 @@ async fn a_change_id_chains_mutations_without_relisting() {
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
             commit: change_id.clone(),
-            author_name: Some("Chained Author".into()),
-            author_email: None,
-            author_time: None,
-            committer_name: None,
-            committer_email: None,
-            committer_time: None,
+            identity: IdentityFieldsDto {
+                author_name: Some("Chained Author".into()),
+                ..Default::default()
+            },
         }))
         .await
         .unwrap()

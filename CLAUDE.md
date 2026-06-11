@@ -66,8 +66,8 @@ unit-testable headless:
   (diffs with tabs, whitespace-only edits) become a line-sequence instead. The
   tool surface is a **superset** of the GTK app:
   `create_commit`/`revert_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
-  the surgical `replace_in_file`/`replace_in_message`, `commit_working_copy`
-  (+ partial) and the conflict `finalize` have no UI counterpart. Mutations are
+  the surgical `replace_in_file`/`replace_in_message` and `commit_working_copy`
+  (+ partial) have no UI counterpart. Mutations are
   refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
   preferred) or `abort_rewrite` settle it first — and `reload_repo` re-opens

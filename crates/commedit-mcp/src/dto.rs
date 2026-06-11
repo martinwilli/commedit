@@ -27,8 +27,8 @@ pub struct CommitDto {
     pub change_id: String,
     /// First line of the commit message.
     pub subject: String,
-    /// Merge commits cannot be reordered, dropped, split or used as a squash
-    /// source (squashing *into* one is fine).
+    /// Merge commits cannot be reordered, dropped, split, reverted,
+    /// cherry-picked or used as a squash source (squashing *into* one is fine).
     pub is_merge: bool,
     /// Local branches and tags pointing at this commit.
     pub refs: Vec<RefDto>,
@@ -330,15 +330,9 @@ pub struct EditIdentityReq {
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
     pub commit: String,
-    /// New author name; omitted fields keep their current value.
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub author_time: Option<String>,
-    pub committer_name: Option<String>,
-    pub committer_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub committer_time: Option<String>,
+    /// New author/committer fields; omitted fields keep their current value.
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 /// One commit's edit within an `edit_commits` batch. At least one of `message`
@@ -351,15 +345,9 @@ pub struct CommitEditDto {
     pub commit: String,
     /// New full commit message (subject + body). Omit to leave the message.
     pub message: Option<String>,
-    /// New author name; omitted fields keep their current value.
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub author_time: Option<String>,
-    pub committer_name: Option<String>,
-    pub committer_email: Option<String>,
-    /// `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
-    pub committer_time: Option<String>,
+    /// New author/committer fields; omitted fields keep their current value.
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -447,9 +435,11 @@ pub struct SplitCommitReq {
     pub files: Vec<FileContentDto>,
 }
 
-/// Optional author/committer overrides for a newly created commit. Every
-/// omitted field defaults to the repository's git-configured identity at the
-/// current time. Flattened into the create/revert/commit-working-copy requests.
+/// Optional author/committer fields (name, email, date), flattened into the
+/// requests that take an identity. How an *omitted* field is treated is
+/// tool-specific: a new-commit tool (create/revert/cherry_pick/commit_working_copy)
+/// fills it from the repository's git-configured identity at "now"; an edit tool
+/// (edit_identity/edit_commits) keeps the commit's current value.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct IdentityFieldsDto {
     pub author_name: Option<String>,
@@ -523,8 +513,15 @@ pub struct DropCommitReq {
     pub commit: String,
 }
 
+/// The result of `drop_commit`. The mutation outcome's `status` and fields are
+/// flattened to the top level — uniform with every other mutation's bare
+/// `SaveResultDto` — and `dropped` rides alongside as an extra sibling.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DropCommitResp {
+    /// The mutation outcome, flattened in: `status` (`clean`/`conflicts`) and
+    /// its fields sit at this object's top level, exactly as the other
+    /// mutations return them.
+    #[serde(flatten)]
     pub result: SaveResultDto,
     /// The dropped commit, now in the session trash. Its `parent_shas` say
     /// where it sat — useful when restoring it later.
@@ -718,4 +715,41 @@ pub struct TimeTravelResp {
 pub struct ReloadResp {
     /// The branch tip after the fresh import.
     pub head_sha: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_commit_resp_flattens_status_to_the_top_level() {
+        // drop_commit must report its outcome like every other mutation —
+        // `status` at the top level — with `dropped` as an extra sibling, not a
+        // result nested under `result`.
+        let resp = DropCommitResp {
+            result: SaveResultDto::Clean { head_sha: Some("abc123".into()) },
+            dropped: CommitDto {
+                sha: "def456".into(),
+                change_id: "zzzz".into(),
+                subject: "dropped one".into(),
+                is_merge: false,
+                refs: Vec::new(),
+                detail: CommitDetailDto {
+                    description: None,
+                    author_name: None,
+                    author_email: None,
+                    author_time: None,
+                    committer_name: None,
+                    committer_email: None,
+                    committer_time: None,
+                    parent_shas: None,
+                },
+            },
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "clean");
+        assert_eq!(v["head_sha"], "abc123");
+        assert!(v.get("result").is_none(), "status must not stay nested under `result`");
+        assert_eq!(v["dropped"]["sha"], "def456");
+    }
 }

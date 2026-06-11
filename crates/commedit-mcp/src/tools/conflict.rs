@@ -159,17 +159,4 @@ impl CommeditServer {
         .await
         .map(Yaml)
     }
-
-    #[tool(
-        description = "Re-check a pending rewrite and export it if its chain is already clean (e.g. after resolutions that auto-cleared the rest). A no-op returning clean when nothing is pending."
-    )]
-    pub async fn finalize(&self) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(|repo, trash| {
-            let outcome = repo.finalize().map_err(internal)?;
-            trash.settle(&outcome);
-            Ok(save_result(repo, &outcome))
-        })
-        .await
-        .map(Yaml)
-    }
 }

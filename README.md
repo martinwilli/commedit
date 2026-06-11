@@ -161,8 +161,8 @@ read tools (`list_history`, `show_commit`, `working_copy_status`,
 `create_commit`, `revert_commit`, `cherry_pick_commit`, `reorder_commit`,
 `drop_commit`, `restore_commit`, `squash_commit`, `commit_working_copy`,
 `discard_working_copy`, `squash_working_copy`), the conflict loop
-(`pending_status`, `read_conflict`, `resolve_conflicts`, `finalize`,
-`abort_rewrite`), and the session safety net (`list_operations`, `undo`,
+(`pending_status`, `read_conflict`, `resolve_conflicts`, `abort_rewrite`),
+and the session safety net (`list_operations`, `undo`,
 `redo`, `jump_to_operation`, `reload_repo`). One server process is one editing
 session: dropped commits stay restorable from a session trash, every landed
 mutation is an undo point, and `jump_to_operation 0` rolls everything back to

@@ -19,8 +19,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_workcopy, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit.",
-        output_schema = crate::wrapper::output_schema::<WorkingCopyStatusResp>()
+        description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit."
     )]
     pub async fn working_copy_status(&self) -> Result<Yaml<WorkingCopyStatusResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -38,8 +37,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree).",
-        output_schema = crate::wrapper::output_schema::<SessionDiffResp>()
+        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree)."
     )]
     pub async fn session_diff(&self) -> Result<Yaml<SessionDiffResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -56,8 +54,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite."
     )]
     pub async fn squash_working_copy(
         &self,
@@ -81,8 +78,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). Refuses when there is nothing tracked to commit. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
     )]
     pub async fn commit_working_copy(
         &self,
@@ -105,8 +101,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true: this is the one action whose data this server cannot bring back (undo restores recorded states, none of which contain the discarded edits).",
-        output_schema = crate::wrapper::output_schema::<OkResp>()
+        description = "Discard ALL uncommitted changes, resetting the working tree to the branch tip. Requires confirm=true: this is the one action whose data this server cannot bring back (undo restores recorded states, none of which contain the discarded edits)."
     )]
     pub async fn discard_working_copy(
         &self,

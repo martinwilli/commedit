@@ -1,21 +1,20 @@
-//! `Yaml<T>` — a tool-result wrapper like rmcp's `Json<T>`, but the human-facing
-//! text content block is YAML instead of compact JSON, so results read cleanly
-//! in a chat transcript. `structured_content` (and the advertised `outputSchema`)
-//! stay JSON, so the machine-readable contract agents rely on is unchanged.
+//! `Yaml<T>` — a tool-result wrapper like rmcp's `Json<T>`, but the result is a
+//! single YAML text content block instead of compact JSON, so it reads cleanly
+//! in a chat transcript. No `structured_content` / `outputSchema` is emitted:
+//! MCP clients that receive structured content surface it as JSON and hide the
+//! text block, so YAML is the sole, human-facing wire form.
 
-use std::any::Any;
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use rmcp::handler::server::tool::IntoCallToolResult;
-use rmcp::model::{CallToolResult, Content, JsonObject};
+use rmcp::model::{CallToolResult, Content};
 use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-/// Wrap a serializable response so the tool result carries it as YAML text plus
-/// JSON `structured_content`. Mirrors `rmcp::handler::server::wrapper::Json`,
-/// down to delegating its `JsonSchema` to `T`.
+/// Wrap a serializable response so the tool result carries it as a single YAML
+/// text content block. Mirrors `rmcp::handler::server::wrapper::Json`, down to
+/// delegating its `JsonSchema` to `T`, but emits no JSON `structured_content`.
 pub struct Yaml<T>(pub T);
 
 impl<T: JsonSchema> JsonSchema for Yaml<T> {
@@ -27,23 +26,17 @@ impl<T: JsonSchema> JsonSchema for Yaml<T> {
     }
 }
 
-impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Yaml<T> {
+impl<T: Serialize + JsonSchema> IntoCallToolResult for Yaml<T> {
     fn into_call_tool_result(self) -> Result<CallToolResult, ErrorData> {
-        let json = serde_json::to_value(&self.0).map_err(|e| {
-            ErrorData::internal_error(format!("serializing structured content: {e}"), None)
-        })?;
         let value = serde_yaml::to_value(&self.0).map_err(|e| {
             ErrorData::internal_error(format!("serializing YAML content: {e}"), None)
         })?;
         let yaml = serde_yaml::to_string(&unfold_blobs(value)).map_err(|e| {
             ErrorData::internal_error(format!("serializing YAML content: {e}"), None)
         })?;
-        // Reuse rmcp's structured constructor (CallToolResult is non-exhaustive),
-        // then swap its compact-JSON text mirror for the readable YAML rendering.
-        // `structured_content` keeps the exact JSON — the authoritative data.
-        let mut result = CallToolResult::structured(json);
-        result.content = vec![Content::text(yaml)];
-        Ok(result)
+        // No `structured_content`: a client that receives it surfaces the JSON
+        // and hides this text block, defeating the readable YAML rendering.
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 }
 
@@ -53,8 +46,8 @@ impl<T: Serialize + JsonSchema + 'static> IntoCallToolResult for Yaml<T> {
 /// transcript (a diff with tabs, or a whitespace-only edit, hits this). For such
 /// values, present the string as a YAML *sequence* of its lines instead — each
 /// line on its own row, individually quoted only as needed — which stays
-/// readable and lossless. Block-renderable strings are left as-is, and the
-/// exact text is always available in `structured_content` regardless.
+/// readable and recovers the text by joining the entries with newlines.
+/// Block-renderable strings are left as-is.
 fn unfold_blobs(value: serde_yaml::Value) -> serde_yaml::Value {
     use serde_yaml::Value;
     match value {
@@ -76,38 +69,27 @@ fn renders_as_block_scalar(s: &str) -> bool {
     !s.contains('\t') && s.split('\n').all(|line| line.trim_end() == line)
 }
 
-/// The output schema rmcp's `#[tool]` macro derives automatically for a `Json<T>`
-/// return. `Yaml<T>` isn't the `Json` identifier the macro keys on (rmcp-macros'
-/// `extract_json_inner_type`), so each tool re-supplies it via
-/// `#[tool(output_schema = ...)]`. Panics at tool-registration time — exactly as
-/// the macro's own generated code does — if `T`'s schema is invalid.
-pub fn output_schema<T: JsonSchema + Any>() -> Arc<JsonObject> {
-    rmcp::handler::server::tool::schema_for_output::<T>().unwrap_or_else(|e| {
-        panic!("invalid output schema for {}: {e}", std::any::type_name::<T>())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dto::SaveResultDto;
 
     #[test]
-    fn yaml_text_mirrors_the_json_structured_content() {
+    fn the_result_is_a_single_yaml_block_with_no_structured_content() {
         let dto = SaveResultDto::Clean { head_sha: Some("abc123".into()) };
         let result = Yaml(dto).into_call_tool_result().expect("into result");
 
-        // The machine-readable half stays JSON, status tag and all.
-        let structured = result.structured_content.expect("structured content present");
-        assert_eq!(structured["status"], "clean");
-        assert_eq!(structured["head_sha"], "abc123");
-
-        // The displayed half is a single YAML block carrying the same data.
+        // No machine-readable JSON half: a client would surface it and hide the
+        // YAML, so the result is the YAML text block alone.
+        assert!(result.structured_content.is_none());
         assert_eq!(result.content.len(), 1);
+
+        // That block is valid YAML carrying the data, status tag and all.
         let text = &result.content[0].as_text().expect("text content").text;
-        let from_yaml: serde_json::Value =
+        let parsed: serde_json::Value =
             serde_yaml::from_str(text).expect("the text block is valid YAML");
-        assert_eq!(from_yaml, structured);
+        assert_eq!(parsed["status"], "clean");
+        assert_eq!(parsed["head_sha"], "abc123");
     }
 
     #[test]
@@ -132,9 +114,11 @@ mod tests {
         assert!(text.contains("blobby:\n"), "blobby should be a sequence:\n{text}");
         assert!(!text.contains("\\n"), "no escaped newlines anywhere:\n{text}");
 
-        // structured_content keeps both as exact JSON strings regardless.
-        let sc = result.structured_content.expect("structured content present");
-        assert_eq!(sc["clean"], "fn main() {\n    ok\n}");
-        assert_eq!(sc["blobby"], "fn main() {\n\tok\n}");
+        // Both forms stay lossless YAML — the block scalar verbatim, the
+        // sequence as one string per line.
+        let parsed: serde_json::Value =
+            serde_yaml::from_str(text).expect("the text block is valid YAML");
+        assert_eq!(parsed["clean"], "fn main() {\n    ok\n}");
+        assert_eq!(parsed["blobby"], serde_json::json!(["fn main() {", "\tok", "}"]));
     }
 }

@@ -17,8 +17,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing.",
-        output_schema = crate::wrapper::output_schema::<ListHistoryResp>()
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Pass brief=true for a compact overview (sha, change_id, subject, is_merge, refs only) of a long history, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas change on every mutation; every tool also accepts the stable change_id (or a unique >= 4-char prefix of either id), so prefer change ids over re-listing."
     )]
     pub async fn list_history(
         &self,
@@ -60,8 +59,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content.",
-        output_schema = crate::wrapper::output_schema::<ShowCommitResp>()
+        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content."
     )]
     pub async fn show_commit(
         &self,
@@ -101,8 +99,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "List the commits dropped to the session trash. They stay restorable (restore_commit, or squash_commit with a trashed source) until the session ends.",
-        output_schema = crate::wrapper::output_schema::<ListTrashResp>()
+        description = "List the commits dropped to the session trash. They stay restorable (restore_commit, or squash_commit with a trashed source) until the session ends."
     )]
     pub async fn list_trash(&self) -> Result<Yaml<ListTrashResp>, ErrorData> {
         self.with_session(|repo, trash| {

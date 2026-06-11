@@ -19,8 +19,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_conflict, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "Whether a conflicted rewrite is pending. While pending, git still shows the pre-rewrite history (git_head_sha) and the held rewrite's tip is jj_head_sha; no other mutation is allowed until the conflicts resolve or the rewrite is aborted.",
-        output_schema = crate::wrapper::output_schema::<PendingStatusResp>()
+        description = "Whether a conflicted rewrite is pending. While pending, git still shows the pre-rewrite history (git_head_sha) and the held rewrite's tip is jj_head_sha; no other mutation is allowed until the conflicts resolve or the rewrite is aborted."
     )]
     pub async fn pending_status(&self) -> Result<Yaml<PendingStatusResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -41,8 +40,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants.",
-        output_schema = crate::wrapper::output_schema::<ReadConflictResp>()
+        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
     )]
     pub async fn read_conflict(
         &self,
@@ -90,8 +88,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Apply resolved contents for one conflicted commit's files: either edited text (all markers removed, echoing its marker_len from read_conflict) or delete=true to remove the file. A deletion is how a modify/delete conflict settles (e.g. a revert that drops a file), and it also works on structural (resolvable=false) paths. Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Apply resolved contents for one conflicted commit's files: either edited text (all markers removed, echoing its marker_len from read_conflict) or delete=true to remove the file. A deletion is how a modify/delete conflict settles (e.g. a revert that drops a file), and it also works on structural (resolvable=false) paths. Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git."
     )]
     pub async fn resolve_conflicts(
         &self,
@@ -144,8 +141,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place.",
-        output_schema = crate::wrapper::output_schema::<AbortResp>()
+        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place."
     )]
     pub async fn abort_rewrite(&self) -> Result<Yaml<AbortResp>, ErrorData> {
         self.with_session(|repo, trash| {
@@ -165,8 +161,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Re-check a pending rewrite and export it if its chain is already clean (e.g. after resolutions that auto-cleared the rest). A no-op returning clean when nothing is pending.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Re-check a pending rewrite and export it if its chain is already clean (e.g. after resolutions that auto-cleared the rest). A no-op returning clean when nothing is pending."
     )]
     pub async fn finalize(&self) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(|repo, trash| {

@@ -16,8 +16,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_ops, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List this session's recorded operations (every landed mutation), oldest first, with the undo cursor. Index 0 is the session start; an entry's index is the state right after it — both are jump_to_operation targets.",
-        output_schema = crate::wrapper::output_schema::<ListOperationsResp>()
+        description = "List this session's recorded operations (every landed mutation), oldest first, with the undo cursor. Index 0 is the session start; an entry's index is the state right after it — both are jump_to_operation targets."
     )]
     pub async fn list_operations(&self) -> Result<Yaml<ListOperationsResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -39,8 +38,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Step one recorded operation back, restoring that state to git and the working tree (uncommitted changes made since are reset but stay recoverable by redo).",
-        output_schema = crate::wrapper::output_schema::<TimeTravelResp>()
+        description = "Step one recorded operation back, restoring that state to git and the working tree (uncommitted changes made since are reset but stay recoverable by redo)."
     )]
     pub async fn undo(&self) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -58,8 +56,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Step one undone operation forward again.",
-        output_schema = crate::wrapper::output_schema::<TimeTravelResp>()
+        description = "Step one undone operation forward again."
     )]
     pub async fn redo(&self) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(|repo, _| {
@@ -77,8 +74,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Travel to any recorded session state: 0 restores the session start (undoing everything), an entry's index from list_operations restores the state right after that operation.",
-        output_schema = crate::wrapper::output_schema::<TimeTravelResp>()
+        description = "Travel to any recorded session state: 0 restores the session start (undoing everything), an entry's index from list_operations restores the state right after that operation."
     )]
     pub async fn jump_to_operation(
         &self,
@@ -101,8 +97,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Re-open the repository to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This starts a fresh session in place: the trash, the operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself is untouched.",
-        output_schema = crate::wrapper::output_schema::<ReloadResp>()
+        description = "Re-open the repository to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This starts a fresh session in place: the trash, the operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself is untouched."
     )]
     pub async fn reload_repo(&self) -> Result<Yaml<ReloadResp>, ErrorData> {
         let path = self.repo_path.clone();

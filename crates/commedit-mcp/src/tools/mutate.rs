@@ -74,8 +74,7 @@ fn file_edits(files: Vec<FileContentDto>, delete_paths: Option<Vec<String>>) -> 
 #[tool_router(router = router_mutate, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "Replace a commit's message (subject + body). Descendants are rebased; the commit's sha changes.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Replace a commit's message (subject + body). Descendants are rebased; the commit's sha changes."
     )]
     pub async fn edit_message(
         &self,
@@ -95,8 +94,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Change a commit's author and/or committer (name, email, date). Omitted fields keep their current value. Unlike other edits this also pins the committer timestamp instead of re-stamping it to now.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Change a commit's author and/or committer (name, email, date). Omitted fields keep their current value. Unlike other edits this also pins the committer timestamp instead of re-stamping it to now."
     )]
     pub async fn edit_identity(
         &self,
@@ -129,8 +127,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Replace file contents inside a commit (whole-file replacement, no patch format). A path in `files` the commit doesn't have is added; `delete_paths` removes files. Descendants are rebased onto the edited tree and may report conflicts.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Replace file contents inside a commit (whole-file replacement, no patch format). A path in `files` the commit doesn't have is added; `delete_paths` removes files. Descendants are rebased onto the edited tree and may report conflicts."
     )]
     pub async fn replace_files(
         &self,
@@ -152,8 +149,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Split a commit in two: the commit keeps the given file contents (the subset to retain, as in replace_files), and a new `fixup!` child commit receives the remainder, so both combined reproduce the original change. Descendants are untouched.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Split a commit in two: the commit keeps the given file contents (the subset to retain, as in replace_files), and a new `fixup!` child commit receives the remainder, so both combined reproduce the original change. Descendants are untouched."
     )]
     pub async fn split_commit(
         &self,
@@ -172,8 +168,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Create a brand-new commit from given file contents and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes; existing descendants rebase onto it (a mid-history insert may report conflicts). Omit `files`/`delete_paths` for an empty commit. Uncommitted changes ride on top untouched — use commit_working_copy to commit those instead.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Create a brand-new commit from given file contents and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes; existing descendants rebase onto it (a mid-history insert may report conflicts). Omit `files`/`delete_paths` for an empty commit. Uncommitted changes ride on top untouched — use commit_working_copy to commit those instead."
     )]
     pub async fn create_commit(
         &self,
@@ -208,8 +203,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Create a commit that reverts another commit's change (its inverse diff, like `git revert`) and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes. The revert may itself conflict where the insertion point diverged from the reverted commit. Merge commits cannot be reverted.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Create a commit that reverts another commit's change (its inverse diff, like `git revert`) and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes. The revert may itself conflict where the insertion point diverged from the reverted commit. Merge commits cannot be reverted."
     )]
     pub async fn revert_commit(
         &self,
@@ -242,8 +236,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Drop a commit from history: its children rebase onto its parent, and the commit moves to the session trash (restorable via restore_commit or squash_commit). Merge commits and the branch's only commit cannot be dropped.",
-        output_schema = crate::wrapper::output_schema::<DropCommitResp>()
+        description = "Drop a commit from history: its children rebase onto its parent, and the commit moves to the session trash (restorable via restore_commit or squash_commit). Merge commits and the branch's only commit cannot be dropped."
     )]
     pub async fn drop_commit(
         &self,
@@ -272,8 +265,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Move a commit to another place in the history: new_parent names the commit that becomes its parent (or `root` for the very first position). A true rebase — commits that don't commute report conflicts. Merge commits cannot be moved.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Move a commit to another place in the history: new_parent names the commit that becomes its parent (or `root` for the very first position). A true rebase — commits that don't commute report conflicts. Merge commits cannot be moved."
     )]
     pub async fn reorder_commit(
         &self,
@@ -300,8 +292,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Graft a trashed commit (see list_trash) back into the history, like reorder_commit: new_parent names the commit that becomes its parent (or `root`). On success it leaves the trash.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Graft a trashed commit (see list_trash) back into the history, like reorder_commit: new_parent names the commit that becomes its parent (or `root`). On success it leaves the trash."
     )]
     pub async fn restore_commit(
         &self,
@@ -328,8 +319,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold one commit into another, anywhere in the graph (the source may also be a trashed commit). mode picks the message handling: fixup keeps the destination's, squash appends the source's body, amend replaces it — defaulting to the source's `fixup!`/`squash!`/`amend!` subject prefix, else fixup. A merge can be the destination but not the source.",
-        output_schema = crate::wrapper::output_schema::<SaveResultDto>()
+        description = "Fold one commit into another, anywhere in the graph (the source may also be a trashed commit). mode picks the message handling: fixup keeps the destination's, squash appends the source's body, amend replaces it — defaulting to the source's `fixup!`/`squash!`/`amend!` subject prefix, else fixup. A merge can be the destination but not the source."
     )]
     pub async fn squash_commit(
         &self,

@@ -102,8 +102,9 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
                 commit: oldest.change_id.clone(),
                 files: vec![ConflictFileEditDto {
                     path: path.path.clone(),
-                    text: "1\nR\n3\n".into(),
-                    marker_len: file.marker_len,
+                    text: Some("1\nR\n3\n".into()),
+                    marker_len: Some(file.marker_len),
+                    delete: None,
                 }],
             }))
             .await
@@ -231,8 +232,9 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
             commit: oldest.change_id.clone(),
             files: vec![ConflictFileEditDto {
                 path: oldest.files[0].path.clone(),
-                text: "1\nB\n3\n".into(),
-                marker_len: file.marker_len,
+                text: Some("1\nB\n3\n".into()),
+                marker_len: Some(file.marker_len),
+                delete: None,
             }],
         }))
         .await
@@ -305,8 +307,9 @@ async fn conflicts_resolve_by_sha_or_prefix() {
                 commit: oldest.change_id[..8].to_string(),
                 files: vec![ConflictFileEditDto {
                     path: oldest.files[0].path.clone(),
-                    text: "1\nR\n3\n".into(),
-                    marker_len: file.marker_len,
+                    text: Some("1\nR\n3\n".into()),
+                    marker_len: Some(file.marker_len),
+                    delete: None,
                 }],
             }))
             .await

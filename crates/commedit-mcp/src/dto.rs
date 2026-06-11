@@ -473,15 +473,24 @@ pub struct ReadConflictResp {
     pub num_sides: usize,
 }
 
-/// One resolved file for `resolve_conflicts`.
+/// One resolved file for `resolve_conflicts` — either edited content, or a
+/// deletion.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ConflictFileEditDto {
     /// The conflicted path being resolved.
     pub path: String,
     /// The file's complete resolved content, all conflict markers removed.
-    pub text: String,
-    /// The `marker_len` `read_conflict` returned for this file.
-    pub marker_len: usize,
+    /// Required unless `delete` is true.
+    pub text: Option<String>,
+    /// The `marker_len` `read_conflict` returned for this file. Required
+    /// alongside `text`; omit when deleting.
+    pub marker_len: Option<usize>,
+    /// Resolve by deleting the path instead of supplying content — the way to
+    /// settle a modify/delete conflict (e.g. a revert that should remove a
+    /// file). Works for structural (resolvable=false) conflicts too, so it is
+    /// also the text route's escape hatch besides abort_rewrite. When true,
+    /// text/marker_len are ignored.
+    pub delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

@@ -1,6 +1,7 @@
 //! The conflict-resolution loop: status while a rewrite is held back, reading
 //! conflicted files, applying resolutions, and bailing out.
 
+use commedit_engine::conflict::FileResolution;
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_router, ErrorData};
@@ -86,7 +87,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Apply resolved contents for one conflicted commit's files (all markers removed, each echoing its marker_len from read_conflict). Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git."
+        description = "Apply resolved contents for one conflicted commit's files: either edited text (all markers removed, echoing its marker_len from read_conflict) or delete=true to remove the file. A deletion is how a modify/delete conflict settles (e.g. a revert that drops a file), and it also works on structural (resolvable=false) paths. Re-rebases the chain: the result is either still-conflicted (continue with the remaining commits) or clean — at which point the whole held-back rewrite is exported to git."
     )]
     pub async fn resolve_conflicts(
         &self,
@@ -100,15 +101,36 @@ impl CommeditServer {
                 return Err(invalid("files must not be empty"));
             }
             let conflicts = repo.pending_conflicts().unwrap_or(&[]);
-            let change_hex =
-                conflicts[find_conflicted(conflicts, &req.commit)?].change_id_hex();
-            let files: Vec<(String, String, usize)> = req
-                .files
-                .into_iter()
-                .map(|f| (f.path, f.text, f.marker_len))
-                .collect();
+            let commit = &conflicts[find_conflicted(conflicts, &req.commit)?];
+            let change_hex = commit.change_id_hex();
+            let conflicted_paths: Vec<String> =
+                commit.files.iter().map(|f| f.path_str()).collect();
+
+            let mut files: Vec<(String, FileResolution)> = Vec::with_capacity(req.files.len());
+            for f in req.files {
+                if f.delete.unwrap_or(false) {
+                    if !conflicted_paths.iter().any(|p| *p == f.path) {
+                        return Err(invalid(format!(
+                            "{} is not a conflicted path of this commit; cannot delete it. \
+                             Its conflicted files are: {}",
+                            f.path,
+                            conflicted_paths.join(", ")
+                        )));
+                    }
+                    files.push((f.path, FileResolution::Delete));
+                } else {
+                    let (Some(text), Some(marker_len)) = (f.text, f.marker_len) else {
+                        return Err(invalid(format!(
+                            "{}: provide text and marker_len to resolve with content, or set \
+                             delete=true to remove the file",
+                            f.path
+                        )));
+                    };
+                    files.push((f.path, FileResolution::Content { text, marker_len }));
+                }
+            }
             let outcome = repo
-                .resolve_conflicts(&change_hex, &files)
+                .resolve_conflicts_ext(&change_hex, &files)
                 .map_err(internal)?;
             trash.settle(&outcome);
             Ok(save_result(repo, &outcome))

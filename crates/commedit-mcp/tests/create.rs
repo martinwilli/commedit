@@ -5,8 +5,8 @@
 mod common;
 
 use commedit_mcp::dto::{
-    CommitWorkingCopyReq, CreateCommitReq, FileContentDto, IdentityFieldsDto, ListHistoryReq,
-    ReplaceFilesReq, RevertCommitReq, SaveResultDto,
+    CommitWorkingCopyReq, ConflictFileEditDto, CreateCommitReq, FileContentDto, IdentityFieldsDto,
+    ListHistoryReq, ReplaceFilesReq, ResolveConflictsReq, RevertCommitReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_repo, open_server};
@@ -287,6 +287,58 @@ async fn revert_commit_inverts_a_commits_change() {
     // The revert undoes second's change: a.txt is back to first's content.
     assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "one");
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
+    let dir = TempDir::new().unwrap();
+    // x.txt is added, then modified — so reverting its addition wants to delete a
+    // file whose content has since diverged: a modify/delete conflict.
+    init_repo(
+        dir.path(),
+        &[("x.txt", "foo\n", "add x"), ("x.txt", "foo\nbar\n", "modify x")],
+    );
+    let server = open_server(dir.path());
+
+    let add_x = history(&server).await.commits[1].change_id.clone();
+    let result = server
+        .revert_commit(Parameters(RevertCommitReq {
+            commit: add_x,
+            new_parent: None,
+            child: None,
+            identity: IdentityFieldsDto::default(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let SaveResultDto::Conflicts { commits, .. } = result else {
+        panic!("the revert should conflict (modify vs delete)");
+    };
+
+    // Resolve by deleting the path — no read_conflict / marker_len needed, which
+    // content resolution could not express (it would leave an empty file).
+    let oldest = &commits[0];
+    let result = server
+        .resolve_conflicts(Parameters(ResolveConflictsReq {
+            commit: oldest.change_id.clone(),
+            files: vec![ConflictFileEditDto {
+                path: oldest.files[0].path.clone(),
+                text: None,
+                marker_len: None,
+                delete: Some(true),
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }), "delete settles the conflict");
+
+    // The file is gone — not present at HEAD and not left as a 0-byte file.
+    let tree = git(dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.contains("x.txt"), "x.txt is removed from the tree: {tree}");
+    assert!(!dir.path().join("x.txt").exists(), "x.txt is gone from disk");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    git(dir.path(), &["fsck", "--no-progress"]);
 }
 
 #[tokio::test]

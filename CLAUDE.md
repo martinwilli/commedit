@@ -27,7 +27,7 @@ cargo test -p commedit-engine    # engine only
 cargo test -p commedit-mcp       # MCP server only
 cargo test --test rewrite        # one integration test binary (each tests/*.rs is its own)
 cargo test plan_reorder          # tests matching a name
-cargo run -- /path/to/repo       # launch the GTK app against a repo (defaults to ".")
+cargo run -p commedit-gtk -- /path/to/repo  # launch the GTK app against a repo (defaults to ".")
 cargo run -p commedit-mcp -- /path/to/repo  # the MCP server on stdio (defaults to ".")
 ```
 

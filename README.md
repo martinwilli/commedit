@@ -133,7 +133,7 @@ and `gtksourceview5-devel` on Fedora).
 ```sh
 cargo build                 # build the workspace
 cargo test                  # run the engine and integration tests
-cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
+cargo run -p commedit-gtk -- /path/to/repo  # launch the app against a repo (defaults to ".")
 ```
 
 ## Use from AI agents (Claude Code plugin)

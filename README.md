@@ -45,7 +45,9 @@ an interactive-rebase session.
   merge graph: side-branch commits move, trash and restore like mainline ones
   (merges keep their shape; the merge commit itself stays put). Where several
   ancestry lines cross the drop gap, a small picker of colored lines asks which
-  one to splice into.
+  one to splice into. A trashed commit also offers a hover button (a down arrow)
+  that drops it out of the trash and writes its changes back to the working tree
+  as **uncommitted** edits — the "uncommit" you'd reach for `git reset --mixed`.
 
 - **Squash by dragging** — drag a commit *onto* another to fold it in. A commit
   with an autosquash prefix (`fixup!` / `squash!` / `amend!`) highlights its
@@ -141,7 +143,9 @@ plugin](https://code.claude.com/docs/en/plugins). With it installed, an agent
 edits history the way the GTK app does — and then some: edit any commit's
 message, identity or file contents, split, reorder, drop, restore and squash
 commits, create new commits and revert or cherry-pick existing ones, fold
-uncommitted changes in or commit them, walk the conflict-resolution loop, and
+uncommitted changes in or commit them, drop a commit while keeping its changes
+unstaged in the working tree (`drop_commit` with `keep_changes`), walk the
+conflict-resolution loop, and
 undo any of it — all while the repository stays a plain git repo and conflicted
 rewrites are held back from git until they resolve or abort. Every tool
 addresses commits by sha or by jj's stable change id (full or a unique prefix),

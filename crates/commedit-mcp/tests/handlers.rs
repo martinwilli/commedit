@@ -7,7 +7,7 @@ use commedit_mcp::dto::{
     CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
     FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq,
     ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq, SquashCommitReq, StrReplaceDto,
+    SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
@@ -21,6 +21,7 @@ async fn shas(server: &CommeditServer) -> Vec<String> {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -59,6 +60,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -114,6 +116,7 @@ async fn list_history_honours_the_limit() {
             limit: Some(2),
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -141,6 +144,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: Some(vec![]),
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -162,6 +166,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: Some(vec![CommitField::AuthorTime, CommitField::CommitterTime]),
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -176,6 +181,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -202,6 +208,7 @@ async fn list_history_marks_merges() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -230,6 +237,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -396,6 +404,7 @@ async fn edit_identity_prefills_omitted_fields() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -431,6 +440,7 @@ async fn edit_identity_prefills_omitted_fields() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -461,6 +471,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -505,6 +516,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -857,6 +869,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -934,6 +947,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1024,6 +1038,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1060,6 +1075,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1118,6 +1134,7 @@ async fn squash(
             source: source.into(),
             dest: dest.into(),
             mode: mode.map(str::to_string),
+            message: None,
         }))
         .await
         .unwrap()
@@ -1226,6 +1243,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1243,6 +1261,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
                 source: merge.sha.clone(),
                 dest: base.sha.clone(),
                 mode: None,
+                message: None,
             }))
             .await,
     );
@@ -1263,6 +1282,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
                 source: main1.sha.clone(),
                 dest: base.sha.clone(),
                 mode: Some("merge".into()),
+                message: None,
             }))
             .await,
     );
@@ -1344,6 +1364,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1379,6 +1400,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1478,4 +1500,50 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
         .0;
     assert_eq!(shown.commit.subject, "second");
     assert_eq!(shown.files[0].path, "b.txt");
+}
+
+#[tokio::test]
+async fn suggest_squash_targets_points_a_fixup_at_its_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "a\n", "add feature"),
+            ("b.txt", "b\n", "unrelated"),
+            ("c.txt", "c\n", "fixup! add feature"),
+        ],
+    );
+    let server = open_server(dir.path());
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    // The tip is the `fixup! add feature` commit.
+    let fixup = history.commits[0].change_id.clone();
+
+    let resp = server
+        .suggest_squash_targets(Parameters(SuggestSquashReq { source: fixup }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(resp.mode.as_deref(), Some("fixup"));
+    assert_eq!(resp.targets.len(), 1, "exactly one matching target");
+    assert_eq!(resp.targets[0].subject, "add feature");
+    assert!(resp.siblings.is_empty());
+
+    // An unprefixed source has nothing to suggest.
+    let plain = history.commits[1].change_id.clone();
+    let resp = server
+        .suggest_squash_targets(Parameters(SuggestSquashReq { source: plain }))
+        .await
+        .unwrap()
+        .0;
+    assert!(resp.mode.is_none());
+    assert!(resp.targets.is_empty() && resp.siblings.is_empty());
 }

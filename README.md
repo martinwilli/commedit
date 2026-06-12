@@ -162,8 +162,9 @@ exits non-zero and the client shows the connection as failed — harmless, by
 design (comm(ed)it never creates repositories).
 
 The tool surface covers everything the app does and adds a few agent-only tools:
-read tools (`list_history`, `show_commit`, `working_copy_status`,
-`session_diff`), mutations (`edit_message`, `edit_identity`, `edit_commits`,
+read tools (`list_history` — optionally with the working-copy status inline —
+`show_commit`, `working_copy_status`, `suggest_squash_targets`, `session_diff`),
+mutations (`edit_message`, `edit_identity`, `edit_commits`,
 `replace_files`, `replace_in_file`, `replace_in_message`, `split_commit`,
 `create_commit`, `revert_commit`, `cherry_pick_commit`, `reorder_commit`,
 `drop_commit`, `restore_commit`, `squash_commit`, `commit_working_copy`,

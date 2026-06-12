@@ -193,12 +193,18 @@ op-log").
   is a valid *target* but never a *source*. Preserves the target's **author** but
   lets jj re-stamp the committer (git `--autosquash` style); the message is
   `compose_squash_message`'d per `SquashMode` (Fixup keeps the target's, Squash
-  appends the source's body, Amend replaces with it). Unlike reorder it does **not**
-  set the head bookmark — the post-squash tip is always a rewrite-descendant of the
-  old head, which jj's automatic bookmark moves follow. The pure, inline-tested
-  helpers (`parse_squash_mode`, `squash_target_subject`, `squash_recommendations`,
-  `compose_squash_message`) read git's `fixup!`/`squash!`/`amend!` subject prefixes
-  so the UI can recommend targets and compose the merged message.
+  appends the source's body, Amend replaces with it) **unless** `squash_into`'s
+  `message: Option<&str>` override is given, which becomes the target's message
+  verbatim (fold-and-reword in one step; threaded through to the MCP
+  `squash_commit`/`squash_working_copy` `message` field, no GTK surface). Unlike
+  reorder it does **not** set the head bookmark — the post-squash tip is always a
+  rewrite-descendant of the old head, which jj's automatic bookmark moves follow.
+  The pure, inline-tested helpers (`parse_squash_mode`, `squash_target_subject`,
+  `squash_recommendations`, `compose_squash_message`) read git's
+  `fixup!`/`squash!`/`amend!` subject prefixes so the UI can recommend targets and
+  compose the merged message; the MCP `suggest_squash_targets` read tool exposes
+  `squash_recommendations` (resolve a prefixed source → its matching destination
+  commit(s) + sibling fixups) so an agent can route an autosquash fold.
 - `split_commit` (`split.rs`) — the diff view's "Split" button (enabled only with
   pending diff edits). Takes the same `(path, content)` edits as `rewrite_files`:
   rewrites the target `C` → `C'` to the **edited** tree (keeping its change id /
@@ -219,7 +225,15 @@ op-log").
   `finish_mutation`/export — so HEAD/refs/index/worktree are untouched and disk
   stays byte-identical; the result is a *chain* of uncommitted entries.
   `squash_working_copy_into` snapshots, resolves the entry, and delegates to
-  `squash_into(.., Fixup)`.
+  `squash_into(.., Fixup)`. Its partial sibling `squash_working_copy_partial_into`
+  (`squash.rs`; MCP `squash_working_copy`'s `paths`/`hunks`/`patches`) folds only a
+  **subset** of the uncommitted changes into `dest` — the `git add -p` to the
+  whole-fold's `git commit -a`. In one tx it builds the selected subset as a
+  throwaway commit `C` on HEAD (via `prepare_partial_commit`, the
+  selection→tree builder shared with `commit_working_copy_partial`), rebuilds the
+  leaf `@` to hold the **full** disk tree on top of `C` (so the worktree stays
+  byte-identical and the unselected delta stays uncommitted), then squashes `C`
+  into `dest` and rebases — `@` rebases back to the full tree, so disk never moves.
 - `drop_working_copy` (`workcopy.rs`; the MCP `discard_working_copy` tool) — the
   trashbin's drop for an *uncommitted* entry: snapshot, resolve by change id,
   `record_abandoned_commit` + `rebase_descendants`, commit the tx **directly** and
@@ -236,7 +250,11 @@ op-log").
   only a selected subset (`PartialSelection`, the `git add -p` jj's whole-tree
   snapshot has no concept of) yet rebuilds `@` holding the **full** disk tree, so
   the remainder stays uncommitted and the files stay byte-identical;
-  `select_groups` picks the kept hunks.
+  `select_groups` picks the kept hunks. Both (and the working-copy squash) accept
+  an `add_paths` list naming brand-new **untracked** files to include — see the
+  snapshot's `add_paths` opt-in below; the snapshot otherwise carries only
+  edits/deletions to tracked files, so a freshly created file is invisible to a
+  commit/fold until named (the `git add` before the `git commit -a`).
 
 ### Working-copy preservation (`workcopy.rs`)
 
@@ -255,7 +273,12 @@ matcher must name exactly the paths in `@`'s parent tip (HEAD's tracked set) so
 "track nothing" doesn't drop committed files and "track everything" doesn't pull in
 untracked ones. Untracked files stay out of `@` yet **stay alive on disk**: jj never
 tracks them, so `materialize_after_rewrite`'s checkout (which only diffs the tracked
-trees) never deletes them. `materialize_after_rewrite` (in the deferred export)
+trees) never deletes them. The one opt-in is `snapshot_working_copy_tracking(add_paths)`,
+which unions caller-named new files into the matcher (force-tracked, so an explicitly
+named path beats a `.gitignore` rule) — surfaced as the `add_paths` field of the MCP
+`commit_working_copy`/`squash_working_copy` tools, so an agent can fold a brand-new
+file in. Once snapshotted into `@` the file stays tracked for the session, so only
+the first snapshot needs to name it. `materialize_after_rewrite` (in the deferred export)
 checks `@'` out to disk via jj and resets the git index to the new tip — falling
 back to a plain `sync_worktree` when there's no working-copy commit. Non-overlapping
 local edits merge cleanly onto the rewritten content.

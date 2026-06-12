@@ -17,6 +17,7 @@ use jj_lib::rewrite::{squash_commits, CommitWithSelection};
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
 use crate::history::{branch_commits, CommitInfo};
 use crate::repo::Repo;
+use crate::workcopy::PartialSelection;
 
 /// Which `--autosquash`-style merge to perform when one commit is dropped onto
 /// another. Derived from the source commit's subject prefix, or chosen in the
@@ -279,9 +280,12 @@ impl Repo {
         squash_recommendations_for(commits, &head, restored)
     }
 
-    /// Merge `source`'s changes into `dest`, recompose `dest`'s message per
-    /// `mode`, drop `source` from history, rebase descendants, and export — all
-    /// in one transaction.
+    /// Merge `source`'s changes into `dest`, set `dest`'s message, drop `source`
+    /// from history, rebase descendants, and export — all in one transaction.
+    /// `message`, when `Some`, becomes `dest`'s new message verbatim; when `None`
+    /// the message is recomposed from `dest` and `source` per `mode`
+    /// ([`compose_squash_message`]) — so a caller that already knows the merged
+    /// message folds and rewords in one step instead of a follow-up edit.
     ///
     /// The destination's author (name, email and author date) is preserved; its
     /// committer is left to jj's rewrite default (re-stamped to the current
@@ -291,9 +295,10 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(source, dest, mode, false)
+            self.squash_into_inner(source, dest, mode, message, false)
         })
     }
 
@@ -307,9 +312,10 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit from trash", || {
-            self.squash_into_inner(source, dest, mode, true)
+            self.squash_into_inner(source, dest, mode, message, true)
         })
     }
 
@@ -319,12 +325,15 @@ impl Repo {
     /// commit. Snapshots first, then resolves the entry to its *current* commit id
     /// (the leaf's churns on snapshot) before delegating to [`Self::squash_into`];
     /// folding the whole leaf leaves jj's recreated empty `@` as a clean working
-    /// copy. Returns the usual [`SaveOutcome`], so a conflicting fold enters the
-    /// shared conflict-resolution flow.
+    /// copy. `message`, when `Some`, replaces `dest`'s message (a working-copy
+    /// entry has no message of its own, so the Fixup default keeps `dest`'s).
+    /// Returns the usual [`SaveOutcome`], so a conflicting fold enters the shared
+    /// conflict-resolution flow.
     pub fn squash_working_copy_into(
         &mut self,
         change_hex: Option<&str>,
         dest: &CommitId,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         // Snapshot before resolving so the resolved id survives squash_into's own
         // (now no-op) snapshot — otherwise a churned leaf id would go stale.
@@ -332,7 +341,125 @@ impl Repo {
         let source = self
             .resolve_working_copy_change(change_hex)
             .context("no working-copy entry to fold")?;
-        self.squash_into(&source, dest, SquashMode::Fixup)
+        self.squash_into(&source, dest, SquashMode::Fixup, message)
+    }
+
+    /// Fold a **subset** of the uncommitted changes into the history commit
+    /// `dest`, leaving the remainder uncommitted — the partial counterpart of
+    /// [`Self::squash_working_copy_into`] (the `git add -p` to its `git commit -a`,
+    /// but folding into an existing commit). The subset is addressed by
+    /// [`PartialSelection`] exactly as [`Self::commit_working_copy_partial`]
+    /// addresses it (relative to HEAD).
+    ///
+    /// Done in one transaction: a throwaway commit `C` holding the selected subset
+    /// is created on HEAD and the leaf `@` is rebuilt to hold the **full** on-disk
+    /// tree on top of it (so disk stays byte-identical and the unselected delta
+    /// stays uncommitted), then `C` is squashed into `dest` — its change folded in,
+    /// `C` abandoned, descendants (including `@`) rebased. Because the rebased `@`
+    /// equals the full disk tree again, the worktree never moves. `message`, when
+    /// `Some`, becomes `dest`'s new message; else `dest`'s is kept (Fixup, like a
+    /// working-copy fold). A clashing fold enters the shared conflict flow.
+    pub fn squash_working_copy_partial_into(
+        &mut self,
+        sel: PartialSelection<'_>,
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("folding part of the working copy", || {
+            self.squash_working_copy_partial_into_inner(sel, dest, message)
+        })
+    }
+
+    fn squash_working_copy_partial_into_inner(
+        &mut self,
+        sel: PartialSelection<'_>,
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        // Snapshot + build the selected subset's tree (`t_commit`) and the full
+        // on-disk tree, against HEAD — shared with commit_working_copy_partial.
+        let (head, head_tree, full_tree, t_commit) = self.prepare_partial_commit(&sel)?;
+
+        let name = self.workspace.workspace_name().to_owned();
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.head_commit();
+        let heads = self.snapshot_heads();
+
+        let store = self.repo.store().clone();
+        let dest_commit = store
+            .get_commit(dest)
+            .context("loading destination commit")?;
+        // A working-copy entry carries no message, so the Fixup default keeps the
+        // destination's; an explicit override replaces it.
+        let new_desc = match message {
+            Some(m) => m.to_string(),
+            None => dest_commit.description().to_string(),
+        };
+        let dest_author = dest_commit.author().clone();
+        let desc = OpDescriptor::new(
+            format!("Squash working copy into {}", op_subject(&dest_commit)),
+            vec![dest_commit.change_id().hex()],
+        );
+
+        let mut tx = self.repo.start_transaction();
+        // C: the selected subset, committed on HEAD.
+        let created = pollster::block_on(
+            tx.repo_mut()
+                .new_commit(vec![head.clone()], t_commit)
+                .set_description("commedit: partial squash staging")
+                .write(),
+        )
+        .context("writing the partial commit")?;
+        let created_id = created.id().clone();
+        // leaf': the remainder — the full on-disk tree as a child of C, with @
+        // pointed at it (via `edit`, not `check_out`: @ must *hold* the full tree so
+        // disk stays byte-identical and leaf'-vs-C is the unselected delta).
+        let remainder = pollster::block_on(
+            tx.repo_mut()
+                .new_commit(vec![created_id.clone()], full_tree)
+                .write(),
+        )
+        .context("writing the working-copy remainder")?;
+        pollster::block_on(tx.repo_mut().edit(name, &remainder))
+            .context("pointing the working copy at the remainder")?;
+
+        // Fold C entirely into dest: its whole change (`C.tree` vs HEAD's tree) is
+        // the selected subset. rebase_descendants then carries @ (and any commits
+        // between dest and HEAD) onto the rewritten line.
+        let sel_for_c = CommitWithSelection {
+            selected_tree: created.tree(),
+            parent_tree: head_tree,
+            commit: created,
+        };
+        let squashed = pollster::block_on(squash_commits(
+            tx.repo_mut(),
+            std::slice::from_ref(&sel_for_c),
+            &dest_commit,
+            /* keep_emptied = */ false,
+        ))
+        .context("squashing commits")?
+        .context("squash produced no commit (empty selection)")?;
+        pollster::block_on(
+            squashed
+                .commit_builder
+                .set_description(new_desc)
+                .set_author(dest_author)
+                .write(),
+        )
+        .context("writing squashed commit")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        // The subset is preserved as a net change, so the post-squash tip is clean
+        // even if an interior commit conflicts spuriously — same CleanTip resolve
+        // as a whole-working-copy fold / reorder.
+        self.finish_mutation_auto_resolve(
+            tx,
+            "commedit: squash working copy (partial)",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
     }
 
     fn squash_into_inner(
@@ -340,6 +467,7 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
         source_is_orphan: bool,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
@@ -369,10 +497,14 @@ impl Repo {
             parent_tree,
         };
 
-        // Recompose the message and capture the author before the borrows move
-        // into the transaction.
-        let new_desc =
-            compose_squash_message(mode, dest_commit.description(), source_commit.description());
+        // Settle the message and capture the author before the borrows move into
+        // the transaction: an explicit override wins, else recompose per `mode`.
+        let new_desc = match message {
+            Some(m) => m.to_string(),
+            None => {
+                compose_squash_message(mode, dest_commit.description(), source_commit.description())
+            }
+        };
         let dest_author = dest_commit.author().clone();
         let desc = OpDescriptor::new(
             format!(

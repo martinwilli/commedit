@@ -9,6 +9,7 @@ use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
+use commedit_engine::workcopy::PartialSelection;
 
 /// A linear `first <- second <- third` repo on `main`.
 fn three_commits(dir: &std::path::Path) {
@@ -45,7 +46,9 @@ fn folding_the_whole_working_copy_into_a_commit_leaves_a_clean_tree() {
     let dest = id_of(&repo, "A");
 
     // Dragging the whole pile (the leaf @) onto "A" folds it in as a Fixup.
-    let outcome = repo.squash_working_copy_into(None, &dest).expect("fold");
+    let outcome = repo
+        .squash_working_copy_into(None, &dest, None)
+        .expect("fold");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
     // "A" gained the change, the branch is unchanged, and the tree is clean —
@@ -82,7 +85,7 @@ fn folding_a_peeled_entry_keeps_the_remainder_uncommitted() {
     let peeled = chain.last().expect("oldest entry").info.change_id_hex();
     let dest = id_of(&repo, "A");
     let outcome = repo
-        .squash_working_copy_into(Some(&peeled), &dest)
+        .squash_working_copy_into(Some(&peeled), &dest, None)
         .expect("fold peeled entry");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -119,7 +122,9 @@ fn a_conflicting_fold_defers_and_leaves_git_untouched() {
     // Uncommitted change to the same line "B" touched; folding into "A" can't apply.
     std::fs::write(dir.join("a.txt"), "1\nLOCAL\n3\n").unwrap();
     let dest = id_of(&repo, "A");
-    let outcome = repo.squash_working_copy_into(None, &dest).expect("fold");
+    let outcome = repo
+        .squash_working_copy_into(None, &dest, None)
+        .expect("fold");
 
     let SaveOutcome::Conflicts { commits } = outcome else {
         panic!("expected the fold to defer as a conflict");
@@ -147,7 +152,7 @@ fn fixup_merges_content_keeps_target_message_drops_source() {
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
     let outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -189,7 +194,7 @@ fn squashes_a_trashed_commit_into_a_chain_commit() {
         .plan_squash_restore(&commits, &second, onto)
         .expect("plan");
     let outcome = repo
-        .squash_restore_into(&source, &dest, SquashMode::Fixup)
+        .squash_restore_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash from trash");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -217,7 +222,7 @@ fn squash_extends_the_target_message() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Squash)
+    repo.squash_into(&source, &dest, SquashMode::Squash, None)
         .expect("squash");
 
     // The target's message gains the source's (unprefixed → full) message.
@@ -238,7 +243,7 @@ fn amend_replaces_the_target_message() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Amend)
+    repo.squash_into(&source, &dest, SquashMode::Amend, None)
         .expect("squash");
 
     // The target's message is replaced by the source's.
@@ -276,7 +281,7 @@ fn squash_preserves_the_target_author() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Fixup)
+    repo.squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
 
     // The target keeps its author (committer may be re-stamped — git-autosquash
@@ -300,7 +305,7 @@ fn fixup_into_a_non_adjacent_ancestor_moves_the_branch() {
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "first");
     let outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -345,7 +350,8 @@ fn squash_via_the_autosquash_prefix_flow() {
 
     let mode = parse_squash_mode(&commits[from].subject).expect("prefixed");
     let (source, dest) = repo.plan_squash(&commits, from, second).expect("plan");
-    repo.squash_into(&source, &dest, mode).expect("squash");
+    repo.squash_into(&source, &dest, mode, None)
+        .expect("squash");
 
     // The fixup folds into "second", keeping its message.
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
@@ -377,7 +383,7 @@ fn conflicting_squash_is_held_back_then_resolved() {
     let source = id_of(&repo, "B");
     let dest = id_of(&repo, "base");
     let mut outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
 
     assert!(
@@ -425,6 +431,148 @@ fn conflicting_squash_is_held_back_then_resolved() {
     assert!(
         !tree.contains(".jjconflict"),
         "no .jjconflict-* in the tree: {tree}"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_fold_lands_a_subset_and_keeps_the_rest_uncommitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two uncommitted changes; fold only a.txt into the older "A" (a whole-file
+    // `paths` selection), leaving b.txt's edit uncommitted.
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    let dest = id_of(&repo, "A");
+    let paths = vec!["a.txt".to_string()];
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
+    let outcome = repo
+        .squash_working_copy_partial_into(sel, &dest, None)
+        .expect("partial fold");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // "A" gained a.txt's change; b.txt at HEAD is unchanged (its edit stays
+    // uncommitted); the disk keeps both edits byte-for-byte.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "a\nAA");
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
+    let remaining = repo.working_copy_chain();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only b.txt's change remains uncommitted"
+    );
+    assert_eq!(remaining[0].file_names, vec!["b.txt".to_string()]);
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn partial_fold_by_hunk_index_folds_one_hunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // One file with two well-separated regions, so editing both makes two hunks.
+    common::init_repo(dir, &[("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n", "base")]);
+    let mut repo = Repo::open(dir).expect("open");
+    std::fs::write(dir.join("f.txt"), "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n").unwrap();
+
+    // Fold only hunk 0 (the line-1 region) into "base"; the line-9 hunk stays.
+    let dest = id_of(&repo, "base");
+    let hunks = vec![("f.txt".to_string(), vec![0usize])];
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &hunks,
+        patches: &[],
+    };
+    let outcome = repo
+        .squash_working_copy_partial_into(sel, &dest, None)
+        .expect("fold hunk 0");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // The committed tip carries only the line-1 edit; the line-9 edit is still on
+    // disk and uncommitted.
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:f.txt"]),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\n9"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n"
+    );
+    assert_eq!(
+        repo.working_copy_chain().len(),
+        1,
+        "line-9 hunk uncommitted"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn squash_into_can_reword_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    three_commits(dir);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let source = id_of(&repo, "third");
+    let dest = id_of(&repo, "second");
+    // An explicit message overrides the mode-derived composition (here it would
+    // otherwise keep "second" for a Fixup) — fold and reword in one step.
+    repo.squash_into(
+        &source,
+        &dest,
+        SquashMode::Fixup,
+        Some("merged second + third"),
+    )
+    .expect("squash");
+
+    assert_eq!(
+        common::git(dir, &["show", "-s", "--format=%B", "main"]),
+        "merged second + third"
+    );
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["merged second + third", "first"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn folding_the_working_copy_can_reword_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "1\n", "A"), ("b.txt", "b\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    std::fs::write(dir.join("a.txt"), "1\n2\n").unwrap();
+    let dest = id_of(&repo, "A");
+    repo.squash_working_copy_into(None, &dest, Some("A (with the a.txt fix)"))
+        .expect("fold");
+
+    // "A" gained both the change and the new message (a working-copy fold has no
+    // source message of its own, so the override is the only way to reword it).
+    assert_eq!(
+        common::git(dir, &["show", "-s", "--format=%B", "HEAD~1"]),
+        "A (with the a.txt fix)"
+    );
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["B", "A (with the a.txt fix)"]
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }

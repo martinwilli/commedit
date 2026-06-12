@@ -19,7 +19,9 @@
 //! don't surface as "uncommitted changes". Because jj never tracks them, they
 //! also stay put on disk through every checkout/materialize — `check_out` only
 //! diffs the tracked trees, so an untracked file (in neither tree) is never
-//! deleted. They survive a rewrite untouched.
+//! deleted. They survive a rewrite untouched. The one way to pull a new file in
+//! is the explicit `add_paths` opt-in of [`Repo::snapshot_working_copy_tracking`]
+//! (e.g. `commit_working_copy` / `squash_working_copy` adding a brand-new file).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -110,20 +112,42 @@ impl Repo {
     /// them, they survive every later checkout untouched (see the module docs). A
     /// no-op on a detached HEAD or when nothing changed since the last snapshot.
     pub fn snapshot_working_copy(&mut self) -> Result<()> {
+        self.snapshot_working_copy_tracking(&[])
+    }
+
+    /// Like [`Self::snapshot_working_copy`], but additionally begins tracking the
+    /// named untracked paths — new files on disk that git doesn't track yet — so a
+    /// brand-new file can be folded into a commit (the snapshot otherwise captures
+    /// only edits/deletions to already-tracked files). Each named path is
+    /// force-tracked, so an explicitly named file is snapshotted even when a
+    /// `.gitignore` rule would cover it: naming it is explicit intent. Once
+    /// snapshotted into `@` the file stays tracked for the rest of the session,
+    /// like `git add`, so only this first snapshot needs to name it; a path that is
+    /// already tracked or absent on disk is a harmless no-op.
+    pub fn snapshot_working_copy_tracking(&mut self, add_paths: &[String]) -> Result<()> {
         // `@` must sit directly on the current tip, or its diff would be the
         // whole history rather than the uncommitted delta.
         self.ensure_working_copy_on_head()?;
         let name = self.workspace.workspace_name().to_owned();
 
-        // Auto-track only the files git already tracks — the paths present in the
-        // tip the working copy sits on (`@`'s parent, i.e. HEAD). commedit's
-        // throwaway jj workspace starts with an *empty* on-disk tree state, so to
-        // the first snapshot every file on disk looks brand-new: "track nothing"
-        // would drop even committed files out of `@`, and "track everything" would
-        // pull in git's untracked files. Matching the base tree's paths tracks
-        // exactly the committed files (capturing their edits/deletions) while
-        // leaving files absent from it — git's untracked files — out of `@`.
-        let tracked = self.tracked_paths_matcher()?;
+        let extra: Vec<RepoPathBuf> = add_paths
+            .iter()
+            .map(|p| {
+                RepoPathBuf::from_internal_string(p)
+                    .with_context(|| format!("invalid path '{p}' in add_paths"))
+            })
+            .collect::<Result<_>>()?;
+
+        // Auto-track the files git already tracks — the paths present in the tip
+        // the working copy sits on (`@`'s parent, i.e. HEAD) — plus any caller-named
+        // `extra` new files. commedit's throwaway jj workspace starts with an
+        // *empty* on-disk tree state, so to the first snapshot every file on disk
+        // looks brand-new: "track nothing" would drop even committed files out of
+        // `@`, and "track everything" would pull in git's untracked files. Matching
+        // the base tree's paths tracks exactly the committed files (capturing their
+        // edits/deletions) while leaving files absent from it — git's untracked
+        // files — out of `@`, unless the caller opted one in via `extra`.
+        let tracked = self.tracked_paths_matcher(&extra)?;
         let base_ignores = self.base_ignores()?;
         let options = SnapshotOptions {
             base_ignores,
@@ -137,7 +161,8 @@ impl Repo {
             // starts empty, so there's nothing for jj's "visit only tracked
             // files" path to find — and the file would surface as a phantom
             // (deleted) uncommitted change. New, untracked files aren't in this
-            // set, so they stay excluded from `@` as before.
+            // set unless the caller named them via `add_paths`, in which case
+            // force-tracking is exactly what pulls them in past any ignore rule.
             force_tracking_matcher: tracked.as_ref(),
             max_new_file_size: u64::MAX,
         };
@@ -173,13 +198,15 @@ impl Repo {
     /// The snapshot's `start_tracking_matcher`: a matcher over exactly the paths
     /// git already tracks — the files present in the tip the working copy sits on
     /// (`@`'s single parent, normally HEAD; a detached HEAD still resolves to its
-    /// commit, so `@` is reattached there). See [`Self::snapshot_working_copy`]
-    /// for why a path-set (rather than "everything" or "nothing") is needed.
-    /// Falls back to [`EverythingMatcher`] — the pre-exclusion behaviour — only
-    /// when there is no `@`, or it sits on the empty root with no single parent to
-    /// read a base tree from (a repo with no commits). That fallback is safe: it
-    /// only risks over-tracking, never dropping a committed file.
-    fn tracked_paths_matcher(&self) -> Result<Box<dyn Matcher>> {
+    /// commit, so `@` is reattached there) — unioned with any `extra` paths the
+    /// caller opted in (new files to begin tracking). See
+    /// [`Self::snapshot_working_copy`] for why a path-set (rather than "everything"
+    /// or "nothing") is needed. Falls back to [`EverythingMatcher`] — the
+    /// pre-exclusion behaviour, which already covers any `extra` — only when there
+    /// is no `@`, or it sits on the empty root with no single parent to read a base
+    /// tree from (a repo with no commits). That fallback is safe: it only risks
+    /// over-tracking, never dropping a committed file.
+    fn tracked_paths_matcher(&self, extra: &[RepoPathBuf]) -> Result<Box<dyn Matcher>> {
         let Some(wc_id) = self.working_copy_commit_id() else {
             return Ok(Box::new(EverythingMatcher));
         };
@@ -197,7 +224,8 @@ impl Repo {
             .store()
             .get_commit(&parents[0])
             .context("loading the working-copy base commit")?;
-        let paths: Vec<RepoPathBuf> = base.tree().entries().map(|(path, _)| path).collect();
+        let mut paths: Vec<RepoPathBuf> = base.tree().entries().map(|(path, _)| path).collect();
+        paths.extend(extra.iter().cloned());
         Ok(Box::new(FilesMatcher::new(paths)))
     }
 
@@ -405,69 +433,9 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
-        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
-        // turned out clean (nothing to commit).
-        self.snapshot_working_copy()?;
-        if self.working_copy_info().is_none() {
-            bail!("no uncommitted changes to commit");
-        }
-        let Some(head) = self.head_commit_id() else {
-            bail!("the repository has no branch head; cannot commit the working copy");
-        };
-        let leaf_id = self
-            .working_copy_commit_id()
-            .context("no working copy to commit")?;
-        let store = self.repo.store().clone();
-        // The leaf @ holds the full on-disk tree (collapsing any split chain); the
-        // remainder will ride on it, and HEAD's tree is the base we splice the
-        // selected subset onto.
-        let full_tree = store
-            .get_commit(&leaf_id)
-            .context("loading the working-copy commit")?
-            .tree();
-        let head_tree = store
-            .get_commit(&head)
-            .context("loading the branch head")?
-            .tree();
-
-        // Build the committed tree on top of HEAD from the selection.
-        let mut t_commit = head_tree.clone();
-        if !sel.paths.is_empty() {
-            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
-        }
-        // The hunks/patches tiers reconstruct text content relative to HEAD; gather
-        // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
-        let mut text_edits: Vec<(String, String)> = Vec::new();
-        for (path, indices) in sel.hunks {
-            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
-            let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
-            let mut kept: BTreeSet<usize> = BTreeSet::new();
-            for &i in indices {
-                let hunk = rendered.hunks.get(i).ok_or_else(|| {
-                    anyhow!(
-                        "hunk index {i} is out of range for '{path}' (it has {} hunk(s))",
-                        rendered.hunks.len()
-                    )
-                })?;
-                kept.extend(hunk.first_group..=hunk.last_group);
-            }
-            text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
-        }
-        for (path, patch) in sel.patches {
-            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
-            let content = apply_patch(&old_f, patch)
-                .with_context(|| format!("applying the patch for '{path}'"))?;
-            text_edits.push((path.clone(), content));
-        }
-        if !text_edits.is_empty() {
-            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
-        }
-
-        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
-        // unmodified path, an empty hunk set, or a patch that changes nothing.
-        if t_commit.tree_ids() == head_tree.tree_ids() {
-            bail!("the selection commits nothing (it matches the branch head)");
-        }
+        // Snapshot the disk and build the selected subset's tree (`t_commit`) plus
+        // the full on-disk tree for the remainder — shared with the partial squash.
+        let (head, _head_tree, full_tree, t_commit) = self.prepare_partial_commit(&sel)?;
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
@@ -527,6 +495,84 @@ impl Repo {
             old_head,
             heads,
         )
+    }
+
+    /// Snapshot the disk and resolve a [`PartialSelection`] into the trees a
+    /// partial commit/squash needs: the branch `head` id, HEAD's tree, the leaf
+    /// `@`'s full on-disk tree, and `t_commit` — HEAD's tree with the selected
+    /// paths/hunks/patches spliced in (the hunks/patches tiers reconstruct text
+    /// relative to HEAD). Bails when the tree is clean, HEAD is detached/unborn, or
+    /// the selection reproduces HEAD exactly (selects nothing). Shared by
+    /// [`Self::commit_working_copy_partial`] and the partial squash
+    /// `squash_working_copy_partial_into`.
+    pub(crate) fn prepare_partial_commit(
+        &mut self,
+        sel: &PartialSelection<'_>,
+    ) -> Result<(CommitId, MergedTree, MergedTree, MergedTree)> {
+        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
+        // turned out clean (nothing to select).
+        self.snapshot_working_copy()?;
+        if self.working_copy_info().is_none() {
+            bail!("no uncommitted changes to commit");
+        }
+        let Some(head) = self.head_commit_id() else {
+            bail!("the repository has no branch head; cannot commit the working copy");
+        };
+        let leaf_id = self
+            .working_copy_commit_id()
+            .context("no working copy to commit")?;
+        let store = self.repo.store().clone();
+        // The leaf @ holds the full on-disk tree (collapsing any split chain); the
+        // remainder will ride on it, and HEAD's tree is the base we splice the
+        // selected subset onto.
+        let full_tree = store
+            .get_commit(&leaf_id)
+            .context("loading the working-copy commit")?
+            .tree();
+        let head_tree = store
+            .get_commit(&head)
+            .context("loading the branch head")?
+            .tree();
+
+        // Build the selected tree on top of HEAD from the selection.
+        let mut t_commit = head_tree.clone();
+        if !sel.paths.is_empty() {
+            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
+        }
+        // The hunks/patches tiers reconstruct text content relative to HEAD; gather
+        // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
+        let mut text_edits: Vec<(String, String)> = Vec::new();
+        for (path, indices) in sel.hunks {
+            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
+            let mut kept: BTreeSet<usize> = BTreeSet::new();
+            for &i in indices {
+                let hunk = rendered.hunks.get(i).ok_or_else(|| {
+                    anyhow!(
+                        "hunk index {i} is out of range for '{path}' (it has {} hunk(s))",
+                        rendered.hunks.len()
+                    )
+                })?;
+                kept.extend(hunk.first_group..=hunk.last_group);
+            }
+            text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
+        }
+        for (path, patch) in sel.patches {
+            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let content = apply_patch(&old_f, patch)
+                .with_context(|| format!("applying the patch for '{path}'"))?;
+            text_edits.push((path.clone(), content));
+        }
+        if !text_edits.is_empty() {
+            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
+        }
+
+        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
+        // unmodified path, an empty hunk set, or a patch that changes nothing.
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+        Ok((head, head_tree, full_tree, t_commit))
     }
 
     /// Read a path's HEAD-side (`old`) and leaf-side (`new`) UTF-8 text for the

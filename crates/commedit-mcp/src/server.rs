@@ -93,8 +93,9 @@ any commit / at root via new_parent. revert_commit inserts the inverse of a \
 commit (like git revert). cherry_pick_commit copies a commit's change in (like \
 git cherry-pick) — the source may be off the current branch, named by its full \
 sha. commit_working_copy turns the current uncommitted changes into a commit on \
-top of HEAD (like git commit -a). A mid-history insert, revert or pick may \
-report conflicts like any rewrite.
+top of HEAD (like git commit -a) — it captures edits to tracked files, so name \
+any brand-new files in its add_paths to include them. A mid-history insert, \
+revert or pick may report conflicts like any rewrite.
 
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).

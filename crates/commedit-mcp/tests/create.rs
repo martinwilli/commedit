@@ -58,6 +58,7 @@ async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp 
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -412,6 +413,7 @@ async fn commit_working_copy_commits_the_dirt() {
                 paths: None,
                 hunks: None,
                 patches: None,
+                add_paths: None,
             }))
             .await,
     );
@@ -430,6 +432,7 @@ async fn commit_working_copy_commits_the_dirt() {
             paths: None,
             hunks: None,
             patches: None,
+            add_paths: None,
         }))
         .await
         .unwrap()

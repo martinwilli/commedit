@@ -14,7 +14,8 @@ use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::ErrorData;
 
-use crate::dto::IdentityFieldsDto;
+use crate::convert::wc_entry_dto;
+use crate::dto::{IdentityFieldsDto, WorkingCopyStatusResp};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 
@@ -120,6 +121,19 @@ fn head_commit(repo: &Repo) -> Result<CommitId, ErrorData> {
 /// tip read back after the save.
 pub fn save_result(repo: &Repo, outcome: &SaveOutcome) -> crate::dto::SaveResultDto {
     crate::convert::save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()))
+}
+
+/// Build the working-copy status DTO: snapshot the on-disk state into the leaf
+/// `@`, then report the (newest-first) uncommitted entries. Shared by the
+/// `working_copy_status` tool and `list_history`'s opt-in `working_copy` block.
+pub fn working_copy_status_resp(repo: &mut Repo) -> Result<WorkingCopyStatusResp, ErrorData> {
+    repo.snapshot_working_copy().map_err(internal)?;
+    let entries = repo.working_copy_chain();
+    Ok(WorkingCopyStatusResp {
+        clean: entries.is_empty(),
+        entries: entries.iter().map(wc_entry_dto).collect(),
+        session_start_head_sha: repo.session_start_head_hex(),
+    })
 }
 
 /// One commit a flexible ref can resolve to: its two full lowercase-hex

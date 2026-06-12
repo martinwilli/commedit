@@ -442,7 +442,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             let enter_conflict_mode = enter_conflict_mode.clone();
                             let selected_change = selected_change.clone();
                             Rc::new(move |mode| {
-                                let outcome = repo.borrow_mut().squash_into(&source, &dest, mode);
+                                let outcome =
+                                    repo.borrow_mut().squash_into(&source, &dest, mode, None);
                                 match outcome {
                                     Ok(SaveOutcome::Clean) => {
                                         *selected_change.borrow_mut() = Some(dest_change.clone());
@@ -566,8 +567,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             let trash_list = trash_list.clone();
                             let trash_scroll = trash_scroll.clone();
                             Rc::new(move |mode| {
-                                let outcome =
-                                    repo.borrow_mut().squash_restore_into(&source, &dest, mode);
+                                let outcome = repo
+                                    .borrow_mut()
+                                    .squash_restore_into(&source, &dest, mode, None);
                                 // On success (Clean or pending Conflicts) the
                                 // changes now live in the target, so forget the
                                 // trashed commit — match by change id, since the
@@ -737,9 +739,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // stable across the rewrite.
                         let dest_change = commits.borrow()[onto].change_id_hex();
                         let change_hex = entry.change_id_hex();
-                        let outcome = repo
-                            .borrow_mut()
-                            .squash_working_copy_into(Some(&change_hex), &dest);
+                        let outcome = repo.borrow_mut().squash_working_copy_into(
+                            Some(&change_hex),
+                            &dest,
+                            None,
+                        );
                         match outcome {
                             Ok(SaveOutcome::Clean) => {
                                 *selected_change.borrow_mut() = Some(dest_change);

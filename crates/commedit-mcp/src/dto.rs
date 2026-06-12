@@ -232,6 +232,11 @@ pub struct ListHistoryReq {
     /// description, author_name, author_email, author_time, committer_name,
     /// committer_email, committer_time, parents.
     pub fields: Option<Vec<CommitField>>,
+    /// Set true to also include the uncommitted-changes status in `working_copy`
+    /// (same content as the working_copy_status tool), saving a round-trip when
+    /// you need both at once — e.g. before folding the working copy into a commit.
+    /// Omit (or false) to skip it; the field is then null.
+    pub working_copy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -250,6 +255,10 @@ pub struct ListHistoryResp {
     pub next_offset: Option<usize>,
     /// Number of dropped commits currently in the session trash.
     pub trash_count: usize,
+    /// The uncommitted-changes status, present only when the request set
+    /// `working_copy: true` (else null) — the same payload as working_copy_status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -273,6 +282,30 @@ pub struct ShowCommitResp {
 pub struct ListTrashResp {
     /// Dropped commits, restorable via `restore_commit` or `squash_commit`.
     pub commits: Vec<CommitDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SuggestSquashReq {
+    /// The commit you intend to fold, from the history or the trash — sha or
+    /// change id, full or a unique prefix. Its leading `fixup!`/`squash!`/`amend!`
+    /// subject token names the target whose matching branch commit(s) are
+    /// suggested as the squash destination.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SuggestSquashResp {
+    /// The squash mode the source's subject prefix requests (`fixup`, `squash` or
+    /// `amend`), or null when it carries no autosquash prefix — in which case
+    /// there is nothing to suggest and both lists below are empty.
+    pub mode: Option<String>,
+    /// The recommended destination(s): branch commits whose subject is the
+    /// source's bare target subject (the prefix stripped), newest first. Usually
+    /// exactly one — pass its change_id straight back as `squash_commit`'s `dest`.
+    pub targets: Vec<CommitDto>,
+    /// Other autosquash-prefixed branch commits aimed at the same target, which
+    /// you may want to fold in as well.
+    pub siblings: Vec<CommitDto>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -565,8 +598,13 @@ pub struct SquashCommitReq {
     pub dest: String,
     /// `fixup` (keep destination's message), `squash` (append source's body)
     /// or `amend` (replace with source's body). Defaults to what the source's
-    /// `fixup!`/`squash!`/`amend!` subject prefix requests, else `fixup`.
+    /// `fixup!`/`squash!`/`amend!` subject prefix requests, else `fixup`. Ignored
+    /// when `message` is given.
     pub mode: Option<String>,
+    /// Optional: the destination's full message after the fold, set verbatim.
+    /// Overrides `mode`'s message handling — use it to fold and reword in one
+    /// call instead of a follow-up edit_message. Omit to let `mode` decide.
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -574,6 +612,41 @@ pub struct SquashWorkingCopyReq {
     /// The commit the uncommitted changes should be folded into — sha or
     /// change id, full or a unique prefix.
     pub dest: String,
+    /// Optional: the destination's full message after the fold, set verbatim.
+    /// The fold is a fixup (the destination's message is kept by default, since
+    /// uncommitted changes carry no message of their own); set this to reword the
+    /// destination in the same call instead of a follow-up edit_message.
+    pub message: Option<String>,
+    /// Optional partial fold: fold only *part* of the uncommitted changes into
+    /// `dest` and leave the rest in the working tree (the in-process `git add -p`
+    /// for a fixup). Omit `paths`, `hunks` and `patches` entirely to fold the
+    /// whole working copy (the default). The three tiers compose in one call, but
+    /// a given file path must appear in at most one of them.
+    ///
+    /// Whole files to fold, by repo-relative path: the file is taken entirely
+    /// (content + mode), and a path you deleted on disk folds in the deletion.
+    /// This is the only tier that handles binary or executable files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Whole hunks to fold, per file. First read the file's numbered `hunks`
+    /// from show_commit on the working-copy entry, then list the indices to fold;
+    /// the unlisted hunks stay uncommitted. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkSelectionDto>>,
+    /// Sub-hunk selections, per file: an edited unified-diff patch (à la
+    /// `git add -p` → `e`) applied to the file's content at HEAD. Use when one
+    /// hunk must be split finer than whole-hunk granularity. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Vec<PatchSelectionDto>>,
+    /// Optional: brand-new untracked files to fold in, by repo-relative path. The
+    /// working copy otherwise carries only edits/deletions to already-tracked
+    /// files, so a file you just created is invisible until you name it here.
+    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
+    /// intent). For a *whole* fold every named file folds in; for a *partial* fold
+    /// also list it under `paths` to select it. Already-tracked or absent paths are
+    /// ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -604,19 +677,30 @@ pub struct CommitWorkingCopyReq {
     /// hunk must be split finer than whole-hunk granularity. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
+    /// Optional: brand-new untracked files to commit, by repo-relative path. The
+    /// working copy otherwise carries only edits/deletions to already-tracked
+    /// files, so a file you just created is invisible until you name it here.
+    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
+    /// intent). For a *whole* commit every named file is committed; for a *partial*
+    /// commit also list it under `paths` to select it. Already-tracked or absent
+    /// paths are ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
 }
 
-/// Selects whole hunks of one file for a partial commit_working_copy.
+/// Selects whole hunks of one file for a partial commit_working_copy /
+/// squash_working_copy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct HunkSelectionDto {
     /// Repo-relative path of the file (forward-slash form).
     pub path: String,
-    /// 0-based hunk indices to commit, taken from the file's `hunks` in
+    /// 0-based hunk indices to select, taken from the file's `hunks` in
     /// show_commit. Must list at least one.
     pub hunks: Vec<usize>,
 }
 
-/// Selects a sub-hunk slice of one file for a partial commit_working_copy.
+/// Selects a sub-hunk slice of one file for a partial commit_working_copy /
+/// squash_working_copy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PatchSelectionDto {
     /// Repo-relative path of the file (forward-slash form).

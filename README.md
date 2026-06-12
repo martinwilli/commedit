@@ -134,73 +134,68 @@ cargo test                  # run the engine and integration tests
 cargo run -- /path/to/repo  # launch the app against a repo (defaults to ".")
 ```
 
-## Use from AI agents (MCP)
+## Use from AI agents (Claude Code plugin)
 
-The same engine is also exposed as an [MCP](https://modelcontextprotocol.io)
-server, `commedit-mcp`, so an AI agent can edit history the way the GTK app
-does — and then some: edit any commit's message, identity or file contents,
-split, reorder, drop, restore and squash commits, create new commits and revert
-or cherry-pick existing ones, fold uncommitted changes in or commit them, walk
-the conflict-resolution loop, and undo any of it — all while the repository
-stays a plain git repo and conflicted rewrites are held back from git until they
-resolve or abort. Every tool addresses commits flexibly — by sha or by jj's
-stable change id, full or a unique prefix — so an agent can chain mutations by
-change id without re-listing the history as shas churn.
+The same engine is exposed to AI agents through a [Claude Code
+plugin](https://code.claude.com/docs/en/plugins). With it installed, an agent
+edits history the way the GTK app does — and then some: edit any commit's
+message, identity or file contents, split, reorder, drop, restore and squash
+commits, create new commits and revert or cherry-pick existing ones, fold
+uncommitted changes in or commit them, walk the conflict-resolution loop, and
+undo any of it — all while the repository stays a plain git repo and conflicted
+rewrites are held back from git until they resolve or abort. Every tool
+addresses commits by sha or by jj's stable change id (full or a unique prefix),
+so the agent can chain mutations by change id as shas churn. Alongside the tools
+the plugin ships skills that teach the agent *when* to reach for these workflows
+and a `commedit-operator` subagent that drives them — see
+[`plugin/README.md`](plugin/README.md) for the full description.
 
-Nobody runs the server by hand: the MCP client spawns the stdio process when a
-session starts and kills it when the session ends. The server takes the
-repository path as its only argument, defaulting to the current directory (and,
-like `git`, walking up to the enclosing repository), so one global registration
-serves every repo with a fresh per-repo, per-session instance:
+The plugin is self-contained: each [GitHub release](../../releases) attaches
+`commedit-plugin.zip`, which bundles a prebuilt server for every supported
+target (Linux x86-64, Linux AArch64, macOS Apple Silicon) plus a launcher that
+picks the right one — nothing to compile, and the only requirement is `git` on
+your `PATH` (the GTK runtime libraries are needed only for the desktop app).
+
+### Installing the plugin
+
+**From your organisation.** If an admin uploaded the zip to your claude.ai team
+settings, the plugin appears in members' `/plugin` list and installs per your
+org's policy — none of the steps below are needed.
+
+**For yourself.** Download `commedit-plugin.zip` from the [latest
+release](../../releases) and unpack it into a directory of its own:
 
 ```sh
-cargo install --path crates/commedit-mcp              # puts commedit-mcp on PATH
-claude mcp add --scope user commedit -- commedit-mcp  # register in Claude Code
+unzip commedit-plugin.zip -d ~/.local/share/commedit/plugin
 ```
 
-Use `--scope project` instead to write a shareable `.mcp.json` for one project,
-or pass an explicit path (`commedit-mcp /path/to/repo`) for other MCP hosts and
-out-of-tree setups. In a directory with no git repository above it the server
-exits non-zero and the client shows the connection as failed — harmless, by
-design (comm(ed)it never creates repositories).
+Then either load it for a single session, or install it persistently.
 
-The tool surface covers everything the app does and adds a few agent-only tools:
-read tools (`list_history` — optionally with the working-copy status inline —
-`show_commit`, `working_copy_status`, `suggest_squash_targets`, `session_diff`),
-mutations (`edit_message`, `edit_identity`, `edit_commits`,
-`replace_files`, `replace_in_file`, `replace_in_message`, `split_commit`,
-`create_commit`, `revert_commit`, `cherry_pick_commit`, `reorder_commit`,
-`drop_commit`, `restore_commit`, `squash_commit`, `commit_working_copy`,
-`discard_working_copy`, `squash_working_copy`), the conflict loop
-(`pending_status`, `read_conflict`, `resolve_conflicts`, `abort_rewrite`),
-and the session safety net (`list_operations`, `undo`,
-`redo`, `jump_to_operation`, `reload_repo`). One server process is one editing
-session: dropped commits stay restorable from a session trash, every landed
-mutation is an undo point, and `jump_to_operation 0` rolls everything back to
-how the session started. Git state is imported at startup, so after an
-out-of-band git operation the agent calls `reload_repo` to re-sync.
+*Single session* — point Claude Code at the unpacked plugin as you launch it:
 
-### As a Claude Code plugin
+```sh
+claude --plugin-dir ~/.local/share/commedit/plugin /path/to/your/repo
+```
 
-Each [GitHub release](../../releases) also attaches `commedit-plugin.zip`, a
-self-contained [Claude Code plugin](https://code.claude.com/docs/en/plugins)
-that registers the `commedit` MCP server for you. It bundles a prebuilt
-`commedit-mcp` for every supported target (Linux x86-64, Linux AArch64, macOS
-Apple Silicon) plus a launcher that picks the right one, so a single zip works
-on any of them — no `cargo install`, only `git` on `PATH`. The plugin lives in
-[`plugin/`](plugin/); the workflow injects the binaries at release time.
+*Persistently, across all sessions* — Claude Code installs plugins from a
+marketplace, so register a one-plugin local marketplace pointing at what you
+unpacked, then install from it:
 
-Distribute it the way that fits you:
+```sh
+mkdir -p ~/.local/share/commedit/.claude-plugin
+cat > ~/.local/share/commedit/.claude-plugin/marketplace.json <<'JSON'
+{
+  "name": "commedit-local",
+  "owner": { "name": "you" },
+  "plugins": [{ "name": "commedit", "source": "./plugin" }]
+}
+JSON
+claude plugin marketplace add ~/.local/share/commedit
+claude plugin install commedit@commedit-local   # then restart Claude Code
+```
 
-- **Organisation upload** — an admin uploads the zip in the claude.ai team
-  settings, and it appears in members' `/plugin` list.
-- **Locally** — unzip it and point Claude Code at the directory:
-
-  ```sh
-  claude --plugin-dir /path/to/commedit-plugin /path/to/your/repo
-  ```
-
-See [`plugin/README.md`](plugin/README.md) for the full plugin description.
+Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
+and ask the agent to list or edit history.
 
 ## Keyboard shortcuts
 

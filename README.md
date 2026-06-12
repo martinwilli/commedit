@@ -86,6 +86,14 @@ an interactive-rebase session.
   snapshot; hovering one highlights the commit rows it touched. The bottom
   **Session start** entry undoes the whole session at once.
 
+## Keyboard shortcuts
+
+- `Ctrl+S` — save the current edits, rewriting the selected commit in place.
+- `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
+  `+` additions, restores `-` removals to context).
+- `Ctrl+Z` / `Ctrl+Y` — in the diff pane, undo and redo your edits.
+- `Ctrl+Q` — close the window.
+
 ## Installing a binary release
 
 Pre-built binaries for Linux (x86-64 and AArch64) and macOS (Apple Silicon) are
@@ -200,14 +208,6 @@ claude plugin install commedit@commedit-local   # then restart Claude Code
 
 Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
 and ask the agent to list or edit history.
-
-## Keyboard shortcuts
-
-- `Ctrl+S` — save the current edits, rewriting the selected commit in place.
-- `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
-  `+` additions, restores `-` removals to context).
-- `Ctrl+Z` / `Ctrl+Y` — in the diff pane, undo and redo your edits.
-- `Ctrl+Q` — close the window.
 
 ## How it works
 

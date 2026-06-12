@@ -160,6 +160,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
             commit: history.commits[1].sha.clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()
@@ -225,6 +226,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
     server
         .drop_commit(Parameters(DropCommitReq {
             commit: history.commits[1].sha.clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap();

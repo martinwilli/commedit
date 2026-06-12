@@ -23,7 +23,8 @@ use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
     ensure_not_pending, find_commit, find_trashed, full_history, lookup_ref, new_commit_identity,
-    plan_splice, resolve_ref, save_result, PendingTrashOp, RefEntry, SpliceTarget, TrashState,
+    plan_splice, resolve_ref, save_result, working_copy_status_resp, PendingTrashOp, RefEntry,
+    SpliceTarget, TrashState,
 };
 use crate::wrapper::Yaml;
 
@@ -425,7 +426,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Drop a commit from history: its children rebase onto its parent, and the commit moves to the session trash (restorable via restore_commit or squash_commit). Merge commits and the branch's only commit cannot be dropped."
+        description = "Drop a commit from history: its children rebase onto its parent. By default the commit moves to the session trash (restorable via restore_commit or squash_commit). Pass keep_changes=true to instead 'uncommit' — the commit leaves history for good and its diff becomes unstaged changes in the working tree (git's reset --mixed), reported in the returned working_copy. Merge commits and the branch's only commit cannot be dropped."
     )]
     pub async fn drop_commit(
         &self,
@@ -450,12 +451,31 @@ impl CommeditServer {
                 &IdAbbrev::new(&repo.repo),
                 DetailFields::ALL,
             );
+            if req.keep_changes {
+                // Uncommit: the commit's diff moves to the working tree, so it is
+                // *not* kept in the trash (its content now lives unstaged on disk).
+                let outcome = repo.drop_keeping_changes(&id).map_err(internal)?;
+                // Report the resulting uncommitted state only once it settles clean
+                // (a pending conflict left the diff unmoved; the conflict tools settle it).
+                let working_copy = match outcome {
+                    commedit_engine::conflict::SaveOutcome::Clean => {
+                        Some(working_copy_status_resp(repo)?)
+                    }
+                    commedit_engine::conflict::SaveOutcome::Conflicts { .. } => None,
+                };
+                return Ok(DropCommitResp {
+                    result: save_result(repo, &outcome),
+                    dropped,
+                    working_copy,
+                });
+            }
             let outcome = run_staged(repo, trash, PendingTrashOp::Push(Box::new(info)), |repo| {
                 repo.abandon_commit(&id)
             })?;
             Ok(DropCommitResp {
                 result: save_result(repo, &outcome),
                 dropped,
+                working_copy: None,
             })
         })
         .await

@@ -1965,6 +1965,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // The trash rows' restore button has the same slot-behind-a-stable-wrapper
+    // shape as the revert button: the rows (and `dragdrop`'s trash repopulation)
+    // capture `on_restore` now, the real handler — which needs `refresh` etc. —
+    // is filled in once everything is built.
+    let on_restore_slot: Rc<RefCell<Option<RestoreToWorktreeCallback>>> =
+        Rc::new(RefCell::new(None));
+    let on_restore: RestoreToWorktreeCallback = {
+        let slot = on_restore_slot.clone();
+        Rc::new(move |idx| {
+            if let Some(handler) = slot.borrow().as_ref() {
+                handler(idx);
+            }
+        })
+    };
+
     // Reload history from the engine, preserving the selected commit by its
     // (rewrite-stable) change id.
     let refresh: Rc<dyn Fn()> = {
@@ -2144,6 +2159,76 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }) as RevertCallback
     });
 
+    // Fill the trash restore-button slot, now that `refresh` / `enter_conflict_mode`
+    // exist. The handler writes the clicked trashed commit's changes to the working
+    // tree as uncommitted edits and drops it from the trash. Deferred to idle — like
+    // the revert button and `dragdrop::run_post_drag` — because it rebuilds the very
+    // trash row whose button fired.
+    *on_restore_slot.borrow_mut() = Some({
+        let repo = repo.clone();
+        let trashed = trashed.clone();
+        let pending_trash_op = pending_trash_op.clone();
+        let trash_list = trash_list.clone();
+        let trash_scroll = trash_scroll.clone();
+        let refresh = refresh.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
+        let show_status = show_status.clone();
+        let pane_mode = pane_mode.clone();
+        let on_restore = on_restore.clone();
+        Rc::new(move |idx: i32| {
+            let repo = repo.clone();
+            let trashed = trashed.clone();
+            let pending_trash_op = pending_trash_op.clone();
+            let trash_list = trash_list.clone();
+            let trash_scroll = trash_scroll.clone();
+            let refresh = refresh.clone();
+            let enter_conflict_mode = enter_conflict_mode.clone();
+            let show_status = show_status.clone();
+            let pane_mode = pane_mode.clone();
+            let on_restore = on_restore.clone();
+            glib::idle_add_local_once(move || {
+                if pane_mode.borrow().is_conflict() {
+                    show_status(
+                        "Resolve the pending conflict before restoring to the working tree",
+                    );
+                    return;
+                }
+                let Some(info) = trashed.borrow().get(idx as usize).cloned() else {
+                    return;
+                };
+                let outcome = repo.borrow_mut().restore_to_working_copy(&info.id);
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        // Its changes are now uncommitted; drop it from the trash.
+                        let change_hex = info.change_id_hex();
+                        trashed
+                            .borrow_mut()
+                            .retain(|c| c.change_id_hex() != change_hex);
+                        // refresh() rebuilds history + the working-copy rows (the new
+                        // uncommitted entry); repopulate the trash to drop its row.
+                        refresh();
+                        populate_trash(
+                            &trash_list,
+                            &trash_scroll,
+                            &trashed.borrow(),
+                            Some(&on_restore),
+                        );
+                        show_status("Restored the commit's changes to the working tree");
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => {
+                        // The changes overlap existing uncommitted edits: hold the
+                        // trash removal until the overlap resolves clean (dropped on
+                        // abort), and resolve it like any conflict.
+                        *pending_trash_op.borrow_mut() =
+                            Some(PendingTrashOp::Restore(info.clone()));
+                        enter_conflict_mode(commits);
+                    }
+                    Err(err) => show_status(&format!("Restore to working tree failed: {err}")),
+                }
+            });
+        }) as RestoreToWorktreeCallback
+    });
+
     // The late-bound callbacks the peeled modules invoke. Assembled here, after
     // its members exist, and handed to `dragdrop`/`conflict` by reference.
     let callbacks = Callbacks {
@@ -2151,6 +2236,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         show_status: show_status.clone(),
         enter_conflict_mode: enter_conflict_mode.clone(),
         exit_conflict_mode: exit_conflict_mode.clone(),
+        on_restore: on_restore.clone(),
     };
 
     // Wire the conflict-mode events (abort + previous/next-conflict navigation).
@@ -2167,6 +2253,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         exit_conflict_mode.clone(),
         show_status.clone(),
         sync_conflict_from_buffer.clone(),
+        on_restore.clone(),
     );
 
     // Render the session "Review" into its (read-only) full-window buffer: the
@@ -2239,6 +2326,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let on_restore = on_restore.clone();
         let review_button = review_button.clone();
         let render_review = render_review.clone();
         move |btn| {
@@ -2315,6 +2403,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let pending_trash_op = pending_trash_op.clone();
                 let trash_list = trash_list.clone();
                 let trash_scroll = trash_scroll.clone();
+                let on_restore = on_restore.clone();
                 let review_button = review_button.clone();
                 let render_review = render_review.clone();
                 move |_, row| {
@@ -2345,7 +2434,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     // and drop any trash change a held-back rewrite was waiting on.
                     pending_trash_op.borrow_mut().take();
                     trashed.borrow_mut().clear();
-                    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    populate_trash(
+                        &trash_list,
+                        &trash_scroll,
+                        &trashed.borrow(),
+                        Some(&on_restore),
+                    );
                     // Re-fire `row-selected` (rows are reused) so the diff pane
                     // reloads the travelled-to content.
                     list.unselect_all();
@@ -2391,6 +2485,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let on_restore = on_restore.clone();
         let history_limit = history_limit.clone();
         let review_button = review_button.clone();
         let render_review = render_review.clone();
@@ -2411,7 +2506,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             exit_conflict_mode();
             pending_trash_op.borrow_mut().take();
             trashed.borrow_mut().clear();
-            populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+            populate_trash(
+                &trash_list,
+                &trash_scroll,
+                &trashed.borrow(),
+                Some(&on_restore),
+            );
             history_limit.set(HISTORY_PAGE);
             // Re-fire `row-selected` (rows are reused) so the diff pane
             // reloads the re-read content.
@@ -2436,7 +2536,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // separate Save step for it.
 
     dragdrop::wire(&widgets, &data, &drag_state, &callbacks);
-    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+    populate_trash(
+        &trash_list,
+        &trash_scroll,
+        &trashed.borrow(),
+        Some(&on_restore),
+    );
 
     // Save: rewrite the message and/or the selected file's content, then reload.
     // Reloading re-selects the commit, which cascades through `row-selected` ->

@@ -170,6 +170,21 @@ op-log").
   children rebase onto its parent), and restore offers the same per-line candidates
   as reorder. The abandoned commit object lingers in the ODB (kept reachable so a
   later restore can graft it back). Restore reuses the `reorder_commit` body.
+- `restore_to_working_copy` / `drop_keeping_changes` (`squash.rs` / `rewrite.rs`) —
+  "uncommit": move a commit's changes into the working copy as *uncommitted* edits
+  instead of dropping them (git's `reset --mixed`). `restore_to_working_copy` is the
+  inverse of `squash_working_copy_into`: it delegates to `squash_restore_into`
+  targeting the leaf `@` as the destination, so an **orphan** (trashed) commit's diff
+  3-way-merges into `@` and lands as unstaged changes — the branch tip never moves
+  (the export is a branch no-op; `materialize_after_rewrite` rewrites the worktree +
+  resets the index), and an overlap with existing uncommitted changes goes through the
+  ordinary working-copy-conflict flow. `drop_keeping_changes` is the in-history entry:
+  `abandon_commit` (correct `SpuriousResolve::Drop` rebase of descendants) **then**
+  `restore_to_working_copy` on the resulting orphan — deliberately two transactions so
+  each half uses the strategy it was built for (a single squash into `@` would assume a
+  clean post-drop tip, which `CleanTip` requires but a drop breaks). Backs the GTK
+  trash-row restore button and the MCP `drop_commit keep_changes`. (`squash_into_inner`
+  gained an optional op-log label so the dropdown reads "Restore … to working copy".)
 - `create_commit` / `revert_commit` / `cherry_pick_commit` (`create.rs`; MCP, plus
   a GTK surface for `revert_commit` — the history list's right-edge hover button, see
   the GTK section) — synthesize a brand-new commit and splice it into the graph at a
@@ -506,20 +521,27 @@ not in `main.rs`:
 - `highlight.rs` — the TextTag palette, syntect colouring (`highlight_diff` /
   `highlight_conflict`), and the inline "pill" geometry/painting.
 - `rows.rs` — commit/working-copy row build + the drag-safe `populate_*` refreshers
-  (the "hide, never unparent" discipline lives in `populate_rows`). A history row's
-  content box is wrapped in an `Overlay` carrying a hover **revert button** that
-  floats at the row's right edge (`halign End`) — so the buttons line up down the
-  list, aligned to the list's right boundary, and only overlap a subject wide enough
-  to scroll under them (mirroring the id cell's copy icon, but row-wide rather than
-  subject-local). Clicking it calls the `RevertCallback` `build_ui` threads through
-  `populate_list` → `set_row_commit` → `commit_row_box` with the row's display index,
-  which defers (idle, like `run_post_drag`) a `revert_commit` placing the revert
-  directly on top of that commit — its parent is the commit, its children the lane
-  edge crossing the gap just above it (`graph.boundaries`). The wrapping `Overlay`
-  (not the subject) is tagged `no-revert` on merge rows so the button never reveals;
-  trash rows skip the wrapper entirely (no graph, no button), and `set_row_commit`'s
-  traversal keys off the graph drawing area's presence to find the content box either
-  way.
+  (the "hide, never unparent" discipline lives in `populate_rows`). Every row is the
+  outer box `[graph area?, content overlay { row box }]`: the ancestry drawing area
+  leads it on a history row (trash rows omit it — no graph), and the content box is
+  always wrapped in an `Overlay` carrying a hover button that floats at the row's
+  right edge (`halign End`) — so buttons line up down the list, aligned to its right
+  boundary, and only overlap a subject wide enough to scroll under them (mirroring
+  the id cell's copy icon, but row-wide). A **history** row gets a **revert button**
+  (`add_revert_button`); a **trash** row gets a **restore button** (`add_restore_button`,
+  the `go-bottom-symbolic` down arrow). Both callbacks (`RevertCallback` /
+  `RestoreToWorktreeCallback`) thread through `populate_list`/`populate_trash` →
+  `set_row_commit` → `commit_row_box`, are slot-filled late in `build_ui` (the
+  `RestoreToWorktreeCallback` also rides in the `Callbacks` bundle so `dragdrop`
+  repopulates the trash with buttons intact), and defer to idle (like `run_post_drag`).
+  Revert places a `revert_commit` on top of the row's commit (parent = the commit,
+  children = the lane edge crossing the gap just above it, `graph.boundaries`); its
+  wrapping `Overlay` is tagged `no-revert` on merge rows so the button never reveals.
+  Restore calls `restore_to_working_copy` (the engine "uncommit"): on `Clean` it drops
+  the commit from `trashed` and refreshes, on a working-copy overlap it enters conflict
+  mode and defers the trash removal (`PendingTrashOp::Restore`, like a drag-restore).
+  `set_row_commit`'s traversal finds the content overlay whether or not a graph area
+  precedes it, so both row kinds share one path.
 - `identity.rs` — the author/committer identity/date fields and conversions.
 - `conflict.rs` — the pure conflict-text helpers **and** the conflict-mode wiring:
   the callback builders (`build_refresh_conflict`/`build_exit_conflict_mode`/

@@ -497,4 +497,25 @@ impl Repo {
             SpuriousResolve::Drop,
         )
     }
+
+    /// Drop `target` from history but keep its changes as **uncommitted** edits in
+    /// the working tree — git's `reset --mixed`. Done in two steps: first
+    /// [`Self::abandon_commit`] removes it (rebasing descendants onto its parent,
+    /// exported, with the correct `SpuriousResolve::Drop` rebuild); then — once
+    /// that lands clean — [`Self::restore_to_working_copy`] re-applies the now-orphan
+    /// commit's diff onto the working-copy commit `@` as unstaged changes. Splitting
+    /// it this way lets each half use the spurious-resolve strategy it was built for
+    /// (a single squash into `@` would wrongly assume a clean post-drop tip). Unlike
+    /// a plain drop the commit is **not** kept in any trash — its content now lives
+    /// in the working tree.
+    ///
+    /// If the drop itself conflicts (a genuine, non-spurious rebase clash), that
+    /// `Conflicts` outcome is returned unchanged and the diff is **not** moved to the
+    /// working copy: the rewrite is left pending for the caller to resolve or abort.
+    pub fn drop_keeping_changes(&mut self, target: &CommitId) -> Result<SaveOutcome> {
+        match self.abandon_commit(target)? {
+            SaveOutcome::Clean => self.restore_to_working_copy(target),
+            conflicts => Ok(conflicts),
+        }
+    }
 }

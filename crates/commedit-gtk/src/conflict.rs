@@ -19,9 +19,9 @@ use crate::buffer_util::buffer_text;
 use crate::highlight::pill;
 use crate::rows::{populate_list, populate_trash};
 use crate::state::{
-    Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, Side, Widgets, CONFLICT_CUE_LABEL,
-    CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS, CUE_THEIRS, HISTORY_PAGE,
-    SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
+    Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, RestoreToWorktreeCallback, Side,
+    Widgets, CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS,
+    CUE_THEIRS, HISTORY_PAGE, SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -460,6 +460,7 @@ pub(crate) fn build_enter_conflict_mode(
 /// the buffer. The engine re-checks the whole chain: when the last conflict clears
 /// it exports the rewrite and we return to the normal view, otherwise the
 /// remaining conflicts are re-shown.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_resolve_current(
     w: &Widgets,
     d: &Data,
@@ -468,6 +469,7 @@ pub(crate) fn build_resolve_current(
     exit_conflict_mode: Rc<dyn Fn()>,
     show_status: Rc<dyn Fn(&str)>,
     sync_conflict_from_buffer: Rc<dyn Fn()>,
+    on_restore: RestoreToWorktreeCallback,
 ) -> Rc<dyn Fn()> {
     let repo = d.repo.clone();
     let pane_mode = d.pane_mode.clone();
@@ -529,7 +531,12 @@ pub(crate) fn build_resolve_current(
                             .borrow_mut()
                             .retain(|c| c.change_id_hex() != info.change_id_hex()),
                     }
-                    populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                    populate_trash(
+                        &trash_list,
+                        &trash_scroll,
+                        &trashed.borrow(),
+                        Some(&on_restore),
+                    );
                 }
                 exit_conflict_mode();
                 refresh();

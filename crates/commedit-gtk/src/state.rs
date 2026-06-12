@@ -38,6 +38,12 @@ pub(crate) type PostDrag = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 /// (wired in `build_ui`, captured by each row in `rows::add_revert_button`).
 pub(crate) type RevertCallback = Rc<dyn Fn(i32)>;
 
+/// A trash row's restore button calls this with the row's display index to write
+/// that dropped commit's changes to the working tree as uncommitted edits (and
+/// remove it from the trash) — wired in `build_ui`, captured by each trash row in
+/// `rows::add_restore_button`.
+pub(crate) type RestoreToWorktreeCallback = Rc<dyn Fn(i32)>;
+
 /// Which list a drag started in, so the shared drop handlers can tell a reorder
 /// (history → history), a drop (history → trash), a restore (trash → history) and
 /// a working-copy fold (working copy → commit) apart. The carried value is just
@@ -261,4 +267,7 @@ pub(crate) struct Callbacks {
     pub(crate) show_status: Rc<dyn Fn(&str)>,
     pub(crate) enter_conflict_mode: Rc<dyn Fn(Vec<ConflictedCommit>)>,
     pub(crate) exit_conflict_mode: Rc<dyn Fn()>,
+    /// Restore a trashed commit's changes to the working tree (by display index),
+    /// for `dragdrop` to repopulate the trash list with its restore buttons intact.
+    pub(crate) on_restore: RestoreToWorktreeCallback,
 }

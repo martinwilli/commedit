@@ -50,6 +50,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let refresh = cb.refresh.clone();
     let show_status = cb.show_status.clone();
     let enter_conflict_mode = cb.enter_conflict_mode.clone();
+    // Repopulating the trash after a drag must keep the restore buttons intact.
+    let on_restore = cb.on_restore.clone();
 
     // Map a y coordinate to an insertion gap: onto a row's lower half drops below
     // it; past the last row drops at the bottom; above the first, at the top. The
@@ -390,6 +392,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let on_restore = on_restore.clone();
         let selected_change = selected_change.clone();
         let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
@@ -539,6 +542,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let trashed = trashed.clone();
                     let trash_list = trash_list.clone();
                     let trash_scroll = trash_scroll.clone();
+                    let on_restore = on_restore.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let Some(info) = trashed.borrow().get(from as usize).cloned() else {
@@ -566,6 +570,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             let trashed = trashed.clone();
                             let trash_list = trash_list.clone();
                             let trash_scroll = trash_scroll.clone();
+                            let on_restore = on_restore.clone();
                             Rc::new(move |mode| {
                                 let outcome = repo
                                     .borrow_mut()
@@ -583,6 +588,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
+                                            Some(&on_restore),
                                         );
                                         *selected_change.borrow_mut() = Some(dest_change.clone());
                                         refresh();
@@ -595,6 +601,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
+                                            Some(&on_restore),
                                         );
                                         enter_conflict_mode(commits);
                                     }
@@ -630,6 +637,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let pending_trash_op = pending_trash_op.clone();
                     let trash_list = trash_list.clone();
                     let trash_scroll = trash_scroll.clone();
+                    let on_restore = on_restore.clone();
                     let selected_change = selected_change.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let list = list.clone();
@@ -658,6 +666,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             let pending_trash_op = pending_trash_op.clone();
                             let trash_list = trash_list.clone();
                             let trash_scroll = trash_scroll.clone();
+                            let on_restore = on_restore.clone();
                             let selected_change = selected_change.clone();
                             let enter_conflict_mode = enter_conflict_mode.clone();
                             let info = info.clone();
@@ -680,6 +689,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
+                                            Some(&on_restore),
                                         );
                                     }
                                     Ok(SaveOutcome::Conflicts { commits }) => {
@@ -916,6 +926,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
+        let on_restore = on_restore.clone();
         let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
@@ -944,6 +955,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
+            let on_restore = on_restore.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
             let list = list.clone();
             let selected_change = selected_change.clone();
@@ -1005,7 +1017,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         }
                         trashed.borrow_mut().push(info);
                         refresh();
-                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                        populate_trash(
+                            &trash_list,
+                            &trash_scroll,
+                            &trashed.borrow(),
+                            Some(&on_restore),
+                        );
                     }
                     Ok(SaveOutcome::Conflicts { commits }) => {
                         // Don't add to the trash yet: the rewrite is held back from

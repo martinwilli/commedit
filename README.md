@@ -180,6 +180,28 @@ mutation is an undo point, and `jump_to_operation 0` rolls everything back to
 how the session started. Git state is imported at startup, so after an
 out-of-band git operation the agent calls `reload_repo` to re-sync.
 
+### As a Claude Code plugin
+
+Each [GitHub release](../../releases) also attaches `commedit-plugin.zip`, a
+self-contained [Claude Code plugin](https://code.claude.com/docs/en/plugins)
+that registers the `commedit` MCP server for you. It bundles a prebuilt
+`commedit-mcp` for every supported target (Linux x86-64, Linux AArch64, macOS
+Apple Silicon) plus a launcher that picks the right one, so a single zip works
+on any of them — no `cargo install`, only `git` on `PATH`. The plugin lives in
+[`plugin/`](plugin/); the workflow injects the binaries at release time.
+
+Distribute it the way that fits you:
+
+- **Organisation upload** — an admin uploads the zip in the claude.ai team
+  settings, and it appears in members' `/plugin` list.
+- **Locally** — unzip it and point Claude Code at the directory:
+
+  ```sh
+  claude --plugin-dir /path/to/commedit-plugin /path/to/your/repo
+  ```
+
+See [`plugin/README.md`](plugin/README.md) for the full plugin description.
+
 ## Keyboard shortcuts
 
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.

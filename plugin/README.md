@@ -43,6 +43,16 @@ Tools surface under the `commedit` server (`list_history`, `show_commit`,
 `split_commit`, `commit_working_copy`, `resolve_conflicts`, `undo`, …). The
 server provides its own usage instructions to the agent on connect.
 
+## Bundled skill
+
+The plugin also ships a **`commit-as-you-go`** skill. It loads when an agent is
+implementing a multi-step task that will produce several commits and teaches the
+discipline that plays to comm(ed)it's strengths: commit each logical unit eagerly
+as you work (extending or fixing a commit later is cheap), rather than writing
+everything and trying to split one big pile at the end (which is hard). Invoke it
+explicitly with `/commedit:commit-as-you-go` to pin it at the start of an
+autonomous run.
+
 ## Requirements
 
 - **`git`** on your `PATH` — the server drives the git CLI for working-copy and

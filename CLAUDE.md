@@ -36,6 +36,12 @@ The GTK crate needs system GTK4 / libsourceview5 development libraries present.
 Run `cargo fmt` and `cargo clippy --workspace --all-targets` before committing,
 and keep clippy warning-free; each commit should build and pass tests on its own.
 
+The Claude Code plugin in `plugin/` bundles `commedit-mcp` (and the agent skills)
+as an MCP server. To build it and install it into your own Claude Code for
+dogfooding — instead of `cargo run -p commedit-mcp` — follow *Developing locally*
+in [`plugin/README.md`](plugin/README.md) (`bin/commedit-mcp-*` is git-ignored, so
+the local build stays out of the tree).
+
 ## Architecture
 
 Three crates, split so the rewrite logic carries **no GTK dependency** and is

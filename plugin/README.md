@@ -135,6 +135,19 @@ cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
 
 `bin/commedit-mcp-*` is git-ignored, so a local build never dirties the tree.
 
+**When rebuilding from inside Claude Code**, `rm` the target before copying — do
+this proactively: the dogfooded `commedit` server holds the old binary open, so a
+plain `cp` fails with `Text file busy`. Unlinking first lets the running process
+keep its old inode while the new build lands at a fresh one:
+
+```sh
+rm -f plugin/bin/commedit-mcp-linux-x86_64
+cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
+```
+
+The still-running server keeps serving the *previous* build until you restart
+Claude Code, so relaunch to pick up the new one.
+
 **Quick loop — one session.** `--plugin-dir` reads `plugin/` in place, so
 rebuilding and relaunching picks up the new binary with no extra step:
 

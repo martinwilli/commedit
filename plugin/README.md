@@ -66,6 +66,22 @@ start of a run.
 In every case descendants are rebased automatically, and a rewrite whose rebase
 conflicts is held back in full until you resolve or abort it.
 
+## Bundled agent
+
+The plugin also ships a subagent, **`commedit-operator`**, that takes the
+commedit-interaction burden off the main agent. Hand it *what* to change — "reword
+commit X", "squash the fixup into Y", "reorder Z before W", "re-date this range",
+"create a commit from these files below HEAD", "resolve the pending conflict",
+"undo the last operation" — and it picks the right tool, performs the action,
+**verifies** it landed (through commedit or read-only `git`), and returns a
+compact summary (outcome, affected `change_id`s, what it checked). It owns the
+details the workflows above describe — `change_id` addressing, the smallest-tool
+choice, conflict holds, the undo/abort safety net — and the bundled skills, which
+it consults on demand. It edits history only via commedit and never touches
+working-tree files itself, so the main agent stays in charge of *what* while the
+operator handles *how*. Delegate one operation (or a tightly-related batch) per
+call.
+
 ## Requirements
 
 - **`git`** on your `PATH` — the server drives the git CLI for working-copy and

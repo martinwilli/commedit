@@ -10,6 +10,13 @@ description: >-
 
 # Reorder, squash & fixup with commedit
 
+> **Delegate each move to the `commedit-operator` subagent.** Decide the target
+> order or fold, then hand it the *what* — "reorder `<id>` before `<id>`", "squash
+> the fixup `<id>` into `<id>`", "drop `<id>`" — and it resolves change_ids, runs
+> the rebase, handles any conflict hold, **verifies**, and reports. The tool detail
+> below is what the operator works from; use these tools directly only when no
+> subagent is available, or when you *are* the operator.
+
 This is `git rebase -i` without the editor choreography, on any commit reachable
 from HEAD: each move is a real rebase that carries the descendants with it. Run
 `list_history` first to see the change_ids, then address commits by

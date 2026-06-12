@@ -10,6 +10,13 @@ description: >-
 
 # Revise an existing commit with commedit
 
+> **Delegate the edit to the `commedit-operator` subagent.** Tell it *what* to
+> revise — "reword commit `<id>` to …", "fix the author/date on `<id>`", "edit
+> `foo.rs` in commit `<id>` to …" — and it picks the smallest tool, runs it,
+> **verifies** the result, and reports back compactly. The mechanics below are what
+> the operator works from; reach for these tools directly only when no subagent is
+> available, or when you *are* the operator.
+
 `git commit --amend` only reaches the tip. commedit amends **any** commit
 reachable from HEAD — its message, its identity, or the files it changed — and
 rebases every descendant for you. Reach for the smallest tool that fits the

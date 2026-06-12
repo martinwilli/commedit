@@ -10,6 +10,15 @@ description: >-
 
 # Commit as you go with commedit
 
+> **Hand each commedit call to the `commedit-operator` subagent.** You own the
+> *plan* — which commits to make and when — but delegate every crystallize / fold /
+> fix step to `commedit-operator` as a one-line *what* ("commit this unit as
+> `<message>`", "fold this fix into commit `<id-or-subject>`", "reword `<id>`"). It
+> chooses the tool, addresses by change_id, runs it, **verifies** it landed, and
+> reports back — keeping rewrite detail out of your context. The tool-level guidance
+> below is what the operator works from; drive these tools yourself only when no
+> subagent is available, or when you *are* the operator.
+
 With commedit, **extending or fixing a commit is cheap; splitting a finished pile
 of changes into commits is expensive.** So commit *early and eagerly* at logical
 boundaries as you work — never write everything and split it afterward. An

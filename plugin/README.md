@@ -46,9 +46,10 @@ server provides its own usage instructions to the agent on connect.
 ## Bundled skills
 
 The plugin also ships skills that teach an agent *when* to reach for these
-tools — the workflows comm(ed)it makes easy. They load on the matching intent,
-or invoke one explicitly (e.g. `/commedit:commit-as-you-go`) to pin it at the
-start of a run.
+workflows — the ones comm(ed)it makes easy — and to **hand the execution to the
+`commedit-operator` subagent** (below) rather than drive the MCP tools from the
+main context. They load on the matching intent, or invoke one explicitly (e.g.
+`/commedit:commit-as-you-go`) to pin it at the start of a run.
 
 - **`commit-as-you-go`** — for a multi-step task that will produce several
   commits: commit each logical unit eagerly as you work (extending or fixing a

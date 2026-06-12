@@ -10,6 +10,13 @@ description: >-
 
 # Insert, revert & cherry-pick with commedit
 
+> **Delegate the insert to the `commedit-operator` subagent.** Hand it the *what* —
+> "create a commit from these files below `<id>`", "revert `<id>`", "cherry-pick
+> `<sha>` from `<branch>`" — and it splices at the right slot, rebases descendants,
+> **verifies**, and reports back. The tool detail below is what the operator works
+> from; drive these tools yourself only when no subagent is available, or when you
+> *are* the operator.
+
 These tools *introduce* a commit and splice it into the graph at a chosen slot.
 The slot is the same everywhere: `new_parent` names the commit that becomes the
 new commit's parent — **omit it** for the top of HEAD, or pass `"root"` for the

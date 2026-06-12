@@ -82,6 +82,11 @@ working-tree files itself, so the main agent stays in charge of *what* while the
 operator handles *how*. Delegate one operation (or a tightly-related batch) per
 call.
 
+Reach for it **instead of running git yourself** for any commit or history
+rewrite — `git commit`, `git commit --amend`, `git rebase -i`, `git cherry-pick`,
+`git revert` — and not just at the tip. Building merge commits and managing
+branches, remotes and pushes stay plain-git tasks.
+
 ## Requirements
 
 - **`git`** on your `PATH` — the server drives the git CLI for working-copy and

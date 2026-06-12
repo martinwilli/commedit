@@ -252,6 +252,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
             commit: a.sha.clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()
@@ -315,6 +316,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
             commit: a.sha.clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()

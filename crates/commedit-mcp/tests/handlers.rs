@@ -1021,6 +1021,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
             commit: target.clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()
@@ -1065,6 +1066,47 @@ async fn drop_then_restore_round_trips_through_the_trash() {
 }
 
 #[tokio::test]
+async fn drop_commit_keep_changes_uncommits_to_the_working_tree() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "a\n", "first"),
+            ("a.txt", "a\nsecond\n", "second"),
+            ("a.txt", "a\nsecond\nthird\n", "third"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // Uncommit the tip: it leaves history and its diff becomes unstaged changes.
+    let tip = shas(&server).await[0].clone();
+    let resp = server
+        .drop_commit(Parameters(DropCommitReq {
+            commit: tip,
+            keep_changes: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&resp.result);
+    assert_eq!(resp.dropped.subject, "third");
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+
+    // The response reports the now-uncommitted change, and it is NOT in the trash.
+    let wc = resp
+        .working_copy
+        .expect("working_copy reported on keep_changes");
+    assert!(!wc.clean);
+    assert_eq!(wc.entries.len(), 1);
+    assert!(wc.entries[0].files.contains(&"a.txt".to_string()));
+    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+
+    // git sees it as an unstaged modification (the index matches HEAD = second).
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "M a.txt");
+    git(dir.path(), &["fsck", "--no-progress"]);
+}
+
+#[tokio::test]
 async fn drop_refuses_merges_and_unknown_restores() {
     let dir = TempDir::new().unwrap();
     init_merge_repo(dir.path());
@@ -1085,6 +1127,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
         server
             .drop_commit(Parameters(DropCommitReq {
                 commit: merge.sha.clone(),
+                keep_changes: false,
             }))
             .await,
     );
@@ -1215,6 +1258,7 @@ async fn squash_from_the_trash_restores_and_folds() {
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
             commit: listed[1].clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()
@@ -1446,6 +1490,7 @@ async fn squash_prefers_a_history_match_over_the_trash() {
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
             commit: listed[1].clone(),
+            keep_changes: false,
         }))
         .await
         .unwrap()
@@ -1484,7 +1529,10 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
 
     let target = shas(&server).await[1].clone();
     let dropped = server
-        .drop_commit(Parameters(DropCommitReq { commit: target }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: target,
+            keep_changes: false,
+        }))
         .await
         .unwrap()
         .0;

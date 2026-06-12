@@ -546,6 +546,13 @@ pub struct DropCommitReq {
     /// The commit to drop — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.
     pub commit: String,
+    /// When true, "uncommit" instead of trashing: the commit leaves history and
+    /// its diff becomes *unstaged* changes in the working tree (git's
+    /// `reset --mixed`), rather than moving to the session trash. The returned
+    /// `working_copy` then reflects the new uncommitted state. Merge commits and
+    /// the branch's only commit still cannot be dropped. Defaults to false.
+    #[serde(default)]
+    pub keep_changes: bool,
 }
 
 /// The result of `drop_commit`. The mutation outcome's `status` and fields are
@@ -558,9 +565,14 @@ pub struct DropCommitResp {
     /// mutations return them.
     #[serde(flatten)]
     pub result: SaveResultDto,
-    /// The dropped commit, now in the session trash. Its `parent_shas` say
-    /// where it sat — useful when restoring it later.
+    /// The dropped commit. Without `keep_changes` it is now in the session trash
+    /// (its `parent_shas` say where it sat — useful when restoring it later); with
+    /// `keep_changes` it left history entirely and its diff is now uncommitted.
     pub dropped: CommitDto,
+    /// Present only on a clean `keep_changes` drop: the resulting uncommitted
+    /// state, with the dropped commit's diff now among the working-copy entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -833,6 +845,7 @@ mod tests {
                     parent_shas: None,
                 },
             },
+            working_copy: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["status"], "clean");
@@ -842,5 +855,9 @@ mod tests {
             "status must not stay nested under `result`"
         );
         assert_eq!(v["dropped"]["sha"], "def456");
+        assert!(
+            v.get("working_copy").is_none(),
+            "working_copy is omitted unless a keep_changes drop populates it"
+        );
     }
 }

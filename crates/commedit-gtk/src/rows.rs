@@ -14,7 +14,7 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 
-use crate::state::RevertCallback;
+use crate::state::{RestoreToWorktreeCallback, RevertCallback};
 
 /// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
 /// (which recomputes it) and every row's drawing area (which reads its own row).
@@ -243,28 +243,85 @@ fn add_revert_button(content: &Overlay, on_revert: &RevertCallback) {
     btn.add_controller(click);
 }
 
+/// Float a restore button over a *trash* row's right edge — the same
+/// non-measured-overlay + hover pattern as [`add_revert_button`], so it lines up
+/// down the list. Clicking it claims the press (so it never selects the row) and
+/// calls `on_restore` with the row's current display index, which writes that
+/// dropped commit's changes to the working tree as uncommitted edits and removes
+/// it from the trash. Trashed commits are never merges, so — unlike the revert
+/// button — there is no `no-revert` suppression.
+fn add_restore_button(content: &Overlay, on_restore: &RestoreToWorktreeCallback) {
+    let btn = gtk::Image::from_icon_name("go-bottom-symbolic");
+    // An explicit pixel size is required: as a non-measured overlay child the
+    // icon would otherwise request zero size and never show.
+    btn.set_pixel_size(16);
+    btn.set_halign(gtk::Align::End);
+    btn.set_valign(gtk::Align::Center);
+    // Keep the icon clear of the list's right edge / scrollbar.
+    btn.set_margin_end(8);
+    btn.set_cursor_from_name(Some("pointer"));
+    btn.set_tooltip_text(Some(
+        "Restore this commit's changes to the working tree (unstaged)",
+    ));
+    btn.add_css_class("commit-revert");
+    btn.set_visible(false);
+    content.add_overlay(&btn);
+
+    // Reveal the button only while the pointer is over the row content.
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter({
+        let btn = btn.clone();
+        move |_, _, _| btn.set_visible(true)
+    });
+    motion.connect_leave({
+        let btn = btn.clone();
+        move |_| btn.set_visible(false)
+    });
+    content.add_controller(motion);
+
+    // Claim the press so the click stays off the row (it must not select it).
+    let click = gtk::GestureClick::new();
+    click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    click.connect_released({
+        let btn = btn.clone();
+        let on_restore = on_restore.clone();
+        move |_, _, _, _| {
+            if let Some(row) = btn
+                .ancestor(ListBoxRow::static_type())
+                .and_downcast::<ListBoxRow>()
+            {
+                on_restore(row.index());
+            }
+        }
+    });
+    btn.add_controller(click);
+}
+
 /// Build the `short-id   subject  [pills]   ⚠` content box shown inside a
 /// history/trash row. The pill box hugs the subject's right edge: the subject
 /// label does *not* expand, the pill box does (start-aligned), so the pills sit
 /// right after the text and the slack stays empty. The trailing warning icon is
 /// present but hidden unless `conflicted`.
 ///
-/// With `graph` (the shared layout and this row's index — history rows only,
-/// trash rows pass `None`), the content box is wrapped in a margin-free outer
-/// box led by the ancestry drawing area: the graph lines must reach the row's
-/// top/bottom edges to connect across rows, which the content box's vertical
-/// margins would otherwise gap. There the content box is also wrapped in an
-/// [`Overlay`] so — when `on_revert` is `Some` — a revert button can float at the
-/// row's right edge (aligned down the list, overlapping only a wide subject), the
-/// same hover pattern as the id cell's copy icon. History rows always get this
-/// wrapper so [`set_row_commit`]'s traversal stays uniform; trash rows (no graph,
-/// no button) skip it.
+/// The content box is always wrapped in an [`Overlay`] inside a margin-free outer
+/// box, so a right-edge action button can float over it (aligned down the list,
+/// overlapping only a wide subject — the same hover pattern as the id cell's copy
+/// icon): a *revert* button on a history row when `on_revert` is `Some`, a
+/// *restore* button on a trash row when `on_restore` is `Some`. With `graph` (the
+/// shared layout and this row's index — history rows only, trash rows pass
+/// `None`) the ancestry drawing area leads the outer box: the graph lines must
+/// reach the row's top/bottom edges to connect across rows, which the content
+/// box's vertical margins would otherwise gap. Both row kinds share this
+/// outer+overlay shape so [`set_row_commit`]'s traversal stays uniform.
 fn commit_row_box(
     commit: &CommitInfo,
     conflicted: bool,
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
     on_revert: Option<&RevertCallback>,
+    on_restore: Option<&RestoreToWorktreeCallback>,
 ) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
@@ -300,28 +357,28 @@ fn commit_row_box(
     row_box.append(&subject_label);
     row_box.append(&pills);
     row_box.append(&badge);
-    match graph {
-        Some((graph, index)) => {
-            // The lane column supplies the leading whitespace.
-            row_box.set_margin_start(4);
-            row_box.set_hexpand(true);
-            // Wrap the content so a revert button can float at the row's right
-            // edge, aligned down the list and overlapping only a wide subject.
-            // History rows always get this wrapper so `set_row_commit`'s traversal
-            // stays uniform.
-            let content = Overlay::new();
-            content.set_hexpand(true);
-            content.set_child(Some(&row_box));
-            if let Some(on_revert) = on_revert {
-                add_revert_button(&content, on_revert);
-            }
-            let outer = GtkBox::new(Orientation::Horizontal, 0);
-            outer.append(&graph_area(graph, index));
-            outer.append(&content);
-            outer
-        }
-        None => row_box,
+    // Wrap the content in an Overlay so an action button can float at the row's
+    // right edge; both history and trash rows get this so `set_row_commit`'s
+    // traversal is uniform.
+    let content = Overlay::new();
+    content.set_hexpand(true);
+    content.set_child(Some(&row_box));
+    if let Some(on_revert) = on_revert {
+        add_revert_button(&content, on_revert);
     }
+    if let Some(on_restore) = on_restore {
+        add_restore_button(&content, on_restore);
+    }
+    let outer = GtkBox::new(Orientation::Horizontal, 0);
+    if let Some((graph, index)) = graph {
+        // The lane column supplies the leading whitespace; the graph lines must
+        // reach the row edges, so the content box drops its leading margin.
+        row_box.set_margin_start(4);
+        row_box.set_hexpand(true);
+        outer.append(&graph_area(graph, index));
+    }
+    outer.append(&content);
+    outer
 }
 
 /// Fill the pill box with one colored label per branch/tag pointing at the
@@ -381,6 +438,7 @@ fn set_row_commit(
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
     on_revert: Option<&RevertCallback>,
+    on_restore: Option<&RestoreToWorktreeCallback>,
 ) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
@@ -389,22 +447,26 @@ fn set_row_commit(
         &commit.subject
     };
     let child = row.child().and_downcast::<GtkBox>();
-    // A history row's child is the outer `[graph area, content overlay]` box from
-    // [`commit_row_box`], the content overlay wrapping the content box (so the
-    // revert button can float at the row's right edge); a trash row's child is the
-    // content box itself — no graph area and no wrapping overlay.
+    // Every row's child is the outer `[graph area?, content overlay]` box from
+    // [`commit_row_box`]: a history row leads with the ancestry drawing area, a
+    // trash row omits it (no graph) but keeps the content overlay so its restore
+    // button can float at the right edge. The content overlay wraps the content
+    // box either way.
     let area = child
         .as_ref()
         .and_then(|b| b.first_child())
         .and_downcast::<gtk::DrawingArea>();
-    let content_overlay = area
-        .as_ref()
-        .and_then(|a| a.next_sibling())
-        .and_downcast::<Overlay>();
-    let row_box = match &content_overlay {
-        Some(content) => content.child().and_downcast::<GtkBox>(),
-        None => child,
+    let content_overlay = match &area {
+        Some(area) => area.next_sibling().and_downcast::<Overlay>(),
+        None => child
+            .as_ref()
+            .and_then(|b| b.first_child())
+            .and_downcast::<Overlay>(),
     };
+    let row_box = content_overlay
+        .as_ref()
+        .and_then(|c| c.child())
+        .and_downcast::<GtkBox>();
     let id_cell = row_box
         .as_ref()
         .and_then(|b| b.first_child())
@@ -450,7 +512,7 @@ fn set_row_commit(
         }
         // Older row layout (or a freshly-created empty row): build it whole.
         _ => row.set_child(Some(&commit_row_box(
-            commit, conflicted, refs, graph, on_revert,
+            commit, conflicted, refs, graph, on_revert, on_restore,
         ))),
     }
 }
@@ -468,6 +530,7 @@ fn set_row_commit(
 /// NULL parent and segfaults. Reusing rows and only *hiding* the surplus keeps
 /// every row parented, so the walk always terminates. Hidden rows are reused
 /// when the list grows again.
+#[allow(clippy::too_many_arguments)]
 fn populate_rows(
     list: &ListBox,
     commits: &[CommitInfo],
@@ -476,6 +539,7 @@ fn populate_rows(
     refs: &BTreeMap<String, Vec<RefDecoration>>,
     graph: Option<&SharedGraph>,
     on_revert: Option<&RevertCallback>,
+    on_restore: Option<&RestoreToWorktreeCallback>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -494,6 +558,7 @@ fn populate_rows(
             refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
             graph.map(|g| (g, i)),
             on_revert,
+            on_restore,
         );
     }
     // Hide surplus rows rather than removing them (see the note above).
@@ -516,7 +581,16 @@ pub(crate) fn populate_list(
     graph: &SharedGraph,
     on_revert: Option<&RevertCallback>,
 ) {
-    populate_rows(list, commits, true, conflicts, refs, Some(graph), on_revert);
+    populate_rows(
+        list,
+        commits,
+        true,
+        conflicts,
+        refs,
+        Some(graph),
+        on_revert,
+        None,
+    );
 }
 
 /// Add the `op-affected` highlight to every history row whose commit's change id
@@ -544,12 +618,20 @@ pub(crate) fn clear_highlight(list: &ListBox) {
 
 /// Fill the trash list with the session's dropped commits, reusing rows. When
 /// empty, the scrolled list is hidden so the panel collapses to just its trash
-/// icon (the icon still carries the drop target).
-pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
+/// icon (the icon still carries the drop target). `on_restore`, when `Some`, adds
+/// a hover button to each row that writes the commit's changes to the working
+/// tree (passed `None` in conflict mode, where restoring is blocked).
+pub(crate) fn populate_trash(
+    list: &ListBox,
+    scroll: &ScrolledWindow,
+    commits: &[CommitInfo],
+    on_restore: Option<&RestoreToWorktreeCallback>,
+) {
     scroll.set_visible(!commits.is_empty());
-    // No ref pills and no ancestry graph in the trash: a dropped commit was
-    // just cut out of its branch, so neither applies here. No revert button
-    // either — a trashed commit isn't part of the branch to revert against.
+    // No ref pills and no ancestry graph in the trash: a dropped commit was just
+    // cut out of its branch, so neither applies here. No revert button either — a
+    // trashed commit isn't part of the branch to revert against — but a restore
+    // button (when `on_restore` is given) pulls its changes into the working tree.
     populate_rows(
         list,
         commits,
@@ -558,6 +640,7 @@ pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &
         &BTreeMap::new(),
         None,
         None,
+        on_restore,
     );
 }
 

@@ -250,7 +250,11 @@ op-log").
   only a selected subset (`PartialSelection`, the `git add -p` jj's whole-tree
   snapshot has no concept of) yet rebuilds `@` holding the **full** disk tree, so
   the remainder stays uncommitted and the files stay byte-identical;
-  `select_groups` picks the kept hunks.
+  `select_groups` picks the kept hunks. Both (and the working-copy squash) accept
+  an `add_paths` list naming brand-new **untracked** files to include — see the
+  snapshot's `add_paths` opt-in below; the snapshot otherwise carries only
+  edits/deletions to tracked files, so a freshly created file is invisible to a
+  commit/fold until named (the `git add` before the `git commit -a`).
 
 ### Working-copy preservation (`workcopy.rs`)
 
@@ -269,7 +273,12 @@ matcher must name exactly the paths in `@`'s parent tip (HEAD's tracked set) so
 "track nothing" doesn't drop committed files and "track everything" doesn't pull in
 untracked ones. Untracked files stay out of `@` yet **stay alive on disk**: jj never
 tracks them, so `materialize_after_rewrite`'s checkout (which only diffs the tracked
-trees) never deletes them. `materialize_after_rewrite` (in the deferred export)
+trees) never deletes them. The one opt-in is `snapshot_working_copy_tracking(add_paths)`,
+which unions caller-named new files into the matcher (force-tracked, so an explicitly
+named path beats a `.gitignore` rule) — surfaced as the `add_paths` field of the MCP
+`commit_working_copy`/`squash_working_copy` tools, so an agent can fold a brand-new
+file in. Once snapshotted into `@` the file stays tracked for the session, so only
+the first snapshot needs to name it. `materialize_after_rewrite` (in the deferred export)
 checks `@'` out to disk via jj and resets the git index to the new tip — falling
 back to a plain `sync_worktree` when there's no working-copy commit. Non-overlapping
 local edits merge cleanly onto the rewritten content.

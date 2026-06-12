@@ -413,6 +413,7 @@ async fn commit_working_copy_commits_the_dirt() {
                 paths: None,
                 hunks: None,
                 patches: None,
+                add_paths: None,
             }))
             .await,
     );
@@ -431,6 +432,7 @@ async fn commit_working_copy_commits_the_dirt() {
             paths: None,
             hunks: None,
             patches: None,
+            add_paths: None,
         }))
         .await
         .unwrap()

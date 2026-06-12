@@ -638,6 +638,15 @@ pub struct SquashWorkingCopyReq {
     /// hunk must be split finer than whole-hunk granularity. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
+    /// Optional: brand-new untracked files to fold in, by repo-relative path. The
+    /// working copy otherwise carries only edits/deletions to already-tracked
+    /// files, so a file you just created is invisible until you name it here.
+    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
+    /// intent). For a *whole* fold every named file folds in; for a *partial* fold
+    /// also list it under `paths` to select it. Already-tracked or absent paths are
+    /// ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -668,6 +677,15 @@ pub struct CommitWorkingCopyReq {
     /// hunk must be split finer than whole-hunk granularity. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
+    /// Optional: brand-new untracked files to commit, by repo-relative path. The
+    /// working copy otherwise carries only edits/deletions to already-tracked
+    /// files, so a file you just created is invisible until you name it here.
+    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
+    /// intent). For a *whole* commit every named file is committed; for a *partial*
+    /// commit also list it under `paths` to select it. Already-tracked or absent
+    /// paths are ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
 }
 
 /// Selects whole hunks of one file for a partial commit_working_copy /

@@ -49,7 +49,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept by default). Pass `message` to reword the destination in the same call. \
+        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept by default). Pass `message` to reword the destination in the same call. Only edits/deletions to tracked files are folded by default; list brand-new untracked files in `add_paths` to include them too. \
 \
 Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-process `git add -p` for a fixup), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to fold everything. The working tree stays byte-identical; an overlap with the commit's content reports conflicts like any rewrite."
     )]
@@ -59,17 +59,21 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
-            repo.snapshot_working_copy().map_err(internal)?;
-            if repo.working_copy_chain().is_empty() {
-                return Err(invalid("the working copy is clean — nothing to fold"));
-            }
             let SquashWorkingCopyReq {
                 dest,
                 message,
                 paths,
                 hunks,
                 patches,
+                add_paths,
             } = req;
+            // Track any named new files before checking for changes, so folding a
+            // brand-new file alone (no tracked edits) isn't seen as a clean tree.
+            repo.snapshot_working_copy_tracking(&add_paths.unwrap_or_default())
+                .map_err(internal)?;
+            if repo.working_copy_chain().is_empty() {
+                return Err(invalid("the working copy is clean — nothing to fold"));
+            }
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &dest)?;
             let dest_id = commits[idx].id.clone();
@@ -96,7 +100,7 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
     }
 
     #[tool(
-        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed; brand-new untracked files are ignored and stay in the working tree (use create_commit to add those). \
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to git-tracked files are committed by default; list brand-new untracked files in `add_paths` to include them too (or use create_commit to author files from explicit contents). \
 \
 Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the in-process `git add -p`), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to commit everything. Refuses when there is nothing tracked to commit, or when the selection commits nothing. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
     )]
@@ -106,7 +110,10 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
-            repo.snapshot_working_copy().map_err(internal)?;
+            // Track any named new files before checking for changes, so committing a
+            // brand-new file alone (no tracked edits) isn't seen as a clean tree.
+            repo.snapshot_working_copy_tracking(&req.add_paths.clone().unwrap_or_default())
+                .map_err(internal)?;
             if repo.working_copy_chain().is_empty() {
                 return Err(invalid("the working copy is clean — nothing to commit"));
             }

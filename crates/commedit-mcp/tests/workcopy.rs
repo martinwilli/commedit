@@ -27,6 +27,7 @@ fn commit_req(
         paths,
         hunks,
         patches,
+        add_paths: None,
     }
 }
 
@@ -103,6 +104,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
                 paths: None,
                 hunks: None,
                 patches: None,
+                add_paths: None,
             }))
             .await,
     );
@@ -121,6 +123,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
             paths: None,
             hunks: None,
             patches: None,
+            add_paths: None,
         }))
         .await
         .unwrap()
@@ -245,6 +248,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
             paths: None,
             hunks: None,
             patches: None,
+            add_paths: None,
         }))
         .await
         .unwrap()
@@ -573,6 +577,7 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
             paths: Some(vec!["a.txt".into()]),
             hunks: None,
             patches: None,
+            add_paths: None,
         }))
         .await
         .unwrap()
@@ -624,4 +629,98 @@ async fn list_history_can_include_working_copy_status() {
     let wc = with_wc.working_copy.expect("working-copy block present");
     assert!(!wc.clean);
     assert_eq!(wc.entries[0].files, vec!["a.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn commit_working_copy_add_paths_includes_a_brand_new_file() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    // A brand-new file is untracked, so without add_paths the tree looks clean
+    // and there is nothing to commit.
+    std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+    let err = expect_err(
+        server
+            .commit_working_copy(Parameters(commit_req("add new", None, None, None)))
+            .await,
+    );
+    assert!(
+        err.message.contains("clean"),
+        "unexpected error: {}",
+        err.message
+    );
+
+    // Naming it in add_paths pulls it into the commit.
+    let mut req = commit_req("add new", None, None, None);
+    req.add_paths = Some(vec!["new.txt".into()]);
+    let result = server.commit_working_copy(Parameters(req)).await.unwrap().0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    assert_eq!(git_log_subjects(dir.path()), ["add new", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD:new.txt"]), "hello");
+    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn commit_working_copy_add_paths_combines_a_new_file_and_a_tracked_edit() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+
+    // A logical unit that both edits a tracked file and introduces a new one
+    // lands as a single commit.
+    std::fs::write(dir.path().join("a.txt"), "1\nedited\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+
+    let mut req = commit_req("feature", None, None, None);
+    req.add_paths = Some(vec!["b.txt".into()]);
+    let result = server.commit_working_copy(Parameters(req)).await.unwrap().0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "1\nedited");
+    assert_eq!(git(dir.path(), &["show", "HEAD:b.txt"]), "new");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn squash_working_copy_add_paths_folds_a_new_file_into_a_commit() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let result = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            dest: history.commits[1].change_id[..8].to_string(),
+            message: None,
+            paths: None,
+            hunks: None,
+            patches: None,
+            add_paths: Some(vec!["c.txt".into()]),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    // The new file folded into "first" (HEAD~1) and the tree is clean again.
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:c.txt"]), "new");
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }

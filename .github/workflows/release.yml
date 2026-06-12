@@ -127,7 +127,8 @@ jobs:
         run: |
           chmod +x plugin/bin/launch.sh plugin/bin/commedit-mcp-*
           (cd plugin && zip -r ../commedit-plugin.zip \
-             .claude-plugin .mcp.json bin README.md -x 'bin/.gitignore')
+             .claude-plugin .mcp.json bin skills agents README.md \
+             -x 'bin/.gitignore')
           unzip -l commedit-plugin.zip
 
       - name: Upload plugin artifact

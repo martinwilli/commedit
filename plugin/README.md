@@ -43,15 +43,28 @@ Tools surface under the `commedit` server (`list_history`, `show_commit`,
 `split_commit`, `commit_working_copy`, `resolve_conflicts`, `undo`, …). The
 server provides its own usage instructions to the agent on connect.
 
-## Bundled skill
+## Bundled skills
 
-The plugin also ships a **`commit-as-you-go`** skill. It loads when an agent is
-implementing a multi-step task that will produce several commits and teaches the
-discipline that plays to comm(ed)it's strengths: commit each logical unit eagerly
-as you work (extending or fixing a commit later is cheap), rather than writing
-everything and trying to split one big pile at the end (which is hard). Invoke it
-explicitly with `/commedit:commit-as-you-go` to pin it at the start of an
-autonomous run.
+The plugin also ships skills that teach an agent *when* to reach for these
+tools — the workflows comm(ed)it makes easy. They load on the matching intent,
+or invoke one explicitly (e.g. `/commedit:commit-as-you-go`) to pin it at the
+start of a run.
+
+- **`commit-as-you-go`** — for a multi-step task that will produce several
+  commits: commit each logical unit eagerly as you work (extending or fixing a
+  commit later is cheap), rather than writing everything and trying to split one
+  big pile at the end (which is hard).
+- **`revise-commit`** — reword a message, fix an author/committer or date, or
+  edit the file contents of *any* commit reachable from `HEAD`, not just the tip
+  `git commit --amend` reaches.
+- **`reorder-and-squash`** — tidy a branch before review or merge: reorder
+  commits, fold fix/WIP commits in (squash, fixup or amend, including autosquash
+  `fixup!`/`squash!`/`amend!` prefixes), or drop a commit.
+- **`insert-and-revert`** — add to history: create a commit and splice it
+  anywhere in the graph, revert a commit, or cherry-pick one from another branch.
+
+In every case descendants are rebased automatically, and a rewrite whose rebase
+conflicts is held back in full until you resolve or abort it.
 
 ## Requirements
 

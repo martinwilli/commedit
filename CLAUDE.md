@@ -198,10 +198,13 @@ op-log").
   verbatim (fold-and-reword in one step; threaded through to the MCP
   `squash_commit`/`squash_working_copy` `message` field, no GTK surface). Unlike
   reorder it does **not** set the head bookmark — the post-squash tip is always a
-  rewrite-descendant of the old head, which jj's automatic bookmark moves follow. The pure, inline-tested
-  helpers (`parse_squash_mode`, `squash_target_subject`, `squash_recommendations`,
-  `compose_squash_message`) read git's `fixup!`/`squash!`/`amend!` subject prefixes
-  so the UI can recommend targets and compose the merged message.
+  rewrite-descendant of the old head, which jj's automatic bookmark moves follow.
+  The pure, inline-tested helpers (`parse_squash_mode`, `squash_target_subject`,
+  `squash_recommendations`, `compose_squash_message`) read git's
+  `fixup!`/`squash!`/`amend!` subject prefixes so the UI can recommend targets and
+  compose the merged message; the MCP `suggest_squash_targets` read tool exposes
+  `squash_recommendations` (resolve a prefixed source → its matching destination
+  commit(s) + sibling fixups) so an agent can route an autosquash fold.
 - `split_commit` (`split.rs`) — the diff view's "Split" button (enabled only with
   pending diff edits). Takes the same `(path, content)` edits as `rewrite_files`:
   rewrites the target `C` → `C'` to the **edited** tree (keeping its change id /

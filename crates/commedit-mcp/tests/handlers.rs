@@ -7,7 +7,7 @@ use commedit_mcp::dto::{
     CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
     FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq,
     ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq, SquashCommitReq, StrReplaceDto,
+    SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
@@ -1500,4 +1500,50 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
         .0;
     assert_eq!(shown.commit.subject, "second");
     assert_eq!(shown.files[0].path, "b.txt");
+}
+
+#[tokio::test]
+async fn suggest_squash_targets_points_a_fixup_at_its_match() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "a\n", "add feature"),
+            ("b.txt", "b\n", "unrelated"),
+            ("c.txt", "c\n", "fixup! add feature"),
+        ],
+    );
+    let server = open_server(dir.path());
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    // The tip is the `fixup! add feature` commit.
+    let fixup = history.commits[0].change_id.clone();
+
+    let resp = server
+        .suggest_squash_targets(Parameters(SuggestSquashReq { source: fixup }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(resp.mode.as_deref(), Some("fixup"));
+    assert_eq!(resp.targets.len(), 1, "exactly one matching target");
+    assert_eq!(resp.targets[0].subject, "add feature");
+    assert!(resp.siblings.is_empty());
+
+    // An unprefixed source has nothing to suggest.
+    let plain = history.commits[1].change_id.clone();
+    let resp = server
+        .suggest_squash_targets(Parameters(SuggestSquashReq { source: plain }))
+        .await
+        .unwrap()
+        .0;
+    assert!(resp.mode.is_none());
+    assert!(resp.targets.is_empty() && resp.siblings.is_empty());
 }

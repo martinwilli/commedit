@@ -284,6 +284,30 @@ pub struct ListTrashResp {
     pub commits: Vec<CommitDto>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SuggestSquashReq {
+    /// The commit you intend to fold, from the history or the trash — sha or
+    /// change id, full or a unique prefix. Its leading `fixup!`/`squash!`/`amend!`
+    /// subject token names the target whose matching branch commit(s) are
+    /// suggested as the squash destination.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SuggestSquashResp {
+    /// The squash mode the source's subject prefix requests (`fixup`, `squash` or
+    /// `amend`), or null when it carries no autosquash prefix — in which case
+    /// there is nothing to suggest and both lists below are empty.
+    pub mode: Option<String>,
+    /// The recommended destination(s): branch commits whose subject is the
+    /// source's bare target subject (the prefix stripped), newest first. Usually
+    /// exactly one — pass its change_id straight back as `squash_commit`'s `dest`.
+    pub targets: Vec<CommitDto>,
+    /// Other autosquash-prefixed branch commits aimed at the same target, which
+    /// you may want to fold in as well.
+    pub siblings: Vec<CommitDto>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct WorkingCopyStatusResp {
     /// True when the working tree matches the branch tip.

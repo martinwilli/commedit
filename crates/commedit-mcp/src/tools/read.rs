@@ -2,6 +2,7 @@
 
 use commedit_engine::diff::commit_changes;
 use commedit_engine::history::IdAbbrev;
+use commedit_engine::squash::{parse_squash_mode, SquashMode};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
@@ -12,10 +13,15 @@ use crate::convert::{commit_dto, file_change_dto, DetailFields};
 /// response so an unbounded walk can't blow the tool's token budget; deeper
 /// history is reachable via `limit` or `offset` paging.
 const DEFAULT_HISTORY_LIMIT: usize = 30;
-use crate::dto::{ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp};
+use crate::dto::{
+    ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp,
+    SuggestSquashReq, SuggestSquashResp,
+};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::{limited_history, resolve_ref, working_copy_status_resp, RefEntry};
+use crate::session::{
+    full_history, limited_history, lookup_ref, resolve_ref, working_copy_status_resp, RefEntry,
+};
 use crate::wrapper::Yaml;
 
 #[tool_router(router = router_read, vis = "pub")]
@@ -130,6 +136,64 @@ impl CommeditServer {
                     .iter()
                     .map(|c| commit_dto(c, &root, &refs, &abbrev, DetailFields::ALL))
                     .collect(),
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Suggest where a fixup/squash/amend commit should be folded. Reads the source commit's leading `fixup!`/`squash!`/`amend!` subject token and returns the matching branch commit(s) as `targets` (pass one straight to squash_commit as `dest`), the `mode` that prefix requests, and any sibling autosquash commits aimed at the same target. Both lists are empty when the source carries no such prefix or nothing matches. The source may be a history or trashed commit and is never modified — this is read-only."
+    )]
+    pub async fn suggest_squash_targets(
+        &self,
+        Parameters(req): Parameters<SuggestSquashReq>,
+    ) -> Result<Yaml<SuggestSquashResp>, ErrorData> {
+        self.with_session(move |repo, trash| {
+            let (_, commits) = full_history(repo)?;
+            // Resolve the source: history first, then the trash (so a ref in both
+            // means the live commit), and pick the matching recommendation walk.
+            let src_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
+            let (highlights, subject) =
+                if let Some(idx) = lookup_ref(&req.source, src_entries.collect())? {
+                    (
+                        repo.squash_recommendations(&commits, idx),
+                        commits[idx].subject.clone(),
+                    )
+                } else {
+                    let trash_entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone()));
+                    let info = resolve_ref(&req.source, trash_entries.collect(), || {
+                        invalid(format!(
+                            "source {} is neither in the branch history nor in the trash \
+                             (see list_history / list_trash)",
+                            req.source
+                        ))
+                    })?;
+                    (
+                        repo.squash_recommendations_for(&commits, &info),
+                        info.subject.clone(),
+                    )
+                };
+            let mode = parse_squash_mode(&subject).map(|m| {
+                match m {
+                    SquashMode::Fixup => "fixup",
+                    SquashMode::Squash => "squash",
+                    SquashMode::Amend => "amend",
+                }
+                .to_string()
+            });
+            let refs = repo.commit_refs();
+            let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let to_dtos = |idxs: &[usize]| -> Vec<_> {
+                idxs.iter()
+                    .map(|&i| commit_dto(&commits[i], &root, &refs, &abbrev, DetailFields::NONE))
+                    .collect()
+            };
+            Ok(SuggestSquashResp {
+                mode,
+                targets: to_dtos(&highlights.targets),
+                siblings: to_dtos(&highlights.siblings),
             })
         })
         .await

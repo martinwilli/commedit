@@ -550,9 +550,13 @@ which have no both-sides hunk model but a whole-file change to drop. Clicking a 
 sets the file's `new_text` to its `old_text` on the *render baseline* (`changes`):
 modify→unmodify, **add→absent (`None`)**, **remove→restore** — the one uniform rule.
 `orig_changes` keeps the pristine content so Save/Split still see the revert as a
-divergence to apply; a reverted addition collapses to a notice in the buffer (so the
-buffer alone can't express the delete), which is why `collect_file_edits` reads the
-delete-intent from the render baseline's `None` and the content from the buffer. A
+divergence to apply. A *file* revert leaves no net change, so `visible_changes` drops
+that file from the rendered buffer **and** the dropdown (the revert handler rebuilds
+the dropdown and re-points it at the viewport-top file) rather than leaving an empty
+notice behind — but it stays in the render baseline, so `collect_file_edits` iterates
+that baseline (not the buffer) and still emits the dropped file's delete/restore from
+its `new_text`. `visible_changes` only hides a file whose no-change state *diverges*
+from `orig` (a true revert), so a mode-only no-textual-change file stays visible. A
 revert never saves on its own.
 
 History drag-and-drop is **zone-based** (`show_zone`): a row's top/bottom quarter

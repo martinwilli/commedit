@@ -180,6 +180,28 @@ fn build_diff_buffer_text(
     (lines.join("\n"), all_hunks, combined.files)
 }
 
+/// The subset of the render baseline `changes` that the diff view actually shows.
+/// A file whose whole change was reverted away — no net change left (`old == new`)
+/// *and* that's a divergence from the pristine `orig` (so it was reverted, not a
+/// mode-only change that started with no textual diff) — is dropped, so a revert
+/// leaves no empty placeholder behind in the buffer or the file dropdown. The full
+/// baseline still drives the save: `collect_file_edits` reads the dropped file's
+/// reverted `new_text` to emit the delete/restore.
+fn visible_changes(changes: &[FileChange], orig: &[FileChange]) -> Vec<FileChange> {
+    changes
+        .iter()
+        .filter(|c| {
+            let no_net_change = c.old_text == c.new_text;
+            let diverged = orig
+                .iter()
+                .find(|o| o.path == c.path)
+                .is_none_or(|o| o.new_text != c.new_text);
+            !(no_net_change && diverged)
+        })
+        .cloned()
+        .collect()
+}
+
 fn build_ui(app: &Application, repo_path: PathBuf) {
     let repo = match Repo::open(&repo_path) {
         Ok(repo) => Rc::new(RefCell::new(repo)),
@@ -870,11 +892,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // `diff --git` lines. `set_text`s the buffer (scroll resets to the top).
     let render_diff_view: Renderer = {
         let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
         Rc::new(move || {
-            let (text, hunks, files) =
-                build_diff_buffer_text(&changes.borrow(), &expansions.borrow());
+            let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
+            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
             apply_diff_text(text, hunks, files, false);
         })
     };
@@ -884,12 +907,28 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // common prefix — so the header stays put and the new context grows below it.
     let rerender_diff_spliced: Renderer = {
         let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
         Rc::new(move || {
-            let (text, hunks, files) =
-                build_diff_buffer_text(&changes.borrow(), &expansions.borrow());
+            let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
+            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
             apply_diff_text(text, hunks, files, true);
+        })
+    };
+
+    // Rebuild the file dropdown from the *visible* changes (a revert can drop a
+    // file). Built here so both the initial load and a revert reuse it; callers
+    // guard with `nav_sync` when a stale selection would otherwise scroll.
+    let rebuild_file_dropdown: Rc<dyn Fn()> = {
+        let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
+        let file_dropdown = file_dropdown.clone();
+        Rc::new(move || {
+            let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
+            let labels: Vec<String> = vis.iter().map(change_label).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            file_dropdown.set_model(Some(&StringList::new(&refs)));
         })
     };
 
@@ -907,8 +946,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let rendered_hunks = rendered_hunks.clone();
         let expansions = expansions.clone();
         let rerender_diff_spliced = rerender_diff_spliced.clone();
+        let rebuild_file_dropdown = rebuild_file_dropdown.clone();
+        let file_dropdown = file_dropdown.clone();
         let combined_files = combined_files.clone();
         let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
         let pane_mode = pane_mode.clone();
         let editing = editing.clone();
         let highlight = highlight.clone();
@@ -970,8 +1012,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
             let expansions = expansions.clone();
             let rerender_diff_spliced = rerender_diff_spliced.clone();
+            let rebuild_file_dropdown = rebuild_file_dropdown.clone();
+            let file_dropdown = file_dropdown.clone();
+            let file_view = file_view.clone();
+            let file_buffer = file_buffer.clone();
             let nav_sync = nav_sync.clone();
             let changes = changes.clone();
+            let orig_changes = orig_changes.clone();
             glib::idle_add_local_once(move || {
                 // Apply the cue and re-render in place (the spliced re-render edits
                 // only the changed span, so GTK keeps the scroll where it sat — no
@@ -1006,6 +1053,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                 }
                 rerender_diff_spliced();
+                // A revert that drops a file's whole change removes it from the
+                // view (`visible_changes`); rebuild the dropdown to match and
+                // re-point it at the file now at the viewport top so its label and
+                // the buffer stay in sync. Only when the visible set actually shrank
+                // — an expand or a partial hunk-revert leaves every file in place.
+                let vis_len = visible_changes(&changes.borrow(), &orig_changes.borrow()).len();
+                if file_dropdown.model().map_or(0, |m| m.n_items()) as usize != vis_len {
+                    rebuild_file_dropdown();
+                    let top = file_view
+                        .vadjustment()
+                        .map(|v| {
+                            let (iter, _) = file_view.line_at_y(v.value() as i32);
+                            diff_file_index_at_line(&file_buffer, iter.line() as usize)
+                        })
+                        .unwrap_or(0);
+                    file_dropdown.set_selected(top as u32);
+                }
                 nav_sync.set(false);
             });
         }
@@ -2802,51 +2866,43 @@ fn history_row(label: &str, subtitle: Option<&str>, current: bool, future: bool)
     row
 }
 
-/// Split the combined diff buffer into the per-file edits whose reconstructed
-/// content differs from the commit's current version. Files rendered read-only
-/// are skipped: removed/binary ones (no `new_text`) and a conflicted merge base
-/// (its notice has no hunks, so applying it would reconstruct empty content and
-/// spuriously "edit" the file to nothing). The original trailing-newline style is
-/// preserved. `Err` carries an apply-failure message (the patch firewall should
-/// make that unreachable, but a save surfaces it rather than dropping silently).
 /// Build the per-file [`FileEdit`]s a Save / Split should apply, by comparing each
 /// file's *intended* new content against the commit's pristine content.
 ///
 /// Three inputs, three roles: `combined` is the live diff buffer — authoritative
-/// for manual content edits; `render` is the render baseline (`changes`) — its
-/// `new_text` of `None` is the one signal a buffer can't carry, a file whose whole
-/// change was reverted away (a dropped addition collapses to a notice, not a
-/// patch); `orig` is the pristine load — the "before" each file diverges from. A
-/// file becomes a [`FileEdit::write`] (content edited, or a removed file restored),
-/// a [`FileEdit::delete`] (an added file's change reverted), or nothing (unchanged).
+/// for manual content edits; `render` is the render baseline (`changes`) — the full
+/// set including files a revert dropped from the view (which therefore have no
+/// buffer section), where its `new_text` is the intended content (`None` = drop the
+/// file); `orig` is the pristine load — the "before" each file diverges from. We
+/// iterate `render` (not the buffer) so a reverted-away file still yields its edit.
+/// A file becomes a [`FileEdit::write`] (content edited, or a removed file
+/// restored), a [`FileEdit::delete`] (an added file's change reverted), or nothing.
 fn collect_file_edits(
     combined: &str,
     render: &[FileChange],
     orig: &[FileChange],
 ) -> Result<Vec<FileEdit>, String> {
+    let sections: HashMap<String, String> = split_combined_patch(combined).into_iter().collect();
     let mut edits = Vec::new();
-    for (path, patch) in split_combined_patch(combined) {
-        let Some(orig_change) = orig.iter().find(|c| c.path == path) else {
+    for r in render {
+        let Some(orig_change) = orig.iter().find(|c| c.path == r.path) else {
             continue;
         };
         // Binary / conflicted-base files have no editable text on either side.
         if orig_change.is_binary || orig_change.conflicted_base {
             continue;
         }
-        let r = render
-            .iter()
-            .find(|c| c.path == path)
-            .unwrap_or(orig_change);
         // The content the file should end up with. A render-baseline `new_text` of
-        // `None` is a dropped file (its addition reverted, or still removed);
-        // otherwise apply the edited patch to the old side to capture both manual
-        // edits and the re-rendered result of a hunk/file revert.
+        // `None` is a dropped file (its addition reverted, or still removed). A file
+        // still shown in the buffer reconstructs from its edited patch (capturing
+        // manual edits); one a revert hid from the view has no section, so its
+        // reverted `new_text` is the intended content directly.
         let target: Option<String> = if r.new_text.is_none() {
             None
-        } else {
+        } else if let Some(patch) = sections.get(&r.path) {
             let old = r.old_text.as_deref().unwrap_or("");
-            let mut content = apply_patch(old, &patch)
-                .map_err(|err| format!("Cannot apply edited patch for {path}: {err}"))?;
+            let mut content = apply_patch(old, patch)
+                .map_err(|err| format!("Cannot apply edited patch for {}: {err}", r.path))?;
             // Match apply_patch's trailing-newline normalization to the intended
             // content's own style so an untouched file yields no spurious edit.
             let want = r.new_text.as_deref().unwrap_or("");
@@ -2854,11 +2910,13 @@ fn collect_file_edits(
                 content.pop();
             }
             Some(content)
+        } else {
+            r.new_text.clone()
         };
         if target.as_deref() != orig_change.new_text.as_deref() {
             edits.push(match target {
-                Some(content) => FileEdit::write(path, content),
-                None => FileEdit::delete(path),
+                Some(content) => FileEdit::write(r.path.clone(), content),
+                None => FileEdit::delete(r.path.clone()),
             });
         }
     }
@@ -3134,5 +3192,39 @@ mod tests {
         let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new());
         let edits = collect_file_edits(&text, &orig, &orig).expect("collect");
         assert!(edits.is_empty(), "got {edits:?}");
+    }
+
+    #[test]
+    fn a_reverted_file_dropped_from_the_view_still_collects_its_edit() {
+        // Revert the modified file: it has no net change left, so visible_changes
+        // drops it from the buffer (no section). collect_file_edits iterates the
+        // full render baseline, so it still emits the revert from `new_text`.
+        let orig = vec![modified("f", "a\nb\n", "a\nB\n"), added("n.txt", "x\n")];
+        let mut render = orig.clone();
+        render[0].new_text = render[0].old_text.clone(); // revert f
+
+        let vis = visible_changes(&render, &orig);
+        assert!(
+            vis.iter().all(|c| c.path != "f"),
+            "f is hidden from the view"
+        );
+        let (text, _h, _f) = build_diff_buffer_text(&vis, &HashMap::new());
+        assert!(!text.contains("a/f b/f"), "f has no buffer section");
+
+        let edits = collect_file_edits(&text, &render, &orig).expect("collect");
+        let f = edits
+            .iter()
+            .find(|e| e.path == "f")
+            .expect("f edit present");
+        assert_eq!(f.content.as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
+    fn visible_changes_keeps_a_mode_only_no_change_file() {
+        // A file that already had no textual change at load (e.g. a mode-only
+        // change) isn't a revert, so it stays visible.
+        let orig = vec![modified("m", "same\n", "same\n")];
+        let vis = visible_changes(&orig, &orig);
+        assert_eq!(vis.len(), 1);
     }
 }

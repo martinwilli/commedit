@@ -279,9 +279,12 @@ impl Repo {
         squash_recommendations_for(commits, &head, restored)
     }
 
-    /// Merge `source`'s changes into `dest`, recompose `dest`'s message per
-    /// `mode`, drop `source` from history, rebase descendants, and export — all
-    /// in one transaction.
+    /// Merge `source`'s changes into `dest`, set `dest`'s message, drop `source`
+    /// from history, rebase descendants, and export — all in one transaction.
+    /// `message`, when `Some`, becomes `dest`'s new message verbatim; when `None`
+    /// the message is recomposed from `dest` and `source` per `mode`
+    /// ([`compose_squash_message`]) — so a caller that already knows the merged
+    /// message folds and rewords in one step instead of a follow-up edit.
     ///
     /// The destination's author (name, email and author date) is preserved; its
     /// committer is left to jj's rewrite default (re-stamped to the current
@@ -291,9 +294,10 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(source, dest, mode, false)
+            self.squash_into_inner(source, dest, mode, message, false)
         })
     }
 
@@ -307,9 +311,10 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit from trash", || {
-            self.squash_into_inner(source, dest, mode, true)
+            self.squash_into_inner(source, dest, mode, message, true)
         })
     }
 
@@ -319,12 +324,15 @@ impl Repo {
     /// commit. Snapshots first, then resolves the entry to its *current* commit id
     /// (the leaf's churns on snapshot) before delegating to [`Self::squash_into`];
     /// folding the whole leaf leaves jj's recreated empty `@` as a clean working
-    /// copy. Returns the usual [`SaveOutcome`], so a conflicting fold enters the
-    /// shared conflict-resolution flow.
+    /// copy. `message`, when `Some`, replaces `dest`'s message (a working-copy
+    /// entry has no message of its own, so the Fixup default keeps `dest`'s).
+    /// Returns the usual [`SaveOutcome`], so a conflicting fold enters the shared
+    /// conflict-resolution flow.
     pub fn squash_working_copy_into(
         &mut self,
         change_hex: Option<&str>,
         dest: &CommitId,
+        message: Option<&str>,
     ) -> Result<SaveOutcome> {
         // Snapshot before resolving so the resolved id survives squash_into's own
         // (now no-op) snapshot — otherwise a churned leaf id would go stale.
@@ -332,7 +340,7 @@ impl Repo {
         let source = self
             .resolve_working_copy_change(change_hex)
             .context("no working-copy entry to fold")?;
-        self.squash_into(&source, dest, SquashMode::Fixup)
+        self.squash_into(&source, dest, SquashMode::Fixup, message)
     }
 
     fn squash_into_inner(
@@ -340,6 +348,7 @@ impl Repo {
         source: &CommitId,
         dest: &CommitId,
         mode: SquashMode,
+        message: Option<&str>,
         source_is_orphan: bool,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
@@ -369,10 +378,14 @@ impl Repo {
             parent_tree,
         };
 
-        // Recompose the message and capture the author before the borrows move
-        // into the transaction.
-        let new_desc =
-            compose_squash_message(mode, dest_commit.description(), source_commit.description());
+        // Settle the message and capture the author before the borrows move into
+        // the transaction: an explicit override wins, else recompose per `mode`.
+        let new_desc = match message {
+            Some(m) => m.to_string(),
+            None => {
+                compose_squash_message(mode, dest_commit.description(), source_commit.description())
+            }
+        };
         let dest_author = dest_commit.author().clone();
         let desc = OpDescriptor::new(
             format!(

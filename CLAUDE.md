@@ -193,9 +193,12 @@ op-log").
   is a valid *target* but never a *source*. Preserves the target's **author** but
   lets jj re-stamp the committer (git `--autosquash` style); the message is
   `compose_squash_message`'d per `SquashMode` (Fixup keeps the target's, Squash
-  appends the source's body, Amend replaces with it). Unlike reorder it does **not**
-  set the head bookmark — the post-squash tip is always a rewrite-descendant of the
-  old head, which jj's automatic bookmark moves follow. The pure, inline-tested
+  appends the source's body, Amend replaces with it) **unless** `squash_into`'s
+  `message: Option<&str>` override is given, which becomes the target's message
+  verbatim (fold-and-reword in one step; threaded through to the MCP
+  `squash_commit`/`squash_working_copy` `message` field, no GTK surface). Unlike
+  reorder it does **not** set the head bookmark — the post-squash tip is always a
+  rewrite-descendant of the old head, which jj's automatic bookmark moves follow. The pure, inline-tested
   helpers (`parse_squash_mode`, `squash_target_subject`, `squash_recommendations`,
   `compose_squash_message`) read git's `fixup!`/`squash!`/`amend!` subject prefixes
   so the UI can recommend targets and compose the merged message.

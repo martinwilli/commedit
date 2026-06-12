@@ -451,7 +451,7 @@ fn squashing_across_merge_branches_lands_on_the_targets_line() {
         .plan_squash(&commits, pos("side-1"), pos("main-1"))
         .expect("cousins on different sides squash");
     let outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 
@@ -489,7 +489,7 @@ fn squashing_into_a_merge_folds_the_change_into_its_tree() {
         .plan_squash(&commits, pos("top"), pos("merge"))
         .expect("the merge is a squash target");
     let outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 

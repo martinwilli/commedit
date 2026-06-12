@@ -57,7 +57,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept). The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite."
+        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept by default). Pass `message` to reword the destination in the same call. The working tree ends up clean; an overlap with the commit's content reports conflicts like any rewrite."
     )]
     pub async fn squash_working_copy(
         &self,
@@ -72,7 +72,7 @@ impl CommeditServer {
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.dest)?;
             let outcome = repo
-                .squash_working_copy_into(None, &commits[idx].id)
+                .squash_working_copy_into(None, &commits[idx].id, req.message.as_deref())
                 .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })

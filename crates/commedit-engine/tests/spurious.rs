@@ -174,7 +174,7 @@ fn spurious_squash_across_an_interior_commit_is_auto_resolved() {
     let onto = commits.iter().position(|c| c.subject == "A").unwrap();
     let (source, dest) = repo.plan_squash(&commits, from, onto).expect("plan");
     let outcome = repo
-        .squash_into(&source, &dest, SquashMode::Fixup)
+        .squash_into(&source, &dest, SquashMode::Fixup, None)
         .expect("squash");
 
     assert!(

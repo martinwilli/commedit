@@ -97,6 +97,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
         server
             .squash_working_copy(Parameters(SquashWorkingCopyReq {
                 dest: first.sha.clone(),
+                message: None,
             }))
             .await,
     );
@@ -109,7 +110,10 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     // Fold a dirty a.txt into the bottom commit ("first" introduced a.txt).
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let result = server
-        .squash_working_copy(Parameters(SquashWorkingCopyReq { dest: first.sha }))
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            dest: first.sha,
+            message: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -227,6 +231,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
     let result = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
             dest: history.commits[1].change_id[..8].to_string(),
+            message: None,
         }))
         .await
         .unwrap()

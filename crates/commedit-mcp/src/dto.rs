@@ -565,8 +565,13 @@ pub struct SquashCommitReq {
     pub dest: String,
     /// `fixup` (keep destination's message), `squash` (append source's body)
     /// or `amend` (replace with source's body). Defaults to what the source's
-    /// `fixup!`/`squash!`/`amend!` subject prefix requests, else `fixup`.
+    /// `fixup!`/`squash!`/`amend!` subject prefix requests, else `fixup`. Ignored
+    /// when `message` is given.
     pub mode: Option<String>,
+    /// Optional: the destination's full message after the fold, set verbatim.
+    /// Overrides `mode`'s message handling — use it to fold and reword in one
+    /// call instead of a follow-up edit_message. Omit to let `mode` decide.
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -574,6 +579,11 @@ pub struct SquashWorkingCopyReq {
     /// The commit the uncommitted changes should be folded into — sha or
     /// change id, full or a unique prefix.
     pub dest: String,
+    /// Optional: the destination's full message after the fold, set verbatim.
+    /// The fold is a fixup (the destination's message is kept by default, since
+    /// uncommitted changes carry no message of their own); set this to reword the
+    /// destination in the same call instead of a follow-up edit_message.
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

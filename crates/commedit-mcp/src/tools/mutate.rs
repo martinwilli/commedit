@@ -517,7 +517,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold one commit into another, anywhere in the graph (the source may also be a trashed commit). mode picks the message handling: fixup keeps the destination's, squash appends the source's body, amend replaces it — defaulting to the source's `fixup!`/`squash!`/`amend!` subject prefix, else fixup. A merge can be the destination but not the source."
+        description = "Fold one commit into another, anywhere in the graph (the source may also be a trashed commit). mode picks the message handling: fixup keeps the destination's, squash appends the source's body, amend replaces it — defaulting to the source's `fixup!`/`squash!`/`amend!` subject prefix, else fixup. Pass `message` to set the destination's resulting message verbatim instead (folds and rewords in one call). A merge can be the destination but not the source."
     )]
     pub async fn squash_commit(
         &self,
@@ -551,7 +551,9 @@ impl CommeditServer {
                          distinct from the destination",
                     )
                         })?;
-                let outcome = repo.squash_into(&src, &dest, mode).map_err(internal)?;
+                let outcome = repo
+                    .squash_into(&src, &dest, mode, req.message.as_deref())
+                    .map_err(internal)?;
                 Ok(save_result(repo, &outcome))
             } else {
                 let trash_entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone()));
@@ -569,8 +571,9 @@ impl CommeditServer {
                     .ok_or_else(|| {
                         invalid("cannot squash the trashed commit onto itself or off-branch")
                     })?;
+                let message = req.message.clone();
                 let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {
-                    repo.squash_restore_into(&src, &dest, mode)
+                    repo.squash_restore_into(&src, &dest, mode, message.as_deref())
                 })?;
                 Ok(save_result(repo, &outcome))
             }

@@ -1118,6 +1118,7 @@ async fn squash(
             source: source.into(),
             dest: dest.into(),
             mode: mode.map(str::to_string),
+            message: None,
         }))
         .await
         .unwrap()
@@ -1243,6 +1244,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
                 source: merge.sha.clone(),
                 dest: base.sha.clone(),
                 mode: None,
+                message: None,
             }))
             .await,
     );
@@ -1263,6 +1265,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
                 source: main1.sha.clone(),
                 dest: base.sha.clone(),
                 mode: Some("merge".into()),
+                message: None,
             }))
             .await,
     );

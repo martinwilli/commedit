@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "commedit",
+  "displayName": "comm(ed)it",
+  "version": "0.4.0",
+  "description": "Edit git history in place from an agent: rewrite any commit's message, identity or file contents, split, reorder, drop or squash commits, and create, revert or cherry-pick commits anywhere in the branch — with descendants rebased automatically. The repo stays a plain git repo throughout.",
+  "author": {
+    "name": "Martin Willi",
+    "email": "martin@strongswan.org"
+  },
+  "homepage": "https://github.com/martinwilli/commedit",
+  "repository": "https://github.com/martinwilli/commedit",
+  "license": "MIT",
+  "keywords": ["git", "history", "rebase", "rewrite", "commit", "mcp"]
+}

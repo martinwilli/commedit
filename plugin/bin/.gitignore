@@ -1,0 +1,3 @@
+# Prebuilt commedit-mcp binaries are injected here by the release workflow
+# (.github/workflows/release.yml); only the launcher is tracked in git.
+/commedit-mcp-*

@@ -137,7 +137,11 @@ pub(crate) fn scroll_to_line(view: &sourceview5::View, buffer: &sourceview5::Buf
 /// where the block spans buffer lines `start_line..=end_line` and `replacement`
 /// is the text to substitute for those lines (newline-terminated). `None` if the
 /// caret is not inside a conflict block.
-fn resolve_conflict_block(text: &str, caret_line: usize, side: Side) -> Option<(usize, usize, String)> {
+fn resolve_conflict_block(
+    text: &str,
+    caret_line: usize,
+    side: Side,
+) -> Option<(usize, usize, String)> {
     let kinds = classify_conflict_lines(text);
     let lines: Vec<&str> = text.split('\n').collect();
     if kinds.is_empty() {
@@ -149,7 +153,9 @@ fn resolve_conflict_block(text: &str, caret_line: usize, side: Side) -> Option<(
     // (rather than walking back and bailing on a closing marker) lets a click on
     // any line of the block resolve it — including the closing marker itself,
     // which carries the "use theirs" cue.
-    let start = (0..=line).rev().find(|&i| kinds[i] == ConflictLineKind::MarkerOurs)?;
+    let start = (0..=line)
+        .rev()
+        .find(|&i| kinds[i] == ConflictLineKind::MarkerOurs)?;
     let end = (start + 1..kinds.len()).find(|&i| kinds[i] == ConflictLineKind::MarkerTheirs)?;
     // Reject a line that sits past this block's close (i.e. between two blocks).
     if line > end {
@@ -245,7 +251,10 @@ pub(crate) fn conflict_file_header_line(buffer: &sourceview5::Buffer, idx: usize
 /// it addresses: which file section it falls in, and which cue within that
 /// section it is (0-based, document order, matching the recorded gaps). `None` if
 /// `line` is not an elision cue.
-pub(crate) fn conflict_cue_gap_at(buffer: &sourceview5::Buffer, line: usize) -> Option<(usize, usize)> {
+pub(crate) fn conflict_cue_gap_at(
+    buffer: &sourceview5::Buffer,
+    line: usize,
+) -> Option<(usize, usize)> {
     let cue = pill(CONFLICT_CUE_LABEL);
     let text = buffer_text(buffer);
     let lines: Vec<&str> = text.split('\n').collect();
@@ -306,8 +315,7 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         // commits; gather them (newest first) and the change ids they cover, so
         // the history walk below can exclude them from what it must reach.
         let wc_chain = repo.borrow().working_copy_chain();
-        let wc_changes: HashSet<String> =
-            wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
+        let wc_changes: HashSet<String> = wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
         let branch_conflicts: Vec<String> = badges
             .iter()
             .filter(|ch| !wc_changes.contains(*ch))
@@ -482,7 +490,10 @@ pub(crate) fn build_resolve_current(
             let mut out = Vec::new();
             let mut unresolved = false;
             for fv in view.iter().filter(|fv| fv.resolvable) {
-                if classify_conflict_lines(&fv.full_text).iter().any(|k| k.is_marker()) {
+                if classify_conflict_lines(&fv.full_text)
+                    .iter()
+                    .any(|k| k.is_marker())
+                {
                     unresolved = true;
                     break;
                 }

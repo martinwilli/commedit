@@ -11,7 +11,10 @@ use commedit_engine::repo::Repo;
 fn untouched_session_has_no_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
 
     let mut repo = Repo::open(dir).expect("open");
     assert!(
@@ -24,7 +27,10 @@ fn untouched_session_has_no_changes() {
 fn working_tree_edits_show_up_as_content_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
 
     let mut repo = Repo::open(dir).expect("open");
 
@@ -55,7 +61,10 @@ fn working_tree_edits_show_up_as_content_changes() {
 fn committed_content_edits_show_up_but_message_edits_do_not() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
 
     let mut repo = Repo::open(dir).expect("open");
 
@@ -68,7 +77,8 @@ fn committed_content_edits_show_up_but_message_edits_do_not() {
         .clone();
 
     // A message-only edit changes no tree, so the review stays empty.
-    repo.rewrite_message(&second, "second (edited)").expect("rewrite message");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("rewrite message");
     assert!(
         repo.session_changes().expect("session changes").is_empty(),
         "a message-only edit does not change any tree content"
@@ -82,7 +92,8 @@ fn committed_content_edits_show_up_but_message_edits_do_not() {
         .expect("edited commit")
         .id
         .clone();
-    repo.rewrite_file(&second, "b.txt", "b rewritten\n").expect("rewrite file");
+    repo.rewrite_file(&second, "b.txt", "b rewritten\n")
+        .expect("rewrite file");
 
     let changes = repo.session_changes().expect("session changes");
     assert_eq!(changes.len(), 1, "only the content edit shows: {changes:?}");
@@ -95,7 +106,10 @@ fn committed_content_edits_show_up_but_message_edits_do_not() {
 fn revert_all_empties_the_review() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
 
     let mut repo = Repo::open(dir).expect("open");
 
@@ -108,7 +122,8 @@ fn revert_all_empties_the_review() {
         .expect("first commit")
         .id
         .clone();
-    repo.rewrite_file(&first, "a.txt", "a committed\n").expect("rewrite file");
+    repo.rewrite_file(&first, "a.txt", "a committed\n")
+        .expect("rewrite file");
     assert!(
         !repo.session_changes().expect("session changes").is_empty(),
         "edits made this session populate the review"

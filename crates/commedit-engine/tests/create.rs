@@ -106,7 +106,10 @@ fn a_modify_delete_conflict_resolves_by_deletion() {
     // file whose content has since diverged — a modify/delete conflict.
     common::init_repo(
         dir,
-        &[("x.txt", "foo\n", "add x"), ("x.txt", "foo\nbar\n", "modify x")],
+        &[
+            ("x.txt", "foo\n", "add x"),
+            ("x.txt", "foo\nbar\n", "modify x"),
+        ],
     );
     let mut repo = Repo::open(dir).expect("open");
 
@@ -129,7 +132,10 @@ fn a_modify_delete_conflict_resolves_by_deletion() {
 
     // x.txt is gone from the tree (here the only file, so the tree is empty) and
     // from disk — not left behind empty.
-    assert_eq!(common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]), "");
+    assert_eq!(
+        common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        ""
+    );
     assert!(!dir.join("x.txt").exists(), "x.txt deleted from disk");
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);

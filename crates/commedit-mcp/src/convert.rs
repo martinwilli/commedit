@@ -57,7 +57,9 @@ impl DetailFields {
     /// list selects everything (full detail), an explicit list selects exactly
     /// the named fields (so `[]` yields a header-only row).
     pub fn from_request(fields: Option<&[CommitField]>) -> Self {
-        let Some(fields) = fields else { return Self::ALL };
+        let Some(fields) = fields else {
+            return Self::ALL;
+        };
         let mut sel = Self::NONE;
         for f in fields {
             match f {
@@ -99,7 +101,10 @@ pub fn commit_dto(
         change_id: abbrev.change(&info.change_id),
         subject: info.subject.clone(),
         is_merge: info.parents.len() >= 2,
-        refs: refs.get(&full_sha).map(|v| v.iter().map(ref_dto).collect()).unwrap_or_default(),
+        refs: refs
+            .get(&full_sha)
+            .map(|v| v.iter().map(ref_dto).collect())
+            .unwrap_or_default(),
         detail: CommitDetailDto {
             description: fields.description.then(|| info.description.clone()),
             author_name: fields.author_name.then(|| info.author_name.clone()),
@@ -215,7 +220,10 @@ pub fn conflicted_commit_dto(c: &ConflictedCommit) -> ConflictedCommitDto {
         files: c
             .files
             .iter()
-            .map(|f| ConflictedPathDto { path: f.path_str(), resolvable: f.resolvable })
+            .map(|f| ConflictedPathDto {
+                path: f.path_str(),
+                resolvable: f.resolvable,
+            })
             .collect(),
     }
 }
@@ -246,10 +254,7 @@ pub fn save_result_dto(outcome: &SaveOutcome, head_sha: Option<String>) -> SaveR
 /// The squash mode a request selects: the explicit `mode` string if given,
 /// else what the source's autosquash subject prefix requests, else Fixup.
 /// `Err` is a human-readable message for an unknown mode string.
-pub fn resolve_squash_mode(
-    mode: Option<&str>,
-    source_subject: &str,
-) -> Result<SquashMode, String> {
+pub fn resolve_squash_mode(mode: Option<&str>, source_subject: &str) -> Result<SquashMode, String> {
     match mode {
         Some("fixup") => Ok(SquashMode::Fixup),
         Some("squash") => Ok(SquashMode::Squash),
@@ -282,7 +287,13 @@ mod tests {
         // Before tidying the lone-space blank context line forces serde_yaml to
         // emit an escaped one-line string; after, it is a readable block scalar.
         let diff = " fn main() {\n \n     ok\n".to_string();
-        let yaml = serde_yaml::to_string(&W { diff: tidy_diff_for_display(diff) }).unwrap();
-        assert!(yaml.contains("diff: |"), "expected a block scalar, got: {yaml:?}");
+        let yaml = serde_yaml::to_string(&W {
+            diff: tidy_diff_for_display(diff),
+        })
+        .unwrap();
+        assert!(
+            yaml.contains("diff: |"),
+            "expected a block scalar, got: {yaml:?}"
+        );
     }
 }

@@ -69,7 +69,9 @@ fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
     let graph = graph.clone();
     area.set_draw_func(move |_, cr, _w, h| {
         let layout = graph.borrow();
-        let Some(row) = layout.rows.get(index) else { return };
+        let Some(row) = layout.rows.get(index) else {
+            return;
+        };
         let h = h as f64;
         let mid = h / 2.0;
         let x = |lane: usize| LANE_W * (lane as f64 + 0.5);
@@ -94,7 +96,14 @@ fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
             if from == to {
                 cr.line_to(x(to), h);
             } else {
-                cr.curve_to(x(from), mid + (h - mid) * 0.7, x(to), mid + (h - mid) * 0.3, x(to), h);
+                cr.curve_to(
+                    x(from),
+                    mid + (h - mid) * 0.7,
+                    x(to),
+                    mid + (h - mid) * 0.3,
+                    x(to),
+                    h,
+                );
             }
             let _ = cr.stroke();
         }
@@ -317,7 +326,10 @@ fn set_row_commit(
         .as_ref()
         .and_then(|b| b.first_child())
         .and_downcast::<Overlay>();
-    let id_label = id_cell.as_ref().and_then(|c| c.child()).and_downcast::<Label>();
+    let id_label = id_cell
+        .as_ref()
+        .and_then(|c| c.child())
+        .and_downcast::<Label>();
     let subject_label = id_cell
         .as_ref()
         .and_then(|c| c.next_sibling())

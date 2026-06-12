@@ -37,7 +37,9 @@ fn run_staged<F>(
     mutate: F,
 ) -> Result<commedit_engine::conflict::SaveOutcome, ErrorData>
 where
-    F: FnOnce(&mut commedit_engine::repo::Repo) -> anyhow::Result<commedit_engine::conflict::SaveOutcome>,
+    F: FnOnce(
+        &mut commedit_engine::repo::Repo,
+    ) -> anyhow::Result<commedit_engine::conflict::SaveOutcome>,
 {
     trash.staged = Some(staged);
     match mutate(repo) {
@@ -112,9 +114,15 @@ impl CommeditServer {
                 author_name: id.author_name.unwrap_or_else(|| c.author_name.clone()),
                 author_email: id.author_email.unwrap_or_else(|| c.author_email.clone()),
                 author_time: id.author_time.unwrap_or_else(|| c.author_time.clone()),
-                committer_name: id.committer_name.unwrap_or_else(|| c.committer_name.clone()),
-                committer_email: id.committer_email.unwrap_or_else(|| c.committer_email.clone()),
-                committer_time: id.committer_time.unwrap_or_else(|| c.committer_time.clone()),
+                committer_name: id
+                    .committer_name
+                    .unwrap_or_else(|| c.committer_name.clone()),
+                committer_email: id
+                    .committer_email
+                    .unwrap_or_else(|| c.committer_email.clone()),
+                committer_time: id
+                    .committer_time
+                    .unwrap_or_else(|| c.committer_time.clone()),
             };
             let outcome = repo.rewrite_identity(&c.id, &identity).map_err(internal)?;
             Ok(save_result(repo, &outcome))
@@ -158,9 +166,15 @@ impl CommeditServer {
                         author_name: id.author_name.unwrap_or_else(|| c.author_name.clone()),
                         author_email: id.author_email.unwrap_or_else(|| c.author_email.clone()),
                         author_time: id.author_time.unwrap_or_else(|| c.author_time.clone()),
-                        committer_name: id.committer_name.unwrap_or_else(|| c.committer_name.clone()),
-                        committer_email: id.committer_email.unwrap_or_else(|| c.committer_email.clone()),
-                        committer_time: id.committer_time.unwrap_or_else(|| c.committer_time.clone()),
+                        committer_name: id
+                            .committer_name
+                            .unwrap_or_else(|| c.committer_name.clone()),
+                        committer_email: id
+                            .committer_email
+                            .unwrap_or_else(|| c.committer_email.clone()),
+                        committer_time: id
+                            .committer_time
+                            .unwrap_or_else(|| c.committer_time.clone()),
                     })
                 } else {
                     None
@@ -193,7 +207,9 @@ impl CommeditServer {
             if edits.is_empty() {
                 return Err(invalid("files and delete_paths must not both be empty"));
             }
-            let outcome = repo.rewrite_files_edits(&commits[idx].id, &edits).map_err(internal)?;
+            let outcome = repo
+                .rewrite_files_edits(&commits[idx].id, &edits)
+                .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await
@@ -214,7 +230,10 @@ impl CommeditServer {
             }
             for e in &req.edits {
                 if e.old.is_empty() {
-                    return Err(invalid(format!("the edit for {} has an empty `old`", e.path)));
+                    return Err(invalid(format!(
+                        "the edit for {} has an empty `old`",
+                        e.path
+                    )));
                 }
             }
             let (_, commits) = full_history(repo)?;
@@ -271,7 +290,9 @@ impl CommeditServer {
                     ),
                 })
             })?;
-            let outcome = repo.rewrite_message(&commits[idx].id, &edited).map_err(internal)?;
+            let outcome = repo
+                .rewrite_message(&commits[idx].id, &edited)
+                .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await
@@ -290,7 +311,9 @@ impl CommeditServer {
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
             let files = file_pairs(req.files)?;
-            let outcome = repo.split_commit(&commits[idx].id, &files).map_err(internal)?;
+            let outcome = repo
+                .split_commit(&commits[idx].id, &files)
+                .map_err(internal)?;
             Ok(save_result(repo, &outcome))
         })
         .await
@@ -420,12 +443,20 @@ impl CommeditServer {
             })?;
             let info = commits[idx].clone();
             let root = repo.root_commit_id().hex();
-            let dropped =
-                commit_dto(&info, &root, &BTreeMap::new(), &IdAbbrev::new(&repo.repo), DetailFields::ALL);
+            let dropped = commit_dto(
+                &info,
+                &root,
+                &BTreeMap::new(),
+                &IdAbbrev::new(&repo.repo),
+                DetailFields::ALL,
+            );
             let outcome = run_staged(repo, trash, PendingTrashOp::Push(Box::new(info)), |repo| {
                 repo.abandon_commit(&id)
             })?;
-            Ok(DropCommitResp { result: save_result(repo, &outcome), dropped })
+            Ok(DropCommitResp {
+                result: save_result(repo, &outcome),
+                dropped,
+            })
         })
         .await
         .map(Yaml)
@@ -512,12 +543,14 @@ impl CommeditServer {
             if let Some(src_idx) = lookup_ref(&req.source, src_entries.collect())? {
                 let mode = resolve_squash_mode(req.mode.as_deref(), &commits[src_idx].subject)
                     .map_err(invalid)?;
-                let (src, dest) = repo.plan_squash(&commits, src_idx, dest_idx).ok_or_else(|| {
-                    invalid(
+                let (src, dest) =
+                    repo.plan_squash(&commits, src_idx, dest_idx)
+                        .ok_or_else(|| {
+                            invalid(
                         "cannot squash: the source must be a non-merge commit on the branch, \
                          distinct from the destination",
                     )
-                })?;
+                        })?;
                 let outcome = repo.squash_into(&src, &dest, mode).map_err(internal)?;
                 Ok(save_result(repo, &outcome))
             } else {
@@ -531,8 +564,9 @@ impl CommeditServer {
                 })?;
                 let mode =
                     resolve_squash_mode(req.mode.as_deref(), &info.subject).map_err(invalid)?;
-                let (src, dest) =
-                    repo.plan_squash_restore(&commits, &info, dest_idx).ok_or_else(|| {
+                let (src, dest) = repo
+                    .plan_squash_restore(&commits, &info, dest_idx)
+                    .ok_or_else(|| {
                         invalid("cannot squash the trashed commit onto itself or off-branch")
                     })?;
                 let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {

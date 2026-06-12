@@ -32,12 +32,18 @@ pub struct FileEdit {
 impl FileEdit {
     /// A write edit: set `path` to `content`.
     pub fn write(path: String, content: String) -> Self {
-        Self { path, content: Some(content) }
+        Self {
+            path,
+            content: Some(content),
+        }
     }
 
     /// A delete edit: remove `path` from the tree (a no-op if it is absent).
     pub fn delete(path: String) -> Self {
-        Self { path, content: None }
+        Self {
+            path,
+            content: None,
+        }
     }
 }
 
@@ -195,20 +201,30 @@ impl Repo {
         for r in replaces {
             let current = match edited.remove(&r.path) {
                 Some(text) => text,
-                None => read_path_text(&tree, &store, &r.path)?
-                    .ok_or_else(|| ReplaceError::NotText { path: r.path.clone() })?,
+                None => read_path_text(&tree, &store, &r.path)?.ok_or_else(|| {
+                    ReplaceError::NotText {
+                        path: r.path.clone(),
+                    }
+                })?,
             };
             let next = replace_checked(&current, &r.old, &r.new, r.all).map_err(|count| {
                 if count == 0 {
-                    ReplaceError::NotFound { path: r.path.clone() }
+                    ReplaceError::NotFound {
+                        path: r.path.clone(),
+                    }
                 } else {
-                    ReplaceError::Ambiguous { path: r.path.clone(), count }
+                    ReplaceError::Ambiguous {
+                        path: r.path.clone(),
+                        count,
+                    }
                 }
             })?;
             edited.insert(r.path.clone(), next);
         }
-        let edits: Vec<FileEdit> =
-            edited.into_iter().map(|(path, content)| FileEdit::write(path, content)).collect();
+        let edits: Vec<FileEdit> = edited
+            .into_iter()
+            .map(|(path, content)| FileEdit::write(path, content))
+            .collect();
         self.rewrite_files_edits(target, &edits)
     }
 }
@@ -342,7 +358,10 @@ mod tests {
 
     #[test]
     fn missing_match_reports_zero() {
-        assert_eq!(replace_checked("nothing to see", "bulck", "bulk", false), Err(0));
+        assert_eq!(
+            replace_checked("nothing to see", "bulck", "bulk", false),
+            Err(0)
+        );
     }
 
     #[test]

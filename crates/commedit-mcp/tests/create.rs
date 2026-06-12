@@ -54,7 +54,11 @@ fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
 
 async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0
@@ -307,7 +311,10 @@ async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
     // file whose content has since diverged: a modify/delete conflict.
     init_repo(
         dir.path(),
-        &[("x.txt", "foo\n", "add x"), ("x.txt", "foo\nbar\n", "modify x")],
+        &[
+            ("x.txt", "foo\n", "add x"),
+            ("x.txt", "foo\nbar\n", "modify x"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -342,12 +349,21 @@ async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
         .await
         .unwrap()
         .0;
-    assert!(matches!(result, SaveResultDto::Clean { .. }), "delete settles the conflict");
+    assert!(
+        matches!(result, SaveResultDto::Clean { .. }),
+        "delete settles the conflict"
+    );
 
     // The file is gone — not present at HEAD and not left as a 0-byte file.
     let tree = git(dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains("x.txt"), "x.txt is removed from the tree: {tree}");
-    assert!(!dir.path().join("x.txt").exists(), "x.txt is gone from disk");
+    assert!(
+        !tree.contains("x.txt"),
+        "x.txt is removed from the tree: {tree}"
+    );
+    assert!(
+        !dir.path().join("x.txt").exists(),
+        "x.txt is gone from disk"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     git(dir.path(), &["fsck", "--no-progress"]);
 }
@@ -456,7 +472,10 @@ async fn cherry_pick_copies_a_commit_from_another_branch() {
     // The change is replayed onto main, keeping the source subject and author.
     assert_eq!(git_log_subjects(dir.path()), ["feature work", "first"]);
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "feat");
-    assert_eq!(git(dir.path(), &["show", "-s", "--format=%an", "HEAD"]), "Tester");
+    assert_eq!(
+        git(dir.path(), &["show", "-s", "--format=%an", "HEAD"]),
+        "Tester"
+    );
     // The provenance trailer records the source (git `cherry-pick -x` style).
     let body = git(dir.path(), &["show", "-s", "--format=%b", "HEAD"]);
     assert!(
@@ -492,7 +511,10 @@ async fn cherry_pick_resolves_an_in_history_change_id_and_places_it() {
     let root = hist.commits.last().unwrap();
     assert_eq!(root.subject, "add b");
     assert!(root.detail.parent_shas.as_ref().unwrap().is_empty());
-    assert_eq!(git(dir.path(), &["show", &format!("{}:b.txt", root.sha)]), "two");
+    assert_eq!(
+        git(dir.path(), &["show", &format!("{}:b.txt", root.sha)]),
+        "two"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -508,7 +530,11 @@ async fn cherry_pick_refuses_a_merge() {
             .cherry_pick_commit(Parameters(pick(&merge, None)))
             .await,
     );
-    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("merge"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]

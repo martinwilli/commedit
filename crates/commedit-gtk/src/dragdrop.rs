@@ -180,9 +180,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             // squashes the trashed commit onto the chain commit at `ci`; a
             // working-copy drag folds that uncommitted entry into it (a fixup).
             let valid = drag_from.get().is_some_and(|from| match drag_origin.get() {
-                DragOrigin::History => {
-                    repo.borrow().plan_squash(&commits.borrow(), from, ci).is_some()
-                }
+                DragOrigin::History => repo
+                    .borrow()
+                    .plan_squash(&commits.borrow(), from, ci)
+                    .is_some(),
                 DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
                     repo.borrow()
                         .plan_squash_restore(&commits.borrow(), info, ci)
@@ -309,7 +310,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             // target(s), yellow for other autosquash commits aimed at the same
             // target. Empty (no-op) unless the dragged commit is prefixed.
             if let Some(from) = drag_from.get() {
-                let recs = repo.borrow().squash_recommendations(&commits.borrow(), from);
+                let recs = repo
+                    .borrow()
+                    .squash_recommendations(&commits.borrow(), from);
                 for i in recs.targets {
                     if let Some(r) = list.row_at_index(i as i32) {
                         r.add_css_class("squash-recommended");
@@ -420,7 +423,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let selected_change = selected_change.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
-                        let plan = repo.borrow().plan_squash(&commits.borrow(), from as usize, onto);
+                        let plan =
+                            repo.borrow()
+                                .plan_squash(&commits.borrow(), from as usize, onto);
                         let Some((source, dest)) = plan else {
                             return;
                         };
@@ -539,7 +544,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             return;
                         };
                         let plan =
-                            repo.borrow().plan_squash_restore(&commits.borrow(), &info, onto);
+                            repo.borrow()
+                                .plan_squash_restore(&commits.borrow(), &info, onto);
                         let Some((source, dest)) = plan else {
                             return;
                         };
@@ -571,7 +577,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                         trashed
                                             .borrow_mut()
                                             .retain(|c| c.change_id_hex() != change_hex);
-                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        populate_trash(
+                                            &trash_list,
+                                            &trash_scroll,
+                                            &trashed.borrow(),
+                                        );
                                         *selected_change.borrow_mut() = Some(dest_change.clone());
                                         refresh();
                                     }
@@ -579,7 +589,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                         trashed
                                             .borrow_mut()
                                             .retain(|c| c.change_id_hex() != change_hex);
-                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        populate_trash(
+                                            &trash_list,
+                                            &trash_scroll,
+                                            &trashed.borrow(),
+                                        );
                                         enter_conflict_mode(commits);
                                     }
                                     Err(err) => show_status(&format!("Squash failed: {err}")),
@@ -660,7 +674,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             .retain(|c| c.change_id_hex() != change_hex);
                                         *selected_change.borrow_mut() = Some(change_hex);
                                         refresh();
-                                        populate_trash(&trash_list, &trash_scroll, &trashed.borrow());
+                                        populate_trash(
+                                            &trash_list,
+                                            &trash_scroll,
+                                            &trashed.borrow(),
+                                        );
                                     }
                                     Ok(SaveOutcome::Conflicts { commits }) => {
                                         // Don't remove from the trash yet: the rewrite
@@ -696,7 +714,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let selected_change = selected_change.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
-                        let entry = wc_entries.borrow().get(from as usize).map(|e| e.info.clone());
+                        let entry = wc_entries
+                            .borrow()
+                            .get(from as usize)
+                            .map(|e| e.info.clone());
                         let Some(entry) = entry else {
                             return;
                         };
@@ -780,8 +801,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             }
             // Same green/yellow squash hints as a history drag, for a trashed
             // commit whose subject carries an autosquash prefix. Empty otherwise.
-            if let Some(info) = drag_from.get().and_then(|f| trashed.borrow().get(f).cloned()) {
-                let recs = repo.borrow().squash_recommendations_for(&commits.borrow(), &info);
+            if let Some(info) = drag_from
+                .get()
+                .and_then(|f| trashed.borrow().get(f).cloned())
+            {
+                let recs = repo
+                    .borrow()
+                    .squash_recommendations_for(&commits.borrow(), &info);
                 for i in recs.targets {
                     if let Some(r) = list.row_at_index(i as i32) {
                         r.add_css_class("squash-recommended");
@@ -1028,7 +1054,10 @@ fn show_squash_popover(target_row: &ListBoxRow, apply: &Rc<dyn Fn(SquashMode)>) 
         b
     };
     let fixup_btn = button("Fixup", "Merge changes in; keep this commit's message.");
-    let squash_btn = button("Squash", "Merge changes in; append the dragged commit's message.");
+    let squash_btn = button(
+        "Squash",
+        "Merge changes in; append the dragged commit's message.",
+    );
     let amend_btn = button(
         "Amend",
         "Merge changes in; replace this commit's message with the dragged commit's.",
@@ -1127,14 +1156,19 @@ fn show_lane_popover(
     // for the bottom gap. Skip hidden surplus rows (`populate_rows` hides, never
     // unparents), whose allocations are stale.
     let row_at = |i: usize| list.row_at_index(i as i32).filter(|r| r.is_visible());
-    let Some((row, at_top)) = row_at(gap)
-        .map(|r| (r, true))
-        .or_else(|| (gap > 0).then(|| row_at(gap - 1).map(|r| (r, false))).flatten())
-    else {
+    let Some((row, at_top)) = row_at(gap).map(|r| (r, true)).or_else(|| {
+        (gap > 0)
+            .then(|| row_at(gap - 1).map(|r| (r, false)))
+            .flatten()
+    }) else {
         return;
     };
     let a = row.allocation();
-    let y = if at_top { a.y() } else { a.y() + a.height() - 1 };
+    let y = if at_top {
+        a.y()
+    } else {
+        a.y() + a.height() - 1
+    };
     popover.set_parent(list);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(a.x(), y, a.width(), 1)));
     popover.set_autohide(true);

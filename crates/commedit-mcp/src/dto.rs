@@ -187,7 +187,9 @@ pub struct OpEntryDto {
 /// type rmcp embeds in one) to carry a root `"type": "object"`, which schemars
 /// omits on its `oneOf` rendering.
 fn tagged_enum_is_an_object(schema: &mut schemars::Schema) {
-    schema.ensure_object().insert("type".into(), "object".into());
+    schema
+        .ensure_object()
+        .insert("type".into(), "object".into());
 }
 
 /// Outcome of a mutation: either the rewrite is clean and exported to git, or
@@ -727,7 +729,9 @@ mod tests {
         // `status` at the top level — with `dropped` as an extra sibling, not a
         // result nested under `result`.
         let resp = DropCommitResp {
-            result: SaveResultDto::Clean { head_sha: Some("abc123".into()) },
+            result: SaveResultDto::Clean {
+                head_sha: Some("abc123".into()),
+            },
             dropped: CommitDto {
                 sha: "def456".into(),
                 change_id: "zzzz".into(),
@@ -749,7 +753,10 @@ mod tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["status"], "clean");
         assert_eq!(v["head_sha"], "abc123");
-        assert!(v.get("result").is_none(), "status must not stay nested under `result`");
+        assert!(
+            v.get("result").is_none(),
+            "status must not stay nested under `result`"
+        );
         assert_eq!(v["dropped"]["sha"], "def456");
     }
 }

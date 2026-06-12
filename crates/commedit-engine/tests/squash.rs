@@ -53,8 +53,14 @@ fn folding_the_whole_working_copy_into_a_commit_leaves_a_clean_tree() {
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
     assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "1\n2");
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
-    assert!(repo.working_copy_chain().is_empty(), "clean tree after folding");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "1\n2\n");
+    assert!(
+        repo.working_copy_chain().is_empty(),
+        "clean tree after folding"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "1\n2\n"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -83,10 +89,20 @@ fn folding_a_peeled_entry_keeps_the_remainder_uncommitted() {
     // "A" gained the a.txt change; the b.txt change is still uncommitted; disk is
     // unchanged (both edits still present, one now committed).
     assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "a\nAA");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
     let remaining = repo.working_copy_chain();
-    assert_eq!(remaining.len(), 1, "only the b.txt change remains uncommitted");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the b.txt change remains uncommitted"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -113,7 +129,9 @@ fn a_conflicting_fold_defers_and_leaves_git_untouched() {
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
     assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "1\nB\n3");
     assert!(
-        !std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("<<<<<<<"),
+        !std::fs::read_to_string(dir.join("a.txt"))
+            .unwrap()
+            .contains("<<<<<<<"),
         "the worktree must be untouched while the conflict is pending"
     );
     common::git(dir, &["fsck", "--no-progress"]);
@@ -128,7 +146,9 @@ fn fixup_merges_content_keeps_target_message_drops_source() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    let outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
     // "third" is gone; "second" keeps its own message but now carries c.txt.
@@ -137,7 +157,10 @@ fn fixup_merges_content_keeps_target_message_drops_source() {
     common::git(dir, &["cat-file", "-e", "HEAD:b.txt"]);
 
     // Transparency.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -177,7 +200,10 @@ fn squashes_a_trashed_commit_into_a_chain_commit() {
     common::git(dir, &["cat-file", "-e", "HEAD:c.txt"]);
 
     // Transparency.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -191,10 +217,14 @@ fn squash_extends_the_target_message() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Squash).expect("squash");
+    repo.squash_into(&source, &dest, SquashMode::Squash)
+        .expect("squash");
 
     // The target's message gains the source's (unprefixed → full) message.
-    assert_eq!(common::git(dir, &["show", "-s", "--format=%B", "main"]), "second\n\nthird");
+    assert_eq!(
+        common::git(dir, &["show", "-s", "--format=%B", "main"]),
+        "second\n\nthird"
+    );
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -208,7 +238,8 @@ fn amend_replaces_the_target_message() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Amend).expect("squash");
+    repo.squash_into(&source, &dest, SquashMode::Amend)
+        .expect("squash");
 
     // The target's message is replaced by the source's.
     assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
@@ -227,7 +258,17 @@ fn squash_preserves_the_target_author() {
     common::git(dir, &["commit", "-q", "-m", "first"]);
     std::fs::write(dir.join("b.txt"), "b\n").unwrap();
     common::git(dir, &["add", "b.txt"]);
-    common::git(dir, &["commit", "-q", "--author", "Alice <alice@example.com>", "-m", "second"]);
+    common::git(
+        dir,
+        &[
+            "commit",
+            "-q",
+            "--author",
+            "Alice <alice@example.com>",
+            "-m",
+            "second",
+        ],
+    );
     std::fs::write(dir.join("c.txt"), "c\n").unwrap();
     common::git(dir, &["add", "c.txt"]);
     common::git(dir, &["commit", "-q", "-m", "third"]);
@@ -235,7 +276,8 @@ fn squash_preserves_the_target_author() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "second");
-    repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    repo.squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
 
     // The target keeps its author (committer may be re-stamped — git-autosquash
     // style — so we don't assert on it).
@@ -257,12 +299,17 @@ fn fixup_into_a_non_adjacent_ancestor_moves_the_branch() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "third");
     let dest = id_of(&repo, "first");
-    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    let outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
     common::git(dir, &["cat-file", "-e", "HEAD:c.txt"]); // source content carried to the tip
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -282,11 +329,17 @@ fn squash_via_the_autosquash_prefix_flow() {
 
     let mut repo = Repo::open(dir).expect("open");
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let from = commits.iter().position(|c| c.subject == "fixup! second").expect("fixup row");
+    let from = commits
+        .iter()
+        .position(|c| c.subject == "fixup! second")
+        .expect("fixup row");
 
     // The prefixed commit recommends "second" (its bare target) as the target.
     let rec = repo.squash_recommendations(&commits, from);
-    let second = commits.iter().position(|c| c.subject == "second").expect("second row");
+    let second = commits
+        .iter()
+        .position(|c| c.subject == "second")
+        .expect("second row");
     assert_eq!(rec.targets, vec![second]);
     assert!(rec.siblings.is_empty());
 
@@ -297,7 +350,10 @@ fn squash_via_the_autosquash_prefix_flow() {
     // The fixup folds into "second", keeping its message.
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
     common::git(dir, &["cat-file", "-e", "HEAD:c.txt"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -320,7 +376,9 @@ fn conflicting_squash_is_held_back_then_resolved() {
     let mut repo = Repo::open(dir).expect("open");
     let source = id_of(&repo, "B");
     let dest = id_of(&repo, "base");
-    let mut outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    let mut outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
 
     assert!(
         matches!(outcome, SaveOutcome::Conflicts { .. }),
@@ -344,7 +402,9 @@ fn conflicting_squash_is_held_back_then_resolved() {
             .expect("a resolvable file")
             .path_str();
         let change_hex = oldest.change_id_hex();
-        let file = repo.read_conflict(&change_hex, &path_str).expect("read conflict");
+        let file = repo
+            .read_conflict(&change_hex, &path_str)
+            .expect("read conflict");
         outcome = repo
             .resolve_conflict(&change_hex, &path_str, "1\nR\n3\n", file.marker_len)
             .expect("resolve");
@@ -356,9 +416,15 @@ fn conflicting_squash_is_held_back_then_resolved() {
     // Plain git now sees the squashed, conflict-free history: B folded into base,
     // A rebased on top.
     assert_eq!(common::git_log_subjects(dir), vec!["A", "base"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains(".jjconflict"), "no .jjconflict-* in the tree: {tree}");
+    assert!(
+        !tree.contains(".jjconflict"),
+        "no .jjconflict-* in the tree: {tree}"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }

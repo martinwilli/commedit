@@ -88,7 +88,10 @@ fn set_entry_date(entry: &Entry, year: i32, month: i32, day: i32) {
 
 /// Give `entry` a built-in ▼ icon that opens a popover of `identities`; picking
 /// one sets the field to its `Name <email>` form.
-pub(crate) fn attach_identity_picker(entry: &Entry, identities: &Rc<RefCell<Vec<(String, String)>>>) {
+pub(crate) fn attach_identity_picker(
+    entry: &Entry,
+    identities: &Rc<RefCell<Vec<(String, String)>>>,
+) {
     entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some("pan-down-symbolic"));
     entry.set_icon_activatable(gtk::EntryIconPosition::Secondary, true);
     entry.set_icon_tooltip_text(
@@ -187,6 +190,9 @@ pub(crate) fn read_identity(fields: &[Entry; 4]) -> Identity {
 pub(crate) fn set_identity_fields(fields: &[Entry; 4], commit: &CommitInfo) {
     fields[0].set_text(&join_name_email(&commit.author_name, &commit.author_email));
     fields[1].set_text(&commit.author_time);
-    fields[2].set_text(&join_name_email(&commit.committer_name, &commit.committer_email));
+    fields[2].set_text(&join_name_email(
+        &commit.committer_name,
+        &commit.committer_email,
+    ));
     fields[3].set_text(&commit.committer_time);
 }

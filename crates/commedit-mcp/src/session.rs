@@ -118,10 +118,7 @@ fn head_commit(repo: &Repo) -> Result<CommitId, ErrorData> {
 
 /// A mutation outcome as the response DTO, with the (possibly moved) branch
 /// tip read back after the save.
-pub fn save_result(
-    repo: &Repo,
-    outcome: &SaveOutcome,
-) -> crate::dto::SaveResultDto {
+pub fn save_result(repo: &Repo, outcome: &SaveOutcome) -> crate::dto::SaveResultDto {
     crate::convert::save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()))
 }
 
@@ -225,7 +222,11 @@ pub fn resolve_ref<T>(
 
 /// The display index of commit ref `r` in the (newest-first) history.
 pub fn find_commit(commits: &[CommitInfo], r: &str) -> Result<usize, ErrorData> {
-    let entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i)).collect();
+    let entries = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| RefEntry::of(c, i))
+        .collect();
     resolve_ref(r, entries, || {
         invalid(format!(
             "commit {r} is not in the current branch history; shas change after every \
@@ -236,9 +237,15 @@ pub fn find_commit(commits: &[CommitInfo], r: &str) -> Result<usize, ErrorData> 
 
 /// The trash entry commit ref `r` resolves to.
 pub fn find_trashed(trash: &TrashState, r: &str) -> Result<CommitInfo, ErrorData> {
-    let entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone())).collect();
+    let entries = trash
+        .entries
+        .iter()
+        .map(|c| RefEntry::of(c, c.clone()))
+        .collect();
     resolve_ref(r, entries, || {
-        invalid(format!("commit {r} is not in the session trash (see list_trash)"))
+        invalid(format!(
+            "commit {r} is not in the session trash (see list_trash)"
+        ))
     })
 }
 
@@ -255,7 +262,9 @@ pub fn find_conflicted(conflicts: &[ConflictedCommit], r: &str) -> Result<usize,
         })
         .collect();
     resolve_ref(r, entries, || {
-        invalid(format!("{r} does not match a pending conflicted commit (see pending_status)"))
+        invalid(format!(
+            "{r} does not match a pending conflicted commit (see pending_status)"
+        ))
     })
 }
 
@@ -340,11 +349,12 @@ pub fn plan_splice(
     let (to, parent_id) = if new_parent == "root" {
         (commits.len(), repo.root_commit_id())
     } else {
-        let idx = find_commit(commits, new_parent)
-            .map_err(|_| invalid(format!(
+        let idx = find_commit(commits, new_parent).map_err(|_| {
+            invalid(format!(
                 "new_parent {new_parent} is not in the current branch history; \
                  use a ref from list_history or the literal \"root\""
-            )))?;
+            ))
+        })?;
         (idx, commits[idx].id.clone())
     };
 
@@ -475,7 +485,10 @@ mod tests {
 
     #[test]
     fn a_full_sha_matches_exactly() {
-        let entries = vec![entry(&sha("aa"), &cid("11"), 1), entry(&sha("bb"), &cid("22"), 2)];
+        let entries = vec![
+            entry(&sha("aa"), &cid("11"), 1),
+            entry(&sha("bb"), &cid("22"), 2),
+        ];
         assert_eq!(lookup_ref(&sha("aa"), entries).unwrap(), Some(1));
     }
 
@@ -485,29 +498,48 @@ mod tests {
         // input must resolve in the change-id namespace, not ambiguously.
         let full_cid = cid("11");
         let colliding_sha = format!("{full_cid}{}", "0".repeat(8));
-        let entries = vec![entry(&sha("aa"), &full_cid, 1), entry(&colliding_sha, &cid("22"), 2)];
+        let entries = vec![
+            entry(&sha("aa"), &full_cid, 1),
+            entry(&colliding_sha, &cid("22"), 2),
+        ];
         assert_eq!(lookup_ref(&full_cid, entries).unwrap(), Some(1));
     }
 
     #[test]
     fn a_prefix_matches_in_either_namespace() {
-        let entries = vec![entry(&sha("abcd12"), &cid("9911"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        let entries = vec![
+            entry(&sha("abcd12"), &cid("9911"), 1),
+            entry(&sha("ff00"), &cid("8822"), 2),
+        ];
         assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
-        let entries = vec![entry(&sha("abcd12"), &cid("9911"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        let entries = vec![
+            entry(&sha("abcd12"), &cid("9911"), 1),
+            entry(&sha("ff00"), &cid("8822"), 2),
+        ];
         assert_eq!(lookup_ref("9911", entries).unwrap(), Some(1));
     }
 
     #[test]
     fn a_prefix_hitting_both_ids_of_one_commit_is_a_single_match() {
-        let entries = vec![entry(&sha("abcd12"), &cid("abcd34"), 1), entry(&sha("ff00"), &cid("8822"), 2)];
+        let entries = vec![
+            entry(&sha("abcd12"), &cid("abcd34"), 1),
+            entry(&sha("ff00"), &cid("8822"), 2),
+        ];
         assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
     }
 
     #[test]
     fn a_shared_prefix_is_ambiguous_and_lists_the_matches() {
-        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1), entry(&sha("abcd34"), &cid("2222"), 2)];
+        let entries = vec![
+            entry(&sha("abcd12"), &cid("1111"), 1),
+            entry(&sha("abcd34"), &cid("2222"), 2),
+        ];
         let err = lookup_ref("abcd", entries).unwrap_err();
-        assert!(err.message.contains("ambiguous"), "message: {}", err.message);
+        assert!(
+            err.message.contains("ambiguous"),
+            "message: {}",
+            err.message
+        );
         assert!(err.message.contains("subject-1") && err.message.contains("subject-2"));
     }
 
@@ -521,7 +553,11 @@ mod tests {
     fn a_short_hex_ref_is_rejected() {
         let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1)];
         let err = lookup_ref("abc", entries).unwrap_err();
-        assert!(err.message.contains("too short"), "message: {}", err.message);
+        assert!(
+            err.message.contains("too short"),
+            "message: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -536,7 +572,10 @@ mod tests {
     fn a_duplicate_sha_dedupes_to_the_first_entry() {
         // The same commit listed twice (history first, trash second) must
         // resolve to the first occurrence, never read as ambiguous.
-        let entries = vec![entry(&sha("abcd12"), &cid("1111"), 1), entry(&sha("abcd12"), &cid("1111"), 2)];
+        let entries = vec![
+            entry(&sha("abcd12"), &cid("1111"), 1),
+            entry(&sha("abcd12"), &cid("1111"), 2),
+        ];
         assert_eq!(lookup_ref("abcd", entries).unwrap(), Some(1));
     }
 }

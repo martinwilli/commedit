@@ -110,13 +110,18 @@ pub fn compute_graph(commits: &[CommitInfo], root: &CommitId) -> GraphLayout {
         let mut fresh = Vec::new();
         for parent in parents {
             row.is_merge = true;
-            let found = (0..lanes.len())
-                .find(|&l| l != row.node_lane && lanes[l].as_ref().is_some_and(|(p, _)| p == parent));
+            let found = (0..lanes.len()).find(|&l| {
+                l != row.node_lane && lanes[l].as_ref().is_some_and(|(p, _)| p == parent)
+            });
             let l = match found {
                 // Converge into a lane already descending to this parent: the
                 // line now carries this commit's edge too.
                 Some(l) => {
-                    lanes[l].as_mut().expect("occupied lane").1.push(commit.id.clone());
+                    lanes[l]
+                        .as_mut()
+                        .expect("occupied lane")
+                        .1
+                        .push(commit.id.clone());
                     l
                 }
                 None => {
@@ -239,8 +244,14 @@ mod tests {
         let g = compute_graph(&h, &cid(0));
         assert_eq!(g.max_lanes, 2);
         assert_eq!(g.rows[0], row(0, true, &[], &[(0, 0), (0, 1)]));
-        assert_eq!(g.rows[1], row(0, false, &[(0, 0), (1, 1)], &[(0, 0), (1, 1)]));
-        assert_eq!(g.rows[2], row(1, false, &[(0, 0), (1, 1)], &[(0, 0), (1, 1)]));
+        assert_eq!(
+            g.rows[1],
+            row(0, false, &[(0, 0), (1, 1)], &[(0, 0), (1, 1)])
+        );
+        assert_eq!(
+            g.rows[2],
+            row(1, false, &[(0, 0), (1, 1)], &[(0, 0), (1, 1)])
+        );
         // The fork point: both lanes' edges bend into the node, lane 1 closes.
         assert_eq!(g.rows[3], row(0, false, &[(0, 0), (1, 0)], &[]));
     }
@@ -273,10 +284,18 @@ mod tests {
         );
         assert_eq!(
             g.rows[2],
-            row(1, true, &[(0, 0), (1, 1), (2, 2)], &[(0, 0), (1, 1), (2, 2), (1, 2)])
+            row(
+                1,
+                true,
+                &[(0, 0), (1, 1), (2, 2)],
+                &[(0, 0), (1, 1), (2, 2), (1, 2)]
+            )
         );
         // Commit 2: lanes 0 and 1 (one per merge) both expected it and join here.
-        assert_eq!(g.rows[3], row(0, false, &[(0, 0), (1, 0), (2, 2)], &[(2, 2)]));
+        assert_eq!(
+            g.rows[3],
+            row(0, false, &[(0, 0), (1, 0), (2, 2)], &[(2, 2)])
+        );
     }
 
     #[test]
@@ -360,6 +379,9 @@ mod tests {
         ];
         let g = compute_graph(&h, &cid(0));
         assert_eq!(g.max_lanes, 2);
-        assert_eq!(g.rows[3], row(0, true, &[(0, 0), (1, 0)], &[(0, 0), (0, 1)]));
+        assert_eq!(
+            g.rows[3],
+            row(0, true, &[(0, 0), (1, 0)], &[(0, 0), (0, 1)])
+        );
     }
 }

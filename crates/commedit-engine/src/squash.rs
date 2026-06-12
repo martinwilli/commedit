@@ -416,8 +416,7 @@ impl Repo {
         )
         .context("writing squashed commit")?;
 
-        pollster::block_on(tx.repo_mut().rebase_descendants())
-            .context("rebasing descendants")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
         // A squash preserves the net change set, so the post-squash tip is clean
         // and identical to the original even when an interior commit conflicts
@@ -472,7 +471,10 @@ mod tests {
         assert_eq!(parse_squash_mode("fixup!"), Some(SquashMode::Fixup));
         assert_eq!(parse_squash_mode("fix things"), None);
         // Only the first token decides the mode.
-        assert_eq!(parse_squash_mode("squash! fixup! x"), Some(SquashMode::Squash));
+        assert_eq!(
+            parse_squash_mode("squash! fixup! x"),
+            Some(SquashMode::Squash)
+        );
     }
 
     #[test]
@@ -492,7 +494,11 @@ mod tests {
 
     /// Newest-first chain: `fixup! second` (0) <- second (1) <- first (2) <- root.
     fn fixup_history() -> Vec<CommitInfo> {
-        vec![ci(3, 2, "fixup! second"), ci(2, 1, "second"), ci(1, 0, "first")]
+        vec![
+            ci(3, 2, "fixup! second"),
+            ci(2, 1, "second"),
+            ci(1, 0, "first"),
+        ]
     }
 
     #[test]
@@ -526,7 +532,10 @@ mod tests {
     fn unprefixed_or_offchain_has_no_recommendations() {
         let h = fixup_history();
         // Row 1 ("second") is not prefixed.
-        assert_eq!(squash_recommendations(&h, &cid(3), 1), SquashHighlights::default());
+        assert_eq!(
+            squash_recommendations(&h, &cid(3), 1),
+            SquashHighlights::default()
+        );
     }
 
     #[test]
@@ -598,7 +607,7 @@ mod tests {
     #[test]
     fn recommends_a_target_for_a_trashed_prefixed_commit() {
         let h = fixup_history(); // 3=fixup! second, 2=second, 1=first
-        // A trashed `fixup! second` (id 9, not in the chain) points at "second".
+                                 // A trashed `fixup! second` (id 9, not in the chain) points at "second".
         let dropped = ci(9, 1, "fixup! second");
         let r = squash_recommendations_for(&h, &cid(3), &dropped);
         // Row 1 is "second"; row 0 is the (in-chain) other fixup, a sibling.
@@ -621,7 +630,11 @@ mod tests {
         );
         // Squash appends the source body (prefix line stripped).
         assert_eq!(
-            compose_squash_message(SquashMode::Squash, "second", "squash! second\n\nmore detail"),
+            compose_squash_message(
+                SquashMode::Squash,
+                "second",
+                "squash! second\n\nmore detail"
+            ),
             "second\n\nmore detail"
         );
         // Empty body collapses to just the destination message.

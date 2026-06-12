@@ -32,10 +32,16 @@ fn current(repo: &Repo) -> Vec<CommitInfo> {
 /// The transparency triple every save must restore for a plain-git user, plus the
 /// "no conflict residue in the tree" invariant.
 fn assert_transparent(dir: &std::path::Path) {
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains(".jjconflict"), "no .jjconflict-* in the tree: {tree}");
+    assert!(
+        !tree.contains(".jjconflict"),
+        "no .jjconflict-* in the tree: {tree}"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -57,10 +63,14 @@ fn message_edit_preserves_both_parents() {
 
     let mut repo = Repo::open(dir).expect("open");
     let merge = by(&current(&repo), "merge").id.clone();
-    repo.rewrite_message(&merge, "merge (edited)").expect("rewrite message");
+    repo.rewrite_message(&merge, "merge (edited)")
+        .expect("rewrite message");
 
     // The tip is still the merge, now with the new subject and both parents.
-    assert_eq!(common::git(dir, &["log", "-1", "--format=%s", "HEAD"]), "merge (edited)");
+    assert_eq!(
+        common::git(dir, &["log", "-1", "--format=%s", "HEAD"]),
+        "merge (edited)"
+    );
     assert!(common::is_merge(dir, "HEAD"), "tip stays a 2-parent merge");
     assert_eq!(parent_subjects(dir), vec!["main-1", "side-1"]);
     assert_transparent(dir);
@@ -82,13 +92,20 @@ fn identity_edit_preserves_both_parents() {
         committer_email: "grace@example.com".to_string(),
         committer_time: "2026-06-06 09:00:00 +0000".to_string(),
     };
-    repo.rewrite_identity(&merge, &id).expect("rewrite identity");
+    repo.rewrite_identity(&merge, &id)
+        .expect("rewrite identity");
 
     // git sees the rewritten author/committer on the merge tip, both parents kept.
     let fmt = "%an|%ae|%ad|%cn|%ce|%cd";
     let line = common::git(
         dir,
-        &["show", "-s", &format!("--format={fmt}"), "--date=format:%Y-%m-%d %H:%M:%S %z", "HEAD"],
+        &[
+            "show",
+            "-s",
+            &format!("--format={fmt}"),
+            "--date=format:%Y-%m-%d %H:%M:%S %z",
+            "HEAD",
+        ],
     );
     let fields: Vec<&str> = line.split('|').collect();
     assert_eq!(fields[0], "Ada Lovelace");
@@ -115,7 +132,10 @@ fn evil_merge_content_edit_keeps_both_parents() {
     repo.rewrite_file(&merge, "base.txt", "1\nEVIL-EDITED\n3\n")
         .expect("rewrite file");
 
-    assert_eq!(common::git(dir, &["show", "HEAD:base.txt"]), "1\nEVIL-EDITED\n3");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:base.txt"]),
+        "1\nEVIL-EDITED\n3"
+    );
     assert!(common::is_merge(dir, "HEAD"), "tip stays a 2-parent merge");
     assert_eq!(parent_subjects(dir), vec!["main-1", "side-1"]);
     assert_transparent(dir);
@@ -133,7 +153,8 @@ fn editing_a_non_merge_ancestor_keeps_the_merge_a_merge() {
     let commits = current(&repo);
     let side = by(&commits, "side-1").id.clone();
     let merge_change = by(&commits, "merge").change_id_hex();
-    repo.rewrite_message(&side, "side-1 (edited)").expect("rewrite");
+    repo.rewrite_message(&side, "side-1 (edited)")
+        .expect("rewrite");
 
     // The merge survived the rebase as a 2-parent merge, now over the edited side.
     let after = current(&repo);
@@ -141,7 +162,11 @@ fn editing_a_non_merge_ancestor_keeps_the_merge_a_merge() {
         .iter()
         .find(|c| c.change_id_hex() == merge_change)
         .expect("merge still present");
-    assert_eq!(merge.parents.len(), 2, "merge keeps both parents after the rebase");
+    assert_eq!(
+        merge.parents.len(),
+        2,
+        "merge keeps both parents after the rebase"
+    );
     assert!(common::is_merge(dir, "HEAD"));
     assert_eq!(parent_subjects(dir), vec!["main-1", "side-1 (edited)"]);
     assert_transparent(dir);
@@ -160,7 +185,8 @@ fn merge_survives_unrelated_rewrite() {
 
     // Edit a first-parent mainline ancestor; the merge must stay reachable and a
     // merge (it is never abandoned — only rebased through the rewrite).
-    repo.rewrite_message(&main1, "main-1 (edited)").expect("rewrite");
+    repo.rewrite_message(&main1, "main-1 (edited)")
+        .expect("rewrite");
 
     assert_eq!(
         common::git(dir, &["rev-list", "--merges", "--count", "HEAD"]),
@@ -168,7 +194,9 @@ fn merge_survives_unrelated_rewrite() {
         "exactly one merge survives in the rewritten history"
     );
     assert!(
-        current(&repo).iter().any(|c| c.change_id_hex() == merge_change && c.parents.len() == 2),
+        current(&repo)
+            .iter()
+            .any(|c| c.change_id_hex() == merge_change && c.parents.len() == 2),
         "the merge is still reachable from the new tip with both parents"
     );
     assert_transparent(dir);
@@ -207,8 +235,14 @@ fn moving_a_commit_out_of_the_merge_ancestry_keeps_the_merge() {
 
     // side-1 now tops the branch; the merge below kept both parents (its
     // emptied side line degenerates to the fork base rather than vanishing).
-    assert_eq!(common::git(dir, &["log", "-1", "--format=%s", "HEAD"]), "side-1");
-    assert!(common::is_merge(dir, "HEAD~1"), "the merge keeps a 2-parent shape");
+    assert_eq!(
+        common::git(dir, &["log", "-1", "--format=%s", "HEAD"]),
+        "side-1"
+    );
+    assert!(
+        common::is_merge(dir, "HEAD~1"),
+        "the merge keeps a 2-parent shape"
+    );
     assert_eq!(common::git(dir, &["show", "HEAD:side.txt"]), "side");
     assert_transparent(dir);
 }
@@ -230,7 +264,11 @@ fn moving_a_commit_into_a_sibling_lane_threads_that_line() {
     let cands = reorder_candidates(&repo, &commits, from, 1);
     assert_eq!(cands.len(), 1, "only the sibling line remains a candidate");
     let mv = cands[0].mv.clone();
-    assert_eq!(mv.new_parents, vec![side.clone()], "the side line is the destination");
+    assert_eq!(
+        mv.new_parents,
+        vec![side.clone()],
+        "the side line is the destination"
+    );
     let outcome = repo
         .reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("reorder");
@@ -239,7 +277,10 @@ fn moving_a_commit_into_a_sibling_lane_threads_that_line() {
     // The merge survives with two parents; main-1 now sits on the side line.
     assert!(common::is_merge(dir, "HEAD"));
     let main1_parent = common::git(dir, &["log", "-1", "--format=%s", "HEAD^2^"]);
-    assert_eq!(common::git(dir, &["log", "-1", "--format=%s", "HEAD^2"]), "main-1");
+    assert_eq!(
+        common::git(dir, &["log", "-1", "--format=%s", "HEAD^2"]),
+        "main-1"
+    );
     assert_eq!(main1_parent, "side-1");
     assert_eq!(common::git(dir, &["show", "HEAD:main.txt"]), "main");
     assert_transparent(dir);
@@ -270,7 +311,11 @@ fn restoring_a_dropped_commit_into_a_chosen_lane_rebuilds_the_side_branch() {
     let to = commits.iter().position(|c| c.subject == "base").unwrap();
     let layout = compute_graph(&commits, &repo.root_commit_id());
     let cands = repo.plan_restore_candidates(&commits, &layout, &side, to);
-    assert_eq!(cands.len(), 2, "both lines into base cross the gap above it");
+    assert_eq!(
+        cands.len(),
+        2,
+        "both lines into base cross the gap above it"
+    );
     let mv = cands
         .iter()
         .map(|c| &c.mv)
@@ -298,7 +343,9 @@ fn dropping_a_side_branch_commit_keeps_the_merge() {
     let mut repo = Repo::open(dir).expect("open");
     let commits = current(&repo);
     let from = commits.iter().position(|c| c.subject == "side-1").unwrap();
-    let target = repo.plan_drop(&commits, from).expect("a side-branch commit is droppable");
+    let target = repo
+        .plan_drop(&commits, from)
+        .expect("a side-branch commit is droppable");
     let outcome = repo.abandon_commit(&target).expect("drop");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 
@@ -307,7 +354,10 @@ fn dropping_a_side_branch_commit_keeps_the_merge() {
     assert!(common::is_merge(dir, "HEAD"));
     assert_eq!(parent_subjects(dir), vec!["base", "main-1"]);
     let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains("side.txt"), "side-1's change is gone: {tree}");
+    assert!(
+        !tree.contains("side.txt"),
+        "side-1's change is gone: {tree}"
+    );
     assert_transparent(dir);
 }
 
@@ -320,7 +370,9 @@ fn dropping_a_commit_below_the_merge_keeps_the_merge() {
     let mut repo = Repo::open(dir).expect("open");
     let commits = current(&repo);
     let from = commits.iter().position(|c| c.subject == "base").unwrap();
-    let target = repo.plan_drop(&commits, from).expect("the fork base is droppable");
+    let target = repo
+        .plan_drop(&commits, from)
+        .expect("the fork base is droppable");
     let outcome = repo.abandon_commit(&target).expect("drop");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 
@@ -352,18 +404,35 @@ fn the_merge_commit_itself_stays_fixed() {
 
     // A merge node is never a drag source — dropping, moving or squashing it
     // away would dissolve the join point's shape…
-    assert_eq!(repo.plan_drop(&commits, merge), None, "merge is not droppable");
+    assert_eq!(
+        repo.plan_drop(&commits, merge),
+        None,
+        "merge is not droppable"
+    );
     assert!(
         reorder_candidates(&repo, &commits, merge, 0).is_empty(),
         "merge is not reorderable"
     );
-    assert_eq!(repo.plan_squash(&commits, merge, tip1), None, "merge is not a squash source");
+    assert_eq!(
+        repo.plan_squash(&commits, merge, tip1),
+        None,
+        "merge is not a squash source"
+    );
 
     // …but it is a valid squash *destination* (an evil-merge style fold), and
     // the commits around it remain fully operable.
-    assert!(repo.plan_squash(&commits, tip1, merge).is_some(), "merge is a squash target");
-    assert!(repo.plan_drop(&commits, tip1).is_some(), "a linear commit is droppable");
-    assert!(repo.plan_squash(&commits, tip2, tip1).is_some(), "linear commits squash");
+    assert!(
+        repo.plan_squash(&commits, tip1, merge).is_some(),
+        "merge is a squash target"
+    );
+    assert!(
+        repo.plan_drop(&commits, tip1).is_some(),
+        "a linear commit is droppable"
+    );
+    assert!(
+        repo.plan_squash(&commits, tip2, tip1).is_some(),
+        "linear commits squash"
+    );
 }
 
 #[test]
@@ -381,7 +450,9 @@ fn squashing_across_merge_branches_lands_on_the_targets_line() {
     let (source, dest) = repo
         .plan_squash(&commits, pos("side-1"), pos("main-1"))
         .expect("cousins on different sides squash");
-    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    let outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 
     // main-1 now carries side.txt; the emptied side line degenerates onto the
@@ -392,7 +463,10 @@ fn squashing_across_merge_branches_lands_on_the_targets_line() {
         .map(|p| format!("HEAD^{p}"))
         .find(|r| common::git(dir, &["log", "-1", "--format=%s", r]) == "main-1")
         .expect("main-1 is a parent of the merge");
-    assert_eq!(common::git(dir, &["show", &format!("{main1}:side.txt")]), "side");
+    assert_eq!(
+        common::git(dir, &["show", &format!("{main1}:side.txt")]),
+        "side"
+    );
     assert_eq!(common::git(dir, &["show", "HEAD:side.txt"]), "side");
     assert_transparent(dir);
 }
@@ -414,13 +488,18 @@ fn squashing_into_a_merge_folds_the_change_into_its_tree() {
     let (source, dest) = repo
         .plan_squash(&commits, pos("top"), pos("merge"))
         .expect("the merge is a squash target");
-    let outcome = repo.squash_into(&source, &dest, SquashMode::Fixup).expect("squash");
+    let outcome = repo
+        .squash_into(&source, &dest, SquashMode::Fixup)
+        .expect("squash");
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
 
     // The merge is the tip again, with both parents, now carrying top.txt as
     // its remerge delta — an evil merge by construction.
     assert!(common::is_merge(dir, "HEAD"));
-    assert_eq!(common::git(dir, &["log", "-1", "--format=%s", "HEAD"]), "merge");
+    assert_eq!(
+        common::git(dir, &["log", "-1", "--format=%s", "HEAD"]),
+        "merge"
+    );
     assert_eq!(parent_subjects(dir), vec!["main-1", "side-1"]);
     assert_eq!(common::git(dir, &["show", "HEAD:top.txt"]), "top");
     assert_transparent(dir);
@@ -436,7 +515,10 @@ fn clean_merge_has_no_remerge_delta() {
     let merge = by(&current(&repo), "merge").id.clone();
     // A clean merge's tree equals the auto-merge of its parents — nothing to edit.
     let changes = commit_changes(&repo.repo, &merge).expect("changes");
-    assert!(changes.is_empty(), "clean merge has an empty remerge delta: {changes:?}");
+    assert!(
+        changes.is_empty(),
+        "clean merge has an empty remerge delta: {changes:?}"
+    );
 }
 
 #[test]
@@ -450,11 +532,17 @@ fn evil_merge_exposes_its_remerge_delta() {
     let changes = commit_changes(&repo.repo, &merge).expect("changes");
 
     // The merge's only delta vs. its (clean) auto-merged base is the evil edit.
-    let base = changes.iter().find(|c| c.path == "base.txt").expect("base.txt delta");
+    let base = changes
+        .iter()
+        .find(|c| c.path == "base.txt")
+        .expect("base.txt delta");
     assert_eq!(base.kind, ChangeKind::Modified);
     assert_eq!(base.old_text.as_deref(), Some("1\n2\n3\n"));
     assert_eq!(base.new_text.as_deref(), Some("1\nEVIL\n3\n"));
-    assert!(!base.conflicted_base, "a clean auto-merge has a resolvable base");
+    assert!(
+        !base.conflicted_base,
+        "a clean auto-merge has a resolvable base"
+    );
 }
 
 #[test]
@@ -469,7 +557,13 @@ fn conflicted_merge_base_is_flagged_read_only() {
 
     // The parents disagree at base.txt, so the auto-merged base is conflicted:
     // there is no single old side, hence the file is flagged not-editable.
-    let base = changes.iter().find(|c| c.path == "base.txt").expect("base.txt delta");
-    assert!(base.conflicted_base, "a disagreeing merge base is flagged conflicted");
+    let base = changes
+        .iter()
+        .find(|c| c.path == "base.txt")
+        .expect("base.txt delta");
+    assert!(
+        base.conflicted_base,
+        "a disagreeing merge base is flagged conflicted"
+    );
     assert_eq!(base.new_text.as_deref(), Some("1\nRESOLVED\n3\n"));
 }

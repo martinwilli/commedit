@@ -18,7 +18,11 @@ fn init_diverged_repo(dir: &Path) {
     let g = |args: &[&str]| common::git(dir, args);
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     g(&["checkout", "-q", "-b", "tmp", "main~1"]);
     std::fs::write(dir.join("d.txt"), "d\n").unwrap();

@@ -39,7 +39,11 @@ pub fn plan_reorder_single(
 ) -> ReorderMove {
     let layout = compute_graph(commits, &repo.root_commit_id());
     let mut cands = repo.plan_reorder_candidates(commits, &layout, from, to);
-    assert_eq!(cands.len(), 1, "expected exactly one destination line for the gap");
+    assert_eq!(
+        cands.len(),
+        1,
+        "expected exactly one destination line for the gap"
+    );
     cands.remove(0).mv
 }
 
@@ -53,7 +57,11 @@ pub fn plan_restore_single(
 ) -> ReorderMove {
     let layout = compute_graph(commits, &repo.root_commit_id());
     let mut cands = repo.plan_restore_candidates(commits, &layout, restored, to);
-    assert_eq!(cands.len(), 1, "expected exactly one destination line for the gap");
+    assert_eq!(
+        cands.len(),
+        1,
+        "expected exactly one destination line for the gap"
+    );
     cands.remove(0).mv
 }
 

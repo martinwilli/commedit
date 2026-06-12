@@ -50,7 +50,9 @@ fn a_history_rewrite_detects_and_resolves_conflicts_across_the_whole_wc_chain() 
     // Resolve the intermediate (oldest "Uncommitted changes"); the leaf's
     // inherited conflict clears on rebase, so the chain settles clean and exports.
     let intermediate = wc[0].change_id_hex();
-    let cf = repo.read_conflict(&intermediate, "f.txt").expect("read conflict");
+    let cf = repo
+        .read_conflict(&intermediate, "f.txt")
+        .expect("read conflict");
     let outcome = repo
         .resolve_conflict(&intermediate, "f.txt", "1\nRESOLVED\n3\n", cf.marker_len)
         .expect("resolve");
@@ -58,9 +60,18 @@ fn a_history_rewrite_detects_and_resolves_conflicts_across_the_whole_wc_chain() 
 
     // The rewrite now applies to git and the resolved uncommitted changes land on
     // disk (both the resolved f.txt and the still-uncommitted g.txt edit).
-    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\nREWRITTEN\n3");
-    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "1\nRESOLVED\n3\n");
-    assert_eq!(std::fs::read_to_string(dir.join("g.txt")).unwrap(), "g\nGG\n");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD~1:f.txt"]),
+        "1\nREWRITTEN\n3"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "1\nRESOLVED\n3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("g.txt")).unwrap(),
+        "g\nGG\n"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -123,11 +134,24 @@ fn conflicting_reorder_is_held_back_then_resolved() {
         let change_hex = oldest.change_id_hex();
 
         // The conflict materializes with 2-way markers (no base section).
-        let file = repo.read_conflict(&change_hex, &path_str).expect("read conflict");
-        assert!(file.text.contains("<<<<<<<"), "opening marker: {}", file.text);
+        let file = repo
+            .read_conflict(&change_hex, &path_str)
+            .expect("read conflict");
+        assert!(
+            file.text.contains("<<<<<<<"),
+            "opening marker: {}",
+            file.text
+        );
         assert!(file.text.contains("======="), "separator: {}", file.text);
-        assert!(file.text.contains(">>>>>>>"), "closing marker: {}", file.text);
-        assert!(!file.text.contains("|||||||"), "2-way markers omit the base");
+        assert!(
+            file.text.contains(">>>>>>>"),
+            "closing marker: {}",
+            file.text
+        );
+        assert!(
+            !file.text.contains("|||||||"),
+            "2-way markers omit the base"
+        );
 
         outcome = repo
             .resolve_conflict(&change_hex, &path_str, "1\nR\n3\n", file.marker_len)
@@ -139,12 +163,18 @@ fn conflicting_reorder_is_held_back_then_resolved() {
 
     // Plain git now sees the reordered, conflict-free history.
     assert_eq!(common::git_log_subjects(dir), vec!["A", "B", "base"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
     // No conflict residue leaked into the tree, and the repo is intact.
     let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains(".jjconflict"), "no .jjconflict-* in the tree: {tree}");
+    assert!(
+        !tree.contains(".jjconflict"),
+        "no .jjconflict-* in the tree: {tree}"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -183,18 +213,29 @@ fn multi_file_conflict_resolves_per_commit_in_one_call() {
             .filter(|f| f.resolvable)
             .map(|f| {
                 let path = f.path_str();
-                let cf = repo.read_conflict(&change_hex, &path).expect("read conflict");
-                let resolved = if path == "f.txt" { "1\nR\n3\n" } else { "x\nR\nz\n" };
+                let cf = repo
+                    .read_conflict(&change_hex, &path)
+                    .expect("read conflict");
+                let resolved = if path == "f.txt" {
+                    "1\nR\n3\n"
+                } else {
+                    "x\nR\nz\n"
+                };
                 (path, resolved.to_string(), cf.marker_len)
             })
             .collect();
         max_files = max_files.max(files.len());
-        outcome = repo.resolve_conflicts(&change_hex, &files).expect("resolve");
+        outcome = repo
+            .resolve_conflicts(&change_hex, &files)
+            .expect("resolve");
         steps += 1;
         assert!(steps < 10, "resolution should converge");
     }
     assert!(!repo.is_pending());
-    assert!(max_files >= 2, "a commit with two conflicted files was resolved at once");
+    assert!(
+        max_files >= 2,
+        "a commit with two conflicted files was resolved at once"
+    );
 
     assert_eq!(common::git_log_subjects(dir), vec!["A", "B", "base"]);
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
@@ -251,9 +292,18 @@ fn merge_rebase_conflict_is_held_back_then_resolved() {
             .path_str();
         assert_eq!(path, "base.txt");
         let change_hex = oldest.change_id_hex();
-        let file = repo.read_conflict(&change_hex, &path).expect("read conflict");
-        assert!(file.text.contains("<<<<<<<"), "opening marker: {}", file.text);
-        assert!(!file.text.contains("|||||||"), "2-way markers omit the base");
+        let file = repo
+            .read_conflict(&change_hex, &path)
+            .expect("read conflict");
+        assert!(
+            file.text.contains("<<<<<<<"),
+            "opening marker: {}",
+            file.text
+        );
+        assert!(
+            !file.text.contains("|||||||"),
+            "2-way markers omit the base"
+        );
         outcome = repo
             .resolve_conflict(&change_hex, &path, "1\nMERGED\n3\n", file.marker_len)
             .expect("resolve");
@@ -265,10 +315,16 @@ fn merge_rebase_conflict_is_held_back_then_resolved() {
     // git now sees the conflict-free rewritten history; the tip is still a merge.
     assert!(common::is_merge(dir, "HEAD"), "tip stays a 2-parent merge");
     assert_eq!(common::git(dir, &["show", "HEAD:base.txt"]), "1\nMERGED\n3");
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     let tree = common::git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
-    assert!(!tree.contains(".jjconflict"), "no .jjconflict-* in the tree: {tree}");
+    assert!(
+        !tree.contains(".jjconflict"),
+        "no .jjconflict-* in the tree: {tree}"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -350,7 +406,9 @@ fn resolving_works_despite_divergent_commits() {
             .expect("a resolvable file")
             .path_str();
         let change_hex = oldest.change_id_hex();
-        let file = repo.read_conflict(&change_hex, &path).expect("read conflict");
+        let file = repo
+            .read_conflict(&change_hex, &path)
+            .expect("read conflict");
         outcome = repo
             .resolve_conflict(&change_hex, &path, "1\nR\n3\n", file.marker_len)
             .expect("resolve");
@@ -365,8 +423,15 @@ fn resolving_works_despite_divergent_commits() {
     let subjects = common::git_log_subjects(dir);
     assert_eq!(subjects.len(), 3);
     assert_eq!(&subjects[..2], &["A", "B"]);
-    assert!(subjects[2].starts_with("base"), "base commit: {}", subjects[2]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert!(
+        subjects[2].starts_with("base"),
+        "base commit: {}",
+        subjects[2]
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\nR\n3");
     common::git(dir, &["fsck", "--no-progress"]);
@@ -405,7 +470,10 @@ fn concurrent_sessions_do_not_corrupt_a_shared_op_log() {
     );
 
     // No commedit metadata leaked into the user's repo, and git is intact.
-    assert!(!dir.join(".jj").exists(), "commedit must not create .jj in the repo");
+    assert!(
+        !dir.join(".jj").exists(),
+        "commedit must not create .jj in the repo"
+    );
     assert!(repo.head_commit_id().is_some());
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -433,11 +501,15 @@ fn abort_leaves_a_single_op_head() {
     // which the next load-at-head merges into the stale, conflicted state.
     let head = repo.head_commit_id().expect("head");
     let commits = history(&repo.repo, &head).expect("history");
-    let b = commits.iter().find(|c| c.subject == "B").expect("B").id.clone();
+    let b = commits
+        .iter()
+        .find(|c| c.subject == "B")
+        .expect("B")
+        .id
+        .clone();
     repo.rewrite_message(&b, "B edited").expect("edit B");
 
-    let heads = pollster::block_on(repo.repo.op_heads_store().get_op_heads())
-        .expect("op heads");
+    let heads = pollster::block_on(repo.repo.op_heads_store().get_op_heads()).expect("op heads");
     assert_eq!(
         heads.len(),
         1,

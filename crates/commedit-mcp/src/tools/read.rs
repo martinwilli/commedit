@@ -12,9 +12,7 @@ use crate::convert::{commit_dto, file_change_dto, DetailFields};
 /// response so an unbounded walk can't blow the tool's token budget; deeper
 /// history is reachable via `limit` or `offset` paging.
 const DEFAULT_HISTORY_LIMIT: usize = 30;
-use crate::dto::{
-    ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp,
-};
+use crate::dto::{ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{limited_history, resolve_ref, RefEntry};

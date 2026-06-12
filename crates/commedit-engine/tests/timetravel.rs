@@ -45,7 +45,8 @@ fn undo_one_clean_edit_restores_git() {
     let mut repo = Repo::open(dir).expect("open");
 
     let second = id_of(&repo, "second");
-    repo.rewrite_message(&second, "second (edited)").expect("edit");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("edit");
     assert_eq!(
         common::git_log_subjects(dir),
         vec!["third", "second (edited)", "first"]
@@ -63,7 +64,10 @@ fn undo_one_clean_edit_restores_git() {
     );
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert!(!repo.can_undo());
     assert!(repo.can_redo());
     assert_eq!(repo.op_cursor(), 0);
@@ -74,11 +78,15 @@ fn undo_one_clean_edit_restores_git() {
 fn redo_reapplies_after_undo() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     let second = id_of(&repo, "second");
-    repo.rewrite_message(&second, "second (edited)").expect("edit");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("edit");
     repo.undo().expect("undo");
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
 
@@ -109,7 +117,8 @@ fn jump_to_intermediate_op() {
 
     // Three distinct mutations.
     let first = id_of(&repo, "first");
-    repo.rewrite_message(&first, "first (edited)").expect("edit 1");
+    repo.rewrite_message(&first, "first (edited)")
+        .expect("edit 1");
     let third = id_of(&repo, "third");
     repo.abandon_commit(&third).expect("drop 3");
     let second = id_of(&repo, "second");
@@ -131,7 +140,10 @@ fn jump_to_intermediate_op() {
     // Jump forward to the latest state.
     repo.jump_to_op(3).expect("jump forward");
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), latest);
-    assert_eq!(common::git_log_subjects(dir), vec!["second", "first (edited)"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["second", "first (edited)"]
+    );
     assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b changed");
     assert_eq!(repo.op_cursor(), 3);
     common::git(dir, &["fsck", "--no-progress"]);
@@ -141,7 +153,10 @@ fn jump_to_intermediate_op() {
 fn new_edit_after_undo_truncates_redo() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     let first = id_of(&repo, "first");
@@ -211,7 +226,8 @@ fn undo_floor_is_session_start() {
     let mut repo = Repo::open(dir).expect("open");
 
     let second = id_of(&repo, "second");
-    repo.rewrite_message(&second, "second (edited)").expect("edit");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("edit");
     let third = id_of(&repo, "third");
     repo.abandon_commit(&third).expect("drop");
 
@@ -303,16 +319,14 @@ fn revert_all_still_lands_cursor_at_zero() {
     let dir = tmp.path();
     common::init_repo(
         dir,
-        &[
-            ("a.txt", "a\n", "first"),
-            ("b.txt", "b\n", "second"),
-        ],
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
     );
     let session_head = common::git(dir, &["rev-parse", "HEAD"]);
     let mut repo = Repo::open(dir).expect("open");
 
     let second = id_of(&repo, "second");
-    repo.rewrite_message(&second, "second (edited)").expect("edit");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("edit");
 
     repo.revert_all().expect("revert all");
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), session_head);

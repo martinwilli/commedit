@@ -174,11 +174,12 @@ impl Repo {
         let git_dir = state_dir.join("git");
         crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
             .context("setting up the session git dir")?;
-        let backend_initializer =
-            |settings: &UserSettings, store_path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
-                let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
-                Ok(Box::new(backend))
-            };
+        let backend_initializer = |settings: &UserSettings,
+                                   store_path: &Path|
+         -> Result<Box<dyn Backend>, BackendInitError> {
+            let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
+            Ok(Box::new(backend))
+        };
 
         let repo = pollster::block_on(ReadonlyRepo::init(
             settings,
@@ -196,10 +197,10 @@ impl Repo {
         // target is the user's worktree but whose state lives in `state_dir`.
         // (`Repo::open` reattaches @ onto the imported git HEAD afterwards.)
         let mut tx = repo.start_transaction();
-        pollster::block_on(
-            tx.repo_mut()
-                .check_out(WorkspaceName::DEFAULT.to_owned(), &repo.store().root_commit()),
-        )
+        pollster::block_on(tx.repo_mut().check_out(
+            WorkspaceName::DEFAULT.to_owned(),
+            &repo.store().root_commit(),
+        ))
         .context("checking out the root commit")?;
         let repo = pollster::block_on(tx.commit("add workspace"))
             .context("committing the initial workspace")?;
@@ -215,8 +216,13 @@ impl Repo {
             )
             .context("initializing the working copy")?;
 
-        let workspace = Workspace::new(workspace_root, repo_dir, working_copy, repo.loader().clone())
-            .context("assembling the jj workspace")?;
+        let workspace = Workspace::new(
+            workspace_root,
+            repo_dir,
+            working_copy,
+            repo.loader().clone(),
+        )
+        .context("assembling the jj workspace")?;
         Ok((workspace, repo))
     }
 
@@ -333,11 +339,16 @@ impl Repo {
         };
         // Session-start tree: the @ recorded in the session-start view, or its
         // HEAD where there was none (detached HEAD).
-        let view = pollster::block_on(session_op.view()).context("reading the session-start view")?;
+        let view =
+            pollster::block_on(session_op.view()).context("reading the session-start view")?;
         let old_id = view
             .get_wc_commit_id(self.workspace.workspace_name())
             .cloned()
-            .or_else(|| self.session_head.as_deref().and_then(CommitId::try_from_hex));
+            .or_else(|| {
+                self.session_head
+                    .as_deref()
+                    .and_then(CommitId::try_from_hex)
+            });
         let Some(old_id) = old_id else {
             return Ok(Vec::new());
         };
@@ -536,10 +547,15 @@ impl Repo {
                     && symbol.name == *name
             })
         };
-        pollster::block_on(git::import_some_refs(tx.repo_mut(), &options, git_ref_filter))
-            .context("importing the checked-out branch")?;
+        pollster::block_on(git::import_some_refs(
+            tx.repo_mut(),
+            &options,
+            git_ref_filter,
+        ))
+        .context("importing the checked-out branch")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing after import")?;
-        self.repo = pollster::block_on(tx.commit("import git refs")).context("committing import")?;
+        self.repo =
+            pollster::block_on(tx.commit("import git refs")).context("committing import")?;
         Ok(())
     }
 }
@@ -619,8 +635,13 @@ const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 /// committed — a repo that sets `committer.email` no longer needs `user.email`
 /// duplicated just for commedit's sake.
 fn build_settings(workspace_root: &Path) -> Result<UserSettings> {
-    let name = committer_field(workspace_root, "GIT_COMMITTER_NAME", "committer.name", "user.name")
-        .unwrap_or_else(|| "commedit".to_string());
+    let name = committer_field(
+        workspace_root,
+        "GIT_COMMITTER_NAME",
+        "committer.name",
+        "user.name",
+    )
+    .unwrap_or_else(|| "commedit".to_string());
     let email = committer_field(
         workspace_root,
         "GIT_COMMITTER_EMAIL",
@@ -634,9 +655,8 @@ fn build_settings(workspace_root: &Path) -> Result<UserSettings> {
     config.add_layer(
         ConfigLayer::parse(ConfigSource::Default, DEFAULT_CONFIG).context("parsing defaults")?,
     );
-    config.add_layer(
-        ConfigLayer::parse(ConfigSource::User, &identity).context("parsing identity")?,
-    );
+    config
+        .add_layer(ConfigLayer::parse(ConfigSource::User, &identity).context("parsing identity")?);
     UserSettings::from_config(config).context("building user settings")
 }
 
@@ -680,7 +700,10 @@ mod tests {
 
         let err = caught.expect_err("a panic must surface as Err");
         assert!(err.to_string().contains("graph has cycle"), "{err}");
-        assert!(err.to_string().contains("testing failed inside jj-lib"), "{err}");
+        assert!(
+            err.to_string().contains("testing failed inside jj-lib"),
+            "{err}"
+        );
         assert_eq!(passed.unwrap(), 7);
     }
 

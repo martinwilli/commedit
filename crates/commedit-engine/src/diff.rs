@@ -5,15 +5,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use futures::io::AsyncReadExt;
 use futures::StreamExt;
-use similar::{ChangeTag, DiffOp, TextDiff};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::RepoPath;
 use jj_lib::store::Store;
-use futures::io::AsyncReadExt;
+use similar::{ChangeTag, DiffOp, TextDiff};
 
 /// How a file changed in a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,11 +217,7 @@ struct Seg<'a> {
 /// Flatten a line-level diff's ops into one sequence of segments, tracking each
 /// line's old/new index and its text. Shared by [`render_diff`] and
 /// [`revert_groups`] so both see identical segmentation and change grouping.
-fn diff_segments<'a>(
-    old_lines: &[&'a str],
-    new_lines: &[&'a str],
-    ops: &[DiffOp],
-) -> Vec<Seg<'a>> {
+fn diff_segments<'a>(old_lines: &[&'a str], new_lines: &[&'a str], ops: &[DiffOp]) -> Vec<Seg<'a>> {
     let mut segs: Vec<Seg> = Vec::new();
     for op in ops {
         match *op {
@@ -508,7 +504,11 @@ pub(crate) fn window_groups(
         .iter()
         .enumerate()
         .map(|(idx, &(a, b))| {
-            let top_avail = if a == 0 { groups[0].0 } else { groups[a].0 - groups[a - 1].1 };
+            let top_avail = if a == 0 {
+                groups[0].0
+            } else {
+                groups[a].0 - groups[a - 1].1
+            };
             let bot_avail = if b + 1 == group_count {
                 total - groups[b].1
             } else {
@@ -1171,7 +1171,10 @@ fn parse_hunk_old_start(header: &str) -> Result<usize> {
         .split('-')
         .nth(1)
         .context("malformed hunk header (no '-')")?;
-    let digits: String = after_minus.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = after_minus
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse::<usize>().context("malformed hunk start")
 }
 
@@ -1238,7 +1241,11 @@ mod tests {
         let mut exp = ContextExpansion::default();
         let rendered = render_diff(&old, &new, "f", &exp);
         assert_eq!(rendered.group_count, 2);
-        assert_eq!(rendered.hunks.len(), 2, "two distant edits start as two hunks");
+        assert_eq!(
+            rendered.hunks.len(),
+            2,
+            "two distant edits start as two hunks"
+        );
         // The first edit (line 3) sits two lines from the top, so there is
         // nothing more to reveal above it; below, the second hunk follows.
         assert!(!rendered.hunks[0].can_expand_up);
@@ -1372,7 +1379,10 @@ mod tests {
         // Selecting group g must equal reverting every group but g.
         let (old, new) = two_change_file();
         let kept: BTreeSet<usize> = [0].into_iter().collect();
-        assert_eq!(select_groups(&old, &new, &kept), revert_groups(&old, &new, 1, 1));
+        assert_eq!(
+            select_groups(&old, &new, &kept),
+            revert_groups(&old, &new, 1, 1)
+        );
     }
 
     /// Concatenate the substrings a line's intra ranges select from its code.
@@ -1396,8 +1406,14 @@ mod tests {
         let old = "let r = f(a, b);";
         let new = "let r = f(a, c);";
         let lines = parse_diff_lines(&unified_diff(&format!("{old}\n"), &format!("{new}\n"), "f"));
-        let removed = lines.iter().find(|l| l.kind == DiffLineKind::Removed).unwrap();
-        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
+        let removed = lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Removed)
+            .unwrap();
+        let added = lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Added)
+            .unwrap();
         assert_eq!(marked(old, &removed.intra), "b");
         assert_eq!(marked(new, &added.intra), "c");
     }
@@ -1407,8 +1423,14 @@ mod tests {
         let old = "a = alpha;\nb = beta;\n";
         let new = "a = alphaX;\nb = betaY;\n";
         let lines = parse_diff_lines(&unified_diff(old, new, "f"));
-        let removed: Vec<_> = lines.iter().filter(|l| l.kind == DiffLineKind::Removed).collect();
-        let added: Vec<_> = lines.iter().filter(|l| l.kind == DiffLineKind::Added).collect();
+        let removed: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Removed)
+            .collect();
+        let added: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Added)
+            .collect();
         assert_eq!(removed.len(), 2);
         assert_eq!(added.len(), 2);
         // Each added line marks the whole changed token, not just the new char.
@@ -1421,7 +1443,10 @@ mod tests {
         // A single changed character inside a token highlights the whole token
         // as one contiguous span — no per-character speckle.
         let lines = parse_diff_lines(&unified_diff("value = foobar;\n", "value = fooBar;\n", "f"));
-        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
+        let added = lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Added)
+            .unwrap();
         assert_eq!(added.intra.len(), 1);
         assert_eq!(marked("value = fooBar;", &added.intra), "fooBar");
     }
@@ -1431,8 +1456,14 @@ mod tests {
         // A near-total rewrite would blanket the line, so emphasis is dropped and
         // only the line background remains.
         let lines = parse_diff_lines(&unified_diff("abcdefgh\n", "12345678\n", "f"));
-        let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
-        let removed = lines.iter().find(|l| l.kind == DiffLineKind::Removed).unwrap();
+        let added = lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Added)
+            .unwrap();
+        let removed = lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Removed)
+            .unwrap();
         assert!(added.intra.is_empty());
         assert!(removed.intra.is_empty());
     }
@@ -1459,7 +1490,7 @@ mod tests {
         assert_roundtrip("removed\nlines\n", "");
         assert_roundtrip("a\nb\nc\n", "a\nb\nc\n");
         assert_roundtrip("x\ny", "x\nY"); // no trailing newline
-        // Multiple hunks (changes separated by more than the context radius).
+                                          // Multiple hunks (changes separated by more than the context radius).
         let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
         let new = "1\nTWO\n3\n4\n5\n6\n7\n8\nNINE\n10\n";
         assert_roundtrip(old, new);
@@ -1643,7 +1674,9 @@ mod tests {
         let combined = render_commit_diff(&changes, &HashMap::new());
         assert!(!combined.files[0].editable);
         assert!(combined.files[0].hunks.is_empty());
-        assert!(combined.text.contains("Conflicted merge base (not editable)"));
+        assert!(combined
+            .text
+            .contains("Conflicted merge base (not editable)"));
     }
 
     /// A 14-line file with a conflict block buried in the middle.
@@ -1699,7 +1732,10 @@ mod tests {
         assert!(!snip.text.contains("<CUE>"));
         assert!(snip.text.contains("a") && snip.text.contains("d"));
         let shown: Vec<&str> = snip.text.split('\n').collect();
-        assert_eq!(reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>"), full);
+        assert_eq!(
+            reconstruct_conflict_file(&shown, &snip.pieces, "<CUE>"),
+            full
+        );
     }
 
     #[test]
@@ -1708,7 +1744,11 @@ mod tests {
         let mut exp = ContextExpansion::default();
         let base = render_conflict_snippets(&full, &exp, "<CUE>");
         // Widen the gap above the block (the leading elided run).
-        let leading = base.gaps.iter().find(|g| g.below == Some(0)).expect("leading gap");
+        let leading = base
+            .gaps
+            .iter()
+            .find(|g| g.below == Some(0))
+            .expect("leading gap");
         exp.expand_gap(leading.above, leading.below);
         let wider = render_conflict_snippets(&full, &exp, "<CUE>");
         assert!(
@@ -1717,7 +1757,10 @@ mod tests {
         );
         // It still reconstructs to the original.
         let shown: Vec<&str> = wider.text.split('\n').collect();
-        assert_eq!(reconstruct_conflict_file(&shown, &wider.pieces, "<CUE>"), full);
+        assert_eq!(
+            reconstruct_conflict_file(&shown, &wider.pieces, "<CUE>"),
+            full
+        );
     }
 
     #[test]

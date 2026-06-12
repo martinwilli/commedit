@@ -34,7 +34,10 @@ fn split_middle_commit_inserts_followup_and_preserves_descendants() {
     // Rewrite "second" to leave f.txt edited; the inserted commit must restore the
     // original "v2" so the tip and "third" are untouched.
     let outcome = repo
-        .split_commit(&target.id, &[("f.txt".to_string(), "v2-edited\n".to_string())])
+        .split_commit(
+            &target.id,
+            &[("f.txt".to_string(), "v2-edited\n".to_string())],
+        )
         .expect("split");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -58,7 +61,10 @@ fn split_middle_commit_inserts_followup_and_preserves_descendants() {
     );
 
     // Transparency invariants hold.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -91,11 +97,23 @@ fn split_working_copy_peels_a_file_into_a_second_entry_without_touching_git() {
     // git is completely untouched and the on-disk content is byte-identical.
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     let status = common::git(dir, &["status", "--porcelain"]);
-    assert!(status.contains("a.txt") && status.contains("b.txt"), "got: {status:?}");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    assert!(
+        status.contains("a.txt") && status.contains("b.txt"),
+        "got: {status:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -120,8 +138,14 @@ fn split_working_copy_chain_survives_a_snapshot() {
         2,
         "the split chain must survive a snapshot"
     );
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
 }
 
 #[test]
@@ -145,8 +169,14 @@ fn reopening_collapses_a_persisted_split_chain_to_one_entry() {
     let chain = repo.working_copy_chain();
     assert_eq!(chain.len(), 1, "the persisted chain collapses on reopen");
     assert_eq!(chain[0].changed_files, 2, "both changes in one entry");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -164,7 +194,10 @@ fn split_tip_commit_moves_branch_to_followup() {
     // Edit the tip's diff to add an extra line; the inserted commit restores the
     // original tip content, so the branch tip stays "a\nb".
     let outcome = repo
-        .split_commit(&target.id, &[("f.txt".to_string(), "a\nb\nc\n".to_string())])
+        .split_commit(
+            &target.id,
+            &[("f.txt".to_string(), "a\nb\nc\n".to_string())],
+        )
         .expect("split");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
@@ -176,7 +209,10 @@ fn split_tip_commit_moves_branch_to_followup() {
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "a\nb"); //   fixup! second (N)
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "a\nb\nc"); // second (C')
 
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }

@@ -39,14 +39,27 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
     let mut refs = BTreeMap::new();
     refs.insert(
         CommitId::new(vec![3]).hex(),
-        vec![RefDecoration { name: "main".into(), kind: RefKind::Branch, current: true }],
+        vec![RefDecoration {
+            name: "main".into(),
+            kind: RefKind::Branch,
+            current: true,
+        }],
     );
 
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &refs, &IdAbbrev::full(), DetailFields::ALL);
+    let dto = commit_dto(
+        &ci(3, &[2]),
+        &root_hex,
+        &refs,
+        &IdAbbrev::full(),
+        DetailFields::ALL,
+    );
     assert_eq!(dto.sha, CommitId::new(vec![3]).hex());
     assert_eq!(dto.change_id, ChangeId::new(vec![3]).hex());
     assert_eq!(dto.subject, "subject 3");
-    assert_eq!(dto.detail.parent_shas.unwrap(), vec![CommitId::new(vec![2]).hex()]);
+    assert_eq!(
+        dto.detail.parent_shas.unwrap(),
+        vec![CommitId::new(vec![2]).hex()]
+    );
     assert!(!dto.is_merge);
     assert_eq!(dto.refs.len(), 1);
     assert_eq!(dto.refs[0].name, "main");
@@ -54,13 +67,23 @@ fn commit_dto_maps_fields_and_filters_the_root_parent() {
     assert!(dto.refs[0].current);
 
     // The oldest commit's parent is the virtual root: not a real commit.
-    let oldest =
-        commit_dto(&ci(1, &[0]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), DetailFields::ALL);
+    let oldest = commit_dto(
+        &ci(1, &[0]),
+        &root_hex,
+        &BTreeMap::new(),
+        &IdAbbrev::full(),
+        DetailFields::ALL,
+    );
     assert!(oldest.detail.parent_shas.unwrap().is_empty());
     assert!(oldest.refs.is_empty());
 
-    let merge =
-        commit_dto(&ci(4, &[3, 2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), DetailFields::ALL);
+    let merge = commit_dto(
+        &ci(4, &[3, 2]),
+        &root_hex,
+        &BTreeMap::new(),
+        &IdAbbrev::full(),
+        DetailFields::ALL,
+    );
     assert!(merge.is_merge);
     assert_eq!(merge.detail.parent_shas.unwrap().len(), 2);
 }
@@ -71,26 +94,45 @@ fn commit_dto_includes_only_the_selected_fields() {
 
     // A header-only row: every verbose field omitted.
     let none = DetailFields::from_request(Some(&[]));
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), none);
+    let dto = commit_dto(
+        &ci(3, &[2]),
+        &root_hex,
+        &BTreeMap::new(),
+        &IdAbbrev::full(),
+        none,
+    );
     let d = &dto.detail;
     assert!(d.description.is_none() && d.author_time.is_none() && d.parent_shas.is_none());
     // The header is still populated.
     assert_eq!(dto.subject, "subject 3");
 
     // An explicit subset includes exactly those fields.
-    let times = DetailFields::from_request(Some(&[
-        CommitField::AuthorTime,
-        CommitField::CommitterTime,
-    ]));
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), times);
+    let times =
+        DetailFields::from_request(Some(&[CommitField::AuthorTime, CommitField::CommitterTime]));
+    let dto = commit_dto(
+        &ci(3, &[2]),
+        &root_hex,
+        &BTreeMap::new(),
+        &IdAbbrev::full(),
+        times,
+    );
     let d = &dto.detail;
     assert_eq!(d.author_time.as_deref(), Some("2026-01-01 10:00:00 +0100"));
-    assert_eq!(d.committer_time.as_deref(), Some("2026-01-02 10:00:00 +0100"));
+    assert_eq!(
+        d.committer_time.as_deref(),
+        Some("2026-01-02 10:00:00 +0100")
+    );
     assert!(d.description.is_none() && d.author_name.is_none() && d.parent_shas.is_none());
 
     // An absent list (the `None` request) selects everything.
     let all = DetailFields::from_request(None);
-    let dto = commit_dto(&ci(3, &[2]), &root_hex, &BTreeMap::new(), &IdAbbrev::full(), all);
+    let dto = commit_dto(
+        &ci(3, &[2]),
+        &root_hex,
+        &BTreeMap::new(),
+        &IdAbbrev::full(),
+        all,
+    );
     assert!(dto.detail.description.is_some() && dto.detail.parent_shas.is_some());
 }
 
@@ -155,7 +197,10 @@ fn save_result_serializes_with_a_status_tag() {
     let json = serde_json::to_value(&dto).unwrap();
     assert_eq!(json["status"], "conflicts");
     assert_eq!(json["guidance"], CONFLICT_GUIDANCE);
-    assert_eq!(json["commits"][0]["change_id"], ChangeId::new(vec![7]).hex());
+    assert_eq!(
+        json["commits"][0]["change_id"],
+        ChangeId::new(vec![7]).hex()
+    );
     assert_eq!(json["commits"][0]["files"][0]["path"], "a.txt");
     assert_eq!(json["commits"][0]["files"][0]["resolvable"], true);
     match dto {
@@ -184,11 +229,26 @@ fn conflicted_commit_dto_keys_on_the_change_id() {
 
 #[test]
 fn squash_mode_resolution_prefers_explicit_then_prefix_then_fixup() {
-    assert_eq!(resolve_squash_mode(Some("squash"), "fixup! x"), Ok(SquashMode::Squash));
-    assert_eq!(resolve_squash_mode(Some("amend"), "x"), Ok(SquashMode::Amend));
-    assert_eq!(resolve_squash_mode(Some("fixup"), "x"), Ok(SquashMode::Fixup));
+    assert_eq!(
+        resolve_squash_mode(Some("squash"), "fixup! x"),
+        Ok(SquashMode::Squash)
+    );
+    assert_eq!(
+        resolve_squash_mode(Some("amend"), "x"),
+        Ok(SquashMode::Amend)
+    );
+    assert_eq!(
+        resolve_squash_mode(Some("fixup"), "x"),
+        Ok(SquashMode::Fixup)
+    );
     assert!(resolve_squash_mode(Some("merge"), "x").is_err());
-    assert_eq!(resolve_squash_mode(None, "squash! x"), Ok(SquashMode::Squash));
+    assert_eq!(
+        resolve_squash_mode(None, "squash! x"),
+        Ok(SquashMode::Squash)
+    );
     assert_eq!(resolve_squash_mode(None, "amend! x"), Ok(SquashMode::Amend));
-    assert_eq!(resolve_squash_mode(None, "plain subject"), Ok(SquashMode::Fixup));
+    assert_eq!(
+        resolve_squash_mode(None, "plain subject"),
+        Ok(SquashMode::Fixup)
+    );
 }

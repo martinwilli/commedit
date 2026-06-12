@@ -78,7 +78,10 @@ fn rewrites_middle_commit_message_visible_to_git() {
 
     // Transparency invariants: HEAD attached to the original branch, and a
     // clean working tree — a plain-git user sees nothing unusual.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
 
     // Repository must remain intact.
@@ -111,7 +114,8 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
         committer_email: "grace@example.com".to_string(),
         committer_time: "2026-06-06 09:00:00 +0000".to_string(),
     };
-    repo.rewrite_identity(&target, &id).expect("rewrite identity");
+    repo.rewrite_identity(&target, &id)
+        .expect("rewrite identity");
 
     // Plain git must see the rewritten author/committer and dates. The rewritten
     // commit is the history root, so resolve it via the first-parent chain.
@@ -119,7 +123,13 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
     let fmt = "%an|%ae|%ad|%cn|%ce|%cd";
     let line = common::git(
         dir,
-        &["show", "-s", &format!("--format={fmt}"), "--date=format:%Y-%m-%d %H:%M:%S %z", &root],
+        &[
+            "show",
+            "-s",
+            &format!("--format={fmt}"),
+            "--date=format:%Y-%m-%d %H:%M:%S %z",
+            &root,
+        ],
     );
     let fields: Vec<&str> = line.split('|').collect();
     assert_eq!(fields[0], "Ada Lovelace");
@@ -137,7 +147,10 @@ fn rewrites_author_and_committer_identity_visible_to_git() {
 fn id_abbrev_emits_floored_unique_prefixes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let repo = Repo::open(dir).expect("open");
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
 
@@ -146,8 +159,16 @@ fn id_abbrev_emits_floored_unique_prefixes() {
         let sha = abbrev.commit(&c.id);
         let change = abbrev.change(&c.change_id);
         // A true, floored prefix that never exceeds the full id.
-        assert!(c.id.hex().starts_with(&sha), "{sha} prefixes {}", c.id.hex());
-        assert!(c.change_id.hex().starts_with(&change), "{change} prefixes {}", c.change_id.hex());
+        assert!(
+            c.id.hex().starts_with(&sha),
+            "{sha} prefixes {}",
+            c.id.hex()
+        );
+        assert!(
+            c.change_id.hex().starts_with(&change),
+            "{change} prefixes {}",
+            c.change_id.hex()
+        );
         assert!(sha.len() >= IdAbbrev::MIN && sha.len() <= c.id.hex().len());
         assert!(change.len() >= IdAbbrev::MIN && change.len() <= c.change_id.hex().len());
     }
@@ -155,7 +176,10 @@ fn id_abbrev_emits_floored_unique_prefixes() {
     // The no-op abbreviator returns full ids unchanged.
     let full = IdAbbrev::full();
     assert_eq!(full.commit(&commits[0].id), commits[0].id.hex());
-    assert_eq!(full.change(&commits[0].change_id), commits[0].change_id.hex());
+    assert_eq!(
+        full.change(&commits[0].change_id),
+        commits[0].change_id.hex()
+    );
 }
 
 #[test]
@@ -194,7 +218,10 @@ fn batch_redates_a_parent_and_child_without_restamping() {
         BatchEdit {
             target: by("second").id.clone(),
             message: None,
-            identity: Some(dated("2026-06-11 18:30:00 +0200", "2026-06-11 18:30:00 +0200")),
+            identity: Some(dated(
+                "2026-06-11 18:30:00 +0200",
+                "2026-06-11 18:30:00 +0200",
+            )),
         },
         BatchEdit {
             target: by("third").id.clone(),
@@ -204,7 +231,10 @@ fn batch_redates_a_parent_and_child_without_restamping() {
         BatchEdit {
             target: by("first").id.clone(),
             message: None,
-            identity: Some(dated("2026-06-11 18:00:00 +0200", "2026-06-11 18:05:00 +0200")),
+            identity: Some(dated(
+                "2026-06-11 18:00:00 +0200",
+                "2026-06-11 18:05:00 +0200",
+            )),
         },
     ];
     // A pure message/identity batch changes no trees, so the rebase is always
@@ -232,10 +262,19 @@ fn batch_redates_a_parent_and_child_without_restamping() {
     let child_sha = a("second").id.hex();
     let cd = common::git(
         dir,
-        &["show", "-s", "--format=%cd", "--date=format:%Y-%m-%d %H:%M:%S %z", &child_sha],
+        &[
+            "show",
+            "-s",
+            "--format=%cd",
+            "--date=format:%Y-%m-%d %H:%M:%S %z",
+            &child_sha,
+        ],
     );
     assert_eq!(cd, "2026-06-11 18:30:00 +0200");
-    assert_eq!(common::git_log_subjects(dir), vec!["third (edited)", "second", "first"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["third (edited)", "second", "first"]
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -283,7 +322,10 @@ fn reorders_commit_to_a_new_position_visible_to_git() {
     );
 
     // Transparency invariants: HEAD attached, clean tree, intact repo.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -371,7 +413,11 @@ fn a_clean_move_to_the_top_keeps_the_worktree_on_the_new_tip() {
     // (whose chain rebuild would mask a stranded working copy) gets involved.
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     // An uncommitted edit that must survive the move.
     std::fs::write(dir.join("local.txt"), "local\n").unwrap();
@@ -388,7 +434,10 @@ fn a_clean_move_to_the_top_keeps_the_worktree_on_the_new_tip() {
     assert_eq!(common::git_log_subjects(dir), vec!["B", "C", "A"]);
     assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "?? local.txt");
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -426,7 +475,10 @@ fn history_has_no_duplicate_rows_after_a_reorder() {
     // The plain-git side must be clean too: no `refs/jj/keep/*` clutter and no
     // unreachable pre-reorder commits surfacing in `git log --all`.
     assert_eq!(
-        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]),
+        common::git(
+            dir,
+            &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]
+        ),
         ""
     );
     let mut all_subjects: Vec<_> = common::git(dir, &["log", "--all", "--format=%s"])
@@ -444,7 +496,11 @@ fn keep_ref_for_a_manual_jj_anonymous_head_is_preserved() {
     let g = |args: &[&str]| common::git(dir, args);
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
 
     // Simulate a manual jj user's un-bookmarked work: a commit off B with no
@@ -470,7 +526,10 @@ fn keep_ref_for_a_manual_jj_anonymous_head_is_preserved() {
     // The anonymous head's keep-ref (and thus the commit) must still be there:
     // commedit only prunes its own history's keep-refs.
     assert_eq!(
-        common::git(dir, &["rev-parse", "--verify", &format!("refs/jj/keep/{anon}")]),
+        common::git(
+            dir,
+            &["rev-parse", "--verify", &format!("refs/jj/keep/{anon}")]
+        ),
         anon
     );
 }
@@ -486,7 +545,11 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     // linear, but the gitk-style view also shows the side branch.
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     g(&["checkout", "-q", "-b", "side", "main~2"]);
     std::fs::write(dir.join("x.txt"), "x\n").unwrap();
@@ -498,7 +561,10 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
     // The view is a DAG (side diverges), yet reordering the linear main branch
     // must still work — this is what the over-strict whole-view gate broke.
-    let third = commits.iter().find(|c| c.subject == "C").expect("C present");
+    let third = commits
+        .iter()
+        .find(|c| c.subject == "C")
+        .expect("C present");
     let from = commits.iter().position(|c| c.id == third.id).unwrap();
     let mv = common::plan_reorder_single(&repo, &commits, from, commits.len());
     repo.reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
@@ -507,9 +573,20 @@ fn reorder_works_on_a_linear_branch_with_a_divergent_side_ref() {
     // main is rearranged and stays linear (no spurious merge), the side branch
     // is untouched, and the repo is intact.
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "C"]);
-    assert_eq!(common::git(dir, &["rev-list", "--merges", "--count", "main"]), "0");
-    assert_eq!(common::git(dir, &["log", "--format=%s", "side"]).lines().next(), Some("X"));
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["rev-list", "--merges", "--count", "main"]),
+        "0"
+    );
+    assert_eq!(
+        common::git(dir, &["log", "--format=%s", "side"])
+            .lines()
+            .next(),
+        Some("X")
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -525,7 +602,11 @@ fn rewrite_leaves_a_backup_branch_on_the_same_tip_untouched() {
     // main; `git branch` creates the ref without moving HEAD.)
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     g(&["branch", "backup"]);
     let backup_before = g(&["rev-parse", "backup"]);
@@ -534,8 +615,12 @@ fn rewrite_leaves_a_backup_branch_on_the_same_tip_untouched() {
 
     let mut repo = Repo::open(dir).expect("open");
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let target = commits.iter().find(|c| c.subject == "B").expect("B present");
-    repo.rewrite_message(&target.id, "B (edited)").expect("rewrite");
+    let target = commits
+        .iter()
+        .find(|c| c.subject == "B")
+        .expect("B present");
+    repo.rewrite_message(&target.id, "B (edited)")
+        .expect("rewrite");
 
     // main is rewritten, but the backup branch must still point at the original
     // commits — rewriting one branch must never drag an unrelated one along.
@@ -571,7 +656,10 @@ fn drops_middle_commit_visible_to_git() {
     assert_eq!(common::git_log_subjects(dir), vec!["third", "first"]);
 
     // Transparency invariants: HEAD attached, clean tree, intact repo.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -605,8 +693,14 @@ fn drops_then_restores_commit_round_trips() {
     repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
         .expect("restore");
 
-    assert_eq!(common::git_log_subjects(dir), vec!["third", "second", "first"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["third", "second", "first"]
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -631,7 +725,10 @@ fn drops_branch_tip_moving_the_branch_to_its_parent() {
 
     // The branch bookmark followed to the parent "second"; the tree is clean.
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -664,7 +761,8 @@ fn revert_all_restores_the_original_session_state_to_git() {
         .expect("second commit present")
         .id
         .clone();
-    repo.rewrite_message(&second, "second (edited)").expect("rewrite");
+    repo.rewrite_message(&second, "second (edited)")
+        .expect("rewrite");
 
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history"); // [third, second (edited), first]
     let tip = repo.plan_drop(&commits, 0).expect("droppable"); // "third"
@@ -685,7 +783,10 @@ fn revert_all_restores_the_original_session_state_to_git() {
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), original_head);
 
     // Transparency invariants hold after the revert.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -712,7 +813,8 @@ fn revert_all_discards_session_working_copy_edits() {
         .expect("first commit present")
         .id
         .clone();
-    repo.rewrite_message(&first, "first (edited)").expect("rewrite");
+    repo.rewrite_message(&first, "first (edited)")
+        .expect("rewrite");
 
     // The edit survived the rewrite (working-copy preservation).
     assert_eq!(
@@ -725,7 +827,10 @@ fn revert_all_discards_session_working_copy_edits() {
     repo.revert_all().expect("revert all");
     assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
     assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }

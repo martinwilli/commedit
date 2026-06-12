@@ -23,9 +23,15 @@ fn opens_repo_transparently() {
     // jj's metadata lives in a throwaway dir outside the repo, so nothing is
     // written into the user's tree (a real jj user's .jj is left untouched, and a
     // non-jj user's tree is not polluted).
-    assert!(!dir.join(".jj").exists(), ".jj must not be created in the repo");
+    assert!(
+        !dir.join(".jj").exists(),
+        ".jj must not be created in the repo"
+    );
     // jj checks out a detached HEAD; we must re-attach it.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     // Nothing was written into the repo, so a plain-git user sees a clean tree.
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
@@ -46,10 +52,19 @@ fn opens_from_a_subdirectory() {
 
     // It operated on the repo root, not the subdirectory: HEAD stays attached,
     // the tree is clean, and no jj metadata leaked into the root or the subdir.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
-    assert!(!dir.join(".jj").exists(), ".jj must not be created in the repo");
-    assert!(!sub.join(".jj").exists(), ".jj must not be created in the subdir");
+    assert!(
+        !dir.join(".jj").exists(),
+        ".jj must not be created in the repo"
+    );
+    assert!(
+        !sub.join(".jj").exists(),
+        ".jj must not be created in the subdir"
+    );
 }
 
 #[test]

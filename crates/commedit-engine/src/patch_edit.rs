@@ -183,7 +183,15 @@ pub fn collapse_diff(text: &str, cursor: Cursor) -> Option<(String, Cursor)> {
             while i < lines.len() && classify_line(lines[i]) == DiffLineKind::Added {
                 i += 1;
             }
-            collapse_block(&lines, rem_start, add_start, i, &mut out, &mut map, &mut changed);
+            collapse_block(
+                &lines,
+                rem_start,
+                add_start,
+                i,
+                &mut out,
+                &mut map,
+                &mut changed,
+            );
         } else {
             map[i] = out.len();
             out.push(lines[i].to_string());
@@ -198,7 +206,13 @@ pub fn collapse_diff(text: &str, cursor: Cursor) -> Option<(String, Cursor)> {
         .get(cursor.line)
         .copied()
         .unwrap_or_else(|| out.len().saturating_sub(1));
-    Some((out.join("\n"), Cursor { line, col: cursor.col }))
+    Some((
+        out.join("\n"),
+        Cursor {
+            line,
+            col: cursor.col,
+        },
+    ))
 }
 
 /// Fold the matching ends of one `-`-run / `+`-run change block into context.
@@ -287,7 +301,13 @@ fn plan_insert(lines: &[&str], sel: Selection, ins: &str) -> EditPlan {
 /// over to keep the caret inside the content (col 0) or to `+`-prefix the
 /// continuation lines of a multi-line payload (so a pasted `\n` never produces a
 /// bare/context line).
-fn insert_into_added(lines: &[&str], l: usize, col_lo: usize, col_hi: usize, ins: &str) -> EditPlan {
+fn insert_into_added(
+    lines: &[&str],
+    l: usize,
+    col_lo: usize,
+    col_hi: usize,
+    ins: &str,
+) -> EditPlan {
     let line = lines[l];
     let single_line = !ins.contains('\n');
     let no_selection = col_lo == col_hi;
@@ -574,7 +594,11 @@ fn delete_context_span(lines: &[&str], lo: Cursor, hi: Cursor) -> Option<PatchEd
     // A selection sitting exactly on line boundaries removes whole lines; one
     // entering a line's content edits it, so the surviving text rejoins as `+`.
     let whole_lines = lo.col == 0 && hi.col == 0;
-    let last = if whole_lines { hi.line.checked_sub(1)? } else { hi.line };
+    let last = if whole_lines {
+        hi.line.checked_sub(1)?
+    } else {
+        hi.line
+    };
     if last < lo.line || last >= lines.len() {
         return None;
     }
@@ -738,10 +762,7 @@ fn deletion_is_safe_lines(lines: &[&str], lo: Cursor, hi: Cursor) -> bool {
     let Some(&line) = lines.get(lo.line) else {
         return false;
     };
-    !line.is_empty()
-        && classify_line(line) == DiffLineKind::Added
-        && lo.col >= 1
-        && hi.col >= 1
+    !line.is_empty() && classify_line(line) == DiffLineKind::Added && lo.col >= 1 && hi.col >= 1
 }
 
 // --- small string helpers (character-based) ---
@@ -861,10 +882,7 @@ mod tests {
     }
 
     fn line_index(patch: &str, predicate: impl Fn(&str) -> bool) -> usize {
-        patch
-            .split('\n')
-            .position(predicate)
-            .expect("line present")
+        patch.split('\n').position(predicate).expect("line present")
     }
 
     #[test]
@@ -897,8 +915,14 @@ mod tests {
         // done by selecting the whole line (see the restore tests below).
         let patch = sample();
         let li = line_index(&patch, |l| l == "-b");
-        assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Backspace), EditPlan::Block);
-        assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Delete), EditPlan::Block);
+        assert_eq!(
+            plan_edit(&patch, caret(li, 1), EditGesture::Backspace),
+            EditPlan::Block
+        );
+        assert_eq!(
+            plan_edit(&patch, caret(li, 1), EditGesture::Delete),
+            EditPlan::Block
+        );
     }
 
     #[test]
@@ -908,7 +932,10 @@ mod tests {
         // Select the whole "-b" line, including its trailing newline.
         let plan = plan_edit(&patch, sel((lb, 0), (lb + 1, 0)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
-        assert!(out.contains(" b\n") && !out.contains("-b"), "restored to context:\n{out}");
+        assert!(
+            out.contains(" b\n") && !out.contains("-b"),
+            "restored to context:\n{out}"
+        );
         // 'b' is no longer dropped from the file.
         assert!(apply_patch("a\nb\nc\n", &out).unwrap().contains('b'));
     }
@@ -929,7 +956,10 @@ mod tests {
         let lb = line_index(&patch, |l| l == "-b");
         let plan = plan_edit(&patch, sel((lb, 0), (lb + 2, 0)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
-        assert!(out.contains(" b\n") && out.contains(" c\n"), "both restored:\n{out}");
+        assert!(
+            out.contains(" b\n") && out.contains(" c\n"),
+            "both restored:\n{out}"
+        );
         assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nb\nc\n");
     }
 
@@ -975,13 +1005,20 @@ mod tests {
         let patch = sample();
         let li = line_index(&patch, |l| l == " c");
         // Mark the context line removed (backspace at its start).
-        let removed = apply(&patch, &edit(plan_edit(&patch, caret(li, 1), EditGesture::Backspace)));
+        let removed = apply(
+            &patch,
+            &edit(plan_edit(&patch, caret(li, 1), EditGesture::Backspace)),
+        );
         assert!(removed.contains("-c\n"), "got:\n{removed}");
         // Restore it by selecting the whole "-c" line and deleting.
         let lc = line_index(&removed, |l| l == "-c");
         let back = apply(
             &removed,
-            &edit(plan_edit(&removed, sel((lc, 0), (lc + 1, 0)), EditGesture::Delete)),
+            &edit(plan_edit(
+                &removed,
+                sel((lc, 0), (lc + 1, 0)),
+                EditGesture::Delete,
+            )),
         );
         assert!(back.contains(" c\n"), "got:\n{back}");
     }
@@ -1016,7 +1053,10 @@ mod tests {
         // No character follows the caret, so the whole line is marked removed.
         let patch = sample();
         let li = line_index(&patch, |l| l == " c");
-        let out = apply(&patch, &edit(plan_edit(&patch, caret(li, 2), EditGesture::Delete)));
+        let out = apply(
+            &patch,
+            &edit(plan_edit(&patch, caret(li, 2), EditGesture::Delete)),
+        );
         assert!(out.contains("-c\n"), "got:\n{out}");
     }
 
@@ -1058,10 +1098,16 @@ mod tests {
         let plan = plan_edit(&patch, sel((l1, 2), (l1 + 2, 4)), EditGesture::Delete);
         let e = edit(plan);
         let out = apply(&patch, &e);
-        assert!(out.contains("-one\n-two\n-three\n+oee\n"), "joined edit:\n{out}");
+        assert!(
+            out.contains("-one\n-two\n-three\n+oee\n"),
+            "joined edit:\n{out}"
+        );
         // Caret at the seam, just after the kept head "o".
         assert_eq!(e.cursor, Cursor::at(line_index(&out, |l| l == "+oee"), 2));
-        assert_eq!(apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(), "oee\nY\n");
+        assert_eq!(
+            apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(),
+            "oee\nY\n"
+        );
     }
 
     #[test]
@@ -1072,7 +1118,10 @@ mod tests {
         let plan = plan_edit(&patch, sel((l1, 0), (l1, 4)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("-one\n+\n"), "emptied, not removed:\n{out}");
-        assert_eq!(apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(), "\ntwo\nthree\nY\n");
+        assert_eq!(
+            apply_patch("one\ntwo\nthree\nx\n", &out).unwrap(),
+            "\ntwo\nthree\nY\n"
+        );
     }
 
     #[test]
@@ -1144,7 +1193,10 @@ mod tests {
         let old = "a\n";
         let patch = unified_diff(old, "a\n    foo\n", "f");
         let li = line_index(&patch, |l| l == "+    foo");
-        let out1 = apply(&patch, &edit(plan_edit(&patch, caret(li, 8), EditGesture::Newline)));
+        let out1 = apply(
+            &patch,
+            &edit(plan_edit(&patch, caret(li, 8), EditGesture::Newline)),
+        );
         // Enter again on the '+    ' line (content is now only the indent).
         let lj = line_index(&out1, |l| l == "+    ");
         let e = edit(plan_edit(&out1, caret(lj, 5), EditGesture::Newline));
@@ -1238,15 +1290,24 @@ mod tests {
                 plan_edit(&patch, caret(li, 2), EditGesture::Insert("x".into())),
                 EditPlan::Block
             );
-            assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Backspace), EditPlan::Block);
-            assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::Newline), EditPlan::Block);
+            assert_eq!(
+                plan_edit(&patch, caret(li, 1), EditGesture::Backspace),
+                EditPlan::Block
+            );
+            assert_eq!(
+                plan_edit(&patch, caret(li, 1), EditGesture::Newline),
+                EditPlan::Block
+            );
         }
     }
 
     #[test]
     fn first_line_backspace_at_start_is_blocked() {
         let patch = sample();
-        assert_eq!(plan_edit(&patch, caret(0, 0), EditGesture::Backspace), EditPlan::Block);
+        assert_eq!(
+            plan_edit(&patch, caret(0, 0), EditGesture::Backspace),
+            EditPlan::Block
+        );
     }
 
     #[test]
@@ -1261,7 +1322,11 @@ mod tests {
             plan_edit(&patch, caret(li, 2), EditGesture::Insert("Z".into())),
             EditPlan::Allow
         );
-        let plan = plan_edit(&patch, sel((li, 1), (li, 2)), EditGesture::Insert("Z".into()));
+        let plan = plan_edit(
+            &patch,
+            sel((li, 1), (li, 2)),
+            EditGesture::Insert("Z".into()),
+        );
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("+Z\n"), "got:\n{out}");
         assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nZ\nc\n");
@@ -1272,7 +1337,11 @@ mod tests {
         let patch = unified_diff("abc\nx\n", "abc\nY\n", "f");
         let li = line_index(&patch, |l| l == " abc");
         // Select "b" (chars 1..2 of content → cols 2..3) and type "Z".
-        let plan = plan_edit(&patch, sel((li, 2), (li, 3)), EditGesture::Insert("Z".into()));
+        let plan = plan_edit(
+            &patch,
+            sel((li, 2), (li, 3)),
+            EditGesture::Insert("Z".into()),
+        );
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("-abc\n+aZc\n"), "got:\n{out}");
         assert!(apply_patch("abc\nx\n", &out).is_ok());
@@ -1316,7 +1385,10 @@ mod tests {
         // Select whole "+b" and "+c" (start of +b through start of +d).
         let plan = plan_edit(&patch, sel((lb, 0), (lb + 2, 0)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
-        assert!(!out.contains("+b") && !out.contains("+c"), "both gone:\n{out}");
+        assert!(
+            !out.contains("+b") && !out.contains("+c"),
+            "both gone:\n{out}"
+        );
         assert!(out.contains("+d\n"), "the untouched line stays:\n{out}");
         assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nd\n");
     }
@@ -1349,7 +1421,10 @@ mod tests {
         let plan = plan_edit(&patch, sel((lb, 2), (lb + 1, 2)), EditGesture::Delete);
         let out = apply(&patch, &edit(plan));
         assert!(out.contains("+byz\n"), "the lines join:\n{out}");
-        assert!(!out.contains("+bcd") && !out.contains("+xyz"), "originals gone:\n{out}");
+        assert!(
+            !out.contains("+bcd") && !out.contains("+xyz"),
+            "originals gone:\n{out}"
+        );
         assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nbyz\n");
     }
 
@@ -1393,7 +1468,10 @@ mod tests {
         // Caret anywhere on "+b": Ctrl+D drops the line.
         let plan = plan_edit(&patch, caret(lb, 1), EditGesture::DeleteLine);
         let out = apply(&patch, &edit(plan));
-        assert!(!out.contains("+b") && out.contains("+c\n"), "only +b gone:\n{out}");
+        assert!(
+            !out.contains("+b") && out.contains("+c\n"),
+            "only +b gone:\n{out}"
+        );
         assert_eq!(apply_patch("a\n", &out).unwrap(), "a\nc\n");
     }
 
@@ -1414,7 +1492,10 @@ mod tests {
         let li = line_index(&patch, |l| l == "-b");
         let plan = plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine);
         let out = apply(&patch, &edit(plan));
-        assert!(out.contains(" b\n") && !out.contains("-b"), "un-removed:\n{out}");
+        assert!(
+            out.contains(" b\n") && !out.contains("-b"),
+            "un-removed:\n{out}"
+        );
         // 'b' is no longer dropped.
         assert!(apply_patch("a\nb\nc\n", &out).unwrap().contains('b'));
     }
@@ -1425,7 +1506,10 @@ mod tests {
         let hunk = line_index(&patch, |l| l.starts_with("@@"));
         let header = line_index(&patch, |l| l.starts_with("---"));
         for li in [hunk, header] {
-            assert_eq!(plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine), EditPlan::Block);
+            assert_eq!(
+                plan_edit(&patch, caret(li, 1), EditGesture::DeleteLine),
+                EditPlan::Block
+            );
         }
     }
 
@@ -1441,7 +1525,10 @@ mod tests {
         // Caret on the re-typed '+b' line (col 2, after 'b').
         let (out, cur) = collapse(&patch, Cursor::at(li, 2));
         assert!(out.contains(" b\n"), "the pair folds to context:\n{out}");
-        assert!(!out.contains("-b") && !out.contains("+b"), "no +/- left:\n{out}");
+        assert!(
+            !out.contains("-b") && !out.contains("+b"),
+            "no +/- left:\n{out}"
+        );
         // Caret lands on the merged context line at the same column, so a further
         // edit re-splits it there.
         assert_eq!(cur, Cursor::at(line_index(&out, |l| l == " b"), 2));
@@ -1469,7 +1556,10 @@ mod tests {
         let (out, _) = collapse(&patch, Cursor::at(0, 0));
         assert!(out.contains(" a\n"), "leading match folds:\n{out}");
         assert!(out.contains(" c\n"), "trailing match folds:\n{out}");
-        assert!(out.contains("-b\n") && out.contains("+X\n"), "middle stays:\n{out}");
+        assert!(
+            out.contains("-b\n") && out.contains("+X\n"),
+            "middle stays:\n{out}"
+        );
         assert_eq!(apply_patch(old, &out).unwrap(), "a\nX\nc\n");
     }
 
@@ -1499,9 +1589,16 @@ mod tests {
         let li = line_index(&patch, |l| l == "+b");
         let (folded, cur) = collapse(&patch, Cursor::at(li, 2));
         // Type 'Z' at the caret on the merged context line.
-        let plan = plan_edit(&folded, Selection::caret(cur), EditGesture::Insert("Z".into()));
+        let plan = plan_edit(
+            &folded,
+            Selection::caret(cur),
+            EditGesture::Insert("Z".into()),
+        );
         let resplit = apply(&folded, &edit(plan));
-        assert!(resplit.contains("-b\n+bZ\n"), "re-split at the caret:\n{resplit}");
+        assert!(
+            resplit.contains("-b\n+bZ\n"),
+            "re-split at the caret:\n{resplit}"
+        );
         assert!(apply_patch("a\nb\nc\n", &resplit).is_ok());
     }
 

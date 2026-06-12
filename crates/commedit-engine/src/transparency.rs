@@ -187,7 +187,11 @@ fn symlink_dir(_target: &Path, _link: &Path) -> Result<()> {
 pub fn local_head_oids(workspace_root: &Path) -> BTreeMap<String, String> {
     let Ok(out) = Command::new("git")
         .current_dir(workspace_root)
-        .args(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"])
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+        ])
         .output()
     else {
         return BTreeMap::new();
@@ -257,9 +261,17 @@ pub fn ref_decorations(workspace_root: &Path) -> BTreeMap<String, Vec<RefDecorat
             _ => continue,
         };
         let decoration = if let Some(name) = refname.strip_prefix("refs/heads/") {
-            RefDecoration { name: name.to_string(), kind: RefKind::Branch, current: false }
+            RefDecoration {
+                name: name.to_string(),
+                kind: RefKind::Branch,
+                current: false,
+            }
         } else if let Some(name) = refname.strip_prefix("refs/tags/") {
-            RefDecoration { name: name.to_string(), kind: RefKind::Tag, current: false }
+            RefDecoration {
+                name: name.to_string(),
+                kind: RefKind::Tag,
+                current: false,
+            }
         } else {
             continue;
         };
@@ -322,7 +334,10 @@ fn run_update_ref_stdin(workspace_root: &Path, commands: &str) -> Result<()> {
         .context("writing ref updates")?;
     let out = child.wait_with_output().context("running git update-ref")?;
     if !out.status.success() {
-        bail!("git update-ref failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "git update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -402,7 +417,12 @@ pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
     let refname = format!("refs/commedit/backup/index-{}", &tree[..tree.len().min(12)]);
     let commit = git_line(
         workspace_root,
-        &["commit-tree", &tree, "-m", "commedit: index backup (staged content not on disk)"],
+        &[
+            "commit-tree",
+            &tree,
+            "-m",
+            "commedit: index backup (staged content not on disk)",
+        ],
     )?;
     let ok = Command::new("git")
         .current_dir(workspace_root)

@@ -4,12 +4,12 @@
 
 mod common;
 
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use commedit_mcp::dto::{
     CommitWorkingCopyReq, DiscardWorkingCopyReq, EditMessageReq, HunkSelectionDto,
     IdentityFieldsDto, ListHistoryReq, PatchSelectionDto, SaveResultDto, ShowCommitReq,
     SquashWorkingCopyReq,
 };
+use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -33,7 +33,10 @@ fn commit_req(
 #[tokio::test]
 async fn uncommitted_changes_survive_a_rewrite() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("a.txt"), "1\nlocal edit\n").unwrap();
@@ -41,7 +44,11 @@ async fn uncommitted_changes_survive_a_rewrite() {
 
     // Rewrite the bottom commit's message — the dirty file must ride along.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -69,12 +76,19 @@ async fn uncommitted_changes_survive_a_rewrite() {
 #[tokio::test]
 async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     // A clean working copy has nothing to fold.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -86,7 +100,11 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
             }))
             .await,
     );
-    assert!(err.message.contains("clean"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("clean"),
+        "unexpected error: {}",
+        err.message
+    );
 
     // Fold a dirty a.txt into the bottom commit ("first" introduced a.txt).
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
@@ -117,8 +135,15 @@ async fn discard_working_copy_requires_confirmation() {
             .discard_working_copy(Parameters(DiscardWorkingCopyReq { confirm: false }))
             .await,
     );
-    assert!(err.message.contains("confirm"), "unexpected error: {}", err.message);
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "dirty\n");
+    assert!(
+        err.message.contains("confirm"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "dirty\n"
+    );
 
     let resp = server
         .discard_working_copy(Parameters(DiscardWorkingCopyReq { confirm: true }))
@@ -128,19 +153,29 @@ async fn discard_working_copy_requires_confirmation() {
     assert!(resp.ok);
 
     // The tree is reset to the branch tip.
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "1\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "1\n"
+    );
     assert!(server.working_copy_status().await.unwrap().0.clean);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     // The discard is on the session op-log (undo can bring the changes back).
     let ops = server.list_operations().await.unwrap().0;
     assert_eq!(ops.ops.len(), 1);
-    assert!(ops.ops[0].label.contains("Drop uncommitted"), "label: {}", ops.ops[0].label);
+    assert!(
+        ops.ops[0].label.contains("Drop uncommitted"),
+        "label: {}",
+        ops.ops[0].label
+    );
 }
 
 #[tokio::test]
 async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("untracked.txt"), "keep me\n").unwrap();
@@ -149,7 +184,11 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
 
     // A rewrite leaves the untracked file untouched on disk.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -169,12 +208,19 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
 #[tokio::test]
 async fn squash_working_copy_accepts_a_change_id_prefix() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -194,7 +240,10 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
 #[tokio::test]
 async fn commit_working_copy_paths_tier_commits_only_listed_files() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("a.txt"), "a\nedit-a\n").unwrap();
@@ -212,7 +261,10 @@ async fn commit_working_copy_paths_tier_commits_only_listed_files() {
         .0;
     assert!(matches!(result, SaveResultDto::Clean { .. }));
 
-    assert_eq!(git_log_subjects(dir.path()), ["commit a", "second", "first"]);
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["commit a", "second", "first"]
+    );
     assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "a\nedit-a");
 
     // The remainder is exactly the b.txt edit, still uncommitted.
@@ -243,7 +295,10 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
     let status = server.working_copy_status().await.unwrap().0;
     let wc_sha = status.entries[0].sha.clone();
     let shown = server
-        .show_commit(Parameters(ShowCommitReq { commit: wc_sha, include_contents: None }))
+        .show_commit(Parameters(ShowCommitReq {
+            commit: wc_sha,
+            include_contents: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -265,7 +320,10 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
         .commit_working_copy(Parameters(commit_req(
             "first hunk",
             None,
-            Some(vec![HunkSelectionDto { path: "f.txt".into(), hunks: vec![0] }]),
+            Some(vec![HunkSelectionDto {
+                path: "f.txt".into(),
+                hunks: vec![0],
+            }]),
             None,
         )))
         .await
@@ -274,8 +332,14 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
     assert!(matches!(result, SaveResultDto::Clean { .. }));
 
     let committed = git(dir.path(), &["show", "HEAD:f.txt"]);
-    assert!(committed.contains("\nL3\n"), "hunk 0 committed: {committed}");
-    assert!(committed.contains("\nl17\n"), "hunk 1 not committed: {committed}");
+    assert!(
+        committed.contains("\nL3\n"),
+        "hunk 0 committed: {committed}"
+    );
+    assert!(
+        committed.contains("\nl17\n"),
+        "hunk 1 not committed: {committed}"
+    );
     let status = server.working_copy_status().await.unwrap().0;
     assert_eq!(status.entries[0].files, vec!["f.txt".to_string()]);
 }
@@ -294,7 +358,10 @@ async fn commit_working_copy_patches_tier_commits_a_sub_hunk() {
             "add A",
             None,
             None,
-            Some(vec![PatchSelectionDto { path: "f.txt".into(), patch }]),
+            Some(vec![PatchSelectionDto {
+                path: "f.txt".into(),
+                patch,
+            }]),
         )))
         .await
         .unwrap()
@@ -302,7 +369,10 @@ async fn commit_working_copy_patches_tier_commits_a_sub_hunk() {
     assert!(matches!(result, SaveResultDto::Clean { .. }));
 
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\n2\nA\n3");
-    assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "1\n2\nA\nB\n3\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        "1\n2\nA\nB\n3\n"
+    );
     let status = server.working_copy_status().await.unwrap().0;
     assert_eq!(status.entries[0].files, vec!["f.txt".to_string()]);
 }
@@ -320,12 +390,19 @@ async fn partial_commit_validation_rejects_bad_selections() {
             .commit_working_copy(Parameters(commit_req(
                 "x",
                 Some(vec!["a.txt".into()]),
-                Some(vec![HunkSelectionDto { path: "a.txt".into(), hunks: vec![0] }]),
+                Some(vec![HunkSelectionDto {
+                    path: "a.txt".into(),
+                    hunks: vec![0],
+                }]),
                 None,
             )))
             .await,
     );
-    assert!(err.message.contains("more than one tier"), "got: {}", err.message);
+    assert!(
+        err.message.contains("more than one tier"),
+        "got: {}",
+        err.message
+    );
 
     // A hunk entry that selects nothing is rejected.
     let err = expect_err(
@@ -333,12 +410,19 @@ async fn partial_commit_validation_rejects_bad_selections() {
             .commit_working_copy(Parameters(commit_req(
                 "x",
                 None,
-                Some(vec![HunkSelectionDto { path: "a.txt".into(), hunks: vec![] }]),
+                Some(vec![HunkSelectionDto {
+                    path: "a.txt".into(),
+                    hunks: vec![],
+                }]),
                 None,
             )))
             .await,
     );
-    assert!(err.message.contains("no hunk indices"), "got: {}", err.message);
+    assert!(
+        err.message.contains("no hunk indices"),
+        "got: {}",
+        err.message
+    );
 
     // Neither failed attempt touched history.
     assert_eq!(git_log_subjects(dir.path()), ["first"]);
@@ -376,7 +460,10 @@ async fn commit_working_copy_composes_all_three_tiers_in_one_call() {
         .commit_working_copy(Parameters(commit_req(
             "compose",
             Some(vec!["g.txt".into()]),
-            Some(vec![HunkSelectionDto { path: "f.txt".into(), hunks: vec![0] }]),
+            Some(vec![HunkSelectionDto {
+                path: "f.txt".into(),
+                hunks: vec![0],
+            }]),
             Some(vec![PatchSelectionDto {
                 path: "h.txt".into(),
                 patch: "@@ -2,2 +2,3 @@\n 2\n+A\n 3\n".into(),
@@ -389,21 +476,33 @@ async fn commit_working_copy_composes_all_three_tiers_in_one_call() {
 
     // Each tier committed exactly its slice.
     let f = git(dir.path(), &["show", "HEAD:f.txt"]);
-    assert!(f.contains("\nL3\n") && f.contains("\nl17\n"), "f.txt hunk 0 only: {f}");
+    assert!(
+        f.contains("\nL3\n") && f.contains("\nl17\n"),
+        "f.txt hunk 0 only: {f}"
+    );
     assert_eq!(git(dir.path(), &["show", "HEAD:g.txt"]), "g\nedited");
     assert_eq!(git(dir.path(), &["show", "HEAD:h.txt"]), "1\n2\nA\n3");
 
     // The remainder is f.txt's hunk 1 and h.txt's `+B`; g.txt is fully committed.
     let status = git(dir.path(), &["status", "--porcelain"]);
-    assert!(status.contains("M f.txt") && status.contains("M h.txt"), "remainder: {status}");
-    assert!(!status.contains("g.txt"), "g.txt was fully committed: {status}");
+    assert!(
+        status.contains("M f.txt") && status.contains("M h.txt"),
+        "remainder: {status}"
+    );
+    assert!(
+        !status.contains("g.txt"),
+        "g.txt was fully committed: {status}"
+    );
     git(dir.path(), &["fsck", "--no-progress"]);
 }
 
 #[tokio::test]
 async fn commit_working_copy_with_no_selection_commits_everything() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("a.txt"), "a\nedit-a\n").unwrap();

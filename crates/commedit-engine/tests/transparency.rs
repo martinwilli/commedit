@@ -22,7 +22,11 @@ fn jj_refs_never_appear_in_the_user_repo() {
     let dir = tmp.path();
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     let assert_no_jj_refs = |when: &str| {
         assert_eq!(
@@ -30,7 +34,10 @@ fn jj_refs_never_appear_in_the_user_repo() {
             "",
             "refs/jj/* leaked into the user repo {when}"
         );
-        assert!(!dir.join(".jj").exists(), ".jj leaked into the user repo {when}");
+        assert!(
+            !dir.join(".jj").exists(),
+            ".jj leaked into the user repo {when}"
+        );
     };
 
     let mut repo = Repo::open(dir).expect("open");
@@ -47,11 +54,15 @@ fn jj_refs_never_appear_in_the_user_repo() {
         .find(|c| c.subject == "B")
         .expect("B present")
         .id;
-    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "B (edited)")
+        .expect("rewrite");
 
     assert_eq!(common::git_log_subjects(dir), vec!["C", "B (edited)", "A"]);
     assert_no_jj_refs("after a rewrite");
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 
     // Nothing persists once the session closes (jj's temp git dir is removed).
@@ -66,7 +77,11 @@ fn restores_an_unrelated_branch_but_leaves_the_current_one() {
     let g = |args: &[&str]| common::git(dir, args);
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     g(&["branch", "backup"]); // at the tip, like main
 
@@ -83,7 +98,11 @@ fn restores_an_unrelated_branch_but_leaves_the_current_one() {
 
     // Only the unrelated branch is reverted; the current branch keeps its move.
     assert_eq!(restored, vec!["refs/heads/backup".to_string()]);
-    assert_eq!(g(&["rev-parse", "backup"]), tip, "backup restored to its tip");
+    assert_eq!(
+        g(&["rev-parse", "backup"]),
+        tip,
+        "backup restored to its tip"
+    );
     assert_ne!(g(&["rev-parse", "main"]), tip, "current branch left alone");
 }
 
@@ -143,11 +162,17 @@ fn ref_decorations_group_branches_and_tags_by_commit() {
     };
     assert_eq!(
         names(&tip),
-        vec![("main".to_string(), RefKind::Branch), ("v1.0".to_string(), RefKind::Tag)]
+        vec![
+            ("main".to_string(), RefKind::Branch),
+            ("v1.0".to_string(), RefKind::Tag)
+        ]
     );
     assert_eq!(
         names(&below),
-        vec![("feature".to_string(), RefKind::Branch), ("light".to_string(), RefKind::Tag)]
+        vec![
+            ("feature".to_string(), RefKind::Branch),
+            ("light".to_string(), RefKind::Tag)
+        ]
     );
 }
 

@@ -47,7 +47,10 @@ fn spurious_reorder_conflict_is_auto_resolved_silently() {
     assert!(!repo.is_pending(), "nothing should be left pending");
 
     // git sees the reordered, conflict-free history: base <- C2-baz <- C1-bar.
-    assert_eq!(common::git_log_subjects(dir), vec!["C1-bar", "C2-baz", "base"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["C1-bar", "C2-baz", "base"]
+    );
     // The tip is byte-identical to the original combined result...
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
     // ...and each commit keeps its own change: C2-baz introduces just `baz` onto
@@ -56,7 +59,10 @@ fn spurious_reorder_conflict_is_auto_resolved_silently() {
     assert_eq!(common::git(dir, &["show", "HEAD~2:f.txt"]), "foo");
 
     // Transparency invariants: HEAD attached, clean tree, intact repo, no residue.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
     // No leftover conflict markers anywhere in the working tree.
@@ -120,7 +126,10 @@ fn spurious_reorder_auto_resolves_and_preserves_uncommitted_changes() {
     // Auto-resolves despite the dirty tree...
     assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
     assert!(!repo.is_pending());
-    assert_eq!(common::git_log_subjects(dir), vec!["C1-bar", "C2-baz", "base"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["C1-bar", "C2-baz", "base"]
+    );
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbaz");
     // ...and the uncommitted changes are preserved on disk and still uncommitted.
     assert_eq!(
@@ -133,7 +142,10 @@ fn spurious_reorder_auto_resolves_and_preserves_uncommitted_changes() {
     );
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
     let status = common::git(dir, &["status", "--porcelain"]);
-    assert!(status.contains("f.txt") && status.contains("other.txt"), "status: {status:?}");
+    assert!(
+        status.contains("f.txt") && status.contains("other.txt"),
+        "status: {status:?}"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -174,11 +186,17 @@ fn spurious_squash_across_an_interior_commit_is_auto_resolved() {
     // C folded into A (Fixup keeps A's message); the tip is the original combined
     // file, and A' now carries `qux` (re-attributed) but not `baz`.
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
-    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz\nqux");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:f.txt"]),
+        "foo\nbar\nbaz\nqux"
+    );
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbar\nqux");
 
     // Transparency invariants.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
     assert!(!std::fs::read_to_string(dir.join("f.txt"))
@@ -222,7 +240,10 @@ fn spurious_drop_conflict_is_auto_resolved() {
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo");
 
     // Transparency invariants.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
     assert!(!std::fs::read_to_string(dir.join("f.txt"))
@@ -254,7 +275,10 @@ fn spurious_drop_then_restore_round_trips_via_auto_resolve() {
     let from = commits.iter().position(|c| c.subject == "C1-bar").unwrap();
     let c1 = commits[from].clone();
     let target = repo.plan_drop(&commits, from).expect("droppable");
-    assert!(matches!(repo.abandon_commit(&target).expect("drop"), SaveOutcome::Clean));
+    assert!(matches!(
+        repo.abandon_commit(&target).expect("drop"),
+        SaveOutcome::Clean
+    ));
     assert_eq!(common::git_log_subjects(dir), vec!["C2-baz", "base"]);
 
     // Restore C1-bar into the gap between C2-baz and base (its original slot).
@@ -271,11 +295,17 @@ fn spurious_drop_then_restore_round_trips_via_auto_resolve() {
     assert!(!repo.is_pending(), "nothing should be left pending");
 
     // Back to the original history, byte-for-byte.
-    assert_eq!(common::git_log_subjects(dir), vec!["C2-baz", "C1-bar", "base"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["C2-baz", "C1-bar", "base"]
+    );
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "foo\nbar\nbaz");
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "foo\nbar");
 
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
     assert!(!std::fs::read_to_string(dir.join("f.txt"))
@@ -315,23 +345,37 @@ fn a_conflicted_rewrite_spanning_a_merge_falls_back_to_manual() {
     // Drop main-1 by raw id (the merge sits between it and the tip, so no linear
     // plan exists — the engine API is what a DAG-aware caller would use).
     let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
-    let main1 = commits.iter().find(|c| c.subject == "main-1").unwrap().id.clone();
+    let main1 = commits
+        .iter()
+        .find(|c| c.subject == "main-1")
+        .unwrap()
+        .id
+        .clone();
     let outcome = repo.abandon_commit(&main1).expect("drop");
 
     assert!(
         matches!(outcome, SaveOutcome::Conflicts { .. }),
         "a conflicted range spanning a merge must go to manual resolution, got {outcome:?}"
     );
-    assert!(repo.is_pending(), "the held-back rewrite leaves a pending resolution");
+    assert!(
+        repo.is_pending(),
+        "the held-back rewrite leaves a pending resolution"
+    );
     // git is untouched while pending: same tip, the merge still a 2-parent merge.
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
-    assert!(common::is_merge(dir, "HEAD"), "the merge keeps both parents");
+    assert!(
+        common::is_merge(dir, "HEAD"),
+        "the merge keeps both parents"
+    );
 
     // Aborting rolls jj back; git never moved.
     repo.abort().expect("abort");
     assert!(!repo.is_pending());
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -363,7 +407,10 @@ fn a_true_drop_conflict_still_falls_back_to_manual() {
         matches!(outcome, SaveOutcome::Conflicts { .. }),
         "a true conflict must still be held back for manual resolution, got {outcome:?}"
     );
-    assert!(repo.is_pending(), "a true conflict leaves a pending resolution");
+    assert!(
+        repo.is_pending(),
+        "a true conflict leaves a pending resolution"
+    );
     // git is untouched while pending.
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(common::git_log_subjects(dir), vec!["C2", "C1", "base"]);
@@ -392,7 +439,10 @@ fn a_true_reorder_conflict_still_falls_back_to_manual() {
         matches!(outcome, SaveOutcome::Conflicts { .. }),
         "a true conflict must still be held back for manual resolution, got {outcome:?}"
     );
-    assert!(repo.is_pending(), "a true conflict leaves a pending resolution");
+    assert!(
+        repo.is_pending(),
+        "a true conflict leaves a pending resolution"
+    );
     // git is untouched while pending.
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);

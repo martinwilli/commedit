@@ -92,14 +92,7 @@ impl Repo {
             .set_rewritten_commit(commit.id().clone(), split.id().clone());
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
-        self.finish_mutation(
-            tx,
-            "commedit: split commit",
-            desc,
-            pre_op,
-            old_head,
-            heads,
-        )
+        self.finish_mutation(tx, "commedit: split commit", desc, pre_op, old_head, heads)
     }
 
     /// Split a working-copy entry (identified by its stable change id, or the
@@ -198,8 +191,14 @@ mod tests {
 
     #[test]
     fn split_message_uses_first_nonempty_line() {
-        assert_eq!(split_message("Add feature\n\nbody text"), "fixup! Add feature");
-        assert_eq!(split_message("  \n  Real subject\nmore"), "fixup! Real subject");
+        assert_eq!(
+            split_message("Add feature\n\nbody text"),
+            "fixup! Add feature"
+        );
+        assert_eq!(
+            split_message("  \n  Real subject\nmore"),
+            "fixup! Real subject"
+        );
     }
 
     #[test]

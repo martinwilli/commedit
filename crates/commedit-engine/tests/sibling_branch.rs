@@ -20,7 +20,11 @@ fn rewriting_the_current_branch_leaves_a_sibling_branch_alone() {
     let g = |args: &[&str]| common::git(dir, args);
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
     // A sibling branch sitting at the tip, sharing the whole chain with `main`.
     g(&["branch", "feature"]);

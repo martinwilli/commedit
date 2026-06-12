@@ -254,8 +254,8 @@ impl Repo {
 
         let store = self.repo.store().clone();
         let mut reader: &[u8] = new_content.as_bytes();
-        let file_id = block_on(store.write_file(&repo_path, &mut reader))
-            .context("writing file blob")?;
+        let file_id =
+            block_on(store.write_file(&repo_path, &mut reader)).context("writing file blob")?;
         let value: MergedTreeValue = Merge::normal(TreeValue::File {
             id: file_id,
             executable,
@@ -266,8 +266,13 @@ impl Repo {
         let new_tree = block_on(builder.write_tree()).context("writing tree")?;
 
         let mut tx = self.repo.start_transaction();
-        block_on(tx.repo_mut().rewrite_commit(&commit).set_tree(new_tree).write())
-            .context("rewriting the working-copy commit")?;
+        block_on(
+            tx.repo_mut()
+                .rewrite_commit(&commit)
+                .set_tree(new_tree)
+                .write(),
+        )
+        .context("rewriting the working-copy commit")?;
         block_on(tx.repo_mut().rebase_descendants()).context("rebasing after edit")?;
         self.repo = block_on(tx.commit("commedit: edit working copy"))
             .context("committing the working-copy edit")?;
@@ -675,8 +680,7 @@ impl Repo {
         // either, so the walk works in both the normal and the resolving state.
         let git_head = self.head_commit_id();
         let jj_head = self.current_head_in_jj();
-        let is_tip =
-            |id: &CommitId| Some(id) == git_head.as_ref() || Some(id) == jj_head.as_ref();
+        let is_tip = |id: &CommitId| Some(id) == git_head.as_ref() || Some(id) == jj_head.as_ref();
         let mut ids = Vec::new();
         let mut id = leaf.clone();
         loop {

@@ -3,7 +3,6 @@
 
 mod common;
 
-use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use commedit_mcp::dto::{
     CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
     FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq,
@@ -11,13 +10,18 @@ use commedit_mcp::dto::{
     SplitCommitReq, SquashCommitReq, StrReplaceDto,
 };
 use commedit_mcp::server::CommeditServer;
+use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 /// The current history's shas, newest first.
 async fn shas(server: &CommeditServer) -> Vec<String> {
     server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0
@@ -51,7 +55,11 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -61,7 +69,10 @@ async fn list_history_returns_the_branch_commits_with_refs() {
     // tip's abbreviated sha is a prefix of it.
     let head = resp.head_sha.as_deref().unwrap();
     let tip = resp.commits[0].sha.as_str();
-    assert!(tip.len() >= 8 && head.starts_with(tip), "tip {tip} prefixes head {head}");
+    assert!(
+        tip.len() >= 8 && head.starts_with(tip),
+        "tip {tip} prefixes head {head}"
+    );
     assert!(!resp.has_more);
     assert_eq!(resp.next_offset, None);
     assert_eq!(resp.offset, 0);
@@ -69,9 +80,16 @@ async fn list_history_returns_the_branch_commits_with_refs() {
 
     // The tip carries the checked-out branch decoration.
     let tip_refs = &resp.commits[0].refs;
-    assert!(tip_refs.iter().any(|r| r.name == "main" && r.kind == "branch" && r.current));
+    assert!(tip_refs
+        .iter()
+        .any(|r| r.name == "main" && r.kind == "branch" && r.current));
     // The oldest commit has no parents (the virtual root is filtered).
-    assert!(resp.commits[2].detail.parent_shas.as_ref().unwrap().is_empty());
+    assert!(resp.commits[2]
+        .detail
+        .parent_shas
+        .as_ref()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         resp.commits[0].detail.parent_shas.clone().unwrap(),
         vec![resp.commits[1].sha.clone()]
@@ -83,12 +101,20 @@ async fn list_history_honours_the_limit() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second"), ("a.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("a.txt", "2\n", "second"),
+            ("a.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: Some(2), offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: Some(2),
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -102,7 +128,10 @@ async fn list_history_fields_selects_the_verbose_detail() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first\n\nwith a long body line"), ("b.txt", "2\n", "second")],
+        &[
+            ("a.txt", "1\n", "first\n\nwith a long body line"),
+            ("b.txt", "2\n", "second"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -143,11 +172,19 @@ async fn list_history_fields_selects_the_verbose_detail() {
 
     // Omitting `fields` carries the full detail, including the message body.
     let full = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
-    let description = full.commits[1].detail.description.as_ref().expect("full listing has detail");
+    let description = full.commits[1]
+        .detail
+        .description
+        .as_ref()
+        .expect("full listing has detail");
     assert!(
         description.contains("with a long body line"),
         "full detail carries the message body: {description}"
@@ -161,7 +198,11 @@ async fn list_history_marks_merges() {
     let server = open_server(dir.path());
 
     let resp = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -177,19 +218,29 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "one\n", "first"), ("a.txt", "one\ntwo\n", "second")],
+        &[
+            ("a.txt", "one\n", "first"),
+            ("a.txt", "one\ntwo\n", "second"),
+        ],
     );
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let sha = history.commits[0].sha.clone();
 
     let resp = server
-        .show_commit(Parameters(ShowCommitReq { commit: sha.clone(), include_contents: None }))
+        .show_commit(Parameters(ShowCommitReq {
+            commit: sha.clone(),
+            include_contents: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -202,7 +253,10 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
     assert!(file.old_text.is_none() && file.new_text.is_none());
 
     let with = server
-        .show_commit(Parameters(ShowCommitReq { commit: sha, include_contents: Some(true) }))
+        .show_commit(Parameters(ShowCommitReq {
+            commit: sha,
+            include_contents: Some(true),
+        }))
         .await
         .unwrap()
         .0;
@@ -224,7 +278,11 @@ async fn show_commit_rejects_an_unknown_ref() {
             }))
             .await,
     );
-    assert!(err.message.contains("not found"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("not found"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -295,7 +353,11 @@ async fn edit_message_rewrites_any_commit_and_exports_to_git() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -311,7 +373,10 @@ async fn edit_message_rewrites_any_commit_and_exports_to_git() {
         .0;
     let head = clean_head(&result);
 
-    assert_eq!(git_log_subjects(dir.path()), ["third", "second, edited", "first"]);
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["third", "second, edited", "first"]
+    );
     assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     git(dir.path(), &["fsck", "--strict"]);
@@ -320,11 +385,18 @@ async fn edit_message_rewrites_any_commit_and_exports_to_git() {
 #[tokio::test]
 async fn edit_identity_prefills_omitted_fields() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -346,14 +418,27 @@ async fn edit_identity_prefills_omitted_fields() {
 
     // The author name changed; everything else was prefilled from the commit,
     // including the committer timestamp (not re-stamped to "now").
-    let show = git(dir.path(), &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"]);
-    assert_eq!(show, "New Author|tester@example.com|Tester|tester@example.com");
+    let show = git(
+        dir.path(),
+        &["log", "-1", "--format=%an|%ae|%cn|%ce", "HEAD"],
+    );
+    assert_eq!(
+        show,
+        "New Author|tester@example.com|Tester|tester@example.com"
+    );
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
-    assert_eq!(listed.commits[0].detail.committer_time.clone().unwrap(), committer_time);
+    assert_eq!(
+        listed.commits[0].detail.committer_time.clone().unwrap(),
+        committer_time
+    );
 }
 
 #[tokio::test]
@@ -361,14 +446,22 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
     // Address by the (abbreviated) change_ids the listing returns — proving they
     // round-trip back as refs.
     let hist = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -403,29 +496,53 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
         .0;
     clean_head(&result);
 
-    assert_eq!(git_log_subjects(dir.path()), ["third (edited)", "second", "first"]);
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["third (edited)", "second", "first"]
+    );
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let detail = |i: usize| listed.commits[i].detail.clone();
     // The child's committer is the pinned value, not re-stamped to "now".
     assert_eq!(detail(1).author_time.unwrap(), "2026-06-11 18:30:00 +0200");
-    assert_eq!(detail(1).committer_time.unwrap(), "2026-06-11 18:30:00 +0200");
+    assert_eq!(
+        detail(1).committer_time.unwrap(),
+        "2026-06-11 18:30:00 +0200"
+    );
     assert_eq!(detail(2).author_time.unwrap(), "2026-06-11 18:00:00 +0200");
-    assert_eq!(detail(2).committer_time.unwrap(), "2026-06-11 18:00:00 +0200");
+    assert_eq!(
+        detail(2).committer_time.unwrap(),
+        "2026-06-11 18:00:00 +0200"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
 #[tokio::test]
 async fn edit_commits_rejects_empty_and_noop_batches() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
-    let empty = expect_err(server.edit_commits(Parameters(EditCommitsReq { edits: vec![] })).await);
-    assert!(empty.message.contains("must not be empty"), "{}", empty.message);
+    let empty = expect_err(
+        server
+            .edit_commits(Parameters(EditCommitsReq { edits: vec![] }))
+            .await,
+    );
+    assert!(
+        empty.message.contains("must not be empty"),
+        "{}",
+        empty.message
+    );
 
     let target = shas(&server).await[0].clone();
     let noop = expect_err(
@@ -456,8 +573,14 @@ async fn replace_files_rewrites_contents_across_descendants() {
         .replace_files(Parameters(ReplaceFilesReq {
             commit: target,
             files: vec![
-                FileContentDto { path: "a.txt".into(), content: "ONE\n".into() },
-                FileContentDto { path: "new.txt".into(), content: "added\n".into() },
+                FileContentDto {
+                    path: "a.txt".into(),
+                    content: "ONE\n".into(),
+                },
+                FileContentDto {
+                    path: "new.txt".into(),
+                    content: "added\n".into(),
+                },
             ],
             delete_paths: None,
         }))
@@ -470,7 +593,10 @@ async fn replace_files_rewrites_contents_across_descendants() {
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "ONE");
     assert_eq!(git(dir.path(), &["show", "HEAD~1:new.txt"]), "added");
     // The descendant rebased onto the edited tree; the worktree follows.
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "ONE\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ONE\n"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -483,10 +609,18 @@ async fn replace_files_requires_files() {
     let sha = shas(&server).await[0].clone();
     let err = expect_err(
         server
-            .replace_files(Parameters(ReplaceFilesReq { commit: sha, files: vec![], delete_paths: None }))
+            .replace_files(Parameters(ReplaceFilesReq {
+                commit: sha,
+                files: vec![],
+                delete_paths: None,
+            }))
             .await,
     );
-    assert!(err.message.contains("files"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("files"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -494,7 +628,10 @@ async fn replace_in_file_rewrites_a_unique_match_across_descendants() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "the bulck form\n", "first"), ("b.txt", "two\n", "second")],
+        &[
+            ("a.txt", "the bulck form\n", "first"),
+            ("b.txt", "two\n", "second"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -517,7 +654,10 @@ async fn replace_in_file_rewrites_a_unique_match_across_descendants() {
     assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "the bulk form");
     // The descendant rebased onto the edited tree; the worktree follows.
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "the bulk form\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "the bulk form\n"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -542,7 +682,11 @@ async fn replace_in_file_rejects_an_ambiguous_match() {
             .await,
     );
     // The ambiguity message comes only from the ReplaceError→invalid path.
-    assert!(err.message.contains("matched 2 times"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("matched 2 times"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -550,7 +694,10 @@ async fn replace_in_message_fixes_a_typo() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "the bulck form"), ("b.txt", "2\n", "second")],
+        &[
+            ("a.txt", "1\n", "the bulck form"),
+            ("b.txt", "2\n", "second"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -587,7 +734,11 @@ async fn replace_in_message_rejects_a_missing_match() {
             }))
             .await,
     );
-    assert!(err.message.contains("not found"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("not found"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -608,7 +759,10 @@ async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
     let result = server
         .split_commit(Parameters(SplitCommitReq {
             commit: target,
-            files: vec![FileContentDto { path: "a.txt".into(), content: "one\ntwo\n".into() }],
+            files: vec![FileContentDto {
+                path: "a.txt".into(),
+                content: "one\ntwo\n".into(),
+            }],
         }))
         .await
         .unwrap()
@@ -621,7 +775,10 @@ async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
     );
     // The split halves combined reproduce the original content.
     assert_eq!(git(dir.path(), &["show", "HEAD~2:a.txt"]), "one\ntwo");
-    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo\nthree");
+    assert_eq!(
+        git(dir.path(), &["show", "HEAD~1:a.txt"]),
+        "one\ntwo\nthree"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -630,7 +787,11 @@ async fn reorder_moves_a_commit_under_a_new_parent() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -656,7 +817,11 @@ async fn reorder_to_root_makes_a_commit_the_first() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
@@ -675,7 +840,10 @@ async fn reorder_to_root_makes_a_commit_the_first() {
     assert_eq!(git_log_subjects(dir.path()), ["second", "first", "third"]);
     // "third" really is the new root commit.
     let bottom = git(dir.path(), &["rev-list", "--max-parents=0", "HEAD"]);
-    assert_eq!(git(dir.path(), &["log", "-1", "--format=%s", &bottom]), "third");
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%s", &bottom]),
+        "third"
+    );
 }
 
 #[tokio::test]
@@ -685,13 +853,25 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
-    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
-    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+    let base = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "base")
+        .unwrap();
+    let main1 = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "main-1")
+        .unwrap();
 
     let err = expect_err(
         server
@@ -702,7 +882,11 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
             }))
             .await,
     );
-    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("merge"),
+        "unexpected error: {}",
+        err.message
+    );
 
     let err = expect_err(
         server
@@ -713,7 +897,11 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
             }))
             .await,
     );
-    assert!(err.message.contains("own parent"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("own parent"),
+        "unexpected error: {}",
+        err.message
+    );
 
     let err = expect_err(
         server
@@ -724,7 +912,11 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
             }))
             .await,
     );
-    assert!(err.message.contains("already a child"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("already a child"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -738,13 +930,25 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let top = history.commits.iter().find(|c| c.subject == "top").unwrap();
-    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
-    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+    let base = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "base")
+        .unwrap();
+    let main1 = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "main-1")
+        .unwrap();
 
     // Two lines (main-1's and side-1's) converge on "base": ambiguous.
     let err = expect_err(
@@ -756,7 +960,11 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
             }))
             .await,
     );
-    assert!(err.message.contains("child to pick"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("child to pick"),
+        "unexpected error: {}",
+        err.message
+    );
     assert!(err.message.contains("main-1") && err.message.contains("side-1"));
 
     // Disambiguated: splice between base and main-1.
@@ -773,7 +981,10 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
 
     // "top" now sits between base and main-1 on the first-parent line.
     assert_eq!(
-        git(dir.path(), &["log", "--first-parent", "--format=%s", "HEAD"]),
+        git(
+            dir.path(),
+            &["log", "--first-parent", "--format=%s", "HEAD"]
+        ),
         "merge\nmain-1\ntop\nbase"
     );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
@@ -784,13 +995,19 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 
     let target = shas(&server).await[1].clone();
     let resp = server
-        .drop_commit(Parameters(DropCommitReq { commit: target.clone() }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: target.clone(),
+        }))
         .await
         .unwrap()
         .0;
@@ -803,7 +1020,11 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].sha, target);
     let listing = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -835,15 +1056,27 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
     let err = expect_err(
-        server.drop_commit(Parameters(DropCommitReq { commit: merge.sha.clone() })).await,
+        server
+            .drop_commit(Parameters(DropCommitReq {
+                commit: merge.sha.clone(),
+            }))
+            .await,
     );
-    assert!(err.message.contains("merge"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("merge"),
+        "unexpected error: {}",
+        err.message
+    );
 
     let err = expect_err(
         server
@@ -854,7 +1087,11 @@ async fn drop_refuses_merges_and_unknown_restores() {
             }))
             .await,
     );
-    assert!(err.message.contains("trash"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("trash"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 /// A repo for squash tests: "target" introduces a.txt, "follow-up" edits it
@@ -899,7 +1136,10 @@ async fn squash_fixup_keeps_the_destinations_message() {
 
     assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
-    assert_eq!(git(dir.path(), &["log", "-1", "--format=%B", "HEAD~1"]).trim(), "target");
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%B", "HEAD~1"]).trim(),
+        "target"
+    );
 }
 
 #[tokio::test]
@@ -956,7 +1196,9 @@ async fn squash_from_the_trash_restores_and_folds() {
 
     let listed = shas(&server).await;
     let dropped = server
-        .drop_commit(Parameters(DropCommitReq { commit: listed[1].clone() }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: listed[1].clone(),
+        }))
         .await
         .unwrap()
         .0;
@@ -980,12 +1222,20 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let merge = history.commits.iter().find(|c| c.is_merge).unwrap();
-    let base = history.commits.iter().find(|c| c.subject == "base").unwrap();
+    let base = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "base")
+        .unwrap();
 
     let err = expect_err(
         server
@@ -996,9 +1246,17 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
             }))
             .await,
     );
-    assert!(err.message.contains("cannot squash"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("cannot squash"),
+        "unexpected error: {}",
+        err.message
+    );
 
-    let main1 = history.commits.iter().find(|c| c.subject == "main-1").unwrap();
+    let main1 = history
+        .commits
+        .iter()
+        .find(|c| c.subject == "main-1")
+        .unwrap();
     let err = expect_err(
         server
             .squash_commit(Parameters(SquashCommitReq {
@@ -1008,25 +1266,38 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
             }))
             .await,
     );
-    assert!(err.message.contains("unknown squash mode"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("unknown squash mode"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
 async fn mutations_reject_a_stale_ref() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("a.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     let stale = shas(&server).await[0].clone();
     server
-        .edit_message(Parameters(EditMessageReq { commit: stale.clone(), message: "new".into() }))
+        .edit_message(Parameters(EditMessageReq {
+            commit: stale.clone(),
+            message: "new".into(),
+        }))
         .await
         .unwrap();
 
     // The pre-rewrite sha is gone from the branch now.
     let err = expect_err(
         server
-            .edit_message(Parameters(EditMessageReq { commit: stale, message: "again".into() }))
+            .edit_message(Parameters(EditMessageReq {
+                commit: stale,
+                message: "again".into(),
+            }))
             .await,
     );
     assert!(
@@ -1039,7 +1310,10 @@ async fn mutations_reject_a_stale_ref() {
 #[tokio::test]
 async fn a_sha_prefix_addresses_a_commit() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     let target = shas(&server).await[1].clone();
@@ -1059,11 +1333,18 @@ async fn a_sha_prefix_addresses_a_commit() {
 #[tokio::test]
 async fn a_change_id_chains_mutations_without_relisting() {
     let dir = TempDir::new().unwrap();
-    init_repo(dir.path(), &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")]);
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -1094,12 +1375,19 @@ async fn a_change_id_chains_mutations_without_relisting() {
     clean_head(&result);
 
     let listed = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     assert_eq!(listed.commits[1].subject, "first, chained");
-    assert_eq!(listed.commits[1].detail.author_name.as_deref().unwrap(), "Chained Author");
+    assert_eq!(
+        listed.commits[1].detail.author_name.as_deref().unwrap(),
+        "Chained Author"
+    );
     assert_eq!(listed.commits[1].change_id, change_id);
 }
 
@@ -1111,10 +1399,17 @@ async fn a_too_short_ref_is_rejected() {
 
     let err = expect_err(
         server
-            .edit_message(Parameters(EditMessageReq { commit: "abc".into(), message: "x".into() }))
+            .edit_message(Parameters(EditMessageReq {
+                commit: "abc".into(),
+                message: "x".into(),
+            }))
             .await,
     );
-    assert!(err.message.contains("too short"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("too short"),
+        "unexpected error: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -1127,13 +1422,18 @@ async fn squash_prefers_a_history_match_over_the_trash() {
     // history *and* (stale) in the trash under the same ids.
     let listed = shas(&server).await;
     let dropped = server
-        .drop_commit(Parameters(DropCommitReq { commit: listed[1].clone() }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: listed[1].clone(),
+        }))
         .await
         .unwrap()
         .0;
     clean_head(&dropped.result);
     server.undo().await.unwrap();
-    assert_eq!(git_log_subjects(dir.path()), ["third", "follow-up", "target"]);
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["third", "follow-up", "target"]
+    );
     assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
 
     // The duplicated ref resolves to the history commit: a plain in-history
@@ -1152,7 +1452,11 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
     let dir = TempDir::new().unwrap();
     init_repo(
         dir.path(),
-        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second"), ("c.txt", "3\n", "third")],
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
     );
     let server = open_server(dir.path());
 

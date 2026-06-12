@@ -76,7 +76,9 @@ mod tests {
 
     #[test]
     fn the_result_is_a_single_yaml_block_with_no_structured_content() {
-        let dto = SaveResultDto::Clean { head_sha: Some("abc123".into()) };
+        let dto = SaveResultDto::Clean {
+            head_sha: Some("abc123".into()),
+        };
         let result = Yaml(dto).into_call_tool_result().expect("into result");
 
         // No machine-readable JSON half: a client would surface it and hide the
@@ -108,17 +110,29 @@ mod tests {
 
         let text = &result.content[0].as_text().expect("text content").text;
         // The tab-free field stays a readable literal block scalar...
-        assert!(text.contains("clean: |"), "clean should be a block scalar:\n{text}");
+        assert!(
+            text.contains("clean: |"),
+            "clean should be a block scalar:\n{text}"
+        );
         // ...the tab-bearing one is unfolded into a sequence of lines, never an
         // escaped one-line "...\n..." blob.
-        assert!(text.contains("blobby:\n"), "blobby should be a sequence:\n{text}");
-        assert!(!text.contains("\\n"), "no escaped newlines anywhere:\n{text}");
+        assert!(
+            text.contains("blobby:\n"),
+            "blobby should be a sequence:\n{text}"
+        );
+        assert!(
+            !text.contains("\\n"),
+            "no escaped newlines anywhere:\n{text}"
+        );
 
         // Both forms stay lossless YAML — the block scalar verbatim, the
         // sequence as one string per line.
         let parsed: serde_json::Value =
             serde_yaml::from_str(text).expect("the text block is valid YAML");
         assert_eq!(parsed["clean"], "fn main() {\n    ok\n}");
-        assert_eq!(parsed["blobby"], serde_json::json!(["fn main() {", "\tok", "}"]));
+        assert_eq!(
+            parsed["blobby"],
+            serde_json::json!(["fn main() {", "\tok", "}"])
+        );
     }
 }

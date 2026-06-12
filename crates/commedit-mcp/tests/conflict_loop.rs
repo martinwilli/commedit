@@ -4,12 +4,12 @@
 
 mod common;
 
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use commedit_mcp::dto::{
     ConflictFileEditDto, DropCommitReq, EditMessageReq, FileContentDto, ListHistoryReq,
     ReadConflictReq, ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
+use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -29,7 +29,11 @@ fn conflicting_repo(dir: &std::path::Path) {
 /// Rewrite commit "A"'s content so the descendant "B" no longer applies.
 async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -37,7 +41,10 @@ async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     server
         .replace_files(Parameters(ReplaceFilesReq {
             commit: a.sha.clone(),
-            files: vec![FileContentDto { path: "f.txt".into(), content: "1\nX\n3\n".into() }],
+            files: vec![FileContentDto {
+                path: "f.txt".into(),
+                content: "1\nX\n3\n".into(),
+            }],
             delete_paths: None,
         }))
         .await
@@ -73,10 +80,17 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
     let stale = git(dir.path(), &["rev-parse", "HEAD"]);
     let err = expect_err(
         server
-            .edit_message(Parameters(EditMessageReq { commit: stale, message: "x".into() }))
+            .edit_message(Parameters(EditMessageReq {
+                commit: stale,
+                message: "x".into(),
+            }))
             .await,
     );
-    assert!(err.message.contains("pending"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("pending"),
+        "unexpected error: {}",
+        err.message
+    );
 
     // Resolve oldest-first until the chain is clean.
     let mut steps = 0;
@@ -94,8 +108,15 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
             .await
             .unwrap()
             .0;
-        assert!(file.text.contains("<<<<<<<"), "markers present: {}", file.text);
-        assert!(!file.text.contains("|||||||"), "2-way markers omit the base");
+        assert!(
+            file.text.contains("<<<<<<<"),
+            "markers present: {}",
+            file.text
+        );
+        assert!(
+            !file.text.contains("|||||||"),
+            "2-way markers omit the base"
+        );
 
         result = server
             .resolve_conflicts(Parameters(ResolveConflictsReq {
@@ -119,7 +140,10 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:f.txt"]), "1\nX\n3");
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
-    assert_eq!(git(dir.path(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        git(dir.path(), &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     let tree = git(dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
     assert!(!tree.contains(".jjconflict"), "no conflict residue: {tree}");
@@ -141,7 +165,11 @@ async fn read_conflict_validates_change_and_path() {
             }))
             .await,
     );
-    assert!(err.message.contains("pending"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("pending"),
+        "unexpected error: {}",
+        err.message
+    );
 
     let result = conflicting_edit(&server).await;
     let SaveResultDto::Conflicts { commits, .. } = result else {
@@ -156,7 +184,11 @@ async fn read_conflict_validates_change_and_path() {
             }))
             .await,
     );
-    assert!(err.message.contains("f.txt"), "names the real conflicted files: {}", err.message);
+    assert!(
+        err.message.contains("f.txt"),
+        "names the real conflicted files: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -168,7 +200,11 @@ async fn abort_rewrite_restores_the_original_history() {
 
     // Abort without a pending rewrite is refused.
     let err = expect_err(server.abort_rewrite().await);
-    assert!(err.message.contains("pending"), "unexpected error: {}", err.message);
+    assert!(
+        err.message.contains("pending"),
+        "unexpected error: {}",
+        err.message
+    );
 
     let result = conflicting_edit(&server).await;
     assert!(matches!(result, SaveResultDto::Conflicts { .. }));
@@ -183,7 +219,10 @@ async fn abort_rewrite_restores_the_original_history() {
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     let tip = git(dir.path(), &["rev-parse", "HEAD"]);
     let clean = server
-        .edit_message(Parameters(EditMessageReq { commit: tip, message: "B, edited".into() }))
+        .edit_message(Parameters(EditMessageReq {
+            commit: tip,
+            message: "B, edited".into(),
+        }))
         .await
         .unwrap()
         .0;
@@ -199,13 +238,19 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
 
     // Dropping "A" leaves "B"'s same-line edit dangling: a true conflict.
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let resp = server
-        .drop_commit(Parameters(DropCommitReq { commit: a.sha.clone() }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: a.sha.clone(),
+        }))
         .await
         .unwrap()
         .0;
@@ -255,13 +300,19 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
     let server = open_server(dir.path());
 
     let history = server
-        .list_history(Parameters(ListHistoryReq { limit: None, offset: None, fields: None }))
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+        }))
         .await
         .unwrap()
         .0;
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let resp = server
-        .drop_commit(Parameters(DropCommitReq { commit: a.sha.clone() }))
+        .drop_commit(Parameters(DropCommitReq {
+            commit: a.sha.clone(),
+        }))
         .await
         .unwrap()
         .0;

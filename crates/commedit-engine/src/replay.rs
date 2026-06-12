@@ -61,19 +61,32 @@ pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
     let mut anchor: Vec<usize> = vec![ours_lines.len(); base_lines.len() + 1];
     for op in TextDiff::from_lines(base, ours).ops() {
         match *op {
-            DiffOp::Equal { old_index, new_index, len } => {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
                 for k in 0..len {
                     base_to_ours[old_index + k] = Some(new_index + k);
                     anchor[old_index + k] = new_index + k;
                 }
             }
-            DiffOp::Delete { old_index, old_len, new_index } => {
+            DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+            } => {
                 for k in 0..old_len {
                     deleted_in_ours[old_index + k] = true;
                     anchor[old_index + k] = new_index;
                 }
             }
-            DiffOp::Replace { old_index, old_len, new_index, .. } => {
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                ..
+            } => {
                 // A base region `ours` rewrote to other content (`base_to_ours`
                 // stays `None`, `deleted` stays `false`); anchor it at the start
                 // of the replacement.
@@ -97,9 +110,9 @@ pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
     let drop_base_range = |a: usize, len: usize, drop_line: &mut Vec<bool>| -> Option<()> {
         for i in a..a + len {
             match base_to_ours[i] {
-                Some(j) => drop_line[j] = true, // ours kept it -> drop it
+                Some(j) => drop_line[j] = true,  // ours kept it -> drop it
                 None if deleted_in_ours[i] => {} // ours already dropped it -> no-op
-                None => return None,            // ours rewrote it -> real conflict
+                None => return None,             // ours rewrote it -> real conflict
             }
         }
         Some(())
@@ -108,14 +121,25 @@ pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
     for op in TextDiff::from_lines(base, theirs).ops() {
         match *op {
             DiffOp::Equal { .. } => {}
-            DiffOp::Insert { old_index, new_index, new_len } => {
+            DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => {
                 let pos = anchor_in_ours(old_index);
                 inserts.push((pos, &theirs_lines[new_index..new_index + new_len]));
             }
-            DiffOp::Delete { old_index, old_len, .. } => {
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
                 drop_base_range(old_index, old_len, &mut drop_line)?;
             }
-            DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
                 drop_base_range(old_index, old_len, &mut drop_line)?;
                 let pos = anchor_in_ours(old_index);
                 inserts.push((pos, &theirs_lines[new_index..new_index + new_len]));

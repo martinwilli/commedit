@@ -274,7 +274,9 @@ pub struct ReorderMove {
 pub fn is_linear_history(commits: &[CommitInfo]) -> bool {
     commits.iter().enumerate().all(|(i, c)| {
         c.parents.len() == 1
-            && commits.get(i + 1).is_none_or(|parent| c.parents[0] == parent.id)
+            && commits
+                .get(i + 1)
+                .is_none_or(|parent| c.parents[0] == parent.id)
     })
 }
 
@@ -335,7 +337,12 @@ fn splice_candidates(
     new_tip: &CommitId,
     to: usize,
 ) -> Vec<ReorderCandidate> {
-    let SpliceCtx { commits, head, layout, root } = *ctx;
+    let SpliceCtx {
+        commits,
+        head,
+        layout,
+        root,
+    } = *ctx;
     let n = commits.len();
     if to == 0 {
         return vec![ReorderCandidate {
@@ -353,8 +360,12 @@ fn splice_candidates(
         if e.parent == *target {
             continue; // the line descending toward the dragged commit itself
         }
-        let children: Vec<CommitId> =
-            e.children.iter().filter(|c| *c != target).cloned().collect();
+        let children: Vec<CommitId> = e
+            .children
+            .iter()
+            .filter(|c| *c != target)
+            .cloned()
+            .collect();
         if children.is_empty() || children.iter().any(|c| !branch.contains(c)) {
             continue;
         }
@@ -427,7 +438,12 @@ pub fn plan_reorder_candidates(
     } else {
         head.clone()
     };
-    let ctx = SpliceCtx { commits, head, layout, root };
+    let ctx = SpliceCtx {
+        commits,
+        head,
+        layout,
+        root,
+    };
     splice_candidates(&ctx, &branch, &dragged.id, &new_tip, to)
 }
 
@@ -452,7 +468,12 @@ pub fn plan_restore_candidates(
         return Vec::new();
     }
     let branch = branch_commits(commits, head);
-    let ctx = SpliceCtx { commits, head, layout, root };
+    let ctx = SpliceCtx {
+        commits,
+        head,
+        layout,
+        root,
+    };
     splice_candidates(&ctx, &branch, &restored.id, head, to)
 }
 
@@ -466,10 +487,7 @@ pub fn plan_restore_candidates(
 /// drop and to validate it.
 pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Option<CommitId> {
     let c = commits.get(index)?;
-    if commits.len() < 2
-        || c.parents.len() != 1
-        || !branch_commits(commits, head).contains(&c.id)
-    {
+    if commits.len() < 2 || c.parents.len() != 1 || !branch_commits(commits, head).contains(&c.id) {
         return None;
     }
     Some(c.id.clone())
@@ -478,9 +496,8 @@ pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Optio
 #[cfg(test)]
 mod tests {
     use super::{
-        format_timestamp, is_linear_history, parse_timestamp, plan_drop,
-        plan_reorder_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
-        ReorderMove,
+        format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_reorder_candidates,
+        plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderMove,
     };
     use crate::graph::compute_graph;
     use jj_lib::backend::{ChangeId, CommitId};
@@ -583,12 +600,7 @@ mod tests {
 
     /// [`plan_reorder_candidates`] over `h` with the graph computed on the fly
     /// (root `0`), the way the `Repo` wrapper calls it.
-    fn reorder_cands(
-        h: &[CommitInfo],
-        head: u8,
-        from: usize,
-        to: usize,
-    ) -> Vec<ReorderCandidate> {
+    fn reorder_cands(h: &[CommitInfo], head: u8, from: usize, to: usize) -> Vec<ReorderCandidate> {
         let g = compute_graph(h, &cid(0));
         plan_reorder_candidates(h, &cid(head), &g, &cid(0), from, to)
     }
@@ -629,7 +641,10 @@ mod tests {
         for (from, to, expected) in cases {
             assert_eq!(
                 reorder_cands(&h, 3, from, to),
-                vec![ReorderCandidate { mv: expected, lane: 0 }],
+                vec![ReorderCandidate {
+                    mv: expected,
+                    lane: 0
+                }],
                 "one line crosses a linear gap ({from}->{to})"
             );
         }
@@ -659,7 +674,10 @@ mod tests {
     fn a_stale_layout_yields_no_candidates() {
         let h = history();
         let g = compute_graph(&h[..2], &cid(0)); // one row short
-        assert_eq!(plan_reorder_candidates(&h, &cid(3), &g, &cid(0), 0, 2), vec![]);
+        assert_eq!(
+            plan_reorder_candidates(&h, &cid(3), &g, &cid(0), 0, 2),
+            vec![]
+        );
     }
 
     /// A merge topology: 4 merges 2 into 3, both branched off 1 (head 4).
@@ -682,7 +700,13 @@ mod tests {
         // other branch between the merge and 2.
         let h = merge_history();
         let cands = reorder_cands(&h, 4, 1, 2);
-        assert_eq!(cands, vec![ReorderCandidate { mv: mv(3, &[2], &[4], 4), lane: 1 }]);
+        assert_eq!(
+            cands,
+            vec![ReorderCandidate {
+                mv: mv(3, &[2], &[4], 4),
+                lane: 1
+            }]
+        );
     }
 
     #[test]
@@ -694,8 +718,14 @@ mod tests {
         assert_eq!(
             cands,
             vec![
-                ReorderCandidate { mv: mv(1, &[3], &[4], 4), lane: 0 },
-                ReorderCandidate { mv: mv(1, &[2], &[4], 4), lane: 1 },
+                ReorderCandidate {
+                    mv: mv(1, &[3], &[4], 4),
+                    lane: 0
+                },
+                ReorderCandidate {
+                    mv: mv(1, &[2], &[4], 4),
+                    lane: 1
+                },
             ]
         );
     }
@@ -706,7 +736,13 @@ mod tests {
         // toward 1 itself (skipped), lane 1 is the genuine sibling candidate.
         let h = merge_history();
         let cands = reorder_cands(&h, 4, 3, 2);
-        assert_eq!(cands, vec![ReorderCandidate { mv: mv(1, &[2], &[4], 4), lane: 1 }]);
+        assert_eq!(
+            cands,
+            vec![ReorderCandidate {
+                mv: mv(1, &[2], &[4], 4),
+                lane: 1
+            }]
+        );
     }
 
     #[test]
@@ -724,9 +760,18 @@ mod tests {
         assert_eq!(
             cands,
             vec![
-                ReorderCandidate { mv: mv(9, &[2], &[5], 6), lane: 0 },
-                ReorderCandidate { mv: mv(9, &[2], &[4], 6), lane: 1 },
-                ReorderCandidate { mv: mv(9, &[1], &[5, 4], 6), lane: 2 },
+                ReorderCandidate {
+                    mv: mv(9, &[2], &[5], 6),
+                    lane: 0
+                },
+                ReorderCandidate {
+                    mv: mv(9, &[2], &[4], 6),
+                    lane: 1
+                },
+                ReorderCandidate {
+                    mv: mv(9, &[1], &[5, 4], 6),
+                    lane: 2
+                },
             ]
         );
     }
@@ -737,7 +782,13 @@ mod tests {
         // gap; no displayed commit sits on the root, so no re-root candidate.
         let h = vec![merge(4, &[3, 2]), ci(3, 1)];
         let cands = reorder_cands(&h, 4, 1, 2);
-        assert_eq!(cands, vec![ReorderCandidate { mv: mv(3, &[2], &[4], 4), lane: 1 }]);
+        assert_eq!(
+            cands,
+            vec![ReorderCandidate {
+                mv: mv(3, &[2], &[4], 4),
+                lane: 1
+            }]
+        );
     }
 
     #[test]
@@ -749,7 +800,13 @@ mod tests {
         assert_eq!(reorder_cands(&h, 4, 1, 1), vec![]);
         // The bottom drop of the branch tip still plans like the chain did.
         let cands = reorder_cands(&h, 4, 1, 5);
-        assert_eq!(cands, vec![ReorderCandidate { mv: mv(4, &[0], &[1], 3), lane: 0 }]);
+        assert_eq!(
+            cands,
+            vec![ReorderCandidate {
+                mv: mv(4, &[0], &[1], 3),
+                lane: 0
+            }]
+        );
     }
 
     #[test]
@@ -759,20 +816,32 @@ mod tests {
         // Top: the restored commit becomes the tip.
         assert_eq!(
             restore_cands(&h, 4, &nine, 0),
-            vec![ReorderCandidate { mv: mv(9, &[4], &[], 9), lane: 0 }]
+            vec![ReorderCandidate {
+                mv: mv(9, &[4], &[], 9),
+                lane: 0
+            }]
         );
         // Below the merge: one candidate per parent line.
         assert_eq!(
             restore_cands(&h, 4, &nine, 1),
             vec![
-                ReorderCandidate { mv: mv(9, &[3], &[4], 4), lane: 0 },
-                ReorderCandidate { mv: mv(9, &[2], &[4], 4), lane: 1 },
+                ReorderCandidate {
+                    mv: mv(9, &[3], &[4], 4),
+                    lane: 0
+                },
+                ReorderCandidate {
+                    mv: mv(9, &[2], &[4], 4),
+                    lane: 1
+                },
             ]
         );
         // Bottom: re-root, the old bottom commit becomes the child.
         assert_eq!(
             restore_cands(&h, 4, &nine, 4),
-            vec![ReorderCandidate { mv: mv(9, &[0], &[1], 4), lane: 0 }]
+            vec![ReorderCandidate {
+                mv: mv(9, &[0], &[1], 4),
+                lane: 0
+            }]
         );
     }
 
@@ -784,15 +853,24 @@ mod tests {
         // (onto the root) — one line per linear gap.
         assert_eq!(
             restore_cands(&h, 3, &nine, 0),
-            vec![ReorderCandidate { mv: mv(9, &[3], &[], 9), lane: 0 }]
+            vec![ReorderCandidate {
+                mv: mv(9, &[3], &[], 9),
+                lane: 0
+            }]
         );
         assert_eq!(
             restore_cands(&h, 3, &nine, 2),
-            vec![ReorderCandidate { mv: mv(9, &[1], &[2], 3), lane: 0 }]
+            vec![ReorderCandidate {
+                mv: mv(9, &[1], &[2], 3),
+                lane: 0
+            }]
         );
         assert_eq!(
             restore_cands(&h, 3, &nine, 3),
-            vec![ReorderCandidate { mv: mv(9, &[0], &[1], 3), lane: 0 }]
+            vec![ReorderCandidate {
+                mv: mv(9, &[0], &[1], 3),
+                lane: 0
+            }]
         );
     }
 

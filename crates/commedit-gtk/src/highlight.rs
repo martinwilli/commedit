@@ -116,9 +116,15 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
     // follows tag-table insertion order).
     add("trailing-ws", &|t| t.set_background(Some("#ff6b6b")));
     // Conflict-resolution pane: "our" side, "their" side, and the marker lines.
-    add("ours-line", &|t| t.set_paragraph_background(Some("#e6ffec")));
-    add("theirs-line", &|t| t.set_paragraph_background(Some("#ddf4ff")));
-    add("base-line", &|t| t.set_paragraph_background(Some("#fff8c5")));
+    add("ours-line", &|t| {
+        t.set_paragraph_background(Some("#e6ffec"))
+    });
+    add("theirs-line", &|t| {
+        t.set_paragraph_background(Some("#ddf4ff"))
+    });
+    add("base-line", &|t| {
+        t.set_paragraph_background(Some("#fff8c5"))
+    });
     add("conflict-marker", &|t| {
         t.set_paragraph_background(Some("#ffd7d5"));
         t.set_foreground(Some("#cf222e"));
@@ -179,7 +185,12 @@ fn fg_tag(buffer: &sourceview5::Buffer, hex: &str) -> TextTag {
 /// currently holds: line backgrounds by kind, syntect language coloring of the
 /// code portion (keeping separate parser state for the removed/added sides so
 /// multi-line constructs stay correct), and intra-line change emphasis.
-pub(crate) fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, ps: &SyntaxSet, theme: &Theme) {
+pub(crate) fn highlight_diff(
+    buffer: &sourceview5::Buffer,
+    path: Option<&str>,
+    ps: &SyntaxSet,
+    theme: &Theme,
+) {
     let start = buffer.start_iter();
     let end = buffer.end_iter();
     let text = buffer.text(&start, &end, false).to_string();
@@ -198,7 +209,9 @@ pub(crate) fn highlight_diff(buffer: &sourceview5::Buffer, path: Option<&str>, p
     };
     // The combined buffer holds several files; `path` is only the fallback. The
     // per-section language is re-derived from each `--- a/PATH` header below.
-    let mut syntax = path.map(pick).unwrap_or_else(|| ps.find_syntax_plain_text());
+    let mut syntax = path
+        .map(pick)
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
     let mut old_hl = HighlightLines::new(syntax, theme);
     let mut new_hl = HighlightLines::new(syntax, theme);
 
@@ -346,7 +359,13 @@ pub(crate) fn highlight_diff_line(
 /// Paint a `highlight_line` result as syntect foreground-color tags over the
 /// code portion (`code`, past the `prefix`-wide diff marker) of buffer line `li`.
 /// Shared by the full and single-line diff highlighters.
-fn apply_code_spans(buffer: &sourceview5::Buffer, li: i32, prefix: usize, code: &str, spans: &[(Style, &str)]) {
+fn apply_code_spans(
+    buffer: &sourceview5::Buffer,
+    li: i32,
+    prefix: usize,
+    code: &str,
+    spans: &[(Style, &str)],
+) {
     let mut byte = 0usize;
     for (style, piece) in spans {
         if byte >= code.len() {
@@ -406,7 +425,9 @@ pub(crate) fn highlight_conflict(
     };
     // `path` is only the fallback; the combined buffer holds several files and the
     // per-section language is re-derived from each `─── PATH ───` header.
-    let mut syntax = path.map(pick).unwrap_or_else(|| ps.find_syntax_plain_text());
+    let mut syntax = path
+        .map(pick)
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
     let mut hl = HighlightLines::new(syntax, theme);
 
     for (li, &kind) in kinds.iter().enumerate() {
@@ -455,7 +476,13 @@ pub(crate) fn highlight_conflict(
                     let ce = raw[..byte + plen].chars().count();
                     let fg = style.foreground;
                     let hex = format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b);
-                    apply_cols(buffer, li as i32, cs as i32, ce as i32, &fg_tag(buffer, &hex));
+                    apply_cols(
+                        buffer,
+                        li as i32,
+                        cs as i32,
+                        ce as i32,
+                        &fg_tag(buffer, &hex),
+                    );
                 }
                 byte += plen;
             }
@@ -497,7 +524,9 @@ fn apply_line_tag(buffer: &sourceview5::Buffer, li: i32, name: &str) {
     let Some(s) = buffer.iter_at_line(li) else {
         return;
     };
-    let e = buffer.iter_at_line(li + 1).unwrap_or_else(|| buffer.end_iter());
+    let e = buffer
+        .iter_at_line(li + 1)
+        .unwrap_or_else(|| buffer.end_iter());
     buffer.apply_tag(&tag, &s, &e);
 }
 

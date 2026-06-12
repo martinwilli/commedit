@@ -55,9 +55,7 @@ impl CommeditServer {
         .map(Yaml)
     }
 
-    #[tool(
-        description = "Step one undone operation forward again."
-    )]
+    #[tool(description = "Step one undone operation forward again.")]
     pub async fn redo(&self) -> Result<Yaml<TimeTravelResp>, ErrorData> {
         self.with_session(|repo, _| {
             ensure_not_pending(repo)?;
@@ -109,7 +107,9 @@ impl CommeditServer {
             *repo = fresh;
             trash.entries.clear();
             trash.staged = None;
-            Ok(ReloadResp { head_sha: repo.head_commit_id().map(|id| id.hex()) })
+            Ok(ReloadResp {
+                head_sha: repo.head_commit_id().map(|id| id.hex()),
+            })
         })
         .await
         .map(Yaml)

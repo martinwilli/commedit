@@ -18,13 +18,13 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{bail, Context, Result};
 use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
 use jj_lib::commit::Commit;
-use jj_lib::merged_tree::MergedTree;
 use jj_lib::conflicts::{
     choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
-    materialize_tree_value, resolve_file_executable, update_from_content,
-    ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
+    materialize_tree_value, resolve_file_executable, update_from_content, ConflictMarkerStyle,
+    ConflictMaterializeOptions, MaterializedTreeValue,
 };
 use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
 use jj_lib::operation::Operation;
@@ -250,7 +250,15 @@ impl Repo {
         old_head: Option<String>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, heads, SpuriousResolve::Off)
+        self.finish_mutation_inner(
+            tx,
+            op_msg,
+            desc,
+            pre_op,
+            old_head,
+            heads,
+            SpuriousResolve::Off,
+        )
     }
 
     /// Like [`Self::finish_mutation`] but, for a reorder or squash, opts the
@@ -266,7 +274,15 @@ impl Repo {
         old_head: Option<String>,
         heads: BTreeMap<String, String>,
     ) -> Result<SaveOutcome> {
-        self.finish_mutation_inner(tx, op_msg, desc, pre_op, old_head, heads, SpuriousResolve::CleanTip)
+        self.finish_mutation_inner(
+            tx,
+            op_msg,
+            desc,
+            pre_op,
+            old_head,
+            heads,
+            SpuriousResolve::CleanTip,
+        )
     }
 
     /// Like [`Self::finish_mutation`] but opts into an explicit
@@ -351,7 +367,10 @@ impl Repo {
             .map(|(path, text, marker_len)| {
                 (
                     path.clone(),
-                    FileResolution::Content { text: text.clone(), marker_len: *marker_len },
+                    FileResolution::Content {
+                        text: text.clone(),
+                        marker_len: *marker_len,
+                    },
                 )
             })
             .collect();
@@ -450,8 +469,8 @@ impl Repo {
         )
         .context("writing resolved commit")?;
         block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        self.repo = block_on(tx.commit("commedit: resolve conflict"))
-            .context("committing resolution")?;
+        self.repo =
+            block_on(tx.commit("commedit: resolve conflict")).context("committing resolution")?;
 
         self.settle()
     }
@@ -485,8 +504,8 @@ impl Repo {
             let view = block_on(p.pre_op.view()).context("reading the pre-rewrite view")?;
             let mut tx = self.repo.start_transaction();
             tx.repo_mut().set_view(view.store_view().clone());
-            self.repo = block_on(tx.commit("commedit: abort rewrite"))
-                .context("recording the abort")?;
+            self.repo =
+                block_on(tx.commit("commedit: abort rewrite")).context("recording the abort")?;
         }
         Ok(())
     }
@@ -745,9 +764,7 @@ impl Repo {
             .into_iter()
             .find(|i| i.change_id == change_id)
             .map(|i| i.id)
-            .with_context(|| {
-                format!("change {change_hex} is not on the current branch chain")
-            })
+            .with_context(|| format!("change {change_hex} is not on the current branch chain"))
     }
 
     /// The branch history that conflict detection must scan: the range rewritten
@@ -848,7 +865,10 @@ impl Repo {
         let head = self.current_head_in_jj();
         let conflicts = self.collect_conflicts(head.as_ref())?;
         if conflicts.is_empty() {
-            let p = self.pending.take().expect("settle requires a pending resolution");
+            let p = self
+                .pending
+                .take()
+                .expect("settle requires a pending resolution");
             self.export_and_sync(p.old_head, &p.heads)?;
             // The mutation landed clean and is now in git: record it as a
             // session op-log entry the "Edit history" dropdown can travel back to.
@@ -872,7 +892,10 @@ impl Repo {
             // The chain was rebuilt clean in jj; settle again to export it.
             return self.settle();
         }
-        let p = self.pending.as_mut().expect("settle requires a pending resolution");
+        let p = self
+            .pending
+            .as_mut()
+            .expect("settle requires a pending resolution");
         p.conflicts = conflicts.clone();
         Ok(SaveOutcome::Conflicts { commits: conflicts })
     }
@@ -924,7 +947,9 @@ impl Repo {
         let Some(head) = self.current_head_in_jj() else {
             return Ok(false);
         };
-        let tip = store.get_commit(&head).context("loading the rewritten tip")?;
+        let tip = store
+            .get_commit(&head)
+            .context("loading the rewritten tip")?;
         // CleanTip *requires* a clean tip (a conflicted one is a true conflict);
         // drop/restore tolerate it and never read it back.
         if !forward && tip.has_conflict() {
@@ -937,7 +962,11 @@ impl Repo {
         }
         let mut chain = Vec::with_capacity(chain_infos.len());
         for info in chain_infos.iter().rev() {
-            chain.push(store.get_commit(&info.id).context("loading a chain commit")?);
+            chain.push(
+                store
+                    .get_commit(&info.id)
+                    .context("loading a chain commit")?,
+            );
         }
         let n = chain.len() - 1; // tip index (oldest-first)
         let Some(lo) = chain.iter().position(|c| c.has_conflict()) else {
@@ -981,7 +1010,9 @@ impl Repo {
         let orig_infos = crate::history::history(&self.repo, &orig_head)?;
         let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
         for info in &orig_infos {
-            let c = store.get_commit(&info.id).context("loading an original commit")?;
+            let c = store
+                .get_commit(&info.id)
+                .context("loading an original commit")?;
             let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
                 .context("reading an original parent tree")?;
             originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
@@ -990,7 +1021,9 @@ impl Repo {
         // commit; yet its rewrite is on the post-restore chain and may fall in the
         // rebuilt range, so seed its original change too.
         if let SpuriousResolve::Restore { commit } = &strategy {
-            let c = store.get_commit(commit).context("loading the restored commit")?;
+            let c = store
+                .get_commit(commit)
+                .context("loading the restored commit")?;
             let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
                 .context("reading the restored commit's parent tree")?;
             originals.insert(c.change_id().clone(), (parent_tree, c.tree()));
@@ -1037,7 +1070,9 @@ impl Repo {
         let mut parent_id = chain[lo - 1].id().clone();
         let mut new_tip = head.clone();
         for i in lo..=n {
-            let tree = trees[i].clone().expect("tree computed for the conflicted range");
+            let tree = trees[i]
+                .clone()
+                .expect("tree computed for the conflicted range");
             let new_commit = block_on(
                 tx.repo_mut()
                     .rewrite_commit(&chain[i])
@@ -1050,7 +1085,9 @@ impl Repo {
             new_tip = new_commit.id().clone();
         }
         if let Some(wc_id) = self.working_copy_commit_id() {
-            let wc = store.get_commit(&wc_id).context("loading the working copy")?;
+            let wc = store
+                .get_commit(&wc_id)
+                .context("loading the working copy")?;
             let new_tip_tree = trees[n].clone().expect("tip tree computed");
             // Carry the working copy's uncommitted delta onto the new tip. For
             // CleanTip the tip is unchanged, so `@`'s pre-mutation tree re-parents
@@ -1159,8 +1196,7 @@ impl Repo {
     ) -> Result<()> {
         let mut tx = self.repo.start_transaction();
         crate::transparency::export_to_git(tx.repo_mut())?;
-        self.repo = block_on(tx.commit("commedit: export to git"))
-            .context("committing export")?;
+        self.repo = block_on(tx.commit("commedit: export to git")).context("committing export")?;
         // jj exported the moved bookmark into its throwaway git dir, not the
         // user's repo; mirror that one branch tip into the real repository. Must
         // precede materialize_after_rewrite, which resets the index to the user's

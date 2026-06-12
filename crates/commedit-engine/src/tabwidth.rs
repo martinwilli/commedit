@@ -172,7 +172,9 @@ fn parse_vscode_settings(text: &str) -> (Option<u32>, HashMap<String, u32>) {
         .and_then(|n| n.trim().parse::<u32>().ok());
     let mut by_lang = HashMap::new();
     for (key, val) in root.take_inner() {
-        let JsonValue::Object(obj) = val else { continue };
+        let JsonValue::Object(obj) = val else {
+            continue;
+        };
         let langs = lang_ids_in_key(&key);
         if langs.is_empty() {
             continue;

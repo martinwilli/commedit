@@ -23,7 +23,10 @@ fn subject_id(repo: &Repo, subject: &str) -> commedit_engine::history::CommitInf
 fn snapshots_disk_into_working_copy_and_materializes_it_back() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
 
     let mut repo = Repo::open(dir).expect("open");
     let head = repo.head_commit_id().expect("head");
@@ -40,7 +43,8 @@ fn snapshots_disk_into_working_copy_and_materializes_it_back() {
 
     // Checking out clean HEAD reverts the tracked edit, but the untracked file
     // is left alone (jj never tracked it) — it stays alive on disk.
-    repo.materialize_working_copy(&head).expect("materialize head");
+    repo.materialize_working_copy(&head)
+        .expect("materialize head");
     assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
     assert_eq!(
         std::fs::read_to_string(dir.join("new.txt")).unwrap(),
@@ -67,7 +71,11 @@ fn unstaged_edit_to_an_untouched_file_survives_a_rewrite() {
     let dir = tmp.path();
     common::init_repo(
         dir,
-        &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B"), ("c.txt", "c\n", "C")],
+        &[
+            ("a.txt", "a\n", "A"),
+            ("b.txt", "b\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
     );
 
     let mut repo = Repo::open(dir).expect("open");
@@ -75,7 +83,8 @@ fn unstaged_edit_to_an_untouched_file_survives_a_rewrite() {
     std::fs::write(dir.join("a.txt"), "a\nlocal edit\n").unwrap();
 
     let target = subject_id(&repo, "B").id;
-    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "B (edited)")
+        .expect("rewrite");
 
     // History rewritten, descendants preserved.
     assert_eq!(common::git_log_subjects(dir), vec!["C", "B (edited)", "A"]);
@@ -87,9 +96,15 @@ fn unstaged_edit_to_an_untouched_file_survives_a_rewrite() {
     // (the common::git helper trims, so the porcelain " M a.txt" loses its lead)
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
     // Transparency holds: HEAD attached, no jj keep-ref clutter, repo intact.
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(
-        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]),
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        common::git(
+            dir,
+            &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]
+        ),
         ""
     );
     common::git(dir, &["fsck", "--no-progress"]);
@@ -119,7 +134,8 @@ fn untracked_file_is_excluded_from_at_but_survives_a_rewrite() {
     );
 
     let target = subject_id(&repo, "A").id;
-    repo.rewrite_message(&target, "A (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "A (edited)")
+        .expect("rewrite");
 
     // The rewrite went through, and the untracked file is still on disk and
     // still untracked — it was never managed by jj, so it stays alive.
@@ -137,7 +153,10 @@ fn non_overlapping_edit_to_a_rewritten_file_is_merged_on_disk() {
     let dir = tmp.path();
     common::init_repo(
         dir,
-        &[("f.txt", "1\n2\n3\n4\n5\n", "base"), ("g.txt", "g\n", "top")],
+        &[
+            ("f.txt", "1\n2\n3\n4\n5\n", "base"),
+            ("g.txt", "g\n", "top"),
+        ],
     );
 
     let mut repo = Repo::open(dir).expect("open");
@@ -156,7 +175,10 @@ fn non_overlapping_edit_to_a_rewritten_file_is_merged_on_disk() {
         "1-rewritten\n2\n3\n4\n5-local\n"
     );
     // The committed history has the rewrite but not the uncommitted edit.
-    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1-rewritten\n2\n3\n4\n5");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD~1:f.txt"]),
+        "1-rewritten\n2\n3\n4\n5"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -175,12 +197,17 @@ fn index_only_staged_content_is_backed_up_across_a_rewrite() {
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
 
     let target = subject_id(&repo, "B").id;
-    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "B (edited)")
+        .expect("rewrite");
 
     // The index-only content was pinned to a recoverable backup ref.
     let backups = common::git(
         dir,
-        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ],
     );
     let backup = backups.lines().next().expect("an index backup ref exists");
     assert!(backup.starts_with("refs/commedit/backup/index-"));
@@ -215,9 +242,17 @@ fn identical_index_only_content_dedups_to_one_backup_ref() {
     // one ref rather than piling up.
     let backups = common::git(
         dir,
-        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ],
     );
-    assert_eq!(backups.lines().count(), 1, "expected a single deduped backup ref, got: {backups}");
+    assert_eq!(
+        backups.lines().count(),
+        1,
+        "expected a single deduped backup ref, got: {backups}"
+    );
 }
 
 #[test]
@@ -229,18 +264,33 @@ fn stale_backup_refs_are_pruned_to_one_on_rewrite() {
     // Seed several backup refs, as if left behind by earlier sessions.
     let tree = common::git(dir, &["rev-parse", "HEAD^{tree}"]);
     for tag in ["aaa", "bbb", "ccc"] {
-        let commit = common::git(dir, &["commit-tree", &tree, "-m", &format!("stale backup {tag}")]);
-        common::git(dir, &["update-ref", &format!("refs/commedit/backup/index-{tag}"), &commit]);
+        let commit = common::git(
+            dir,
+            &["commit-tree", &tree, "-m", &format!("stale backup {tag}")],
+        );
+        common::git(
+            dir,
+            &[
+                "update-ref",
+                &format!("refs/commedit/backup/index-{tag}"),
+                &commit,
+            ],
+        );
     }
 
     let mut repo = Repo::open(dir).expect("open");
     let target = subject_id(&repo, "B").id;
-    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "B (edited)")
+        .expect("rewrite");
 
     // The rewrite prunes the pile-up down to a single most-recent backup ref.
     let backups = common::git(
         dir,
-        &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ],
     );
     assert_eq!(
         backups.lines().count(),
@@ -260,10 +310,18 @@ fn a_plain_unstaged_edit_creates_no_backup_ref() {
     std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
 
     let target = subject_id(&repo, "B").id;
-    repo.rewrite_message(&target, "B (edited)").expect("rewrite");
+    repo.rewrite_message(&target, "B (edited)")
+        .expect("rewrite");
 
     assert_eq!(
-        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/commedit/backup/"]),
+        common::git(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/commedit/backup/"
+            ]
+        ),
         ""
     );
 }
@@ -316,20 +374,32 @@ fn overlapping_edit_defers_as_a_conflict_then_resolves() {
     assert_eq!(common::git_log_subjects(dir), vec!["top", "base"]);
     assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\n2\n3");
     assert!(
-        !std::fs::read_to_string(dir.join("f.txt")).unwrap().contains("<<<<<<<"),
+        !std::fs::read_to_string(dir.join("f.txt"))
+            .unwrap()
+            .contains("<<<<<<<"),
         "git/worktree must be untouched while the conflict is pending"
     );
 
     // Resolve @ in the pane, exactly like a commit conflict: read the markers,
     // write back a resolution.
-    let cf = repo.read_conflict(&wc.change_id_hex(), "f.txt").expect("read conflict");
+    let cf = repo
+        .read_conflict(&wc.change_id_hex(), "f.txt")
+        .expect("read conflict");
     let outcome = repo
-        .resolve_conflict(&wc.change_id_hex(), "f.txt", "1\n2-resolved\n3\n", cf.marker_len)
+        .resolve_conflict(
+            &wc.change_id_hex(),
+            "f.txt",
+            "1\n2-resolved\n3\n",
+            cf.marker_len,
+        )
         .expect("resolve");
 
     // Now the rewrite applies to git, and the resolved working copy lands on disk.
     assert!(matches!(outcome, SaveOutcome::Clean));
-    assert_eq!(common::git(dir, &["show", "HEAD~1:f.txt"]), "1\n2-rewritten\n3");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD~1:f.txt"]),
+        "1\n2-rewritten\n3"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join("f.txt")).unwrap(),
         "1\n2-resolved\n3\n"
@@ -385,7 +455,10 @@ fn dropping_the_working_copy_discards_all_uncommitted_changes() {
     // git is untouched: same tip, same branch, clean status.
     assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -442,12 +515,18 @@ fn dropping_one_split_chain_entry_discards_only_its_slice() {
     // One entry left, holding only the a.txt change; b.txt is back to HEAD.
     let chain = repo.working_copy_chain();
     assert_eq!(chain.len(), 1);
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nAA\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
     assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
 
     // git is untouched throughout.
     assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -503,7 +582,10 @@ fn tracked_file_in_ignored_directory_is_not_a_phantom_change() {
 fn partial_commit_paths_tier_commits_only_listed_files() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     // Edit two tracked files; commit only a.txt whole.
@@ -511,25 +593,41 @@ fn partial_commit_paths_tier_commits_only_listed_files() {
     std::fs::write(dir.join("b.txt"), "b\nedit-b\n").unwrap();
 
     let paths = vec!["a.txt".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     let outcome = repo
         .commit_working_copy_partial(sel, "commit a only", None)
         .expect("partial commit");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
     // The new commit holds the edited a.txt and the *original* b.txt.
-    assert_eq!(common::git_log_subjects(dir), ["commit a only", "second", "first"]);
+    assert_eq!(
+        common::git_log_subjects(dir),
+        ["commit a only", "second", "first"]
+    );
     assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nedit-a");
     assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b");
 
     // Disk is byte-identical for both files — only b.txt's edit stays uncommitted.
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nedit-a\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nedit-b\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nedit-a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nedit-b\n"
+    );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
 
     // One remaining chain entry (the remainder); transparency holds.
     assert_eq!(repo.working_copy_chain().len(), 1);
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
@@ -553,7 +651,11 @@ fn partial_commit_hunks_tier_commits_only_the_selected_hunk() {
     std::fs::write(dir.join("f.txt"), &edited).unwrap();
 
     let hunks = vec![("f.txt".to_string(), vec![0usize])];
-    let sel = PartialSelection { paths: &[], hunks: &hunks, patches: &[] };
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &hunks,
+        patches: &[],
+    };
     let outcome = repo
         .commit_working_copy_partial(sel, "first hunk", None)
         .expect("partial commit");
@@ -561,8 +663,14 @@ fn partial_commit_hunks_tier_commits_only_the_selected_hunk() {
 
     // Committed content keeps hunk 0 (L3) but reverts hunk 1 (l17 stays original).
     let committed = common::git(dir, &["show", "HEAD:f.txt"]);
-    assert!(committed.contains("\nL3\n"), "hunk 0 committed, got: {committed}");
-    assert!(committed.contains("\nl17\n"), "hunk 1 not committed, got: {committed}");
+    assert!(
+        committed.contains("\nL3\n"),
+        "hunk 0 committed, got: {committed}"
+    );
+    assert!(
+        committed.contains("\nl17\n"),
+        "hunk 1 not committed, got: {committed}"
+    );
 
     // Disk is unchanged (both edits present); the remainder is hunk 1.
     assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), edited);
@@ -582,15 +690,29 @@ fn partial_commit_patches_tier_commits_a_sub_hunk_and_rejects_a_corrupt_patch() 
     std::fs::write(dir.join("f.txt"), "1\n2\nA\nB\n3\n").unwrap();
     let patch = "@@ -2,2 +2,3 @@\n 2\n+A\n 3\n";
     let patches = vec![("f.txt".to_string(), patch.to_string())];
-    let sel = PartialSelection { paths: &[], hunks: &[], patches: &patches };
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &[],
+        patches: &patches,
+    };
     repo.commit_working_copy_partial(sel, "add A only", None)
         .expect("partial commit");
     assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), "1\n2\nA\n3");
-    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "1\n2\nA\nB\n3\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "1\n2\nA\nB\n3\n"
+    );
 
     // A patch whose context doesn't match the file is rejected, not mis-applied.
-    let bad = vec![("f.txt".to_string(), "@@ -1,1 +1,2 @@\n NOPE\n+X\n".to_string())];
-    let sel = PartialSelection { paths: &[], hunks: &[], patches: &bad };
+    let bad = vec![(
+        "f.txt".to_string(),
+        "@@ -1,1 +1,2 @@\n NOPE\n+X\n".to_string(),
+    )];
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &[],
+        patches: &bad,
+    };
     assert!(repo.commit_working_copy_partial(sel, "bad", None).is_err());
     common::git(dir, &["fsck", "--no-progress"]);
 }
@@ -600,7 +722,10 @@ fn partial_commit_of_everything_matches_commit_working_copy() {
     // Two identical repos edited the same way: one whole-commits, the other
     // partial-commits every changed path. The resulting trees must be identical.
     let edit = |dir: &Path| {
-        common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+        common::init_repo(
+            dir,
+            &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+        );
         std::fs::write(dir.join("a.txt"), "a\nx\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\ny\n").unwrap();
     };
@@ -618,7 +743,11 @@ fn partial_commit_of_everything_matches_commit_working_copy() {
     edit(part);
     let mut prepo = Repo::open(part).expect("open");
     let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     prepo
         .commit_working_copy_partial(sel, "all", None)
         .expect("partial commit");
@@ -637,13 +766,20 @@ fn partial_commit_of_everything_matches_commit_working_copy() {
 fn partial_commit_with_an_empty_selection_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     // Edit a.txt, but select the *unmodified* b.txt → the commit would be empty.
     std::fs::write(dir.join("a.txt"), "a\nedit\n").unwrap();
     let paths = vec!["b.txt".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     let err = repo
         .commit_working_copy_partial(sel, "nope", None)
         .unwrap_err();
@@ -658,14 +794,21 @@ fn partial_commit_with_an_empty_selection_errors() {
 fn partial_commit_paths_tier_commits_a_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     // Delete a.txt on disk and edit b.txt; commit only the deletion.
     std::fs::remove_file(dir.join("a.txt")).unwrap();
     std::fs::write(dir.join("b.txt"), "b\nedit\n").unwrap();
     let paths = vec!["a.txt".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     repo.commit_working_copy_partial(sel, "drop a", None)
         .expect("partial commit");
 
@@ -702,16 +845,29 @@ fn partial_commit_value_splice_preserves_exec_bit_and_rejects_binary_text_tiers(
 
     // The binary can't be addressed by hunk (or patch) — text tiers reject it.
     let hunks = vec![("data.bin".to_string(), vec![0usize])];
-    let sel = PartialSelection { paths: &[], hunks: &hunks, patches: &[] };
-    let err = repo.commit_working_copy_partial(sel, "x", None).unwrap_err();
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &hunks,
+        patches: &[],
+    };
+    let err = repo
+        .commit_working_copy_partial(sel, "x", None)
+        .unwrap_err();
     assert!(err.to_string().contains("binary"), "got: {err}");
 
     // The executable commits whole via the paths tier, keeping its 100755 mode.
     let paths = vec!["run.sh".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     repo.commit_working_copy_partial(sel, "update script", None)
         .expect("partial commit");
-    assert_eq!(common::git(dir, &["show", "HEAD:run.sh"]), "#!/bin/sh\necho bye");
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:run.sh"]),
+        "#!/bin/sh\necho bye"
+    );
     assert!(
         common::git(dir, &["ls-tree", "HEAD", "run.sh"]).starts_with("100755"),
         "the executable bit is preserved by the value-splice"
@@ -723,7 +879,10 @@ fn partial_commit_value_splice_preserves_exec_bit_and_rejects_binary_text_tiers(
 fn partial_commit_collapses_a_split_working_copy_chain() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    common::init_repo(dir, &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")]);
+    common::init_repo(
+        dir,
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
     let mut repo = Repo::open(dir).expect("open");
 
     // Two uncommitted edits peeled into a two-entry chain.
@@ -736,19 +895,36 @@ fn partial_commit_collapses_a_split_working_copy_chain() {
     // A partial commit reads the leaf's full tree, collapsing the chain; the
     // remainder is a single entry.
     let paths = vec!["a.txt".to_string()];
-    let sel = PartialSelection { paths: &paths, hunks: &[], patches: &[] };
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
     let outcome = repo
         .commit_working_copy_partial(sel, "commit a", None)
         .expect("partial commit");
     assert!(matches!(outcome, SaveOutcome::Clean));
 
     assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nAA");
-    assert_eq!(repo.working_copy_chain().len(), 1, "chain collapsed to the remainder");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\nBB\n");
-    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
-    assert_eq!(common::git(dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(
-        common::git(dir, &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]),
+        repo.working_copy_chain().len(),
+        1,
+        "chain collapsed to the remainder"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        common::git(
+            dir,
+            &["for-each-ref", "--format=%(refname)", "refs/jj/keep/"]
+        ),
         ""
     );
     common::git(dir, &["fsck", "--no-progress"]);

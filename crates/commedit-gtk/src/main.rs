@@ -9,9 +9,9 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::diff::{
-    apply_patch, commit_changes, reconstruct_conflict_file,
-    render_commit_diff, render_conflict_snippets, revert_groups, split_combined_patch,
-    CombinedFile, ContextExpansion, FileChange, HunkInfo,
+    apply_patch, commit_changes, reconstruct_conflict_file, render_commit_diff,
+    render_conflict_snippets, revert_groups, split_combined_patch, CombinedFile, ContextExpansion,
+    FileChange, HunkInfo,
 };
 use commedit_engine::graph::{compute_graph, GraphLayout};
 use commedit_engine::history::{history, history_limited, CommitInfo};
@@ -25,14 +25,13 @@ use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
-use sourceview5::prelude::ViewExt;
 use gtk::{
-    gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction,
-    DropDown, Entry, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, Grid, HeaderBar, Label, ListBox, ListBoxRow,
-    Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, Shortcut,
-    ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
+    gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown, Entry,
+    EventControllerKey, EventControllerScroll, EventControllerScrollFlags, Grid, HeaderBar, Label,
+    ListBox, ListBoxRow, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow,
+    Shortcut, ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
 };
+use sourceview5::prelude::ViewExt;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
@@ -832,28 +831,30 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let rendered_hunks = rendered_hunks.clone();
         let highlight = highlight.clone();
-        Rc::new(move |text: String, all_hunks, files: Vec<CombinedFile>, splice: bool| {
-            editing.set(true);
-            if splice {
-                splice_buffer_text(&file_buffer, &text);
-            } else {
-                // A fresh render is a new editing context, not an undoable edit:
-                // mark it irreversible so it clears the undo history rather than
-                // letting a later Ctrl+Z revert the load itself.
-                file_buffer.begin_irreversible_action();
-                file_buffer.set_text(&text);
-                file_buffer.end_irreversible_action();
-            }
-            file_view.set_editable(files.iter().any(|f| f.editable));
-            *rendered_hunks.borrow_mut() = all_hunks;
-            *combined_files.borrow_mut() = files;
-            // Highlight in this same main-loop turn, before GTK paints, so the
-            // diff appears once fully colored instead of flashing plain first and
-            // then re-highlighting via the debounced `changed` handler (which is
-            // suppressed while `editing` is set).
-            highlight();
-            editing.set(false);
-        })
+        Rc::new(
+            move |text: String, all_hunks, files: Vec<CombinedFile>, splice: bool| {
+                editing.set(true);
+                if splice {
+                    splice_buffer_text(&file_buffer, &text);
+                } else {
+                    // A fresh render is a new editing context, not an undoable edit:
+                    // mark it irreversible so it clears the undo history rather than
+                    // letting a later Ctrl+Z revert the load itself.
+                    file_buffer.begin_irreversible_action();
+                    file_buffer.set_text(&text);
+                    file_buffer.end_irreversible_action();
+                }
+                file_view.set_editable(files.iter().any(|f| f.editable));
+                *rendered_hunks.borrow_mut() = all_hunks;
+                *combined_files.borrow_mut() = files;
+                // Highlight in this same main-loop turn, before GTK paints, so the
+                // diff appears once fully colored instead of flashing plain first and
+                // then re-highlighting via the debounced `changed` handler (which is
+                // suppressed while `editing` is set).
+                highlight();
+                editing.set(false);
+            },
+        )
     };
     // Full render: every file's diff in one buffer, files separated by
     // `diff --git` lines. `set_text`s the buffer (scroll resets to the top).
@@ -904,11 +905,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let nav_sync = nav_sync.clone();
         let conflict_expand_cell = conflict_expand_cell.clone();
         move |gesture, _n_press, x, y| {
-            let (bx, by) = file_view.window_to_buffer_coords(
-                gtk::TextWindowType::Widget,
-                x as i32,
-                y as i32,
-            );
+            let (bx, by) =
+                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
             let Some(iter) = file_view.iter_at_location(bx, by) else {
                 return;
             };
@@ -1252,7 +1250,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 if fv.resolvable {
                     // Drop the inline resolve cues we appended to marker lines, so
                     // they don't accrete into the reconstructed text on re-render.
-                    let cleaned: Vec<String> = section.iter().map(|l| strip_marker_cue(l)).collect();
+                    let cleaned: Vec<String> =
+                        section.iter().map(|l| strip_marker_cue(l)).collect();
                     let refs: Vec<&str> = cleaned.iter().map(String::as_str).collect();
                     fv.full_text = reconstruct_conflict_file(&refs, &fv.pieces, &cue);
                 }
@@ -1399,7 +1398,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-
     // Firewall: every interactive mutation of the diff buffer goes through the
     // structured-edit planner so it can never produce a patch that fails to
     // apply. Programmatic loads/edits set the `editing` guard and pass straight
@@ -1429,7 +1427,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 line: iter.line() as usize,
                 col: iter.line_offset() as usize,
             });
-            match plan_edit(&buffer_text(buffer), caret, EditGesture::Insert(text.to_string())) {
+            match plan_edit(
+                &buffer_text(buffer),
+                caret,
+                EditGesture::Insert(text.to_string()),
+            ) {
                 EditPlan::Allow => {}
                 EditPlan::Block => {
                     buffer.stop_signal_emission_by_name("insert-text");
@@ -1573,7 +1575,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 gdk::Key::d | gdk::Key::D if ctrl => EditGesture::DeleteLine,
                 _ => return glib::Propagation::Proceed,
             };
-            match plan_edit(&buffer_text(&file_buffer), buffer_selection(&file_buffer), gesture) {
+            match plan_edit(
+                &buffer_text(&file_buffer),
+                buffer_selection(&file_buffer),
+                gesture,
+            ) {
                 EditPlan::Allow => glib::Propagation::Proceed,
                 EditPlan::Block => {
                     show_status(READ_ONLY_HINT);
@@ -1881,8 +1887,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let (loaded, has_more) = {
                 let r = repo.borrow();
                 match r.head_commit_id() {
-                    Some(head) => history_limited(&r.repo, &head, 0, history_limit.get())
-                        .unwrap_or_default(),
+                    Some(head) => {
+                        history_limited(&r.repo, &head, 0, history_limit.get()).unwrap_or_default()
+                    }
                     None => (Vec::new(), false),
                 }
             };
@@ -2300,17 +2307,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let saved_cursor = file_buffer.cursor_position();
                 // Edit each changed file of the selected entry in place (no rebase
                 // that moves the tip, so a loop is fine).
-                let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()) {
-                    Ok(edits) => edits,
-                    Err(msg) => {
-                        show_status(&msg);
-                        return;
-                    }
-                };
+                let edits =
+                    match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()) {
+                        Ok(edits) => edits,
+                        Err(msg) => {
+                            show_status(&msg);
+                            return;
+                        }
+                    };
                 let change = selected_wc_change.borrow().clone();
                 for (path, content) in &edits {
                     if let Err(err) =
-                        repo.borrow_mut().edit_working_copy_file(change.as_deref(), path, content)
+                        repo.borrow_mut()
+                            .edit_working_copy_file(change.as_deref(), path, content)
                     {
                         show_status(&format!("Working-copy edit failed: {err}"));
                         return;
@@ -2379,7 +2388,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
             // File content edits across every file of the combined diff, applied
             // in one rewrite so a multi-file Save is a single transaction.
-            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()) {
+            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow())
+            {
                 Ok(edits) => edits,
                 Err(msg) => {
                     show_status(&msg);
@@ -2409,7 +2419,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 if let Some(info) = resolve_commit(&repo, &change_id) {
                     commit_id = info.id;
                 }
-                let outcome = repo.borrow_mut().rewrite_identity(&commit_id, &new_identity);
+                let outcome = repo
+                    .borrow_mut()
+                    .rewrite_identity(&commit_id, &new_identity);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {}
                     Ok(SaveOutcome::Conflicts { commits }) => {
@@ -2454,7 +2466,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     if let Some(iter) = file_buffer.iter_at_line(top_line as i32) {
                         file_buffer.place_cursor(&iter);
                     }
-                    file_dropdown.set_selected(diff_file_index_at_line(&file_buffer, top_line) as u32);
+                    file_dropdown
+                        .set_selected(diff_file_index_at_line(&file_buffer, top_line) as u32);
                 }
             }
             nav_sync.set(false);
@@ -2497,7 +2510,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if pane_mode.borrow().is_conflict() {
                 return;
             }
-            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()) {
+            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow())
+            {
                 Ok(edits) => edits,
                 Err(msg) => {
                     show_status(&msg);
@@ -2539,7 +2553,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // the reloaded diff stay in sync.
             if viewing_wc.get() {
                 let change = selected_wc_change.borrow().clone();
-                if let Err(err) = repo.borrow_mut().split_working_copy(change.as_deref(), &edits) {
+                if let Err(err) = repo
+                    .borrow_mut()
+                    .split_working_copy(change.as_deref(), &edits)
+                {
                     show_status(&format!("Split failed: {err}"));
                     return;
                 }
@@ -2596,8 +2613,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             save();
             glib::Propagation::Stop
         });
-        let trigger = ShortcutTrigger::parse_string("<Control>s")
-            .expect("valid shortcut trigger");
+        let trigger = ShortcutTrigger::parse_string("<Control>s").expect("valid shortcut trigger");
         Shortcut::new(Some(trigger), Some(action))
     };
     // Ctrl+Q closes the window.
@@ -2607,8 +2623,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             window.close();
             glib::Propagation::Stop
         });
-        let trigger = ShortcutTrigger::parse_string("<Control>q")
-            .expect("valid shortcut trigger");
+        let trigger = ShortcutTrigger::parse_string("<Control>q").expect("valid shortcut trigger");
         Shortcut::new(Some(trigger), Some(action))
     };
     let shortcuts = ShortcutController::new();
@@ -2812,7 +2827,10 @@ mod tests {
         assert_eq!(pills.len(), 2);
         assert_eq!(pills[0].2, "↕ expand context");
         assert_eq!(pills[1].2, REVERT_HUNK_LABEL);
-        assert!(pills[0].1 < pills[1].0, "pill ranges are disjoint & ordered");
+        assert!(
+            pills[0].1 < pills[1].0,
+            "pill ranges are disjoint & ordered"
+        );
         let chars: Vec<char> = line.chars().collect();
         for &(lc, rc, _) in &pills {
             assert_eq!(chars[lc], CUE_CAP_L);

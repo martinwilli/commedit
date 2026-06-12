@@ -16,7 +16,7 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    plan_drop, plan_reorder_candidates, plan_restore_candidates, parse_timestamp, CommitInfo,
+    parse_timestamp, plan_drop, plan_reorder_candidates, plan_restore_candidates, CommitInfo,
     ReorderCandidate,
 };
 use crate::repo::Repo;
@@ -47,7 +47,9 @@ impl Repo {
     /// descendants onto the rewritten commit, and export the result to git in a
     /// single transaction.
     pub fn rewrite_message(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
-        crate::repo::catch_jj("editing the message", || self.rewrite_message_inner(target, message))
+        crate::repo::catch_jj("editing the message", || {
+            self.rewrite_message_inner(target, message)
+        })
     }
 
     fn rewrite_message_inner(&mut self, target: &CommitId, message: &str) -> Result<SaveOutcome> {
@@ -71,8 +73,7 @@ impl Repo {
                 .write(),
         )
         .context("writing rewritten commit")?;
-        pollster::block_on(tx.repo_mut().rebase_descendants())
-            .context("rebasing descendants")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
         self.finish_mutation(
             tx,
@@ -91,7 +92,9 @@ impl Repo {
     /// stamping the committer to "now" on a rewrite; run it last in a save so the
     /// edited values win over the side effects of message/content edits.
     pub fn rewrite_identity(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
-        crate::repo::catch_jj("editing the identity", || self.rewrite_identity_inner(target, id))
+        crate::repo::catch_jj("editing the identity", || {
+            self.rewrite_identity_inner(target, id)
+        })
     }
 
     fn rewrite_identity_inner(&mut self, target: &CommitId, id: &Identity) -> Result<SaveOutcome> {
@@ -173,12 +176,20 @@ impl Repo {
         let mut prepared: Vec<Prepared> = Vec::with_capacity(edits.len());
         for edit in &edits {
             if !seen.insert(edit.target.clone()) {
-                bail!("commit {} appears more than once in the batch", edit.target.hex());
+                bail!(
+                    "commit {} appears more than once in the batch",
+                    edit.target.hex()
+                );
             }
             if edit.message.is_none() && edit.identity.is_none() {
-                bail!("edit for {} changes neither message nor identity", edit.target.hex());
+                bail!(
+                    "edit for {} changes neither message nor identity",
+                    edit.target.hex()
+                );
             }
-            let commit = store.get_commit(&edit.target).context("loading target commit")?;
+            let commit = store
+                .get_commit(&edit.target)
+                .context("loading target commit")?;
             let signatures = match &edit.identity {
                 Some(id) => {
                     let author = Signature {
@@ -224,7 +235,10 @@ impl Repo {
         let mut order: Vec<usize> = (0..prepared.len()).collect();
         order.sort_by_key(|&i| anc_count[i]);
 
-        let affected: Vec<String> = prepared.iter().map(|p| p.commit.change_id().hex()).collect();
+        let affected: Vec<String> = prepared
+            .iter()
+            .map(|p| p.commit.change_id().hex())
+            .collect();
         let label = format!(
             "Edit {} commit{}",
             prepared.len(),
@@ -252,7 +266,9 @@ impl Repo {
                 builder = builder.set_description(message);
             }
             if let Some((author, committer)) = &p.signatures {
-                builder = builder.set_author(author.clone()).set_committer(committer.clone());
+                builder = builder
+                    .set_author(author.clone())
+                    .set_committer(committer.clone());
             }
             pollster::block_on(builder.write()).context("writing rewritten commit")?;
         }
@@ -418,12 +434,9 @@ impl Repo {
         };
 
         let mut tx = self.repo.start_transaction();
-        let stats = pollster::block_on(move_commits(
-            tx.repo_mut(),
-            &loc,
-            &RebaseOptions::default(),
-        ))
-        .context("splicing commit")?;
+        let stats =
+            pollster::block_on(move_commits(tx.repo_mut(), &loc, &RebaseOptions::default()))
+                .context("splicing commit")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
         // Point the branch at the new head. A splice need not rewrite the old

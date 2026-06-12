@@ -189,7 +189,8 @@ pub(crate) const CONFLICT_STRUCTURAL_NOTICE: &str =
 
 /// Status-line hint shown when the patch firewall blocks an edit that would break
 /// the unified-diff structure.
-pub(crate) const READ_ONLY_HINT: &str = "Edit blocked — this change would break the patch structure.";
+pub(crate) const READ_ONLY_HINT: &str =
+    "Edit blocked — this change would break the patch structure.";
 /// Status-line hint shown when an edit would touch the conflict view's structural
 /// layout lines (file headers, elision cues, notices).
 pub(crate) const CONFLICT_LAYOUT_HINT: &str =

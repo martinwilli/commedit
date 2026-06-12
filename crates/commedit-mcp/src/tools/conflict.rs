@@ -76,7 +76,9 @@ impl CommeditServer {
                     req.path
                 )));
             }
-            let file = repo.read_conflict(&change_hex, &req.path).map_err(internal)?;
+            let file = repo
+                .read_conflict(&change_hex, &req.path)
+                .map_err(internal)?;
             Ok(ReadConflictResp {
                 text: file.text,
                 marker_len: file.marker_len,
@@ -104,8 +106,7 @@ impl CommeditServer {
             let conflicts = repo.pending_conflicts().unwrap_or(&[]);
             let commit = &conflicts[find_conflicted(conflicts, &req.commit)?];
             let change_hex = commit.change_id_hex();
-            let conflicted_paths: Vec<String> =
-                commit.files.iter().map(|f| f.path_str()).collect();
+            let conflicted_paths: Vec<String> = commit.files.iter().map(|f| f.path_str()).collect();
 
             let mut files: Vec<(String, FileResolution)> = Vec::with_capacity(req.files.len());
             for f in req.files {

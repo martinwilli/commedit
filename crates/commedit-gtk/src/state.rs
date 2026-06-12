@@ -33,6 +33,11 @@ pub(crate) type Renderer = Rc<dyn Fn()>;
 /// (see `dragdrop::run_post_drag`); `None` between drags.
 pub(crate) type PostDrag = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
+/// A history row's revert button (floating at the row's right edge) calls this with
+/// the row's display index to drop a revert of that commit directly on top of it
+/// (wired in `build_ui`, captured by each row in `rows::add_revert_button`).
+pub(crate) type RevertCallback = Rc<dyn Fn(i32)>;
+
 /// Which list a drag started in, so the shared drop handlers can tell a reorder
 /// (history → history), a drop (history → trash), a restore (trash → history) and
 /// a working-copy fold (working copy → commit) apart. The carried value is just

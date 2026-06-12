@@ -278,6 +278,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; } \
              .commit-id-copy { background-color: @theme_base_color; \
              color: @theme_fg_color; border-radius: 4px; padding: 0 1px; } \
+             .commit-revert { background-color: @theme_base_color; \
+             color: @theme_fg_color; border-radius: 4px; padding: 0 1px; } \
              .ref-pill { font-size: smaller; border-radius: 9px; padding: 0 7px; } \
              .ref-branch { background-color: rgba(46, 194, 126, 0.25); \
              border: 1px solid rgba(46, 194, 126, 0.8); } \
@@ -1871,6 +1873,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // The history rows' subject revert button calls back here with the clicked
+    // row's display index. The real handler needs `refresh` / `enter_conflict_mode`
+    // (built below), so it can't exist when `refresh` is built — break the cycle
+    // with a slot filled in once everything is constructed, behind a stable wrapper
+    // the rows capture now and that reads the slot at click time.
+    let on_revert_slot: Rc<RefCell<Option<RevertCallback>>> = Rc::new(RefCell::new(None));
+    let on_revert: RevertCallback = {
+        let slot = on_revert_slot.clone();
+        Rc::new(move |idx| {
+            if let Some(handler) = slot.borrow().as_ref() {
+                handler(idx);
+            }
+        })
+    };
+
     // Reload history from the engine, preserving the selected commit by its
     // (rewrite-stable) change id.
     let refresh: Rc<dyn Fn()> = {
@@ -1883,6 +1900,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let history_limit = history_limit.clone();
         let history_has_more = history_has_more.clone();
         let refresh_wc = refresh_wc.clone();
+        let on_revert = on_revert.clone();
         Rc::new(move || {
             let (loaded, has_more) = {
                 let r = repo.borrow();
@@ -1902,7 +1920,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             {
                 let cs = commits.borrow();
                 let refs = repo.borrow().commit_refs();
-                populate_list(&list, &cs, &HashSet::new(), &refs, &graph);
+                populate_list(&list, &cs, &HashSet::new(), &refs, &graph, Some(&on_revert));
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
                 let mut ids: Vec<(String, String)> = Vec::new();
@@ -1970,6 +1988,84 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // `with_resolve_cues`).
     let enter_conflict_mode =
         conflict::build_enter_conflict_mode(&widgets, &data, refresh_conflict.clone());
+
+    // Fill the revert-button slot now that `refresh` / `enter_conflict_mode` exist.
+    // The handler drops a revert of the clicked commit directly on top of it (its
+    // descendants rebase onto the revert). Deferred to idle because it rebuilds the
+    // very row whose button fired — the same widget-tree-mutation hazard as
+    // `dragdrop::run_post_drag`.
+    *on_revert_slot.borrow_mut() = Some({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let graph = graph.clone();
+        let selected_change = selected_change.clone();
+        let pane_mode = pane_mode.clone();
+        let refresh = refresh.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
+        let show_status = show_status.clone();
+        Rc::new(move |idx: i32| {
+            let repo = repo.clone();
+            let commits = commits.clone();
+            let graph = graph.clone();
+            let selected_change = selected_change.clone();
+            let pane_mode = pane_mode.clone();
+            let refresh = refresh.clone();
+            let enter_conflict_mode = enter_conflict_mode.clone();
+            let show_status = show_status.clone();
+            glib::idle_add_local_once(move || {
+                if pane_mode.borrow().is_conflict() {
+                    show_status("Resolve the pending conflict before reverting");
+                    return;
+                }
+                // Resolve the clicked commit and the slot to splice its revert into.
+                let (target, change, new_children) = {
+                    let commits = commits.borrow();
+                    let Some(commit) = commits.get(idx as usize) else {
+                        return;
+                    };
+                    if commit.parents.len() > 1 {
+                        show_status("Cannot revert a merge commit");
+                        return;
+                    }
+                    let target = commit.id.clone();
+                    let change = commit.change_id_hex();
+                    // Parent the revert on the clicked commit; its children are the
+                    // commit's current branch children, which rebase onto the
+                    // revert. The clicked commit (display index `idx`) is the parent
+                    // of the lane edge crossing the gap just above it
+                    // (`boundaries[idx - 1]`); at the tip (idx 0) there are no
+                    // children and the revert becomes the new HEAD.
+                    let new_children = if idx == 0 {
+                        Vec::new()
+                    } else {
+                        graph
+                            .borrow()
+                            .boundaries
+                            .get(idx as usize - 1)
+                            .and_then(|edges| edges.iter().find(|e| e.parent == target))
+                            .map(|e| e.children.clone())
+                            .unwrap_or_default()
+                    };
+                    (target, change, new_children)
+                };
+                let outcome = repo.borrow_mut().revert_commit(
+                    &target,
+                    vec![target.clone()],
+                    new_children,
+                    None,
+                );
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        // Re-select the clicked commit; the revert sits above it.
+                        *selected_change.borrow_mut() = Some(change);
+                        refresh();
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                    Err(err) => show_status(&format!("Revert failed: {err}")),
+                }
+            });
+        }) as RevertCallback
+    });
 
     // The late-bound callbacks the peeled modules invoke. Assembled here, after
     // its members exist, and handed to `dragdrop`/`conflict` by reference.

@@ -368,7 +368,10 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         // held back, so they keep decorating the untouched ancestors below it
         // (the rewritten commits' pending ids match no ref, correctly).
         let refs = repo.borrow().commit_refs();
-        populate_list(&list, &commits.borrow(), &badges, &refs, &graph);
+        // No revert button while resolving conflicts: the rows reuse the buttons
+        // built by the normal refresh, and the callback's conflict-mode guard
+        // refuses a revert until the pending rewrite settles.
+        populate_list(&list, &commits.borrow(), &badges, &refs, &graph, None);
         conflict_label.set_text(&format!(
             "Conflicts from the rewrite must be resolved before it applies to git — \
              {n_files} file(s) across {n_commits} commit(s) remaining."

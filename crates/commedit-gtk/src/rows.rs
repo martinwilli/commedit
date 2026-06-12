@@ -14,6 +14,8 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 
+use crate::state::RevertCallback;
+
 /// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
 /// (which recomputes it) and every row's drawing area (which reads its own row).
 pub(crate) type SharedGraph = Rc<RefCell<GraphLayout>>;
@@ -183,6 +185,64 @@ fn set_id_hash(cell: &Overlay, full_hash: &str) {
     cell.set_tooltip_text(Some(full_hash));
 }
 
+/// Float a revert button over `content`'s right edge — the row's right boundary, so
+/// the buttons line up down the list and a wide subject simply scrolls underneath —
+/// revealed on hover, the same non-measured-overlay + hover pattern as [`id_cell`]'s
+/// copy icon. Clicking it claims the press (so it never selects the row) and calls
+/// `on_revert` with the row's current display index, which drops a revert of that
+/// commit directly on top of it. The button stays hidden while `content` is tagged
+/// `no-revert` (merge commits, set by [`set_row_commit`]), since a merge has no
+/// single parent to invert.
+fn add_revert_button(content: &Overlay, on_revert: &RevertCallback) {
+    let btn = gtk::Image::from_icon_name("edit-undo-symbolic");
+    // An explicit pixel size is required: as a non-measured overlay child the
+    // icon would otherwise request zero size and never show.
+    btn.set_pixel_size(16);
+    btn.set_halign(gtk::Align::End);
+    btn.set_valign(gtk::Align::Center);
+    // Keep the icon clear of the list's right edge / scrollbar.
+    btn.set_margin_end(8);
+    btn.set_cursor_from_name(Some("pointer"));
+    btn.set_tooltip_text(Some("Revert this commit (drops a revert on top of it)"));
+    btn.add_css_class("commit-revert");
+    btn.set_visible(false);
+    content.add_overlay(&btn);
+
+    // Reveal the button only while the pointer is over the row content, and never
+    // on a merge row (the `no-revert` class).
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter({
+        let btn = btn.clone();
+        let content = content.clone();
+        move |_, _, _| btn.set_visible(!content.has_css_class("no-revert"))
+    });
+    motion.connect_leave({
+        let btn = btn.clone();
+        move |_| btn.set_visible(false)
+    });
+    content.add_controller(motion);
+
+    // Clicking the button reverts the commit. Claim the press so the click stays
+    // off the row: unlike clicking the row, it must not select the commit.
+    let click = gtk::GestureClick::new();
+    click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    click.connect_released({
+        let btn = btn.clone();
+        let on_revert = on_revert.clone();
+        move |_, _, _, _| {
+            if let Some(row) = btn
+                .ancestor(ListBoxRow::static_type())
+                .and_downcast::<ListBoxRow>()
+            {
+                on_revert(row.index());
+            }
+        }
+    });
+    btn.add_controller(click);
+}
+
 /// Build the `short-id   subject  [pills]   ⚠` content box shown inside a
 /// history/trash row. The pill box hugs the subject's right edge: the subject
 /// label does *not* expand, the pill box does (start-aligned), so the pills sit
@@ -193,12 +253,18 @@ fn set_id_hash(cell: &Overlay, full_hash: &str) {
 /// trash rows pass `None`), the content box is wrapped in a margin-free outer
 /// box led by the ancestry drawing area: the graph lines must reach the row's
 /// top/bottom edges to connect across rows, which the content box's vertical
-/// margins would otherwise gap.
+/// margins would otherwise gap. There the content box is also wrapped in an
+/// [`Overlay`] so — when `on_revert` is `Some` — a revert button can float at the
+/// row's right edge (aligned down the list, overlapping only a wide subject), the
+/// same hover pattern as the id cell's copy icon. History rows always get this
+/// wrapper so [`set_row_commit`]'s traversal stays uniform; trash rows (no graph,
+/// no button) skip it.
 fn commit_row_box(
     commit: &CommitInfo,
     conflicted: bool,
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
+    on_revert: Option<&RevertCallback>,
 ) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
@@ -239,9 +305,19 @@ fn commit_row_box(
             // The lane column supplies the leading whitespace.
             row_box.set_margin_start(4);
             row_box.set_hexpand(true);
+            // Wrap the content so a revert button can float at the row's right
+            // edge, aligned down the list and overlapping only a wide subject.
+            // History rows always get this wrapper so `set_row_commit`'s traversal
+            // stays uniform.
+            let content = Overlay::new();
+            content.set_hexpand(true);
+            content.set_child(Some(&row_box));
+            if let Some(on_revert) = on_revert {
+                add_revert_button(&content, on_revert);
+            }
             let outer = GtkBox::new(Orientation::Horizontal, 0);
             outer.append(&graph_area(graph, index));
-            outer.append(&row_box);
+            outer.append(&content);
             outer
         }
         None => row_box,
@@ -304,6 +380,7 @@ fn set_row_commit(
     conflicted: bool,
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
+    on_revert: Option<&RevertCallback>,
 ) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = if commit.subject.is_empty() {
@@ -312,14 +389,20 @@ fn set_row_commit(
         &commit.subject
     };
     let child = row.child().and_downcast::<GtkBox>();
-    // A history row's child is the outer `[graph area, content box]` box from
-    // [`commit_row_box`]; a trash row's child is the content box itself.
+    // A history row's child is the outer `[graph area, content overlay]` box from
+    // [`commit_row_box`], the content overlay wrapping the content box (so the
+    // revert button can float at the row's right edge); a trash row's child is the
+    // content box itself — no graph area and no wrapping overlay.
     let area = child
         .as_ref()
         .and_then(|b| b.first_child())
         .and_downcast::<gtk::DrawingArea>();
-    let row_box = match &area {
-        Some(area) => area.next_sibling().and_downcast::<GtkBox>(),
+    let content_overlay = area
+        .as_ref()
+        .and_then(|a| a.next_sibling())
+        .and_downcast::<Overlay>();
+    let row_box = match &content_overlay {
+        Some(content) => content.child().and_downcast::<GtkBox>(),
         None => child,
     };
     let id_cell = row_box
@@ -336,7 +419,7 @@ fn set_row_commit(
         .and_downcast::<Label>();
     let pills = subject_label
         .as_ref()
-        .and_then(|l| l.next_sibling())
+        .and_then(|c| c.next_sibling())
         .and_downcast::<GtkBox>();
     let badge = row_box
         .as_ref()
@@ -347,6 +430,15 @@ fn set_row_commit(
             id_label.set_markup(&format!("<tt>{short}</tt>"));
             set_id_hash(&id_cell, &commit.id_hex());
             subject_label.set_text(subject);
+            // A merge has no single parent to invert: suppress its revert button
+            // (the content overlay hosts it; trash rows have none).
+            if let Some(content) = &content_overlay {
+                if commit.parents.len() > 1 {
+                    content.add_css_class("no-revert");
+                } else {
+                    content.remove_css_class("no-revert");
+                }
+            }
             set_pills(&pills, refs);
             badge.set_visible(conflicted);
             if let (Some(area), Some((graph, _))) = (&area, graph) {
@@ -357,7 +449,9 @@ fn set_row_commit(
             }
         }
         // Older row layout (or a freshly-created empty row): build it whole.
-        _ => row.set_child(Some(&commit_row_box(commit, conflicted, refs, graph))),
+        _ => row.set_child(Some(&commit_row_box(
+            commit, conflicted, refs, graph, on_revert,
+        ))),
     }
 }
 
@@ -381,6 +475,7 @@ fn populate_rows(
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
     graph: Option<&SharedGraph>,
+    on_revert: Option<&RevertCallback>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -398,6 +493,7 @@ fn populate_rows(
             conflicts.contains(&commit.change_id_hex()),
             refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
             graph.map(|g| (g, i)),
+            on_revert,
         );
     }
     // Hide surplus rows rather than removing them (see the note above).
@@ -418,8 +514,9 @@ pub(crate) fn populate_list(
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
     graph: &SharedGraph,
+    on_revert: Option<&RevertCallback>,
 ) {
-    populate_rows(list, commits, true, conflicts, refs, Some(graph));
+    populate_rows(list, commits, true, conflicts, refs, Some(graph), on_revert);
 }
 
 /// Add the `op-affected` highlight to every history row whose commit's change id
@@ -451,8 +548,17 @@ pub(crate) fn clear_highlight(list: &ListBox) {
 pub(crate) fn populate_trash(list: &ListBox, scroll: &ScrolledWindow, commits: &[CommitInfo]) {
     scroll.set_visible(!commits.is_empty());
     // No ref pills and no ancestry graph in the trash: a dropped commit was
-    // just cut out of its branch, so neither applies here.
-    populate_rows(list, commits, false, &HashSet::new(), &BTreeMap::new(), None);
+    // just cut out of its branch, so neither applies here. No revert button
+    // either — a trashed commit isn't part of the branch to revert against.
+    populate_rows(
+        list,
+        commits,
+        false,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        None,
+        None,
+    );
 }
 
 /// Summarize an entry's changed files as up to two basenames plus a count of the

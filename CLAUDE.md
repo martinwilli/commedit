@@ -66,9 +66,11 @@ unit-testable headless:
   content hides the text block); strings YAML can't render as a literal block
   (diffs with tabs, whitespace-only edits) become a line-sequence instead. The
   tool surface is a **superset** of the GTK app:
-  `create_commit`/`revert_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
+  `create_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
   the surgical `replace_in_file`/`replace_in_message` and `commit_working_copy`
-  (+ partial) have no UI counterpart. Mutations are
+  (+ partial) have no UI counterpart (`revert_commit` is the exception — the
+  history list's right-edge hover button drops a revert on top of a commit). Mutations
+  are
   refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
   preferred) or `abort_rewrite` settle it first — and `reload_repo` re-opens
@@ -162,8 +164,9 @@ op-log").
   children rebase onto its parent), and restore offers the same per-line candidates
   as reorder. The abandoned commit object lingers in the ODB (kept reachable so a
   later restore can graft it back). Restore reuses the `reorder_commit` body.
-- `create_commit` / `revert_commit` / `cherry_pick_commit` (`create.rs`; MCP-only,
-  no GTK surface) — synthesize a brand-new commit and splice it into the graph at a
+- `create_commit` / `revert_commit` / `cherry_pick_commit` (`create.rs`; MCP, plus
+  a GTK surface for `revert_commit` — the history list's right-edge hover button, see
+  the GTK section) — synthesize a brand-new commit and splice it into the graph at a
   `(new_parent_ids, new_child_ids)` slot, the same slot a reorder/restore plan
   resolves: a fresh commit is structurally a "restore" of one that was never in
   history, so all three share the `insert_new_commit` body and opt into the
@@ -468,7 +471,20 @@ not in `main.rs`:
 - `highlight.rs` — the TextTag palette, syntect colouring (`highlight_diff` /
   `highlight_conflict`), and the inline "pill" geometry/painting.
 - `rows.rs` — commit/working-copy row build + the drag-safe `populate_*` refreshers
-  (the "hide, never unparent" discipline lives in `populate_rows`).
+  (the "hide, never unparent" discipline lives in `populate_rows`). A history row's
+  content box is wrapped in an `Overlay` carrying a hover **revert button** that
+  floats at the row's right edge (`halign End`) — so the buttons line up down the
+  list, aligned to the list's right boundary, and only overlap a subject wide enough
+  to scroll under them (mirroring the id cell's copy icon, but row-wide rather than
+  subject-local). Clicking it calls the `RevertCallback` `build_ui` threads through
+  `populate_list` → `set_row_commit` → `commit_row_box` with the row's display index,
+  which defers (idle, like `run_post_drag`) a `revert_commit` placing the revert
+  directly on top of that commit — its parent is the commit, its children the lane
+  edge crossing the gap just above it (`graph.boundaries`). The wrapping `Overlay`
+  (not the subject) is tagged `no-revert` on merge rows so the button never reveals;
+  trash rows skip the wrapper entirely (no graph, no button), and `set_row_commit`'s
+  traversal keys off the graph drawing area's presence to find the content box either
+  way.
 - `identity.rs` — the author/committer identity/date fields and conversions.
 - `conflict.rs` — the pure conflict-text helpers **and** the conflict-mode wiring:
   the callback builders (`build_refresh_conflict`/`build_exit_conflict_mode`/

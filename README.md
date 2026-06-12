@@ -49,6 +49,13 @@ an interactive-rebase session.
   matching target while you drag and folds in on drop; an ordinary commit opens a
   small fixup / squash / amend picker.
 
+- **Revert a commit in place** — hover a commit's row in the history list and a
+  revert button appears at its right edge (aligned down the list); clicking it
+  drops a `Revert "…"` commit directly on top of that commit, neutralizing its
+  change while keeping both in history (its descendants rebase onto the revert).
+  Unlike dropping a commit into the trash, the original stays and the undo is
+  recorded explicitly.
+
 - **Conflicts never reach your git history** — a reorder, drop or squash is a
   real rebase, so it can conflict. Spurious conflicts (nearby but independent
   edits) are resolved for you automatically; a genuine one is held back — `git`

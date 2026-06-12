@@ -98,3 +98,54 @@ claude --plugin-dir /path/to/commedit-plugin /path/to/your/repo
 
 Then confirm the `commedit` tools are available (`/plugin`), open a repo, and ask
 the agent to list or edit history.
+
+## Developing locally
+
+A source checkout has **no binaries** in `bin/` — the release workflow injects
+them and only `launch.sh` is tracked. Build the one for your platform first
+(`launch.sh` looks for `commedit-mcp-<os>-<arch>`, with `os` ∈ `linux`/`macos`
+and `arch` ∈ `x86_64`/`aarch64`):
+
+```sh
+cargo build --release -p commedit-mcp
+cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
+```
+
+`bin/commedit-mcp-*` is git-ignored, so a local build never dirties the tree.
+
+**Quick loop — one session.** `--plugin-dir` reads `plugin/` in place, so
+rebuilding and relaunching picks up the new binary with no extra step:
+
+```sh
+claude --plugin-dir plugin /path/to/your/repo
+```
+
+**Persistent install — across all sessions.** Register `plugin/` through a local
+"directory" marketplace (its plugin `source` must be a path *inside* the
+marketplace, so symlink the checkout in), then install from it:
+
+```sh
+mkdir -p ~/commedit-marketplace/.claude-plugin
+ln -sfn "$PWD/plugin" ~/commedit-marketplace/plugin
+cat > ~/commedit-marketplace/.claude-plugin/marketplace.json <<'JSON'
+{
+  "name": "commedit-local",
+  "owner": { "name": "you" },
+  "plugins": [{ "name": "commedit", "source": "./plugin" }]
+}
+JSON
+claude plugin marketplace add ~/commedit-marketplace
+claude plugin install commedit@commedit-local   # then restart Claude Code
+```
+
+Installing **snapshots** the plugin into Claude Code's cache, so after each
+rebuild re-copy the binary and refresh the snapshot — then restart to apply:
+
+```sh
+cargo build --release -p commedit-mcp
+cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
+claude plugin update commedit@commedit-local
+```
+
+(If `update` won't refresh because `plugin.json`'s `version` is unchanged,
+`claude plugin uninstall commedit@commedit-local` and install again.)

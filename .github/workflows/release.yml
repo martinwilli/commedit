@@ -1,11 +1,15 @@
-# Builds release binaries for Linux and macOS.
+# Builds release artifacts for Linux and macOS:
+#   - the GTK desktop app (`commedit`), one tarball per target, and
+#   - `commedit-plugin.zip`, a Claude Code plugin bundling the `commedit-mcp`
+#     server binary for every target (see plugin/README.md).
 #
-# The app links dynamically against system GTK4 + GtkSourceView5, so these
-# artifacts are NOT self-contained. The end user must have a compatible runtime
+# The GTK app links dynamically against system GTK4 + GtkSourceView5, so those
+# tarballs are NOT self-contained. The end user must have a compatible runtime
 # (and `git` on PATH) installed — see the "Installing a binary release" section
 # of README.md:
 #   - Linux:   apt install git libgtk-4-1 libgtksourceview-5-0  (or distro equivalent)
 #   - macOS:   brew install git gtk4 gtksourceview5
+# The MCP server (and thus the plugin) only needs `git` on PATH.
 #
 # Push a tag like `v0.1.0` to cut a GitHub Release; or run manually via the
 # Actions tab to just produce downloadable build artifacts.
@@ -30,10 +34,13 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: commedit-linux-x86_64.tar.gz
+            mcp_asset: commedit-mcp-linux-x86_64
           - os: ubuntu-24.04-arm
             asset: commedit-linux-aarch64.tar.gz
+            mcp_asset: commedit-mcp-linux-aarch64
           - os: macos-latest
             asset: commedit-macos-aarch64.tar.gz
+            mcp_asset: commedit-mcp-macos-aarch64
     steps:
       - uses: actions/checkout@v6
 
@@ -52,22 +59,86 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The MCP server has no GTK dependency, so building it alongside the app
+      # reuses the same toolchain and compile cache for free.
       - name: Build
-        run: cargo build --release --locked -p commedit-gtk
+        run: cargo build --release --locked -p commedit-gtk -p commedit-mcp
 
-      - name: Package
+      - name: Package app
         run: tar -C target/release -czf "${{ matrix.asset }}" commedit
 
+      # Stage the MCP binary under its target-specific name, the name the
+      # plugin launcher (plugin/bin/launch.sh) resolves at runtime.
+      - name: Stage MCP binary
+        run: cp target/release/commedit-mcp "${{ matrix.mcp_asset }}"
+
       # --- Publish --------------------------------------------------------
-      - name: Upload build artifact
+      - name: Upload app artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
-      - name: Attach to release
+      # Consumed by the `plugin` job, not attached to the release on its own.
+      - name: Upload MCP binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.mcp_asset }}
+          path: ${{ matrix.mcp_asset }}
+
+      - name: Attach app to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true
+
+  # Bundle the per-target MCP binaries into a single Claude Code plugin zip.
+  plugin:
+    name: package plugin
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # All three commedit-mcp-* binaries land directly in plugin/bin/, next to
+      # the launcher that dispatches between them.
+      - name: Download MCP binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: commedit-mcp-*
+          path: plugin/bin
+          merge-multiple: true
+
+      # On a tagged release, pin the plugin version to the tag (v0.3.0 -> 0.3.0)
+      # so org-distributed installs see each release as a new version.
+      - name: Set plugin version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tmp=$(mktemp)
+          jq --arg v "$version" '.version = $v' \
+            plugin/.claude-plugin/plugin.json > "$tmp"
+          mv "$tmp" plugin/.claude-plugin/plugin.json
+
+      # zip stores the +x bits we set here (the launcher self-heals the binary
+      # bit too, so the plugin still works if the channel drops permissions).
+      - name: Assemble plugin zip
+        run: |
+          chmod +x plugin/bin/launch.sh plugin/bin/commedit-mcp-*
+          (cd plugin && zip -r ../commedit-plugin.zip \
+             .claude-plugin .mcp.json bin README.md -x 'bin/.gitignore')
+          unzip -l commedit-plugin.zip
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: commedit-plugin.zip
+          path: commedit-plugin.zip
+
+      - name: Attach plugin to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: commedit-plugin.zip
           fail_on_unmatched_files: true

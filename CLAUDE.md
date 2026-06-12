@@ -222,7 +222,15 @@ op-log").
   `finish_mutation`/export — so HEAD/refs/index/worktree are untouched and disk
   stays byte-identical; the result is a *chain* of uncommitted entries.
   `squash_working_copy_into` snapshots, resolves the entry, and delegates to
-  `squash_into(.., Fixup)`.
+  `squash_into(.., Fixup)`. Its partial sibling `squash_working_copy_partial_into`
+  (`squash.rs`; MCP `squash_working_copy`'s `paths`/`hunks`/`patches`) folds only a
+  **subset** of the uncommitted changes into `dest` — the `git add -p` to the
+  whole-fold's `git commit -a`. In one tx it builds the selected subset as a
+  throwaway commit `C` on HEAD (via `prepare_partial_commit`, the
+  selection→tree builder shared with `commit_working_copy_partial`), rebuilds the
+  leaf `@` to hold the **full** disk tree on top of `C` (so the worktree stays
+  byte-identical and the unselected delta stays uncommitted), then squashes `C`
+  into `dest` and rebases — `@` rebases back to the full tree, so disk never moves.
 - `drop_working_copy` (`workcopy.rs`; the MCP `discard_working_copy` tool) — the
   trashbin's drop for an *uncommitted* entry: snapshot, resolve by change id,
   `record_abandoned_commit` + `rebase_descendants`, commit the tx **directly** and

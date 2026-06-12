@@ -98,6 +98,9 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
             .squash_working_copy(Parameters(SquashWorkingCopyReq {
                 dest: first.sha.clone(),
                 message: None,
+                paths: None,
+                hunks: None,
+                patches: None,
             }))
             .await,
     );
@@ -113,6 +116,9 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
             dest: first.sha,
             message: None,
+            paths: None,
+            hunks: None,
+            patches: None,
         }))
         .await
         .unwrap()
@@ -232,6 +238,9 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
             dest: history.commits[1].change_id[..8].to_string(),
             message: None,
+            paths: None,
+            hunks: None,
+            patches: None,
         }))
         .await
         .unwrap()
@@ -526,4 +535,52 @@ async fn commit_working_copy_with_no_selection_commits_everything() {
     assert_eq!(git(dir.path(), &["show", "HEAD:b.txt"]), "b\nedit-b");
     assert!(server.working_copy_status().await.unwrap().0.clean);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn squash_working_copy_can_reword_and_fold_partially() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    // Two dirty files; fold only a.txt into "first" and reword it in one call,
+    // leaving b.txt's edit uncommitted.
+    std::fs::write(dir.path().join("a.txt"), "1\nA\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "2\nB\n").unwrap();
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let first = history.commits[1].change_id.clone();
+
+    let result = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            dest: first,
+            message: Some("first (with a.txt)".into()),
+            paths: Some(vec!["a.txt".into()]),
+            hunks: None,
+            patches: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(matches!(result, SaveResultDto::Clean { .. }));
+
+    // "first" gained a.txt's change and the new message; b.txt stays uncommitted.
+    assert_eq!(
+        git_log_subjects(dir.path()),
+        ["second", "first (with a.txt)"]
+    );
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nA");
+    let status = server.working_copy_status().await.unwrap().0;
+    assert!(!status.clean);
+    assert_eq!(status.entries[0].files, vec!["b.txt".to_string()]);
 }

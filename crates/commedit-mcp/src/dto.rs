@@ -584,6 +584,27 @@ pub struct SquashWorkingCopyReq {
     /// uncommitted changes carry no message of their own); set this to reword the
     /// destination in the same call instead of a follow-up edit_message.
     pub message: Option<String>,
+    /// Optional partial fold: fold only *part* of the uncommitted changes into
+    /// `dest` and leave the rest in the working tree (the in-process `git add -p`
+    /// for a fixup). Omit `paths`, `hunks` and `patches` entirely to fold the
+    /// whole working copy (the default). The three tiers compose in one call, but
+    /// a given file path must appear in at most one of them.
+    ///
+    /// Whole files to fold, by repo-relative path: the file is taken entirely
+    /// (content + mode), and a path you deleted on disk folds in the deletion.
+    /// This is the only tier that handles binary or executable files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Whole hunks to fold, per file. First read the file's numbered `hunks`
+    /// from show_commit on the working-copy entry, then list the indices to fold;
+    /// the unlisted hunks stay uncommitted. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkSelectionDto>>,
+    /// Sub-hunk selections, per file: an edited unified-diff patch (à la
+    /// `git add -p` → `e`) applied to the file's content at HEAD. Use when one
+    /// hunk must be split finer than whole-hunk granularity. Text files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Vec<PatchSelectionDto>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -616,17 +637,19 @@ pub struct CommitWorkingCopyReq {
     pub patches: Option<Vec<PatchSelectionDto>>,
 }
 
-/// Selects whole hunks of one file for a partial commit_working_copy.
+/// Selects whole hunks of one file for a partial commit_working_copy /
+/// squash_working_copy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct HunkSelectionDto {
     /// Repo-relative path of the file (forward-slash form).
     pub path: String,
-    /// 0-based hunk indices to commit, taken from the file's `hunks` in
+    /// 0-based hunk indices to select, taken from the file's `hunks` in
     /// show_commit. Must list at least one.
     pub hunks: Vec<usize>,
 }
 
-/// Selects a sub-hunk slice of one file for a partial commit_working_copy.
+/// Selects a sub-hunk slice of one file for a partial commit_working_copy /
+/// squash_working_copy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PatchSelectionDto {
     /// Repo-relative path of the file (forward-slash form).

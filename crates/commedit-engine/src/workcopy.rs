@@ -405,69 +405,9 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
-        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
-        // turned out clean (nothing to commit).
-        self.snapshot_working_copy()?;
-        if self.working_copy_info().is_none() {
-            bail!("no uncommitted changes to commit");
-        }
-        let Some(head) = self.head_commit_id() else {
-            bail!("the repository has no branch head; cannot commit the working copy");
-        };
-        let leaf_id = self
-            .working_copy_commit_id()
-            .context("no working copy to commit")?;
-        let store = self.repo.store().clone();
-        // The leaf @ holds the full on-disk tree (collapsing any split chain); the
-        // remainder will ride on it, and HEAD's tree is the base we splice the
-        // selected subset onto.
-        let full_tree = store
-            .get_commit(&leaf_id)
-            .context("loading the working-copy commit")?
-            .tree();
-        let head_tree = store
-            .get_commit(&head)
-            .context("loading the branch head")?
-            .tree();
-
-        // Build the committed tree on top of HEAD from the selection.
-        let mut t_commit = head_tree.clone();
-        if !sel.paths.is_empty() {
-            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
-        }
-        // The hunks/patches tiers reconstruct text content relative to HEAD; gather
-        // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
-        let mut text_edits: Vec<(String, String)> = Vec::new();
-        for (path, indices) in sel.hunks {
-            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
-            let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
-            let mut kept: BTreeSet<usize> = BTreeSet::new();
-            for &i in indices {
-                let hunk = rendered.hunks.get(i).ok_or_else(|| {
-                    anyhow!(
-                        "hunk index {i} is out of range for '{path}' (it has {} hunk(s))",
-                        rendered.hunks.len()
-                    )
-                })?;
-                kept.extend(hunk.first_group..=hunk.last_group);
-            }
-            text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
-        }
-        for (path, patch) in sel.patches {
-            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
-            let content = apply_patch(&old_f, patch)
-                .with_context(|| format!("applying the patch for '{path}'"))?;
-            text_edits.push((path.clone(), content));
-        }
-        if !text_edits.is_empty() {
-            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
-        }
-
-        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
-        // unmodified path, an empty hunk set, or a patch that changes nothing.
-        if t_commit.tree_ids() == head_tree.tree_ids() {
-            bail!("the selection commits nothing (it matches the branch head)");
-        }
+        // Snapshot the disk and build the selected subset's tree (`t_commit`) plus
+        // the full on-disk tree for the remainder — shared with the partial squash.
+        let (head, _head_tree, full_tree, t_commit) = self.prepare_partial_commit(&sel)?;
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
@@ -527,6 +467,84 @@ impl Repo {
             old_head,
             heads,
         )
+    }
+
+    /// Snapshot the disk and resolve a [`PartialSelection`] into the trees a
+    /// partial commit/squash needs: the branch `head` id, HEAD's tree, the leaf
+    /// `@`'s full on-disk tree, and `t_commit` — HEAD's tree with the selected
+    /// paths/hunks/patches spliced in (the hunks/patches tiers reconstruct text
+    /// relative to HEAD). Bails when the tree is clean, HEAD is detached/unborn, or
+    /// the selection reproduces HEAD exactly (selects nothing). Shared by
+    /// [`Self::commit_working_copy_partial`] and the partial squash
+    /// `squash_working_copy_partial_into`.
+    pub(crate) fn prepare_partial_commit(
+        &mut self,
+        sel: &PartialSelection<'_>,
+    ) -> Result<(CommitId, MergedTree, MergedTree, MergedTree)> {
+        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
+        // turned out clean (nothing to select).
+        self.snapshot_working_copy()?;
+        if self.working_copy_info().is_none() {
+            bail!("no uncommitted changes to commit");
+        }
+        let Some(head) = self.head_commit_id() else {
+            bail!("the repository has no branch head; cannot commit the working copy");
+        };
+        let leaf_id = self
+            .working_copy_commit_id()
+            .context("no working copy to commit")?;
+        let store = self.repo.store().clone();
+        // The leaf @ holds the full on-disk tree (collapsing any split chain); the
+        // remainder will ride on it, and HEAD's tree is the base we splice the
+        // selected subset onto.
+        let full_tree = store
+            .get_commit(&leaf_id)
+            .context("loading the working-copy commit")?
+            .tree();
+        let head_tree = store
+            .get_commit(&head)
+            .context("loading the branch head")?
+            .tree();
+
+        // Build the selected tree on top of HEAD from the selection.
+        let mut t_commit = head_tree.clone();
+        if !sel.paths.is_empty() {
+            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
+        }
+        // The hunks/patches tiers reconstruct text content relative to HEAD; gather
+        // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
+        let mut text_edits: Vec<(String, String)> = Vec::new();
+        for (path, indices) in sel.hunks {
+            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
+            let mut kept: BTreeSet<usize> = BTreeSet::new();
+            for &i in indices {
+                let hunk = rendered.hunks.get(i).ok_or_else(|| {
+                    anyhow!(
+                        "hunk index {i} is out of range for '{path}' (it has {} hunk(s))",
+                        rendered.hunks.len()
+                    )
+                })?;
+                kept.extend(hunk.first_group..=hunk.last_group);
+            }
+            text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
+        }
+        for (path, patch) in sel.patches {
+            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let content = apply_patch(&old_f, patch)
+                .with_context(|| format!("applying the patch for '{path}'"))?;
+            text_edits.push((path.clone(), content));
+        }
+        if !text_edits.is_empty() {
+            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
+        }
+
+        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
+        // unmodified path, an empty hunk set, or a patch that changes nothing.
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+        Ok((head, head_tree, full_tree, t_commit))
     }
 
     /// Read a path's HEAD-side (`old`) and leaf-side (`new`) UTF-8 text for the

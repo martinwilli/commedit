@@ -7,7 +7,7 @@ use commedit_engine::workcopy::PartialSelection;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::{file_change_dto, wc_entry_dto};
+use crate::convert::file_change_dto;
 use crate::dto::{
     CommitWorkingCopyReq, DiscardWorkingCopyReq, HunkSelectionDto, OkResp, PatchSelectionDto,
     SaveResultDto, SessionDiffResp, SquashWorkingCopyReq, WorkingCopyStatusResp,
@@ -16,6 +16,7 @@ use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
     ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
+    working_copy_status_resp,
 };
 use crate::wrapper::Yaml;
 
@@ -25,18 +26,9 @@ impl CommeditServer {
         description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit."
     )]
     pub async fn working_copy_status(&self) -> Result<Yaml<WorkingCopyStatusResp>, ErrorData> {
-        self.with_session(|repo, _| {
-            // A fresh read wants the latest on-disk state folded in.
-            repo.snapshot_working_copy().map_err(internal)?;
-            let entries = repo.working_copy_chain();
-            Ok(WorkingCopyStatusResp {
-                clean: entries.is_empty(),
-                entries: entries.iter().map(wc_entry_dto).collect(),
-                session_start_head_sha: repo.session_start_head_hex(),
-            })
-        })
-        .await
-        .map(Yaml)
+        self.with_session(|repo, _| working_copy_status_resp(repo))
+            .await
+            .map(Yaml)
     }
 
     #[tool(

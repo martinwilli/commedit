@@ -21,6 +21,7 @@ async fn shas(server: &CommeditServer) -> Vec<String> {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -59,6 +60,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -114,6 +116,7 @@ async fn list_history_honours_the_limit() {
             limit: Some(2),
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -141,6 +144,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: Some(vec![]),
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -162,6 +166,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: Some(vec![CommitField::AuthorTime, CommitField::CommitterTime]),
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -176,6 +181,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -202,6 +208,7 @@ async fn list_history_marks_merges() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -230,6 +237,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -396,6 +404,7 @@ async fn edit_identity_prefills_omitted_fields() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -431,6 +440,7 @@ async fn edit_identity_prefills_omitted_fields() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -461,6 +471,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -505,6 +516,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -857,6 +869,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -934,6 +947,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1024,6 +1038,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1060,6 +1075,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1227,6 +1243,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1347,6 +1364,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -1382,6 +1400,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()

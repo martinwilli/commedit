@@ -15,13 +15,13 @@ const DEFAULT_HISTORY_LIMIT: usize = 30;
 use crate::dto::{ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::{limited_history, resolve_ref, RefEntry};
+use crate::session::{limited_history, resolve_ref, working_copy_status_resp, RefEntry};
 use crate::wrapper::Yaml;
 
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Returns up to `limit` commits (default 30) from `offset`; when `has_more`, page on with the returned `next_offset`. Each commit always carries its header (sha, change_id, subject, is_merge, refs); use `fields` to pick which verbose fields (message, identity, parents) come with it — omit for all of them, pass a subset (e.g. just the timestamps when re-dating) or `[]` for a header-only overview, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas/change_ids are abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them straight back as a commit ref; shas change on every mutation while the change_id is stable, so prefer change ids over re-listing."
+        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Returns up to `limit` commits (default 30) from `offset`; when `has_more`, page on with the returned `next_offset`. Each commit always carries its header (sha, change_id, subject, is_merge, refs); use `fields` to pick which verbose fields (message, identity, parents) come with it — omit for all of them, pass a subset (e.g. just the timestamps when re-dating) or `[]` for a header-only overview, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas/change_ids are abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them straight back as a commit ref; shas change on every mutation while the change_id is stable, so prefer change ids over re-listing. Set `working_copy: true` to also get the uncommitted-changes status inline (same as working_copy_status), saving a round-trip."
     )]
     pub async fn list_history(
         &self,
@@ -29,6 +29,13 @@ impl CommeditServer {
     ) -> Result<Yaml<ListHistoryResp>, ErrorData> {
         self.with_session(move |repo, trash| {
             let trash_count = trash.entries.len();
+            // Opt-in working-copy block (snapshots the disk), folded in to save a
+            // separate working_copy_status round-trip.
+            let working_copy = if req.working_copy.unwrap_or(false) {
+                Some(working_copy_status_resp(repo)?)
+            } else {
+                None
+            };
             let Some(_) = repo.head_commit_id() else {
                 return Ok(ListHistoryResp {
                     head_sha: None,
@@ -37,6 +44,7 @@ impl CommeditServer {
                     offset: 0,
                     next_offset: None,
                     trash_count,
+                    working_copy,
                 });
             };
             let offset = req.offset.unwrap_or(0);
@@ -57,6 +65,7 @@ impl CommeditServer {
                 offset,
                 next_offset,
                 trash_count,
+                working_copy,
             })
         })
         .await

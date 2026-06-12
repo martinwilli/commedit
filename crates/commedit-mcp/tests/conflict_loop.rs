@@ -33,6 +33,7 @@ async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -242,6 +243,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -304,6 +306,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()

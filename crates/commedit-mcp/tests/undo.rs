@@ -17,6 +17,7 @@ async fn edit_tip_message(server: &commedit_mcp::server::CommeditServer, message
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -151,6 +152,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -175,6 +177,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -214,6 +217,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -243,6 +247,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -274,6 +279,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()

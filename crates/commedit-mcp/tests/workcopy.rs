@@ -48,6 +48,7 @@ async fn uncommitted_changes_survive_a_rewrite() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -88,6 +89,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -198,6 +200,7 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -230,6 +233,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
             limit: None,
             offset: None,
             fields: None,
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -555,6 +559,7 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
             limit: None,
             offset: None,
             fields: Some(vec![]),
+            working_copy: None,
         }))
         .await
         .unwrap()
@@ -583,4 +588,40 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
     let status = server.working_copy_status().await.unwrap().0;
     assert!(!status.clean);
     assert_eq!(status.entries[0].files, vec!["b.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn list_history_can_include_working_copy_status() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "1\n", "first")]);
+    let server = open_server(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "1\ndirty\n").unwrap();
+
+    // Without the flag, no working-copy block is attached.
+    let plain = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(plain.working_copy.is_none());
+
+    // With it, the uncommitted change rides along in one call.
+    let with_wc = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: Some(vec![]),
+            working_copy: Some(true),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let wc = with_wc.working_copy.expect("working-copy block present");
+    assert!(!wc.clean);
+    assert_eq!(wc.entries[0].files, vec!["a.txt".to_string()]);
 }

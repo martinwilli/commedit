@@ -232,6 +232,11 @@ pub struct ListHistoryReq {
     /// description, author_name, author_email, author_time, committer_name,
     /// committer_email, committer_time, parents.
     pub fields: Option<Vec<CommitField>>,
+    /// Set true to also include the uncommitted-changes status in `working_copy`
+    /// (same content as the working_copy_status tool), saving a round-trip when
+    /// you need both at once — e.g. before folding the working copy into a commit.
+    /// Omit (or false) to skip it; the field is then null.
+    pub working_copy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -250,6 +255,10 @@ pub struct ListHistoryResp {
     pub next_offset: Option<usize>,
     /// Number of dropped commits currently in the session trash.
     pub trash_count: usize,
+    /// The uncommitted-changes status, present only when the request set
+    /// `working_copy: true` (else null) — the same payload as working_copy_status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

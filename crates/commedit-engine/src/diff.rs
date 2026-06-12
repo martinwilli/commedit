@@ -607,6 +607,10 @@ pub fn render_commit_diff(
                 "\\ Binary file (not editable)"
             } else if change.conflicted_base {
                 "\\ Conflicted merge base (not editable)"
+            } else if change.old_text.is_none() {
+                // Neither side present: the file's addition was dropped (a
+                // revert in the diff pane set `new_text` to the absent old side).
+                "\\ File addition reverted"
             } else {
                 "\\ File removed by this commit"
             };

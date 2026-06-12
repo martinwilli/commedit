@@ -27,9 +27,12 @@ an interactive-rebase session.
   changed words tinted inline, and each hunk has an *expand context* control to
   reveal more of the surrounding file.
 
-- **Revert hunks or files** — every hunk and every file carries a *revert*
-  control to drop those changes from the commit. Reverting doesn't save on its
-  own; you then **Save** to drop the changes or **Split** to peel them off.
+- **Revert hunks or files** — every changed file carries a *revert* control to
+  drop its change from the commit, and every hunk of a modified file one to drop
+  just that hunk. It works whatever the change is: a modified file reverts to its
+  old content, a file the commit *added* is dropped entirely, and one it *removed*
+  is restored. Reverting doesn't save on its own; you then **Save** to drop the
+  changes or **Split** to peel them off.
 
 - **Split one commit into two** — when the diff has pending edits, **Split**
   keeps your edited version *and* inserts a follow-up commit holding everything

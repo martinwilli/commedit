@@ -6,6 +6,15 @@ mod common;
 use commedit_engine::diff::{commit_changes, ChangeKind};
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
+use commedit_engine::tree::FileEdit;
+
+fn commit_by_subject(repo: &Repo, subject: &str) -> commedit_engine::history::CommitInfo {
+    history(&repo.repo, &repo.head_commit_id().expect("head"))
+        .unwrap()
+        .into_iter()
+        .find(|c| c.subject == subject)
+        .unwrap_or_else(|| panic!("commit {subject:?}"))
+}
 
 fn second_commit_id(repo: &Repo) -> commedit_engine::history::CommitInfo {
     history(&repo.repo, &repo.head_commit_id().expect("head"))
@@ -70,6 +79,77 @@ fn rewrites_file_content_in_middle_commit() {
     assert_eq!(subjects, vec!["third", "second", "first"]);
 
     // Transparency invariants hold.
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn reverting_an_added_file_deletes_it_from_the_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // "second" adds b.txt; "third" is unrelated, so dropping b.txt rebases clean.
+    common::init_repo(dir, &[("a.txt", "a\n", "first")]);
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    common::git(dir, &["add", "-A"]);
+    common::git(dir, &["commit", "-qm", "second"]);
+    common::git(dir, &["commit", "--allow-empty", "-qm", "third"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let target = commit_by_subject(&repo, "second");
+
+    // Drop the file the commit added (what a "revert file" on an added file does).
+    repo.rewrite_files_edits(&target.id, &[FileEdit::delete("b.txt".to_string())])
+        .expect("delete file");
+
+    // b.txt is gone at the tip; a.txt and the history are otherwise intact.
+    let (ok, _) = common::git_allow_failure(dir, &["cat-file", "-e", "HEAD:b.txt"]);
+    assert!(!ok, "b.txt should no longer exist at HEAD");
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a");
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["third", "second", "first"]
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn reverting_a_removed_file_recreates_it_in_the_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // "second" deletes b.txt (added by "first"); reverting that restores it.
+    common::init_repo(dir, &[("a.txt", "a\n", "zeroth")]);
+    std::fs::write(dir.join("b.txt"), "b-orig\n").unwrap();
+    common::git(dir, &["add", "-A"]);
+    common::git(dir, &["commit", "-qm", "first"]);
+    common::git(dir, &["rm", "-q", "b.txt"]);
+    common::git(dir, &["commit", "-qm", "second"]);
+    common::git(dir, &["commit", "--allow-empty", "-qm", "third"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let target = commit_by_subject(&repo, "second");
+
+    // Restore the file the commit removed (what a "revert file" on a removed file
+    // does — `new_text` drops to the old side, collected as a write).
+    repo.rewrite_files_edits(
+        &target.id,
+        &[FileEdit::write("b.txt".to_string(), "b-orig\n".to_string())],
+    )
+    .expect("recreate file");
+
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b-orig");
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["third", "second", "first", "zeroth"]
+    );
     assert_eq!(
         common::git(dir, &["symbolic-ref", "HEAD"]),
         "refs/heads/main"

@@ -20,29 +20,42 @@ use jj_lib::repo::Repo as _;
 
 use crate::conflict::SaveOutcome;
 use crate::repo::Repo;
+use crate::tree::FileEdit;
 
 impl Repo {
-    /// Split commit `target`: rewrite it to the edited diff given by `files`
-    /// (`(path, content)` pairs, as produced for [`Repo::rewrite_files`]), and
-    /// insert a new "fixup! …" commit holding the original tree as its child so
-    /// the two combined reproduce the original commit. Descendants rebase onto the
-    /// inserted commit through the shared export pipeline.
+    /// Split commit `target` from `(path, content)` write edits — the write-only
+    /// convenience over [`Repo::split_commit_edits`] for the callers that never
+    /// delete a path (the MCP tool, tests).
     pub fn split_commit(
         &mut self,
         target: &CommitId,
         files: &[(String, String)],
     ) -> Result<SaveOutcome> {
+        let edits: Vec<FileEdit> = files
+            .iter()
+            .map(|(path, content)| FileEdit::write(path.clone(), content.clone()))
+            .collect();
+        self.split_commit_edits(target, &edits)
+    }
+
+    /// Split commit `target`: rewrite it to the edited diff given by `edits`
+    /// ([`FileEdit`]s, as produced for [`Repo::rewrite_files_edits`] — a write
+    /// edits content, a delete drops a file the commit added), and insert a new
+    /// "fixup! …" commit holding the original tree as its child so the two
+    /// combined reproduce the original commit. Descendants rebase onto the
+    /// inserted commit through the shared export pipeline.
+    pub fn split_commit_edits(
+        &mut self,
+        target: &CommitId,
+        edits: &[FileEdit],
+    ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("splitting the commit", || {
-            self.split_commit_inner(target, files)
+            self.split_commit_inner(target, edits)
         })
     }
 
-    fn split_commit_inner(
-        &mut self,
-        target: &CommitId,
-        files: &[(String, String)],
-    ) -> Result<SaveOutcome> {
-        if files.is_empty() {
+    fn split_commit_inner(&mut self, target: &CommitId, edits: &[FileEdit]) -> Result<SaveOutcome> {
+        if edits.is_empty() {
             bail!("nothing to split: the diff has no edits");
         }
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
@@ -60,7 +73,7 @@ impl Repo {
         // descendants rebase onto exactly the base they were built on.
         let orig_tree = commit.tree();
         // T_edited: the same tree with the user's diff edits spliced in.
-        let edited_tree = crate::tree::splice_files_into_tree(commit.tree(), &store, files)?;
+        let edited_tree = crate::tree::splice_edits_into_tree(commit.tree(), &store, edits)?;
         let author = commit.author().clone();
         let message = split_message(commit.description());
         let desc = self.op_desc_for("Split", target);
@@ -109,17 +122,31 @@ impl Repo {
         change_hex: Option<&str>,
         files: &[(String, String)],
     ) -> Result<()> {
+        let edits: Vec<FileEdit> = files
+            .iter()
+            .map(|(path, content)| FileEdit::write(path.clone(), content.clone()))
+            .collect();
+        self.split_working_copy_edits(change_hex, &edits)
+    }
+
+    /// The [`FileEdit`] form of [`Self::split_working_copy`], so a revert that
+    /// drops a file the entry adds peels through as a deletion.
+    pub fn split_working_copy_edits(
+        &mut self,
+        change_hex: Option<&str>,
+        edits: &[FileEdit],
+    ) -> Result<()> {
         crate::repo::catch_jj("splitting the working copy", || {
-            self.split_working_copy_inner(change_hex, files)
+            self.split_working_copy_inner(change_hex, edits)
         })
     }
 
     fn split_working_copy_inner(
         &mut self,
         change_hex: Option<&str>,
-        files: &[(String, String)],
+        edits: &[FileEdit],
     ) -> Result<()> {
-        if files.is_empty() {
+        if edits.is_empty() {
             bail!("nothing to split: the diff has no edits");
         }
         // Snapshot the disk into the leaf @ first (its commit id churns here),
@@ -136,7 +163,7 @@ impl Repo {
         let change_hex = commit.change_id().hex();
         let store = self.repo.store().clone();
         let orig_tree = commit.tree();
-        let edited_tree = crate::tree::splice_files_into_tree(commit.tree(), &store, files)?;
+        let edited_tree = crate::tree::splice_edits_into_tree(commit.tree(), &store, edits)?;
 
         let mut tx = self.repo.start_transaction();
         // E': the entry, rewritten to the edited diff (keeps its change id).

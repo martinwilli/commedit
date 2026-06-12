@@ -206,7 +206,9 @@ op-log").
   `squash_recommendations` (resolve a prefixed source → its matching destination
   commit(s) + sibling fixups) so an agent can route an autosquash fold.
 - `split_commit` (`split.rs`) — the diff view's "Split" button (enabled only with
-  pending diff edits). Takes the same `(path, content)` edits as `rewrite_files`:
+  pending diff edits). Takes the same edits as `rewrite_files` — a write-only
+  `(path, content)` entry point plus a `split_commit_edits(&[FileEdit])` form (used
+  by the GTK Save/Split path, so a reverted addition peels through as a deletion):
   rewrites the target `C` → `C'` to the **edited** tree (keeping its change id /
   message / author), then `new_commit`s `N` holding `C`'s **original** tree as
   `C'`'s child (message `fixup! <subject>`, original author), so `C'` + `N`
@@ -214,7 +216,7 @@ op-log").
   `set_rewritten_commit(C, N)`, which **overwrites** the `C → C'` rewrite so
   `rebase_descendants` (and the bookmark and `@`) follow `C → N` — and `N` restores
   the original tree descendants were built on, so the rebase is clean. The tree
-  splice is shared with `rewrite_files` via `tree::splice_files_into_tree`;
+  splice is shared with `rewrite_files` via `tree::splice_edits_into_tree`;
   `split_message` (pure, inline-tested) builds the message.
 - `split_working_copy` (`split.rs`) + `squash_working_copy_into` (`squash.rs`) —
   the same Split button and drag-to-squash, but on an *uncommitted* entry (see
@@ -318,7 +320,8 @@ Caveats this creates:
 - The GTK UI shows the working-copy chain as **rows above the history list**
   (`populate_wc`, mirrored in `wc_entries`), deliberately *not* part of the history
   list, so the reorder/drop/squash index arithmetic is untouched. A row is editable
-  (Save → `edit_working_copy_file`, the tip doesn't move) and splittable (Split →
+  (Save → `edit_working_copy_file`, whose `new_content: Option<&str>` takes `None`
+  to drop a file the entry adds; the tip doesn't move) and splittable (Split →
   `split_working_copy`), and is a drag *source* (`DragOrigin::WorkingCopy`): dropped
   onto a commit it folds in as a fixup — `show_zone` offers it only the red squash
   target, never the blue reorder gap (uncommitted entries can't be reordered into
@@ -455,14 +458,17 @@ buffer always still applies as a patch. Three pure, GTK-free modules:
   / `HunkInfo`), classify lines (`classify_line` / `DiffLineKind`), and apply an
   edited patch back (`apply_patch`). `revert_groups(old, new, first, last)` rebuilds
   `new` with one hunk's change groups dropped back to `old`, backing the *revert
-  hunk* / *revert file* cues; its dual `select_groups(old, new, kept)` rebuilds `new`
+  hunk* cue (the whole-file *revert file* cue just sets `new = old` directly, which
+  for an added/removed file means absent/restored); its dual
+  `select_groups(old, new, kept)` rebuilds `new`
   keeping only the named change groups (the rest reverted to `old`), backing the MCP
   partial working-copy commit (`commit_working_copy_partial`). `render_commit_diff`
   lays **all** of a commit's files
   into one buffer (separated by `diff --git` lines; per-file placement in
   `CombinedFile`) and `split_combined_patch` cuts the edited buffer back per file;
-  `rewrite_files` (`tree.rs`) splices several files' new content into the tree in one
-  rewrite. The conflict pane reuses the same windowing
+  `rewrite_files_edits` (`tree.rs`, taking `FileEdit`s so a `None` content removes a
+  path) splices several files' new content into the tree in one rewrite. The conflict
+  pane reuses the same windowing
   (`render_conflict_snippets` / `reconstruct_conflict_file`).
 - `patch_edit.rs` — `plan_edit(text, selection, gesture)` maps a raw edit gesture
   (Insert/Newline/Backspace/Delete) to a structurally-valid `EditPlan`. Rules: only
@@ -536,10 +542,17 @@ the two fighting), and `highlight_diff` switches syntect language per file. Both
 entry points funnel through `scroll_to_file` / `scroll_to_conflict_file`, where
 `apply_tab_width` sets the view's tab width from the repo's editor configs for the
 top file. Save splits the buffer per file and applies every edit in one
-`rewrite_files`. Each `@@` header carries a *revert hunk* cue and each `diff --git`
-line a *revert file* cue (`DiffCue`); clicking one `revert_groups`-rewrites the shown
-diff against the *render baseline* (`changes`), while `orig_changes` keeps the
-pristine content so Save/Split still see the revert as a divergence to apply — a
+`rewrite_files_edits` (the `FileEdit` form — `collect_file_edits` returns
+`Vec<FileEdit>`, so a revert can emit a *delete* as well as a write). A *modified*
+file's `@@` headers carry a *revert hunk* cue; **every** changed file's `diff --git`
+line carries a *revert file* cue (`DiffCue`) — including added and removed files,
+which have no both-sides hunk model but a whole-file change to drop. Clicking a cue
+sets the file's `new_text` to its `old_text` on the *render baseline* (`changes`):
+modify→unmodify, **add→absent (`None`)**, **remove→restore** — the one uniform rule.
+`orig_changes` keeps the pristine content so Save/Split still see the revert as a
+divergence to apply; a reverted addition collapses to a notice in the buffer (so the
+buffer alone can't express the delete), which is why `collect_file_edits` reads the
+delete-intent from the render baseline's `None` and the content from the buffer. A
 revert never saves on its own.
 
 History drag-and-drop is **zone-based** (`show_zone`): a row's top/bottom quarter

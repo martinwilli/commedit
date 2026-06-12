@@ -246,6 +246,8 @@ impl Repo {
     /// Edit a file of a working-copy entry through the diff pane: splice
     /// `new_content` into the entry's tree and write the result to disk — like
     /// editing any commit, but the branch tip doesn't move (no history export).
+    /// `new_content` of `None` removes the path (reverting a file the entry adds);
+    /// `Some` writes it (editing, or restoring a file the entry deletes).
     /// `change_hex` selects which uncommitted entry to edit (its stable change id,
     /// resolved after snapshotting); `None` targets the leaf `@`. Snapshots the
     /// disk first so a concurrent external edit to another file isn't clobbered.
@@ -253,7 +255,7 @@ impl Repo {
         &mut self,
         change_hex: Option<&str>,
         path: &str,
-        new_content: &str,
+        new_content: Option<&str>,
     ) -> Result<()> {
         crate::repo::catch_jj("editing the working copy", || {
             self.edit_working_copy_file_inner(change_hex, path, new_content)
@@ -264,7 +266,7 @@ impl Repo {
         &mut self,
         change_hex: Option<&str>,
         path: &str,
-        new_content: &str,
+        new_content: Option<&str>,
     ) -> Result<()> {
         self.snapshot_working_copy()?;
         let wc_id = self
@@ -278,17 +280,23 @@ impl Repo {
         let change_hex = commit.change_id().hex();
         let repo_path = RepoPathBuf::from_internal_string(path).context("invalid path")?;
         let base_tree = commit.tree();
-        let (executable, copy_id) = crate::tree::existing_file_meta(&base_tree, &repo_path);
 
         let store = self.repo.store().clone();
-        let mut reader: &[u8] = new_content.as_bytes();
-        let file_id =
-            block_on(store.write_file(&repo_path, &mut reader)).context("writing file blob")?;
-        let value: MergedTreeValue = Merge::normal(TreeValue::File {
-            id: file_id,
-            executable,
-            copy_id,
-        });
+        let value: MergedTreeValue = match new_content {
+            Some(content) => {
+                let (executable, copy_id) = crate::tree::existing_file_meta(&base_tree, &repo_path);
+                let mut reader: &[u8] = content.as_bytes();
+                let file_id = block_on(store.write_file(&repo_path, &mut reader))
+                    .context("writing file blob")?;
+                Merge::normal(TreeValue::File {
+                    id: file_id,
+                    executable,
+                    copy_id,
+                })
+            }
+            // Absent value: remove the path from the entry's tree.
+            None => Merge::absent(),
+        };
         let mut builder = MergedTreeBuilder::new(base_tree);
         builder.set_or_remove(repo_path, value);
         let new_tree = block_on(builder.write_tree()).context("writing tree")?;

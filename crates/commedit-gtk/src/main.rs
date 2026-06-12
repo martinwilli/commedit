@@ -22,6 +22,7 @@ use commedit_engine::patch_edit::{
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
 use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
+use commedit_engine::tree::FileEdit;
 use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
@@ -134,19 +135,25 @@ fn build_diff_buffer_text(
 ) -> (String, Vec<HunkInfo>, Vec<CombinedFile>) {
     let combined = render_commit_diff(changes, expansions);
     let mut lines: Vec<String> = combined.text.split('\n').map(str::to_string).collect();
-    // A file's changes can be reverted only if both sides exist as text — i.e. a
-    // *modified* file. Added (no old) / removed (no new) files are excluded: the
-    // content-only edit path can't delete or recreate a path. (`file.editable`
-    // alone would still include additions, whose old side is absent.)
-    let revertable = |path: &str| {
-        changes
-            .iter()
-            .find(|c| c.path == path)
-            .is_some_and(|c| c.old_text.is_some() && c.new_text.is_some())
+    let change_for = |path: &str| changes.iter().find(|c| c.path == path);
+    // A *hunk* revert is a partial content reversal — meaningful only for a
+    // modified file, where both sides exist as text and the hunk's `-`/`+` groups
+    // can be dropped back to the old side.
+    let revert_hunk_ok =
+        |path: &str| change_for(path).is_some_and(|c| c.old_text.is_some() && c.new_text.is_some());
+    // A *file* revert drops a file's whole change: modify -> unmodify, add ->
+    // delete, remove -> restore. Eligible wherever the two sides differ as text
+    // (so not a mode-only change) and the file is editable as text (not binary /
+    // conflicted-base). The save path expresses the add/remove cases as a
+    // delete / recreate via `FileEdit`.
+    let revert_file_ok = |path: &str| {
+        change_for(path).is_some_and(|c| {
+            !c.is_binary && !c.conflicted_base && c.old_text.as_deref() != c.new_text.as_deref()
+        })
     };
     let mut all_hunks: Vec<HunkInfo> = Vec::new();
     for file in &combined.files {
-        let revert = file.editable && revertable(&file.path);
+        let hunk_revert = file.editable && revert_hunk_ok(&file.path);
         for hunk in &file.hunks {
             if let Some(l) = lines.get_mut(hunk.header_line) {
                 match (hunk.can_expand_up, hunk.can_expand_down) {
@@ -155,15 +162,16 @@ fn build_diff_buffer_text(
                     (false, true) => l.push_str(&format!("  {}", pill("↓ expand context"))),
                     (false, false) => {}
                 }
-                if revert {
+                if hunk_revert {
                     l.push_str(&format!("  {}", pill(REVERT_HUNK_LABEL)));
                 }
             }
             all_hunks.push(hunk.clone());
         }
-        // The "revert file" cue rides the `diff --git` separator. Only where there
-        // is something to revert (an editable, modified file with hunks).
-        if revert && !file.hunks.is_empty() {
+        // The "revert file" cue rides the `diff --git` separator. A removed file
+        // has no hunks but still a change to undo, so this is gated on the change,
+        // not on the hunk list.
+        if revert_file_ok(&file.path) {
             if let Some(l) = lines.get_mut(file.start_line) {
                 l.push_str(&format!("  {}", pill(REVERT_FILE_LABEL)));
             }
@@ -1096,12 +1104,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let update_split_sensitivity: Rc<dyn Fn()> = {
         let split_button = split_button.clone();
         let file_buffer = file_buffer.clone();
+        let changes = changes.clone();
         let orig_changes = orig_changes.clone();
         let pane_mode = pane_mode.clone();
         Rc::new(move || {
             let has_edits = !pane_mode.borrow().is_conflict()
                 && matches!(
-                    collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()),
+                    collect_file_edits(
+                        &buffer_text(&file_buffer),
+                        &changes.borrow(),
+                        &orig_changes.borrow(),
+                    ),
                     Ok(edits) if !edits.is_empty()
                 );
             split_button.set_sensitive(has_edits);
@@ -2403,20 +2416,24 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let saved_cursor = file_buffer.cursor_position();
                 // Edit each changed file of the selected entry in place (no rebase
                 // that moves the tip, so a loop is fine).
-                let edits =
-                    match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow()) {
-                        Ok(edits) => edits,
-                        Err(msg) => {
-                            show_status(&msg);
-                            return;
-                        }
-                    };
+                let edits = match collect_file_edits(
+                    &buffer_text(&file_buffer),
+                    &changes.borrow(),
+                    &orig_changes.borrow(),
+                ) {
+                    Ok(edits) => edits,
+                    Err(msg) => {
+                        show_status(&msg);
+                        return;
+                    }
+                };
                 let change = selected_wc_change.borrow().clone();
-                for (path, content) in &edits {
-                    if let Err(err) =
-                        repo.borrow_mut()
-                            .edit_working_copy_file(change.as_deref(), path, content)
-                    {
+                for edit in &edits {
+                    if let Err(err) = repo.borrow_mut().edit_working_copy_file(
+                        change.as_deref(),
+                        &edit.path,
+                        edit.content.as_deref(),
+                    ) {
                         show_status(&format!("Working-copy edit failed: {err}"));
                         return;
                     }
@@ -2484,8 +2501,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
             // File content edits across every file of the combined diff, applied
             // in one rewrite so a multi-file Save is a single transaction.
-            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow())
-            {
+            let edits = match collect_file_edits(
+                &buffer_text(&file_buffer),
+                &changes.borrow(),
+                &orig_changes.borrow(),
+            ) {
                 Ok(edits) => edits,
                 Err(msg) => {
                     show_status(&msg);
@@ -2493,7 +2513,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             };
             if !edits.is_empty() {
-                let outcome = repo.borrow_mut().rewrite_files(&commit_id, &edits);
+                let outcome = repo.borrow_mut().rewrite_files_edits(&commit_id, &edits);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {}
                     Ok(SaveOutcome::Conflicts { commits }) => {
@@ -2606,8 +2626,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             if pane_mode.borrow().is_conflict() {
                 return;
             }
-            let edits = match collect_file_edits(&buffer_text(&file_buffer), &orig_changes.borrow())
-            {
+            let edits = match collect_file_edits(
+                &buffer_text(&file_buffer),
+                &changes.borrow(),
+                &orig_changes.borrow(),
+            ) {
                 Ok(edits) => edits,
                 Err(msg) => {
                     show_status(&msg);
@@ -2651,7 +2674,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let change = selected_wc_change.borrow().clone();
                 if let Err(err) = repo
                     .borrow_mut()
-                    .split_working_copy(change.as_deref(), &edits)
+                    .split_working_copy_edits(change.as_deref(), &edits)
                 {
                     show_status(&format!("Split failed: {err}"));
                     return;
@@ -2685,7 +2708,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             };
             // Own statement so the `RefMut` drops before the match arms run
             // (`enter_conflict_mode`/`refresh` re-borrow `repo`).
-            let outcome = repo.borrow_mut().split_commit(&commit_id, &edits);
+            let outcome = repo.borrow_mut().split_commit_edits(&commit_id, &edits);
             match outcome {
                 Ok(SaveOutcome::Clean) => {}
                 Ok(SaveOutcome::Conflicts { commits }) => {
@@ -2786,32 +2809,57 @@ fn history_row(label: &str, subtitle: Option<&str>, current: bool, future: bool)
 /// spuriously "edit" the file to nothing). The original trailing-newline style is
 /// preserved. `Err` carries an apply-failure message (the patch firewall should
 /// make that unreachable, but a save surfaces it rather than dropping silently).
+/// Build the per-file [`FileEdit`]s a Save / Split should apply, by comparing each
+/// file's *intended* new content against the commit's pristine content.
+///
+/// Three inputs, three roles: `combined` is the live diff buffer — authoritative
+/// for manual content edits; `render` is the render baseline (`changes`) — its
+/// `new_text` of `None` is the one signal a buffer can't carry, a file whose whole
+/// change was reverted away (a dropped addition collapses to a notice, not a
+/// patch); `orig` is the pristine load — the "before" each file diverges from. A
+/// file becomes a [`FileEdit::write`] (content edited, or a removed file restored),
+/// a [`FileEdit::delete`] (an added file's change reverted), or nothing (unchanged).
 fn collect_file_edits(
     combined: &str,
-    changes: &[FileChange],
-) -> Result<Vec<(String, String)>, String> {
+    render: &[FileChange],
+    orig: &[FileChange],
+) -> Result<Vec<FileEdit>, String> {
     let mut edits = Vec::new();
     for (path, patch) in split_combined_patch(combined) {
-        let Some(change) = changes.iter().find(|c| c.path == path) else {
+        let Some(orig_change) = orig.iter().find(|c| c.path == path) else {
             continue;
         };
-        if change.conflicted_base {
+        // Binary / conflicted-base files have no editable text on either side.
+        if orig_change.is_binary || orig_change.conflicted_base {
             continue;
         }
-        let Some(original) = change.new_text.as_deref() else {
-            continue;
-        };
-        let old = change.old_text.as_deref().unwrap_or("");
-        match apply_patch(old, &patch) {
-            Ok(mut content) => {
-                if !original.is_empty() && !original.ends_with('\n') && content.ends_with('\n') {
-                    content.pop();
-                }
-                if content != original {
-                    edits.push((path, content));
-                }
+        let r = render
+            .iter()
+            .find(|c| c.path == path)
+            .unwrap_or(orig_change);
+        // The content the file should end up with. A render-baseline `new_text` of
+        // `None` is a dropped file (its addition reverted, or still removed);
+        // otherwise apply the edited patch to the old side to capture both manual
+        // edits and the re-rendered result of a hunk/file revert.
+        let target: Option<String> = if r.new_text.is_none() {
+            None
+        } else {
+            let old = r.old_text.as_deref().unwrap_or("");
+            let mut content = apply_patch(old, &patch)
+                .map_err(|err| format!("Cannot apply edited patch for {path}: {err}"))?;
+            // Match apply_patch's trailing-newline normalization to the intended
+            // content's own style so an untouched file yields no spurious edit.
+            let want = r.new_text.as_deref().unwrap_or("");
+            if !want.is_empty() && !want.ends_with('\n') && content.ends_with('\n') {
+                content.pop();
             }
-            Err(err) => return Err(format!("Cannot apply edited patch for {path}: {err}")),
+            Some(content)
+        };
+        if target.as_deref() != orig_change.new_text.as_deref() {
+            edits.push(match target {
+                Some(content) => FileEdit::write(path, content),
+                None => FileEdit::delete(path),
+            });
         }
     }
     Ok(edits)
@@ -2898,6 +2946,17 @@ mod tests {
             kind: ChangeKind::Added,
             old_text: None,
             new_text: Some(new.to_string()),
+            is_binary: false,
+            conflicted_base: false,
+        }
+    }
+
+    fn removed(path: &str, old: &str) -> FileChange {
+        FileChange {
+            path: path.to_string(),
+            kind: ChangeKind::Removed,
+            old_text: Some(old.to_string()),
+            new_text: None,
             is_binary: false,
             conflicted_base: false,
         }
@@ -2994,11 +3053,86 @@ mod tests {
     }
 
     #[test]
-    fn added_files_get_no_revert_cue() {
-        // No old side means a content-only edit can't drop the change, so neither
-        // revert cue is offered for an added file.
-        let (text, _h, _f) = build_diff_buffer_text(&[added("new.txt", "x\ny\n")], &HashMap::new());
+    fn added_file_gets_a_file_revert_cue_but_no_hunk_revert_cue() {
+        // An added file's whole change can be dropped (revert file -> delete), but
+        // a *hunk* revert needs an old side, so it's not offered.
+        let (text, _hunks, files) =
+            build_diff_buffer_text(&[added("new.txt", "x\ny\n")], &HashMap::new());
         assert!(!text.contains(REVERT_HUNK_LABEL));
-        assert!(!text.contains(REVERT_FILE_LABEL));
+        let lines: Vec<&str> = text.split('\n').collect();
+        let sep = lines[files[0].start_line];
+        let pills = pills_on_line(sep);
+        assert_eq!(pills.len(), 1);
+        assert_eq!(pills[0].2, REVERT_FILE_LABEL);
+    }
+
+    #[test]
+    fn removed_file_gets_a_file_revert_cue() {
+        // A removed file has no hunks (it renders as a notice) but still a change
+        // to undo, so the revert-file cue rides its `diff --git` separator.
+        let (text, _hunks, files) =
+            build_diff_buffer_text(&[removed("gone.txt", "a\nb\n")], &HashMap::new());
+        assert!(!text.contains(REVERT_HUNK_LABEL));
+        let lines: Vec<&str> = text.split('\n').collect();
+        let sep = lines[files[0].start_line];
+        let pills = pills_on_line(sep);
+        assert_eq!(pills.len(), 1);
+        assert_eq!(pills[0].2, REVERT_FILE_LABEL);
+        assert_eq!(
+            diff_cue_at(&[], sep, files[0].start_line, pills[0].0),
+            Some(DiffCue::RevertFile)
+        );
+    }
+
+    /// Apply a `RevertFile` to `change` the way the click handler does (the render
+    /// baseline's `new_text` drops to the old side), then render and collect the
+    /// edits a Save would apply against the pristine `orig`.
+    fn revert_file_and_collect(orig: &[FileChange]) -> Vec<FileEdit> {
+        let mut render = orig.to_vec();
+        for c in render.iter_mut() {
+            c.new_text = c.old_text.clone();
+        }
+        let (text, _h, _f) = build_diff_buffer_text(&render, &HashMap::new());
+        collect_file_edits(&text, &render, orig).expect("collect")
+    }
+
+    #[test]
+    fn reverting_an_added_file_collects_a_delete() {
+        let edits = revert_file_and_collect(&[added("new.txt", "x\ny\n")]);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "new.txt");
+        assert!(
+            edits[0].content.is_none(),
+            "an added file's revert deletes it"
+        );
+    }
+
+    #[test]
+    fn reverting_a_removed_file_collects_a_recreate() {
+        let edits = revert_file_and_collect(&[removed("gone.txt", "a\nb\n")]);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "gone.txt");
+        assert_eq!(edits[0].content.as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
+    fn reverting_a_modified_file_collects_the_old_content() {
+        let edits = revert_file_and_collect(&[modified("f", "a\nb\n", "a\nB\n")]);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].content.as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
+    fn an_untouched_diff_collects_no_edits() {
+        // Render the pristine diff and collect against the same baseline: nothing
+        // diverges, so a plain reselect (no edits) saves nothing.
+        let orig = vec![
+            modified("f", "a\nb\n", "a\nB\n"),
+            added("new.txt", "x\n"),
+            removed("gone.txt", "z\n"),
+        ];
+        let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new());
+        let edits = collect_file_edits(&text, &orig, &orig).expect("collect");
+        assert!(edits.is_empty(), "got {edits:?}");
     }
 }

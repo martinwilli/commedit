@@ -298,7 +298,7 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(source, dest, mode, message, false)
+            self.squash_into_inner(source, dest, mode, message, false, None)
         })
     }
 
@@ -315,7 +315,7 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit from trash", || {
-            self.squash_into_inner(source, dest, mode, message, true)
+            self.squash_into_inner(source, dest, mode, message, true, None)
         })
     }
 
@@ -342,6 +342,35 @@ impl Repo {
             .resolve_working_copy_change(change_hex)
             .context("no working-copy entry to fold")?;
         self.squash_into(&source, dest, SquashMode::Fixup, message)
+    }
+
+    /// Apply a *trashed* (orphan) commit's changes onto the working copy as
+    /// uncommitted edits — the inverse of [`Self::squash_working_copy_into`]
+    /// (which folds the working copy *into* a commit). `source` is an orphan no
+    /// longer reachable from any head, so squashing it into the leaf working-copy
+    /// commit `@` lands its diff as unstaged changes without moving the branch
+    /// tip: `finish_mutation`'s export is a branch no-op and
+    /// `materialize_after_rewrite` merely rewrites the worktree and resets the git
+    /// index to the unchanged tip. An overlap with the user's existing uncommitted
+    /// changes leaves `@` conflicted and enters the shared conflict-resolution flow
+    /// like any other rewrite. The engine behind the GTK trash-row "restore to
+    /// working tree" button and the second half of [`Self::drop_keeping_changes`].
+    pub fn restore_to_working_copy(&mut self, source: &CommitId) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("restoring the changes to the working copy", || {
+            // Snapshot before resolving so the leaf id survives squash_into_inner's
+            // own (now no-op) snapshot — otherwise a churned leaf id would go stale.
+            self.snapshot_working_copy()?;
+            let dest = self
+                .working_copy_commit_id()
+                .context("no working copy to restore the changes into")?;
+            let source_commit = self
+                .repo
+                .store()
+                .get_commit(source)
+                .context("loading the commit to restore")?;
+            let label = format!("Restore {} to working copy", op_subject(&source_commit));
+            self.squash_into_inner(source, &dest, SquashMode::Fixup, None, true, Some(label))
+        })
     }
 
     /// Fold a **subset** of the uncommitted changes into the history commit
@@ -462,6 +491,7 @@ impl Repo {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,
         source: &CommitId,
@@ -469,6 +499,7 @@ impl Repo {
         mode: SquashMode,
         message: Option<&str>,
         source_is_orphan: bool,
+        label: Option<String>,
     ) -> Result<SaveOutcome> {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
@@ -507,11 +538,13 @@ impl Repo {
         };
         let dest_author = dest_commit.author().clone();
         let desc = OpDescriptor::new(
-            format!(
-                "Squash {} into {}",
-                op_subject(&source_commit),
-                op_subject(&dest_commit)
-            ),
+            label.unwrap_or_else(|| {
+                format!(
+                    "Squash {} into {}",
+                    op_subject(&source_commit),
+                    op_subject(&dest_commit)
+                )
+            }),
             vec![
                 source_commit.change_id().hex(),
                 dest_commit.change_id().hex(),

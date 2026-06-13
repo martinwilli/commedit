@@ -102,8 +102,16 @@ an interactive-rebase session.
   snapshot; hovering one highlights the commit rows it touched. The bottom
   **Session start** entry undoes the whole session at once.
 
+- **Search the history** — the search box beside the Reload button (focus it with
+  `Ctrl+F`) matches what you type against the commit subjects, highlighting the
+  matched characters in the list and scrolling to the first hit as you go. It's a
+  plain substring search like `git log --grep`: type several words and each must
+  appear (in any order), so `fix login` finds "Login: fix the redirect". Press
+  `Enter` to select that commit, and `Enter` again to step to the next match.
+
 ## Keyboard shortcuts
 
+- `Ctrl+F` — focus the commit search box; `Enter` jumps to the next match.
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.
 - `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
   `+` additions, restores `-` removals to context).

@@ -359,6 +359,48 @@ fn add_restore_button(content: &Overlay, on_restore: &RestoreToWorktreeCallback)
     btn.add_controller(click);
 }
 
+/// The subject text shown in a row: the commit's subject, or a placeholder when
+/// it has no description. Shared so the row build, in-place update, and the
+/// search highlight/reset all agree on the placeholder.
+fn display_subject(commit: &CommitInfo) -> &str {
+    if commit.subject.is_empty() {
+        "(no description)"
+    } else {
+        &commit.subject
+    }
+}
+
+/// The subject `Label` of a row, via the shared
+/// `[graph?, content-overlay → row_box → (id_cell, subject_label, …)]` layout.
+/// Mirrors the subject leg of [`set_row_commit`]'s traversal; `None` for a row
+/// that hasn't been populated yet.
+fn row_subject_label(row: &ListBoxRow) -> Option<Label> {
+    let child = row.child().and_downcast::<GtkBox>();
+    let area = child
+        .as_ref()
+        .and_then(|b| b.first_child())
+        .and_downcast::<gtk::DrawingArea>();
+    let content_overlay = match &area {
+        Some(area) => area.next_sibling().and_downcast::<Overlay>(),
+        None => child
+            .as_ref()
+            .and_then(|b| b.first_child())
+            .and_downcast::<Overlay>(),
+    };
+    let row_box = content_overlay
+        .as_ref()
+        .and_then(|c| c.child())
+        .and_downcast::<GtkBox>();
+    let id_cell = row_box
+        .as_ref()
+        .and_then(|b| b.first_child())
+        .and_downcast::<Overlay>();
+    id_cell
+        .as_ref()
+        .and_then(|c| c.next_sibling())
+        .and_downcast::<Label>()
+}
+
 /// Build the `short-id   subject  [pills]   ⚠` content box shown inside a
 /// history/trash row. The pill box hugs the subject's right edge: the subject
 /// label does *not* expand, the pill box does (start-aligned), so the pills sit
@@ -385,11 +427,7 @@ fn commit_row_box(
     on_restore: Option<&RestoreToWorktreeCallback>,
 ) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
-    let subject = if commit.subject.is_empty() {
-        "(no description)"
-    } else {
-        &commit.subject
-    };
+    let subject = display_subject(commit);
     let id_cell = id_cell(&short, &commit.id_hex());
     let subject_label = Label::builder()
         .label(subject)
@@ -507,11 +545,7 @@ fn set_row_commit(
     on_restore: Option<&RestoreToWorktreeCallback>,
 ) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
-    let subject = if commit.subject.is_empty() {
-        "(no description)"
-    } else {
-        &commit.subject
-    };
+    let subject = display_subject(commit);
     let child = row.child().and_downcast::<GtkBox>();
     // Every row's child is the outer `[graph area?, content overlay]` box from
     // [`commit_row_box`]: a history row leads with the ancestry drawing area, a
@@ -689,6 +723,63 @@ pub(crate) fn clear_highlight(list: &ListBox) {
     while let Some(row) = list.row_at_index(i) {
         row.remove_css_class("op-affected");
         i += 1;
+    }
+}
+
+/// Paint the search matches of `query` across the history `list` (matching the
+/// commit subjects by substring term, see [`crate::search::search_match`]) and
+/// return the matched row indices, ascending. A matched subject's characters are
+/// highlighted via [`crate::search::highlight_markup`]; every other row — and
+/// every row when `query` is empty, the "search cleared" path — is reset to plain
+/// text. Mirrors the row-walking style of
+/// [`highlight_affected`] / [`clear_highlight`].
+pub(crate) fn apply_search_highlight(
+    list: &ListBox,
+    commits: &[CommitInfo],
+    query: &str,
+) -> Vec<usize> {
+    let mut matches = Vec::new();
+    for (i, commit) in commits.iter().enumerate() {
+        let Some(row) = list.row_at_index(i as i32) else {
+            break;
+        };
+        let Some(label) = row_subject_label(&row) else {
+            continue;
+        };
+        match crate::search::search_match(&commit.subject, query) {
+            Some(pos) => {
+                label.set_markup(&crate::search::highlight_markup(
+                    display_subject(commit),
+                    &pos,
+                ));
+                matches.push(i);
+            }
+            None => label.set_text(display_subject(commit)),
+        }
+    }
+    matches
+}
+
+/// Scroll `scroll` so the row at display index `idx` in `list` is visible. The
+/// row's bounds are taken in `list` coordinates — the same space the scrolled
+/// window's vertical adjustment uses, since `list` is its scroll child — and the
+/// adjustment is nudged the minimum needed to bring the row into the page. No-op
+/// if the row isn't present or laid out yet.
+pub(crate) fn scroll_row_into_view(scroll: &ScrolledWindow, list: &ListBox, idx: usize) {
+    let Some(row) = list.row_at_index(idx as i32) else {
+        return;
+    };
+    let Some(bounds) = row.compute_bounds(list) else {
+        return;
+    };
+    let adj = scroll.vadjustment();
+    let top = bounds.y() as f64;
+    let bottom = top + bounds.height() as f64;
+    let page = adj.page_size();
+    if top < adj.value() {
+        adj.set_value(top.max(adj.lower()));
+    } else if bottom > adj.value() + page {
+        adj.set_value((bottom - page).clamp(adj.lower(), (adj.upper() - page).max(adj.lower())));
     }
 }
 

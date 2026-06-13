@@ -9,6 +9,7 @@ use futures::io::AsyncReadExt;
 use futures::StreamExt;
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::matchers::EverythingMatcher;
+use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::RepoPath;
@@ -96,6 +97,49 @@ pub fn tree_changes(
         });
     }
     Ok(changes)
+}
+
+/// Build a single combined diff over several commits, in minimal form.
+///
+/// `commit_ids` must be ordered **oldest-first**. The base is the parent tree of
+/// the oldest commit; each commit's introduced change (its own tree vs. its
+/// parent's tree) is then re-applied onto an accumulator via a 3-way tree merge —
+/// the same `MergedTree::merge` primitive [`crate::create`] uses to cherry-pick.
+/// `Merge::from_vec([acc, parent, commit])` is `acc − parent + commit`, i.e. "apply
+/// the commit's introduced change onto `acc`". For a contiguous linear range this
+/// telescopes to the cumulative diff `parent_of_oldest → newest`; for a gapped or
+/// divergent selection it composes a cherry-pick stack. If a step leaves the
+/// accumulator conflicted (the selected changes overlap and can't be combined into
+/// one tree), the combination isn't representable and this returns `Ok(None)`. The
+/// commits are only read (no rewrite), so this is safe to call for display.
+pub fn combined_changes(
+    repo: &ReadonlyRepo,
+    commit_ids: &[CommitId],
+) -> Result<Option<Vec<FileChange>>> {
+    let store = repo.store().clone();
+    let Some(first) = commit_ids.first() else {
+        return Ok(Some(Vec::new()));
+    };
+    let first_commit = store
+        .get_commit(first)
+        .context("loading the oldest commit")?;
+    let base = pollster::block_on(first_commit.parent_tree(repo)).context("parent tree")?;
+
+    let mut acc = base.clone();
+    for id in commit_ids {
+        let commit = store.get_commit(id).context("loading a commit")?;
+        let parent_tree = pollster::block_on(commit.parent_tree(repo)).context("parent tree")?;
+        acc = pollster::block_on(MergedTree::merge(Merge::from_vec(vec![
+            (acc, "combined so far".to_string()),
+            (parent_tree, "before the commit".to_string()),
+            (commit.tree(), "the commit".to_string()),
+        ])))
+        .context("combining commit changes")?;
+        if acc.has_conflict() {
+            return Ok(None);
+        }
+    }
+    tree_changes(&store, &base, &acc).map(Some)
 }
 
 /// Render a standard unified diff of `old` → `new` with `@@` hunk headers and

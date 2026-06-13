@@ -3,8 +3,10 @@
 //! trash, and the reorder/restore splice planner.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
+use anyhow::Context as _;
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::graph::compute_graph;
 use commedit_engine::history::{history, history_limited, CommitInfo, IdAbbrev, ReorderMove};
@@ -116,6 +118,70 @@ pub fn ensure_not_pending(repo: &Repo) -> Result<(), ErrorData> {
         ));
     }
     Ok(())
+}
+
+/// Validate that `requested` is the main checkout or a linked worktree of the
+/// repository currently rooted at `current_root` — they share a git *common
+/// dir* — and return its canonical toplevel for [`Repo::open`]. Refused
+/// otherwise, so a `reload_repo` retarget stays scoped to one repository's
+/// worktrees and can never re-home the session to an unrelated repo.
+pub(crate) fn resolve_worktree_target(
+    current_root: &Path,
+    requested: &str,
+) -> Result<PathBuf, ErrorData> {
+    let requested = Path::new(requested);
+    let want = git_common_dir(requested).ok_or_else(|| {
+        invalid(format!(
+            "{} is not inside a git repository",
+            requested.display()
+        ))
+    })?;
+    let have = git_common_dir(current_root).ok_or_else(|| {
+        internal(anyhow::anyhow!(
+            "the open repository at {} has no resolvable git dir",
+            current_root.display()
+        ))
+    })?;
+    if want != have {
+        let worktrees = git_capture(current_root, &["worktree", "list"]).unwrap_or_default();
+        return Err(invalid(format!(
+            "{} is not a worktree of this repository; reload_repo can only re-home to one \
+             of:\n{worktrees}",
+            requested.display()
+        )));
+    }
+    // A real worktree of this repo: resolve its toplevel so the response root and
+    // Repo::open both see a canonical path (git resolves it from any subdir).
+    let top = git_capture(requested, &["rev-parse", "--show-toplevel"]).map_err(internal)?;
+    Ok(PathBuf::from(top))
+}
+
+/// The canonical git *common dir* of the repository containing `dir`, or `None`
+/// when `dir` is not inside a git repository. Two checkouts share this exactly
+/// when they are worktrees of the same repository (mirrors `git_objects_dir` in
+/// the engine's `transparency.rs`).
+fn git_common_dir(dir: &Path) -> Option<PathBuf> {
+    let raw = git_capture(dir, &["rev-parse", "--git-common-dir"]).ok()?;
+    // `--git-common-dir` prints relative to `dir` (e.g. `.git`) or absolute (a
+    // linked worktree's main `.git`); join handles both, canonicalize resolves.
+    std::fs::canonicalize(dir.join(raw)).ok()
+}
+
+/// Run a read-only `git` query in `dir`, returning trimmed stdout. Errors when
+/// git is missing or exits non-zero (e.g. `dir` is not a git repository).
+fn git_capture(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {args:?}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The branch head plus the full ancestry walk. The full list (never a

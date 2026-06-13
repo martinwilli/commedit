@@ -912,10 +912,21 @@ pub struct TimeTravelResp {
     pub cursor: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReloadRepoReq {
+    /// Optional path to re-home this session to a *different worktree of the
+    /// same repository* — its main checkout or any linked worktree (they share
+    /// a git common dir). Omit to reload the current repository in place. A path
+    /// outside this repository's worktrees is refused.
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReloadResp {
     /// The branch tip after the fresh import.
     pub head_sha: Option<String>,
+    /// The repository root the session is now pointed at.
+    pub root: String,
 }
 
 #[cfg(test)]

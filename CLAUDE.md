@@ -107,7 +107,13 @@ unit-testable headless:
   `git commit` on top of HEAD is imported into the *existing* session — trash and
   op-log intact. `reload_repo` (`with_session_no_sync`, the lone opt-out) is the
   heavier full reset, reserved for what a fast-forward sync can't absorb: a branch
-  switch or out-of-band history rewrite.
+  switch or out-of-band history rewrite. It also takes an optional `path` to
+  **re-home the session to a sibling worktree** of the same repo (its main checkout
+  or any linked worktree) — `session.rs`'s `resolve_worktree_target` scope-guards it
+  by **shared git common-dir** (refusing an unrelated repo) and the handler reopens
+  the live `repo.workspace_root()` otherwise, so no separate repo-path is kept. This
+  lets one session edit history isolated in a `git worktree` and re-home afterward;
+  the `work-in-worktree` plugin skill drives the setup.
 
 ### The jj-over-git "transparency" model (the central idea)
 

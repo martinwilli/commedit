@@ -5,7 +5,7 @@ mod common;
 
 use commedit_mcp::dto::{
     DiscardWorkingCopyReq, DropCommitReq, EditMessageReq, FileContentDto, JumpToOperationReq,
-    ListHistoryReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto,
+    ListHistoryReq, ReloadRepoReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto,
 };
 use common::{expect_err, git, git_log_subjects, init_repo, open_server};
 use rmcp::handler::server::wrapper::Parameters;
@@ -237,7 +237,11 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
     git(dir.path(), &["add", "x.txt"]);
     git(dir.path(), &["commit", "-qm", "external"]);
 
-    let resp = server.reload_repo().await.unwrap().0;
+    let resp = server
+        .reload_repo(Parameters(ReloadRepoReq { path: None }))
+        .await
+        .unwrap()
+        .0;
     assert_eq!(
         resp.head_sha.unwrap(),
         git(dir.path(), &["rev-parse", "HEAD"])
@@ -303,7 +307,10 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
     assert!(server.pending_status().await.unwrap().0.pending);
 
     // Reload while pending: allowed, the held rewrite is simply dropped.
-    server.reload_repo().await.unwrap();
+    server
+        .reload_repo(Parameters(ReloadRepoReq { path: None }))
+        .await
+        .unwrap();
     assert!(!server.pending_status().await.unwrap().0.pending);
     assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head_before);
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);

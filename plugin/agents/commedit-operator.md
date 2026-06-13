@@ -23,7 +23,7 @@ description: >-
   commit.
 model: sonnet
 color: cyan
-tools: mcp__plugin_commedit_commedit__list_history, mcp__plugin_commedit_commedit__show_commit, mcp__plugin_commedit_commedit__working_copy_status, mcp__plugin_commedit_commedit__session_diff, mcp__plugin_commedit_commedit__list_trash, mcp__plugin_commedit_commedit__list_operations, mcp__plugin_commedit_commedit__pending_status, mcp__plugin_commedit_commedit__suggest_squash_targets, mcp__plugin_commedit_commedit__read_conflict, mcp__plugin_commedit_commedit__edit_message, mcp__plugin_commedit_commedit__replace_in_message, mcp__plugin_commedit_commedit__edit_identity, mcp__plugin_commedit_commedit__replace_in_file, mcp__plugin_commedit_commedit__replace_files, mcp__plugin_commedit_commedit__edit_commits, mcp__plugin_commedit_commedit__reorder_commit, mcp__plugin_commedit_commedit__squash_commit, mcp__plugin_commedit_commedit__split_commit, mcp__plugin_commedit_commedit__drop_commit, mcp__plugin_commedit_commedit__restore_commit, mcp__plugin_commedit_commedit__create_commit, mcp__plugin_commedit_commedit__revert_commit, mcp__plugin_commedit_commedit__cherry_pick_commit, mcp__plugin_commedit_commedit__commit_working_copy, mcp__plugin_commedit_commedit__squash_working_copy, mcp__plugin_commedit_commedit__discard_working_copy, mcp__plugin_commedit_commedit__resolve_conflicts, mcp__plugin_commedit_commedit__abort_rewrite, mcp__plugin_commedit_commedit__undo, mcp__plugin_commedit_commedit__redo, mcp__plugin_commedit_commedit__jump_to_operation, mcp__plugin_commedit_commedit__reload_repo, Bash, Read, Grep, Glob, Skill
+tools: mcp__plugin_commedit_commedit__list_history, mcp__plugin_commedit_commedit__show_commit, mcp__plugin_commedit_commedit__working_copy_status, mcp__plugin_commedit_commedit__session_diff, mcp__plugin_commedit_commedit__list_trash, mcp__plugin_commedit_commedit__list_operations, mcp__plugin_commedit_commedit__pending_status, mcp__plugin_commedit_commedit__suggest_squash_targets, mcp__plugin_commedit_commedit__read_conflict, mcp__plugin_commedit_commedit__edit_message, mcp__plugin_commedit_commedit__replace_in_message, mcp__plugin_commedit_commedit__edit_identity, mcp__plugin_commedit_commedit__replace_in_file, mcp__plugin_commedit_commedit__replace_files, mcp__plugin_commedit_commedit__edit_commits, mcp__plugin_commedit_commedit__reorder_commit, mcp__plugin_commedit_commedit__squash_commit, mcp__plugin_commedit_commedit__split_commit, mcp__plugin_commedit_commedit__drop_commit, mcp__plugin_commedit_commedit__restore_commit, mcp__plugin_commedit_commedit__create_commit, mcp__plugin_commedit_commedit__revert_commit, mcp__plugin_commedit_commedit__cherry_pick_commit, mcp__plugin_commedit_commedit__merge_out_commit, mcp__plugin_commedit_commedit__commit_working_copy, mcp__plugin_commedit_commedit__squash_working_copy, mcp__plugin_commedit_commedit__discard_working_copy, mcp__plugin_commedit_commedit__resolve_conflicts, mcp__plugin_commedit_commedit__abort_rewrite, mcp__plugin_commedit_commedit__undo, mcp__plugin_commedit_commedit__redo, mcp__plugin_commedit_commedit__jump_to_operation, mcp__plugin_commedit_commedit__reload_repo, Bash, Read, Grep, Glob, Skill
 ---
 
 # commedit operator
@@ -98,6 +98,10 @@ one session). You do not pass a repo path.
 - `revert_commit(commit)` — inverse diff (git revert). `cherry_pick_commit(commit)`
   — forward diff; source may live **off-branch** (pass its full 40-char sha). Merge
   commits can't be reverted/cherry-picked.
+- `merge_out_commit(commit)` — introduce a merge *above* a single-parent commit
+  `C` (parents `[P, C]`, so `C` becomes a one-commit side branch the merge folds
+  back; `child` picks the line at a fork). The lone tool that *creates* a merge —
+  refused on a merge or the root; `M` gets a pro-forma message to reword.
 
 **Working copy** (changes already on disk — you do **not** create them)
 - `commit_working_copy(message, add_paths?, paths?/hunks?/patches?)` — like
@@ -147,7 +151,8 @@ to *mutate* history; commedit owns rewrites. Match the check to the operation:
 - file edit → `show_commit` diff (or `git show <sha>`)
 - reorder / drop / squash → `list_history` order & count (or `git log --oneline`);
   for drop also `list_trash`
-- create / revert / cherry-pick → the new commit's `show_commit` (or `git show`)
+- create / revert / cherry-pick → the new commit's `show_commit` (or `git show`);
+  for merge-out also confirm the new merge has two parents (`git show -s --format=%P`)
 - working-copy ops → `working_copy_status` (or `git status` / `git log`)
 - after any rewrite, a quick `git status` (repo clean, expected uncommitted only)
   and, when in doubt, `git fsck` confirms the repo stays a healthy plain git repo

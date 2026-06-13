@@ -601,6 +601,19 @@ pub struct RestoreCommitReq {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MergeOutReq {
+    /// The single-parent commit C to merge out — sha or change id, full or a
+    /// unique prefix (>= 4 chars), case-insensitive. A merge M is introduced
+    /// directly above it; merge commits and the repository root (which have no
+    /// single parent) cannot be merged out.
+    pub commit: String,
+    /// When several lines converge above C (a fork), the child line the merge
+    /// should take over (same ref forms), as in `reorder_commit`. Usually
+    /// omitted.
+    pub child: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SquashCommitReq {
     /// The commit to fold, from the history or the trash — sha or change id,
     /// full or a unique prefix. A ref present in both resolves to the

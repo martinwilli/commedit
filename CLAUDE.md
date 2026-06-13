@@ -74,8 +74,10 @@ unit-testable headless:
   tool surface is a **superset** of the GTK app:
   `create_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
   the surgical `replace_in_file`/`replace_in_message` and `commit_working_copy`
-  (+ partial) have no UI counterpart (`revert_commit` is the exception — the
-  history list's right-edge hover button drops a revert on top of a commit). Mutations
+  (+ partial) have no UI counterpart; `revert_commit` and `merge_out_commit`
+  (introducing a merge) are the exceptions that *also* have a GTK surface — the
+  history list's right-edge hover buttons drop a revert, or a merge, onto a
+  commit. Mutations
   are
   refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
@@ -201,6 +203,25 @@ op-log").
   reverted/cherry-picked (no single parent to diff). A top-gap insert (empty
   `new_child_ids`) splices beneath the working-copy chain like reorder, so
   uncommitted changes ride on top.
+- `merge_out_commit` (`create.rs`; MCP `merge_out_commit` and a GTK surface — the
+  history list's right-edge hover button beside revert, see the GTK section) — the
+  one entry point that *creates a merge* (everything else only edits/preserves
+  them). The MCP handler maps the agent's target commit onto the gap-above slot the
+  same way `create_commit` does (a `plan_splice` with `new_parent` = the commit,
+  reusing the `child` fork disambiguator) and returns the lean `save_result`.
+  Given a single-parent commit `C` (parent `P`), it inserts a merge `M` in `C`'s
+  gap-above slot with `new_parent_ids = [P, C]` (P first = mainline, C second = the
+  merged-out side branch) and `M`'s tree = **`C`'s tree** passed explicitly to
+  `insert_new_commit` (which it shares with create/revert/cherry-pick) — so the
+  merge introduces no change of its own and `C`'s descendants rebase onto `M` as a
+  no-op (always `Clean` absent a working-copy overlap). `P` is an ancestor of `C`,
+  so `M` is a **degenerate merge** jj keeps intact (ancestor-redundant parents
+  aren't simplified — the same reason a reorder out of a merge leaves a 2-parent
+  merge); `C` becomes a one-commit side branch you then populate by moving commits
+  onto it. Refused on a merge **or the root** — jj gives the root commit the
+  virtual root as its single parent, so the guard rejects both `len != 1` and a
+  sole virtual-root parent. `M` gets a pro-forma `Merge "<subject>"` message to
+  reword later.
 - `replace_in_files` (`tree.rs`; MCP `replace_in_file` / `replace_in_message`,
   no GTK surface) — the surgical counterpart to `rewrite_files`: targeted
   `old`→`new` text replacements (unique unless `all`) read from the target's tree,
@@ -528,15 +549,23 @@ not in `main.rs`:
   right edge (`halign End`) — so buttons line up down the list, aligned to its right
   boundary, and only overlap a subject wide enough to scroll under them (mirroring
   the id cell's copy icon, but row-wide). A **history** row gets a **revert button**
-  (`add_revert_button`); a **trash** row gets a **restore button** (`add_restore_button`,
-  the `go-bottom-symbolic` down arrow). Both callbacks (`RevertCallback` /
-  `RestoreToWorktreeCallback`) thread through `populate_list`/`populate_trash` →
+  (`add_revert_button`) and, beside it, a **merge-out button** (`add_merge_out_button`,
+  the `go-next-symbolic` right arrow at `margin_end 28` so it sits just left of
+  revert's `margin_end 8`); a **trash** row gets a **restore button**
+  (`add_restore_button`, the `go-bottom-symbolic` down arrow). The three callbacks
+  (`RevertCallback` / `MergeOutCallback` / `RestoreToWorktreeCallback`) thread through
+  `populate_list`/`populate_trash` →
   `set_row_commit` → `commit_row_box`, are slot-filled late in `build_ui` (the
   `RestoreToWorktreeCallback` also rides in the `Callbacks` bundle so `dragdrop`
-  repopulates the trash with buttons intact), and defer to idle (like `run_post_drag`).
+  repopulates the trash with buttons intact; revert + merge-out are re-passed by
+  `refresh`), and defer to idle (like `run_post_drag`).
   Revert places a `revert_commit` on top of the row's commit (parent = the commit,
-  children = the lane edge crossing the gap just above it, `graph.boundaries`); its
-  wrapping `Overlay` is tagged `no-revert` on merge rows so the button never reveals.
+  children = the lane edge crossing the gap just above it, `graph.boundaries`).
+  Merge-out (`merge_out_commit`) uses the **same** gap-above slot — same
+  `graph.boundaries` child computation — to introduce a merge above the commit; both
+  buttons share the `no-revert` tag on merge rows (a merge has no single parent), so
+  neither reveals there. Both re-select the clicked commit on `Clean` (the new
+  commit sits one row above).
   Restore calls `restore_to_working_copy` (the engine "uncommit"): on `Clean` it drops
   the commit from `trashed` and refreshes, on a working-copy overlap it enters conflict
   mode and defers the trash removal (`PendingTrashOp::Restore`, like a drag-restore).

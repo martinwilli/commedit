@@ -61,6 +61,15 @@ an interactive-rebase session.
   Unlike dropping a commit into the trash, the original stays and the undo is
   recorded explicitly.
 
+- **Merge a commit out** — beside the revert button, a right-arrow button
+  introduces a new merge commit just above the hovered commit: the commit becomes
+  a one-commit side branch that the merge folds back into the mainline, with a
+  pro-forma message to reword later. It's a way to *add* a merge — turning linear
+  history into a branchy one to organize it — rather than just edit around the
+  merges you already have. Once the merge is there, reorder commits onto its side
+  branch to group them under it. The content is untouched (the merge introduces no
+  change of its own) and the commit's descendants rebase straight onto it.
+
 - **Conflicts never reach your git history** — a reorder, drop or squash is a
   real rebase, so it can conflict. Spurious conflicts (nearby but independent
   edits) are resolved for you automatically; a genuine one is held back — `git`
@@ -150,7 +159,8 @@ The same engine is exposed to AI agents through a [Claude Code
 plugin](https://code.claude.com/docs/en/plugins). With it installed, an agent
 edits history the way the GTK app does — and then some: edit any commit's
 message, identity or file contents, split, reorder, drop, restore and squash
-commits, create new commits and revert or cherry-pick existing ones, fold
+commits, create new commits and revert or cherry-pick existing ones, introduce a
+merge above a commit, fold
 uncommitted changes in or commit them, drop a commit while keeping its changes
 unstaged in the working tree (`drop_commit` with `keep_changes`), walk the
 conflict-resolution loop, and

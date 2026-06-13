@@ -1965,6 +1965,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // The history rows' merge-out button uses the same slot-behind-a-stable-wrapper
+    // shape as the revert button (it needs `refresh` / `enter_conflict_mode`, built
+    // below): the rows capture `on_merge_out` now, the real handler is filled in once
+    // everything is constructed.
+    let on_merge_out_slot: Rc<RefCell<Option<MergeOutCallback>>> = Rc::new(RefCell::new(None));
+    let on_merge_out: MergeOutCallback = {
+        let slot = on_merge_out_slot.clone();
+        Rc::new(move |idx| {
+            if let Some(handler) = slot.borrow().as_ref() {
+                handler(idx);
+            }
+        })
+    };
+
     // The trash rows' restore button has the same slot-behind-a-stable-wrapper
     // shape as the revert button: the rows (and `dragdrop`'s trash repopulation)
     // capture `on_restore` now, the real handler — which needs `refresh` etc. —
@@ -1993,6 +2007,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let history_has_more = history_has_more.clone();
         let refresh_wc = refresh_wc.clone();
         let on_revert = on_revert.clone();
+        let on_merge_out = on_merge_out.clone();
         Rc::new(move || {
             let (loaded, has_more) = {
                 let r = repo.borrow();
@@ -2012,7 +2027,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             {
                 let cs = commits.borrow();
                 let refs = repo.borrow().commit_refs();
-                populate_list(&list, &cs, &HashSet::new(), &refs, &graph, Some(&on_revert));
+                populate_list(
+                    &list,
+                    &cs,
+                    &HashSet::new(),
+                    &refs,
+                    &graph,
+                    Some(&on_revert),
+                    Some(&on_merge_out),
+                );
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
                 let mut ids: Vec<(String, String)> = Vec::new();
@@ -2157,6 +2180,79 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             });
         }) as RevertCallback
+    });
+
+    // Fill the merge-out-button slot, now that `refresh` / `enter_conflict_mode`
+    // exist. The handler introduces a merge directly above the clicked commit — the
+    // commit becomes a side branch the merge folds back, its descendants rebasing
+    // onto the merge. Deferred to idle (it rebuilds the very row whose button fired)
+    // and computes the splice slot exactly like the revert handler.
+    *on_merge_out_slot.borrow_mut() = Some({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let graph = graph.clone();
+        let selected_change = selected_change.clone();
+        let pane_mode = pane_mode.clone();
+        let refresh = refresh.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
+        let show_status = show_status.clone();
+        Rc::new(move |idx: i32| {
+            let repo = repo.clone();
+            let commits = commits.clone();
+            let graph = graph.clone();
+            let selected_change = selected_change.clone();
+            let pane_mode = pane_mode.clone();
+            let refresh = refresh.clone();
+            let enter_conflict_mode = enter_conflict_mode.clone();
+            let show_status = show_status.clone();
+            glib::idle_add_local_once(move || {
+                if pane_mode.borrow().is_conflict() {
+                    show_status("Resolve the pending conflict before introducing a merge");
+                    return;
+                }
+                // Resolve the clicked commit and the slot the merge splices into.
+                let (target, change, new_children) = {
+                    let commits = commits.borrow();
+                    let Some(commit) = commits.get(idx as usize) else {
+                        return;
+                    };
+                    if commit.parents.len() != 1 {
+                        show_status("Can only introduce a merge above a single-parent commit");
+                        return;
+                    }
+                    let target = commit.id.clone();
+                    let change = commit.change_id_hex();
+                    // The new merge takes the gap just above the clicked commit; its
+                    // children are the commit's current branch children (which rebase
+                    // onto the merge), the lane edge crossing that gap
+                    // (`boundaries[idx - 1]`). At the tip (idx 0) there are none and
+                    // the merge becomes the new HEAD.
+                    let new_children = if idx == 0 {
+                        Vec::new()
+                    } else {
+                        graph
+                            .borrow()
+                            .boundaries
+                            .get(idx as usize - 1)
+                            .and_then(|edges| edges.iter().find(|e| e.parent == target))
+                            .map(|e| e.children.clone())
+                            .unwrap_or_default()
+                    };
+                    (target, change, new_children)
+                };
+                let outcome = repo.borrow_mut().merge_out_commit(&target, new_children);
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        // Re-select the clicked commit; the new merge sits just above
+                        // it, one click away to reword its pro-forma message.
+                        *selected_change.borrow_mut() = Some(change);
+                        refresh();
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                    Err(err) => show_status(&format!("Merge-out failed: {err}")),
+                }
+            });
+        }) as MergeOutCallback
     });
 
     // Fill the trash restore-button slot, now that `refresh` / `enter_conflict_mode`

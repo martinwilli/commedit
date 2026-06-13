@@ -3,7 +3,9 @@
 //! [`Repo::create_commit`] synthesizes a commit from given file contents;
 //! [`Repo::revert_commit`] from the inverse of an existing commit's diff;
 //! [`Repo::cherry_pick_commit`] from the forward diff of any commit in the
-//! shared object store (even one off the current branch). All three splice the
+//! shared object store (even one off the current branch);
+//! [`Repo::merge_out_commit`] a degenerate merge above a commit, to organize a
+//! linear history into a branchy one. All four splice the
 //! new commit into the graph the same way [`Repo::restore_commit`]
 //! grafts a trashed commit back — a fresh commit is structurally a "restore" of
 //! one that was never in the history. The shared [`Repo::insert_new_commit`]
@@ -247,8 +249,65 @@ impl Repo {
         )
     }
 
+    /// Introduce a new merge commit `M` directly above `target` (`C`), to
+    /// artificially organize a linear history into a branchy one. `M`'s parents
+    /// are `C`'s parent `P` (the first parent, so the mainline runs straight
+    /// through `P`) and `C` itself (the second parent, the merged-out side
+    /// branch); `M`'s tree equals `C`'s tree, so the merge is content-clean and
+    /// `C`'s former children rebase onto `M` untouched. `P` is an ancestor of
+    /// `C`, so this is a degenerate merge jj keeps intact (ancestor-redundant
+    /// parents are deliberately not simplified) — `C` becomes a one-commit side
+    /// branch that more commits can then be moved onto. `M` carries a pro-forma
+    /// message to edit later. Only a single-parent commit can be merged out (a
+    /// merge / the root has no single parent `P`). `new_child_ids` are `C`'s
+    /// current children, the slot `M` splices into (empty → on top of HEAD as the
+    /// new tip; see [`Self::create_commit`]). Exported in one transaction; clean
+    /// by construction absent an overlap with uncommitted changes.
+    pub fn merge_out_commit(
+        &mut self,
+        target: &CommitId,
+        new_child_ids: Vec<CommitId>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("introducing the merge", || {
+            self.merge_out_commit_inner(target, new_child_ids)
+        })
+    }
+
+    fn merge_out_commit_inner(
+        &mut self,
+        target: &CommitId,
+        new_child_ids: Vec<CommitId>,
+    ) -> Result<SaveOutcome> {
+        let store = self.repo.store().clone();
+        let commit = store
+            .get_commit(target)
+            .context("loading the commit to merge out")?;
+        // Need a single *real* parent `P`: a merge has several, and the repo root's
+        // only parent is jj's virtual root commit (which can't be a merge parent).
+        let parent = match commit.parent_ids() {
+            [p] if *p != self.root_commit_id() => p.clone(),
+            _ => bail!("can only introduce a merge above a single-parent commit"),
+        };
+        // `M`'s tree is `C`'s tree: the merge introduces no change of its own, so
+        // descendants (built on `C`'s tree) rebase onto `M` as a no-op.
+        let tree = commit.tree();
+        let subject = commit.description().lines().next().unwrap_or("").trim();
+        let message = format!("Merge \"{subject}\"\n");
+        let label = format!("Merge out \"{subject}\"");
+        // Parent order [P, C]: first parent P is the mainline, second parent C the
+        // side branch (see the doc comment).
+        self.insert_new_commit(
+            vec![parent, target.clone()],
+            new_child_ids,
+            tree,
+            &message,
+            None,
+            label,
+        )
+    }
+
     /// Shared body of [`Self::create_commit`]/[`Self::revert_commit`]/
-    /// [`Self::cherry_pick_commit`]: write a new commit holding `tree`, splice it
+    /// [`Self::cherry_pick_commit`]/[`Self::merge_out_commit`]: write a new commit holding `tree`, splice it
     /// between `new_parent_ids`/`new_child_ids`,
     /// rebase descendants, point the branch at the resulting tip, and export — all
     /// in one transaction. See the module docs for the splice/working-copy story.

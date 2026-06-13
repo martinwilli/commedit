@@ -38,6 +38,12 @@ pub(crate) type PostDrag = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 /// (wired in `build_ui`, captured by each row in `rows::add_revert_button`).
 pub(crate) type RevertCallback = Rc<dyn Fn(i32)>;
 
+/// A history row's merge-out button (beside the revert button) calls this with the
+/// row's display index to introduce a merge commit directly above that commit — the
+/// commit becomes a side branch the new merge folds back (wired in `build_ui`,
+/// captured by each row in `rows::add_merge_out_button`).
+pub(crate) type MergeOutCallback = Rc<dyn Fn(i32)>;
+
 /// A trash row's restore button calls this with the row's display index to write
 /// that dropped commit's changes to the working tree as uncommitted edits (and
 /// remove it from the trash) — wired in `build_ui`, captured by each trash row in

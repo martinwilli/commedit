@@ -3,9 +3,9 @@ name: insert-and-revert
 description: >-
   Use when adding to history rather than editing it in place — create a
   brand-new commit and splice it anywhere in the graph (not just on top of
-  HEAD), revert a commit (git-revert-style inverse), or cherry-pick a commit
-  from another branch. Each rebases existing descendants and can land
-  mid-history.
+  HEAD), revert a commit (git-revert-style inverse), cherry-pick a commit
+  from another branch, or introduce a merge above a commit. Each rebases existing
+  descendants and can land mid-history.
 ---
 
 # Insert, revert & cherry-pick with commedit
@@ -47,6 +47,16 @@ branch — pass its full 40-char sha (from `git log <branch>`); its branch is
 never touched, only its change is copied. The source's author is preserved and a
 `(cherry picked from …)` provenance trailer is recorded. Merge commits can't be
 cherry-picked.
+
+## Merge out
+
+`merge_out_commit(commit)` introduces a **merge** directly above a single-parent
+commit `C` (parent `P`): the new merge `M` gets parents `[P, C]` and `C`'s tree,
+so it adds no change of its own and `C` becomes a one-commit side branch you can
+then move further commits onto. It is the one tool that *creates* a merge — a way
+to organize a linear history into a branchy one. A merge commit or the repository
+root can't be merged out (no single parent); `M` carries a pro-forma message to
+reword afterwards.
 
 ## When things go sideways
 

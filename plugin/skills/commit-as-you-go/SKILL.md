@@ -47,6 +47,8 @@ reorder or drop it later in one call, and descendants rebase automatically.
    Make the edit on disk, then fold it into that commit with
    `squash_working_copy(dest=<change_id>)` — its message is kept. Add `paths` /
    `hunks` / `patches` to fold only part, and `add_paths` to fold in a new file.
+   A brand-new (untracked) file is **silently skipped** unless named in
+   `add_paths`; in a partial fold it must be in **both** `add_paths` and `paths`.
 
 4. **Fixing a commit already in history:**
    - message → `replace_in_message` (surgical) or `edit_message` (whole message)

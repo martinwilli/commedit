@@ -112,10 +112,12 @@ one session). You do not pass a repo path.
 
 **Working copy** (changes already on disk — you do **not** create them)
 - `commit_working_copy(message, add_paths?, paths?/hunks?/patches?)` — like
-  `git commit -a`; `add_paths` names new untracked files (invisible otherwise);
-  the `paths`/`hunks`/`patches` selection commits only part
+  `git commit -a`; the `paths`/`hunks`/`patches` selection commits only part. A
+  brand-new (untracked) file is **silently skipped** unless named in `add_paths`;
+  in a *partial* commit it must be in **both** `add_paths` and `paths`. After
+  committing a unit that adds a file, verify the file landed in the commit's tree.
 - `squash_working_copy(dest, …)` — fold uncommitted (or part) into a commit;
-  keeps dest's message unless `message` given
+  keeps dest's message unless `message` given. Same `add_paths` rule for new files.
 - `discard_working_copy` — **irreversible**; only on explicit instruction
 
 **Timeline / recovery**

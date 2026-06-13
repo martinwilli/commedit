@@ -20,6 +20,13 @@ an interactive-rebase session.
   identity and dates, or the actual content of the files it changed. Saving
   rewrites the commit and rebases everything built on top of it.
 
+- **Select several commits at once** — ctrl/shift-click to pick more than one. The
+  right pane turns read-only and shows their *combined* diff as a single minimal
+  patch (not stacked hunks), and a note when the changes overlap so they can't be
+  combined. The author/committer fields show the shared value where the commits
+  agree and a *(differs)* note where they don't — type a new name or date and
+  **Save** writes it to every selected commit at once.
+
 - **Structured diff editing** — file changes are an editable unified diff with a
   firewall that keeps the buffer a patch that still applies: typing on a context
   line splits it into a removed/added pair, deleting a removed line restores it,

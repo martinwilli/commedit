@@ -630,6 +630,22 @@ not in `main.rs`:
 - `dragdrop.rs` — the whole drag-and-drop surface behind `dragdrop::wire`: the
   reorder-gap/squash-target feedback (`show_zone`), the drag sources / drop targets,
   the deferred `post_drag` staging (`run_post_drag`), and the squash/lane popovers.
+- `search.rs` — the **pure**, GTK-free commit-search core, inline-tested:
+  `search_match` (case-insensitive substring/term matching over a subject —
+  whitespace-split terms, each a required substring, order-independent AND; returns
+  the matched char indices for *every* occurrence) and `highlight_markup` (escapes
+  the subject and wraps the matched chars in a Pango `<span>`). Deliberately **not**
+  a fuzzy subsequence — that over-matches by accepting the typed chars scattered
+  anywhere, surprising in a find-in-list box (git tools — gitk, tig, `git log
+  --grep` — all use substring search). The header's `SearchEntry` (packed right of
+  Reload, focused by the `Ctrl+F` shortcut) drives `rows::apply_search_highlight`
+  (re-paints every row's subject — matches highlighted, the rest plain text, so an
+  empty query is also the reset path — and returns the matching row indices) and
+  `rows::scroll_row_into_view` (nudges `history_scroll`'s vadjustment via the row's
+  `compute_bounds`). `search-changed` re-highlights + scrolls to the first hit
+  without changing the selection; `activate` (Enter) steps a cursor through the
+  match indices, selecting each via the `refresh` `selection_sync` pattern.
+  `refresh` re-applies an active query after it rebuilds the rows.
 
 `build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
 diff-pane render/firewall/navigation closures, `save`/`refresh`, the "Edit history"

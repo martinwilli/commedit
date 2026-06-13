@@ -7,10 +7,12 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::op_entry_dto;
-use crate::dto::{JumpToOperationReq, ListOperationsResp, ReloadResp, TimeTravelResp};
+use crate::dto::{
+    JumpToOperationReq, ListOperationsResp, ReloadRepoReq, ReloadResp, TimeTravelResp,
+};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
-use crate::session::ensure_not_pending;
+use crate::session::{ensure_not_pending, resolve_worktree_target};
 use crate::wrapper::Yaml;
 
 #[tool_router(router = router_ops, vis = "pub")]
@@ -95,22 +97,31 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Re-open the repository to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This starts a fresh session in place: the trash, the operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself is untouched."
+        description = "Re-open the repository to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This starts a fresh session in place: the trash, the operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself is untouched. Pass `path` to re-home the session to a different worktree of the SAME repository (its main checkout or any linked worktree) — e.g. to edit history isolated in a `git worktree`; a path outside this repository's worktrees is refused."
     )]
-    pub async fn reload_repo(&self) -> Result<Yaml<ReloadResp>, ErrorData> {
-        let path = self.repo_path.clone();
+    pub async fn reload_repo(
+        &self,
+        Parameters(req): Parameters<ReloadRepoReq>,
+    ) -> Result<Yaml<ReloadResp>, ErrorData> {
         // Deliberately not pending-guarded: a held rewrite never touched git,
         // so dropping it with the session state is safe. Skips the out-of-band
         // catch-up too — reopening from scratch is how reload handles a moved
         // (or switched) HEAD, so it must not be pre-empted by the catch-up.
         self.with_session_no_sync(move |repo, trash| {
+            // No-arg reload reopens the live root; a `path` re-homes to a sibling
+            // worktree, scope-guarded so it can only target this same repository.
+            let target = match req.path {
+                Some(p) => resolve_worktree_target(repo.workspace_root(), &p)?,
+                None => repo.workspace_root().to_path_buf(),
+            };
             // Only swap on success — a failed reload keeps the current session.
-            let fresh = Repo::open(&path).map_err(internal)?;
+            let fresh = Repo::open(&target).map_err(internal)?;
             *repo = fresh;
             trash.entries.clear();
             trash.staged = None;
             Ok(ReloadResp {
                 head_sha: repo.head_commit_id().map(|id| id.hex()),
+                root: repo.workspace_root().display().to_string(),
             })
         })
         .await

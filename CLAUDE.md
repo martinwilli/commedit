@@ -76,7 +76,11 @@ unit-testable headless:
   mutating; a freshly-minted commit (a split's fixup child, a
   created/reverted/cherry-picked commit, a restored trash commit) is found as
   `post − pre`. Plain message/identity/file edits stay lean (`save_result`, no
-  slice). Every result is wrapped in `Yaml<T>`
+  slice). The read-only `show_graph` tool exposes that same adjacency for the
+  **whole** branch (`graph_adjacency` in `convert.rs` — the shared
+  `adjacency_tables`/`render_adjacency` the topology slice also uses), so an agent
+  can read the merge/branch shape on demand without a mutation. Every result is
+  wrapped in `Yaml<T>`
   (`wrapper.rs`) — serialized as a single human-readable YAML text block with
   **no** `structured_content`/`outputSchema` (a client that gets structured
   content hides the text block); strings YAML can't render as a literal block

@@ -9,8 +9,8 @@ use commedit_engine::history::{CommitInfo, IdAbbrev};
 use commedit_engine::squash::SquashMode;
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_mcp::convert::{
-    commit_dto, conflicted_commit_dto, file_change_dto, resolve_squash_mode, save_result_dto,
-    topology_slice, DetailFields, CONFLICT_GUIDANCE,
+    commit_dto, conflicted_commit_dto, file_change_dto, graph_adjacency, resolve_squash_mode,
+    save_result_dto, topology_slice, DetailFields, CONFLICT_GUIDANCE,
 };
 use commedit_mcp::dto::{CommitField, SaveResultDto};
 use jj_lib::backend::{ChangeId, CommitId};
@@ -354,4 +354,33 @@ fn topology_slice_finds_freshly_minted_and_returns_none_when_empty() {
     // Nothing anchored, nothing minted, a single-parent tip: no slice at all.
     let full_pre = pre_set(&commits);
     assert!(topology_slice(&commits, &[], &full_pre, &IdAbbrev::full()).is_none());
+}
+
+#[test]
+fn graph_adjacency_emits_every_commit_with_parents_and_children() {
+    // A merge M over two lanes joining at the root Z: M(105) -> [Y(102), X(104)],
+    // X -> [Z(101)], Y -> [Z], Z -> virtual root.
+    let m = node(5, 105, &[2, 4]);
+    let x = node(4, 104, &[1]);
+    let y = node(2, 102, &[1]);
+    let z = node(1, 101, &[0]);
+    let commits = vec![m, x, y, z];
+
+    let graph = graph_adjacency(&commits, &IdAbbrev::full());
+    assert_eq!(graph.len(), 4, "every commit appears, unfiltered");
+
+    // The merge tip: both parents in its own order, no children.
+    assert_eq!(graph[0].change_id, change_hex(105));
+    assert_eq!(graph[0].parents, vec![change_hex(102), change_hex(104)]);
+    assert!(graph[0].children.is_empty());
+
+    // X and Y each converge on the merge.
+    assert_eq!(graph[1].children, vec![change_hex(105)]);
+    assert_eq!(graph[2].children, vec![change_hex(105)]);
+
+    // The fork base Z: no parents (its parent is the virtual root), both lanes as
+    // children in history order (X before Y, as they appear in the list).
+    assert_eq!(graph[3].change_id, change_hex(101));
+    assert!(graph[3].parents.is_empty());
+    assert_eq!(graph[3].children, vec![change_hex(104), change_hex(102)]);
 }

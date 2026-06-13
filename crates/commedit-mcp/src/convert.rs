@@ -273,31 +273,8 @@ pub fn topology_slice(
     pre_change_ids: &HashSet<String>,
     abbrev: &IdAbbrev,
 ) -> Option<TopologyDto> {
-    // commit-id hex -> the commit, for mapping a parent id to its change_id.
-    let by_id: HashMap<String, &CommitInfo> = commits.iter().map(|c| (c.id_hex(), c)).collect();
-    // Invert parents: parent commit-id hex -> its children's change_ids, in
-    // history order. The virtual root never appears in `commits`, so its entry
-    // (if any) is created but never read.
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for c in commits {
-        for p in &c.parents {
-            children
-                .entry(p.hex())
-                .or_default()
-                .push(abbrev.change(&c.change_id));
-        }
-    }
-
-    let render = |c: &CommitInfo| AdjacencyDto {
-        change_id: abbrev.change(&c.change_id),
-        subject: c.subject.clone(),
-        parents: c
-            .parents
-            .iter()
-            .filter_map(|p| by_id.get(&p.hex()).map(|pc| abbrev.change(&pc.change_id)))
-            .collect(),
-        children: children.get(&c.id_hex()).cloned().unwrap_or_default(),
-    };
+    let (change_of, children) = adjacency_tables(commits, abbrev);
+    let render = |c: &CommitInfo| render_adjacency(c, &change_of, &children, abbrev);
 
     let anchor_set: HashSet<&str> = anchors.iter().map(String::as_str).collect();
     let mut affected = Vec::new();
@@ -324,6 +301,64 @@ pub fn topology_slice(
         affected,
         merge_tip,
     })
+}
+
+/// The whole branch as a graph: every commit (newest first) with its parents and
+/// children by change_id — the full view the `topology` slice gives in miniature.
+/// Backs the read-only `show_graph` query.
+pub fn graph_adjacency(commits: &[CommitInfo], abbrev: &IdAbbrev) -> Vec<AdjacencyDto> {
+    let (change_of, children) = adjacency_tables(commits, abbrev);
+    commits
+        .iter()
+        .map(|c| render_adjacency(c, &change_of, &children, abbrev))
+        .collect()
+}
+
+/// The two tables [`render_adjacency`] reads to emit a commit's neighbourhood:
+/// `change_of` maps a commit-id hex to that commit's (abbreviated) change_id, so a
+/// parent edge resolves to a change_id; `children` inverts parents into each
+/// commit-id hex's children's change_ids, in history order. The virtual root
+/// never appears in `commits`, so it gets no `change_of` entry (parent edges to it
+/// are filtered out) and its `children` bucket is never read.
+fn adjacency_tables(
+    commits: &[CommitInfo],
+    abbrev: &IdAbbrev,
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let change_of: HashMap<String, String> = commits
+        .iter()
+        .map(|c| (c.id_hex(), abbrev.change(&c.change_id)))
+        .collect();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for c in commits {
+        for p in &c.parents {
+            children
+                .entry(p.hex())
+                .or_default()
+                .push(abbrev.change(&c.change_id));
+        }
+    }
+    (change_of, children)
+}
+
+/// One commit's [`AdjacencyDto`] from the [`adjacency_tables`]: its own change_id,
+/// its parents' change_ids (the virtual root filtered out), and the change_ids of
+/// the commits rebased directly on top of it.
+fn render_adjacency(
+    c: &CommitInfo,
+    change_of: &HashMap<String, String>,
+    children: &HashMap<String, Vec<String>>,
+    abbrev: &IdAbbrev,
+) -> AdjacencyDto {
+    AdjacencyDto {
+        change_id: abbrev.change(&c.change_id),
+        subject: c.subject.clone(),
+        parents: c
+            .parents
+            .iter()
+            .filter_map(|p| change_of.get(&p.hex()).cloned())
+            .collect(),
+        children: children.get(&c.id_hex()).cloned().unwrap_or_default(),
+    }
 }
 
 /// The squash mode a request selects: the explicit `mode` string if given,

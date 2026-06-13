@@ -319,6 +319,18 @@ pub struct ListTrashResp {
     pub commits: Vec<CommitDto>,
 }
 
+/// The whole branch as a graph — the standalone read of the same shape a
+/// topology-changing mutation folds into its result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ShowGraphResp {
+    /// The branch tip, or null on a detached/unborn HEAD.
+    pub head_sha: Option<String>,
+    /// Every commit reachable from HEAD (newest first), each with its parents
+    /// and children by change_id — the merge/branch structure at a glance. The
+    /// repository's root has no parents; a tip has no children.
+    pub commits: Vec<AdjacencyDto>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SuggestSquashReq {
     /// The commit you intend to fold, from the history or the trash — sha or

@@ -89,6 +89,41 @@ async fn merge_out_the_tip_becomes_the_new_head() {
 }
 
 #[tokio::test]
+async fn merge_out_reports_the_merge_topology() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_repo(
+        dir,
+        &[("a.txt", "one\n", "first"), ("b.txt", "two\n", "second")],
+    );
+    let server = open_server(dir);
+
+    let result = merge_out(&server, &git(dir, &["rev-parse", "HEAD"])).await;
+    let topology = match &result {
+        SaveResultDto::Clean { topology, .. } => topology.clone().expect("topology present"),
+        SaveResultDto::Conflicts { .. } => panic!("expected a clean save"),
+    };
+
+    // The new merge surfaces with its two parents — verifiable without a re-read.
+    let merge = topology
+        .affected
+        .iter()
+        .find(|a| a.parents.len() == 2)
+        .expect("the new merge with two parents is in the topology");
+    // The merged-out commit C appears anchored, gaining the merge as its child.
+    let second = topology
+        .affected
+        .iter()
+        .find(|a| a.subject == "second")
+        .expect("the merged-out commit is anchored in the topology");
+    assert_eq!(
+        second.children,
+        vec![merge.change_id.clone()],
+        "C gained the merge as its child"
+    );
+}
+
+#[tokio::test]
 async fn merge_out_refuses_a_merge_and_the_root() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();

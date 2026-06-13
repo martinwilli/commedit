@@ -71,14 +71,13 @@ unit-testable headless:
   **no** `structured_content`/`outputSchema` (a client that gets structured
   content hides the text block); strings YAML can't render as a literal block
   (diffs with tabs, whitespace-only edits) become a line-sequence instead. The
-  tool surface is *nearly* a **superset** of the GTK app:
+  tool surface is a **superset** of the GTK app:
   `create_commit`/`cherry_pick_commit`, the bulk `edit_commits`,
   the surgical `replace_in_file`/`replace_in_message` and `commit_working_copy`
-  (+ partial) have no UI counterpart (`revert_commit` is the exception — the
-  history list's right-edge hover button drops a revert on top of a commit). The one
-  GTK-only mutation is `merge_out_commit` (the right-arrow button beside revert,
-  introducing a merge) — deliberately not exposed to agents, the inverse of the
-  superset. Mutations
+  (+ partial) have no UI counterpart; `revert_commit` and `merge_out_commit`
+  (introducing a merge) are the exceptions that *also* have a GTK surface — the
+  history list's right-edge hover buttons drop a revert, or a merge, onto a
+  commit. Mutations
   are
   refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
@@ -204,9 +203,12 @@ op-log").
   reverted/cherry-picked (no single parent to diff). A top-gap insert (empty
   `new_child_ids`) splices beneath the working-copy chain like reorder, so
   uncommitted changes ride on top.
-- `merge_out_commit` (`create.rs`; GTK-only — the history list's right-edge hover
-  button beside revert, see the GTK section; **no MCP surface**) — the one entry
-  point that *creates a merge* (everything else only edits/preserves them).
+- `merge_out_commit` (`create.rs`; MCP `merge_out_commit` and a GTK surface — the
+  history list's right-edge hover button beside revert, see the GTK section) — the
+  one entry point that *creates a merge* (everything else only edits/preserves
+  them). The MCP handler maps the agent's target commit onto the gap-above slot the
+  same way `create_commit` does (a `plan_splice` with `new_parent` = the commit,
+  reusing the `child` fork disambiguator) and returns the lean `save_result`.
   Given a single-parent commit `C` (parent `P`), it inserts a merge `M` in `C`'s
   gap-above slot with `new_parent_ids = [P, C]` (P first = mainline, C second = the
   merged-out side branch) and `M`'s tree = **`C`'s tree** passed explicitly to

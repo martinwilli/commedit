@@ -15,9 +15,9 @@ use rmcp::{tool, tool_router, ErrorData};
 use crate::convert::{commit_dto, resolve_squash_mode, DetailFields};
 use crate::dto::{
     CherryPickCommitReq, CreateCommitReq, DropCommitReq, DropCommitResp, EditCommitsReq,
-    EditIdentityReq, EditMessageReq, FileContentDto, ReorderCommitReq, ReplaceFilesReq,
-    ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, RevertCommitReq, SaveResultDto,
-    SplitCommitReq, SquashCommitReq,
+    EditIdentityReq, EditMessageReq, FileContentDto, MergeOutReq, ReorderCommitReq,
+    ReplaceFilesReq, ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, RevertCommitReq,
+    SaveResultDto, SplitCommitReq, SquashCommitReq,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -597,6 +597,47 @@ impl CommeditServer {
                 })?;
                 Ok(save_result(repo, &outcome))
             }
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Introduce a merge directly above a commit, to organize a linear history into a branchy one (the GTK app's merge-out button). Given a single-parent commit C with parent P, it inserts a merge M with parents [P, C] — P the mainline first parent, C the merged-out side branch — and M's tree equal to C's, so the merge introduces no change of its own and C's descendants rebase onto it cleanly (Clean absent an overlap with uncommitted changes). C becomes a one-commit side branch you can then move further commits onto (reorder_commit); M carries a pro-forma `Merge \"<subject>\"` message to reword later (edit_message). Merge commits and the repository root cannot be merged out — they have no single parent. This is the inverse of every other tool, which only edits or preserves merges; building a merge between two real branches stays a plain-git task."
+    )]
+    pub async fn merge_out_commit(
+        &self,
+        Parameters(req): Parameters<MergeOutReq>,
+    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+        self.with_session(move |repo, _| {
+            ensure_not_pending(repo)?;
+            let (_, commits) = full_history(repo)?;
+            let idx = find_commit(&commits, &req.commit)?;
+            // Need exactly one *real* parent: a merge has several, and the root's
+            // sole parent is jj's virtual root commit (which can't be a merge
+            // parent). Mirror the engine guard so the message is an `invalid`.
+            let parents = &commits[idx].parents;
+            if parents.len() != 1 || parents[0] == repo.root_commit_id() {
+                return Err(invalid(
+                    "can only introduce a merge above a single-parent commit (a merge \
+                     or the repository root has no single parent to fold out)",
+                ));
+            }
+            let target = commits[idx].id.clone();
+            // The merge takes the gap directly above C, so its children are C's
+            // current children — the very slot a create_commit with new_parent = C
+            // lands in (empty at the tip, where the merge becomes the new HEAD).
+            let mv = plan_splice(
+                repo,
+                &commits,
+                SpliceTarget::New,
+                &req.commit,
+                req.child.as_deref(),
+            )?;
+            let outcome = repo
+                .merge_out_commit(&target, mv.new_children)
+                .map_err(internal)?;
+            Ok(save_result(repo, &outcome))
         })
         .await
         .map(Yaml)

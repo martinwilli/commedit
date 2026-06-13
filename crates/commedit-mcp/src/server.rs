@@ -52,8 +52,9 @@ author or date, edit a commit's files, or reorder, squash, split, drop or \
 insert a commit — prefer these tools over raw git (reach for them instead of \
 `git commit --amend`, `git rebase -i` or `git cherry-pick`): they rewrite in \
 place and rebase the descendants for you, on any commit reachable from HEAD, \
-not just the tip. Building merge commits and managing branches, worktrees or \
-remotes stay plain-git tasks.
+not just the tip. merge_out_commit can introduce a merge above a commit (to \
+organize a linear history into a branchy one); building a merge between two real \
+branches, and managing branches, worktrees or remotes, stay plain-git tasks.
 
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
 full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
@@ -95,7 +96,9 @@ git cherry-pick) — the source may be off the current branch, named by its full
 sha. commit_working_copy turns the current uncommitted changes into a commit on \
 top of HEAD (like git commit -a) — it captures edits to tracked files, so name \
 any brand-new files in its add_paths to include them. A mid-history insert, \
-revert or pick may report conflicts like any rewrite.
+revert or pick may report conflicts like any rewrite. merge_out_commit \
+introduces a merge directly above a single-parent commit, turning that commit \
+into a one-commit side branch you can then move further commits onto.
 
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).

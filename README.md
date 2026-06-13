@@ -159,7 +159,8 @@ The same engine is exposed to AI agents through a [Claude Code
 plugin](https://code.claude.com/docs/en/plugins). With it installed, an agent
 edits history the way the GTK app does — and then some: edit any commit's
 message, identity or file contents, split, reorder, drop, restore and squash
-commits, create new commits and revert or cherry-pick existing ones, fold
+commits, create new commits and revert or cherry-pick existing ones, introduce a
+merge above a commit, fold
 uncommitted changes in or commit them, drop a commit while keeping its changes
 unstaged in the working tree (`drop_commit` with `keep_changes`), walk the
 conflict-resolution loop, and

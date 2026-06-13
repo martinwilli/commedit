@@ -94,8 +94,9 @@ any commit / at root via new_parent. revert_commit inserts the inverse of a \
 commit (like git revert). cherry_pick_commit copies a commit's change in (like \
 git cherry-pick) — the source may be off the current branch, named by its full \
 sha. commit_working_copy turns the current uncommitted changes into a commit on \
-top of HEAD (like git commit -a) — it captures edits to tracked files, so name \
-any brand-new files in its add_paths to include them. A mid-history insert, \
+top of HEAD (like git commit -a) — it captures edits to already-tracked files \
+only, so a brand-new (untracked) file is silently skipped unless named in its \
+add_paths (the same holds for squash_working_copy). A mid-history insert, \
 revert or pick may report conflicts like any rewrite. merge_out_commit \
 introduces a merge directly above a single-parent commit, turning that commit \
 into a one-commit side branch you can then move further commits onto.

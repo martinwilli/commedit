@@ -697,7 +697,10 @@ pub struct SquashWorkingCopyReq {
     ///
     /// Whole files to fold, by repo-relative path: the file is taken entirely
     /// (content + mode), and a path you deleted on disk folds in the deletion.
-    /// This is the only tier that handles binary or executable files.
+    /// This is the only tier that handles binary or executable files. A brand-new
+    /// (untracked) file named here is still skipped unless it is ALSO in
+    /// `add_paths` — listing it under `paths` selects it, `add_paths` is what
+    /// begins tracking it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
     /// Whole hunks to fold, per file. First read the file's numbered `hunks`
@@ -736,7 +739,10 @@ pub struct CommitWorkingCopyReq {
     ///
     /// Whole files to commit, by repo-relative path: the file is taken entirely
     /// (content + mode), and a path you deleted on disk commits the deletion.
-    /// This is the only tier that handles binary or executable files.
+    /// This is the only tier that handles binary or executable files. A brand-new
+    /// (untracked) file named here is still skipped unless it is ALSO in
+    /// `add_paths` — listing it under `paths` selects it, `add_paths` is what
+    /// begins tracking it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
     /// Whole hunks to commit, per file. First read the file's numbered `hunks`

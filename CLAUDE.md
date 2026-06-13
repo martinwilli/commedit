@@ -676,6 +676,21 @@ not in `main.rs`:
   mode and defers the trash removal (`PendingTrashOp::Restore`, like a drag-restore).
   `set_row_commit`'s traversal finds the content overlay whether or not a graph area
   precedes it, so both row kinds share one path.
+  The row box itself is `[id_cell, lint_badge, subject_label, pills, conflict_badge]`:
+  the **lint badge** (`build_lint_badge`/`update_lint_badge`, a clickable emoji `Label`
+  sitting *between* the id cell and the subject — so a flagged summary reads as prefixed
+  by the 🤔, a conforming one is flush after the id since a hidden box child takes no
+  space, and the right-edge revert/merge-out hover buttons can't cover it on a long,
+  ellipsized subject) is a `crate::msglint` finding, shown only when the commit's summary
+  drifts from the repo's learned style. It's an inline cell, not a right-edge overlay
+  (the action buttons are). It's always present (hidden when clean) so the traversal
+  stays uniform across history/trash rows; its `LintFixCallback` threads through
+  `populate_list` → `set_row_commit` → `commit_row_box` like the revert/merge-out ones
+  (slot-filled in `build_ui`, deferred to idle), while `refresh` learns the
+  `RepoStyle` once per rebuild and passes it down to paint each row's badge (conflict
+  mode and trash rows pass `None`, so neither lints). The handler auto-fixes the
+  mechanical lints via `rewrite_message`, else selects the commit and focuses the
+  message editor.
 - `identity.rs` — the author/committer identity/date fields and conversions.
 - `conflict.rs` — the pure conflict-text helpers **and** the conflict-mode wiring:
   the callback builders (`build_refresh_conflict`/`build_exit_conflict_mode`/
@@ -700,6 +715,31 @@ not in `main.rs`:
   without changing the selection; `activate` (Enter) steps a cursor through the
   match indices, selecting each via the `refresh` `selection_sync` pattern.
   `refresh` re-applies an active query after it rebuilds the rows.
+- `msglint.rs` — the **pure**, GTK-free commit-message linter, inline-tested, the
+  same shape as `search.rs`. commedit is a general tool, so it imposes **no** house
+  style: `RepoStyle::learn(subjects)` infers a repo's *own* de-facto conventions from
+  its history — does a strong majority (`MAJORITY`) carry a `type:`/`subsystem:`
+  prefix (the `+` form `history+mcp:` included), capitalize the summary *after* the
+  prefix (`majority_case`), avoid a trailing period, and how long do subjects run (a
+  p90×1.5 cutoff, double-gated by the `LONG_ABS_FLOOR` git wrap so a terse repo isn't
+  nagged). Prefix **casing** is learned **per token** (`prefix_casings`: lowercased
+  key → canonical exact spelling), not as one global lower/upper norm — a casing
+  becomes canonical only when it's dominant (≥ `MAJORITY`) *and* recurs
+  (≥ `MIN_PREFIX_OCCURRENCES`), so a legitimately-uppercase proper-noun prefix
+  (`NEWS:` for the NEWS file, `README:` for README.md) is its own canonical form and
+  never flagged, a one-off `GTK:` against many `gtk:` is, and a brand-new prefix seen
+  once is left alone (it could be a new proper noun). Below `MIN_SAMPLE` human
+  subjects, or with no clear majority on an axis, that axis is "no opinion" (empty
+  `RepoStyle` field) and never flags. Auto-generated subjects
+  (merges/reverts/un-squashed fixups/initial commit) carry no authorial style, so
+  `is_autogen` excludes them from both the sample and linting. `lint_subject` returns
+  the drift as `Lint`s (`LintKind::{MissingPrefix,PrefixCapitalization,Capitalization,
+  TrailingPeriod,TooLong}`); `autofix_subject` applies only the *mechanical* ones
+  (re-case the prefix to its canonical spelling, flip the summary's first letter,
+  strip a stray trailing period but never an `…` ellipsis), leaving the judgment
+  calls (missing prefix, over-long) for a human; `replace_subject` splices a fixed
+  summary back into the full description for `rewrite_message`. Drives the `rows.rs`
+  lint badge (see above) — the linter is GTK-only, no MCP counterpart.
 
 `build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
 diff-pane render/firewall/navigation closures, `save`/`refresh`, the "Edit history"

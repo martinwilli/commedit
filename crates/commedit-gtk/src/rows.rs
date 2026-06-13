@@ -14,7 +14,8 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 
-use crate::state::{MergeOutCallback, RestoreToWorktreeCallback, RevertCallback};
+use crate::msglint::{self, RepoStyle};
+use crate::state::{LintFixCallback, MergeOutCallback, RestoreToWorktreeCallback, RevertCallback};
 
 /// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
 /// (which recomputes it) and every row's drawing area (which reads its own row).
@@ -359,6 +360,77 @@ fn add_restore_button(content: &Overlay, on_restore: &RestoreToWorktreeCallback)
     btn.add_controller(click);
 }
 
+/// Build the commit-style "smiley" badge — a clickable 🤔 [`Label`] shown inline
+/// **left of the subject** (the caller appends it between the id cell and the
+/// subject text), so a flagged summary reads as prefixed by the 🤔 rather than
+/// having it float at the row's right edge where the revert/merge-out hover buttons
+/// would cover a long, ellipsized subject. It is **persistent** (shown whenever
+/// [`update_lint_badge`] finds the summary drifts from the repo's de-facto
+/// conventions, see [`crate::msglint`], not only on hover) and collapses to zero
+/// width while hidden, so a conforming summary sits flush after the id. Clicking it
+/// claims the press (so it never selects/drags the row, like the id cell's copy
+/// icon) and calls `on_lint` with the row's current display index, which auto-fixes
+/// the mechanical issues or opens the commit for a manual edit. Inert (never wired,
+/// stays hidden) on rows with no `on_lint` — trash rows.
+fn build_lint_badge(on_lint: Option<&LintFixCallback>) -> Label {
+    let badge = Label::new(None);
+    badge.set_visible(false);
+    badge.set_valign(gtk::Align::Center);
+    badge.set_cursor_from_name(Some("pointer"));
+    badge.add_css_class("commit-lint");
+    if let Some(on_lint) = on_lint {
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(|gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        click.connect_released({
+            let badge = badge.clone();
+            let on_lint = on_lint.clone();
+            move |_, _, _, _| {
+                if let Some(row) = badge
+                    .ancestor(ListBoxRow::static_type())
+                    .and_downcast::<ListBoxRow>()
+                {
+                    on_lint(row.index());
+                }
+            }
+        });
+        badge.add_controller(click);
+    }
+    badge
+}
+
+/// Refresh a row's lint badge for `commit` against the repo's learned `style`:
+/// show the 🤔 with a tooltip listing the drift (and what a click will do) when the
+/// summary is out of step, hide it otherwise. Merge commits and missing styles
+/// (small sample / undecided) are never flagged.
+fn update_lint_badge(badge: &Label, commit: &CommitInfo, style: Option<&RepoStyle>) {
+    let lints = match style {
+        Some(style) if commit.parents.len() <= 1 => msglint::lint_subject(&commit.subject, style),
+        _ => Vec::new(),
+    };
+    if lints.is_empty() {
+        badge.set_visible(false);
+        badge.set_tooltip_text(None);
+        return;
+    }
+    let fixable = lints.iter().any(|l| l.auto_fixable());
+    let mut tip = String::from("This summary is out of step with the repo's commit style:");
+    for lint in &lints {
+        tip.push_str("\n\u{2022} ");
+        tip.push_str(&lint.message);
+    }
+    tip.push('\n');
+    tip.push_str(if fixable {
+        "Click to fix it automatically."
+    } else {
+        "Click to edit the message."
+    });
+    badge.set_text("\u{1F914}"); // 🤔
+    badge.set_tooltip_text(Some(&tip));
+    badge.set_visible(true);
+}
+
 /// The subject text shown in a row: the commit's subject, or a placeholder when
 /// it has no description. Shared so the row build, in-place update, and the
 /// search highlight/reset all agree on the placeholder.
@@ -371,9 +443,10 @@ fn display_subject(commit: &CommitInfo) -> &str {
 }
 
 /// The subject `Label` of a row, via the shared
-/// `[graph?, content-overlay → row_box → (id_cell, subject_label, …)]` layout.
-/// Mirrors the subject leg of [`set_row_commit`]'s traversal; `None` for a row
-/// that hasn't been populated yet.
+/// `[graph?, content-overlay → row_box → (id_cell, lint_badge, subject_label, …)]`
+/// layout. Mirrors the subject leg of [`set_row_commit`]'s traversal (the lint
+/// badge sits between the id cell and the subject); `None` for a row that hasn't
+/// been populated yet.
 fn row_subject_label(row: &ListBoxRow) -> Option<Label> {
     let child = row.child().and_downcast::<GtkBox>();
     let area = child
@@ -395,7 +468,11 @@ fn row_subject_label(row: &ListBoxRow) -> Option<Label> {
         .as_ref()
         .and_then(|b| b.first_child())
         .and_downcast::<Overlay>();
-    id_cell
+    let lint_badge = id_cell
+        .as_ref()
+        .and_then(|c| c.next_sibling())
+        .and_downcast::<Label>();
+    lint_badge
         .as_ref()
         .and_then(|c| c.next_sibling())
         .and_downcast::<Label>()
@@ -411,12 +488,16 @@ fn row_subject_label(row: &ListBoxRow) -> Option<Label> {
 /// box, so a right-edge action button can float over it (aligned down the list,
 /// overlapping only a wide subject — the same hover pattern as the id cell's copy
 /// icon): a *revert* button on a history row when `on_revert` is `Some`, a
-/// *restore* button on a trash row when `on_restore` is `Some`. With `graph` (the
+/// *restore* button on a trash row when `on_restore` is `Some`. The persistent
+/// *lint badge* is **not** a right-edge overlay — it is an inline row-box cell
+/// between the id and the subject (so the hover buttons can't cover it), shown when
+/// the summary drifts from the repo style. With `graph` (the
 /// shared layout and this row's index — history rows only, trash rows pass
 /// `None`) the ancestry drawing area leads the outer box: the graph lines must
 /// reach the row's top/bottom edges to connect across rows, which the content
 /// box's vertical margins would otherwise gap. Both row kinds share this
 /// outer+overlay shape so [`set_row_commit`]'s traversal stays uniform.
+#[allow(clippy::too_many_arguments)]
 fn commit_row_box(
     commit: &CommitInfo,
     conflicted: bool,
@@ -425,6 +506,8 @@ fn commit_row_box(
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
+    on_lint: Option<&LintFixCallback>,
+    style: Option<&RepoStyle>,
 ) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = display_subject(commit);
@@ -453,6 +536,13 @@ fn commit_row_box(
         .margin_bottom(4)
         .build();
     row_box.append(&id_cell);
+    // The lint badge sits between the id and the subject, so a flagged summary reads
+    // as prefixed by the 🤔 and a conforming one is flush after the id (a hidden box
+    // child takes no space). Inline, not a right-edge overlay, so the revert/merge-out
+    // hover buttons can't cover it on a long subject.
+    let lint_badge = build_lint_badge(on_lint);
+    update_lint_badge(&lint_badge, commit, style);
+    row_box.append(&lint_badge);
     row_box.append(&subject_label);
     row_box.append(&pills);
     row_box.append(&badge);
@@ -543,6 +633,8 @@ fn set_row_commit(
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
+    on_lint: Option<&LintFixCallback>,
+    style: Option<&RepoStyle>,
 ) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
     let subject = display_subject(commit);
@@ -575,7 +667,12 @@ fn set_row_commit(
         .as_ref()
         .and_then(|c| c.child())
         .and_downcast::<Label>();
-    let subject_label = id_cell
+    // The lint badge sits between the id cell and the subject (see `commit_row_box`).
+    let lint_badge = id_cell
+        .as_ref()
+        .and_then(|c| c.next_sibling())
+        .and_downcast::<Label>();
+    let subject_label = lint_badge
         .as_ref()
         .and_then(|c| c.next_sibling())
         .and_downcast::<Label>();
@@ -601,6 +698,11 @@ fn set_row_commit(
                     content.remove_css_class("no-revert");
                 }
             }
+            // The lint badge is a row_box cell between the id and subject — refresh
+            // it for this commit.
+            if let Some(lint_badge) = &lint_badge {
+                update_lint_badge(lint_badge, commit, style);
+            }
             set_pills(&pills, refs);
             badge.set_visible(conflicted);
             if let (Some(area), Some((graph, _))) = (&area, graph) {
@@ -619,6 +721,8 @@ fn set_row_commit(
             on_revert,
             on_merge_out,
             on_restore,
+            on_lint,
+            style,
         ))),
     }
 }
@@ -647,6 +751,8 @@ fn populate_rows(
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
+    on_lint: Option<&LintFixCallback>,
+    style: Option<&RepoStyle>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
         let row = list.row_at_index(i as i32).unwrap_or_else(|| {
@@ -667,6 +773,8 @@ fn populate_rows(
             on_revert,
             on_merge_out,
             on_restore,
+            on_lint,
+            style,
         );
     }
     // Hide surplus rows rather than removing them (see the note above).
@@ -681,6 +789,7 @@ fn populate_rows(
 /// [`populate_rows`]. `refs` (commit hex → branch/tag names, from
 /// `Repo::commit_refs`) supplies the pill decorations after each subject;
 /// `graph` (from `compute_graph` over the same commits) the ancestry lines.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn populate_list(
     list: &ListBox,
     commits: &[CommitInfo],
@@ -689,6 +798,8 @@ pub(crate) fn populate_list(
     graph: &SharedGraph,
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
+    on_lint: Option<&LintFixCallback>,
+    style: Option<&RepoStyle>,
 ) {
     populate_rows(
         list,
@@ -700,6 +811,8 @@ pub(crate) fn populate_list(
         on_revert,
         on_merge_out,
         None,
+        on_lint,
+        style,
     );
 }
 
@@ -809,6 +922,8 @@ pub(crate) fn populate_trash(
         None,
         None,
         on_restore,
+        None,
+        None,
     );
 }
 

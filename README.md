@@ -114,6 +114,17 @@ an interactive-rebase session.
   appear (in any order), so `fix login` finds "Login: fix the redirect". Press
   `Enter` to select that commit, and `Enter` again to step to the next match.
 
+- **Spot off-style commit summaries** — comm(ed)it learns the conventions your repo
+  *already* follows from its own history — whether subjects carry a `type:` prefix
+  (and how it's cased), capitalize the summary, avoid a trailing period, how long they
+  run — and marks any
+  commit whose summary drifts from that norm with a small 🤔 in the list (its tooltip
+  says what's off). It never imposes a house style: a repo with no clear convention,
+  or too little history to tell, gets no marks at all. Click the marker to fix the
+  mechanical slips in place (capitalization, a stray period) — or, when only judgment
+  calls remain (a missing prefix, an over-long summary), to jump to the message and
+  edit it yourself.
+
 ## Keyboard shortcuts
 
 - `Ctrl+F` — focus the commit search box; `Enter` jumps to the next match.

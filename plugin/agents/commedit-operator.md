@@ -2,11 +2,15 @@
 name: commedit-operator
 description: >-
   Use this for ANY commit you would create or rewrite on the current branch, in
-  preference to running git yourself. Whenever you'd reach for `git commit`,
-  `git commit -a`, `git commit --amend`, `git rebase -i`, `git cherry-pick` or
-  `git revert`, delegate the intent here instead — it works on any commit
-  reachable from HEAD (not just the tip), rebases descendants automatically, and
-  verifies the result, so raw git is never the right tool for a commit. Hand it
+  preference to driving the commedit MCP tools yourself or running git. Whenever
+  you'd reach for `git commit`, `git commit -a`, `git commit --amend`,
+  `git rebase -i`, `git cherry-pick` or `git revert` — OR for a commedit mutation
+  tool yourself (commit_working_copy, create_commit, reorder_commit,
+  squash_commit, split_commit, drop_commit, edit_message, edit_commits, …) —
+  delegate the intent here instead. It works on any commit reachable from HEAD
+  (not just the tip), rebases descendants automatically, and verifies the result,
+  so neither a direct commedit tool call nor raw git is the right way to land a
+  commit. Hand it
   the WHAT — "commit the working copy as …", "reword commit X", "re-author /
   re-date this range", "edit foo.rs in commit B to …", "squash the fixup into Y",
   "reorder Z before W", "drop / restore A", "create a commit from these files
@@ -15,8 +19,9 @@ description: >-
   confirms it through commedit or read-only git, and returns a compact summary
   (outcome, affected change_ids/shas, what it verified). It owns every commedit
   interaction detail — change_id addressing, the smallest-tool choice, conflict
-  holds, the undo/abort safety net — so you neither touch raw git for a commit nor
-  carry that detail yourself. Delegate one operation, or a tightly-related batch,
+  holds, the undo/abort safety net — so you drive neither the commedit tools nor
+  raw git for a commit yourself, and carry none of that detail. Delegate one
+  operation, or a tightly-related batch,
   per call. Building merge commits and managing branches, worktrees, remotes, tags
   or pushes stay plain-git tasks — those are not for this agent. It never modifies
   working-tree files itself: make any on-disk edits first, then delegate the

@@ -15,8 +15,8 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
-    ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
-    working_copy_status_resp,
+    change_id_set, ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
+    save_result_topo, working_copy_status_resp,
 };
 use crate::wrapper::Yaml;
 
@@ -76,6 +76,8 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
             }
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &dest)?;
+            let pre = change_id_set(&commits);
+            let anchors = vec![commits[idx].change_id_hex()];
             let dest_id = commits[idx].id.clone();
 
             // A partial fold is requested when any selection tier is present.
@@ -93,7 +95,7 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
                 repo.squash_working_copy_into(None, &dest_id, message.as_deref())
                     .map_err(internal)?
             };
-            Ok(save_result(repo, &outcome))
+            save_result_topo(repo, &outcome, &pre, &anchors)
         })
         .await
         .map(Yaml)

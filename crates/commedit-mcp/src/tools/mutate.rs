@@ -22,9 +22,9 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
-    ensure_not_pending, find_commit, find_trashed, full_history, lookup_ref, new_commit_identity,
-    plan_splice, resolve_ref, save_result, working_copy_status_resp, PendingTrashOp, RefEntry,
-    SpliceTarget, TrashState,
+    change_id_set, ensure_not_pending, find_commit, find_trashed, full_history, lookup_ref,
+    new_commit_identity, plan_splice, resolve_ref, save_result, save_result_topo,
+    working_copy_status_resp, PendingTrashOp, RefEntry, SpliceTarget, TrashState,
 };
 use crate::wrapper::Yaml;
 
@@ -311,11 +311,13 @@ impl CommeditServer {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
+            let pre = change_id_set(&commits);
+            let anchors = vec![commits[idx].change_id_hex()];
             let files = file_pairs(req.files)?;
             let outcome = repo
                 .split_commit(&commits[idx].id, &files)
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            save_result_topo(repo, &outcome, &pre, &anchors)
         })
         .await
         .map(Yaml)
@@ -331,6 +333,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
+            let pre = change_id_set(&commits);
             let new_parent = req.new_parent.unwrap_or_else(|| head.hex());
             let mv = plan_splice(
                 repo,
@@ -350,7 +353,8 @@ impl CommeditServer {
                     &edits,
                 )
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            // The new commit has no pre-known change_id — found via post − pre.
+            save_result_topo(repo, &outcome, &pre, &[])
         })
         .await
         .map(Yaml)
@@ -370,6 +374,7 @@ impl CommeditServer {
             if commits[idx].parents.len() > 1 {
                 return Err(invalid("cannot revert a merge commit"));
             }
+            let pre = change_id_set(&commits);
             let target = commits[idx].id.clone();
             let new_parent = req.new_parent.unwrap_or_else(|| head.hex());
             let mv = plan_splice(
@@ -383,7 +388,8 @@ impl CommeditServer {
             let outcome = repo
                 .revert_commit(&target, mv.new_parents, mv.new_children, identity.as_ref())
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            // The revert commit has no pre-known change_id — found via post − pre.
+            save_result_topo(repo, &outcome, &pre, &[])
         })
         .await
         .map(Yaml)
@@ -399,6 +405,7 @@ impl CommeditServer {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
+            let pre = change_id_set(&commits);
             // Resolve in-history refs (sha/change id/prefix) as usual; fall back
             // to a direct ODB load for a full sha that names a commit off the
             // branch. Keep find_commit's error otherwise, so an ambiguous or
@@ -419,7 +426,8 @@ impl CommeditServer {
             let outcome = repo
                 .cherry_pick_commit(&target, mv.new_parents, mv.new_children, identity.as_ref())
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            // The picked commit has no pre-known change_id — found via post − pre.
+            save_result_topo(repo, &outcome, &pre, &[])
         })
         .await
         .map(Yaml)
@@ -442,6 +450,18 @@ impl CommeditServer {
                      commit stay fixed",
                 )
             })?;
+            // The dropped commit's parent now carries its former children — the
+            // verifiable change. Resolve it to a stable change_id (single-parent,
+            // guaranteed by plan_drop); a root-most drop (parent is the virtual
+            // root) leaves no anchor, so topology is then None.
+            let pre = change_id_set(&commits);
+            let anchors: Vec<String> = commits[idx]
+                .parents
+                .first()
+                .and_then(|p| commits.iter().find(|c| &c.id == p))
+                .map(|c| c.change_id_hex())
+                .into_iter()
+                .collect();
             let info = commits[idx].clone();
             let root = repo.root_commit_id().hex();
             let dropped = commit_dto(
@@ -464,7 +484,7 @@ impl CommeditServer {
                     commedit_engine::conflict::SaveOutcome::Conflicts { .. } => None,
                 };
                 return Ok(DropCommitResp {
-                    result: save_result(repo, &outcome),
+                    result: save_result_topo(repo, &outcome, &pre, &anchors)?,
                     dropped,
                     working_copy,
                 });
@@ -473,7 +493,7 @@ impl CommeditServer {
                 repo.abandon_commit(&id)
             })?;
             Ok(DropCommitResp {
-                result: save_result(repo, &outcome),
+                result: save_result_topo(repo, &outcome, &pre, &anchors)?,
                 dropped,
                 working_copy: None,
             })
@@ -493,6 +513,8 @@ impl CommeditServer {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
+            let pre = change_id_set(&commits);
+            let anchors = vec![commits[idx].change_id_hex()];
             let mv = plan_splice(
                 repo,
                 &commits,
@@ -503,7 +525,7 @@ impl CommeditServer {
             let outcome = repo
                 .reorder_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            save_result_topo(repo, &outcome, &pre, &anchors)
         })
         .await
         .map(Yaml)
@@ -520,6 +542,8 @@ impl CommeditServer {
             ensure_not_pending(repo)?;
             let info = find_trashed(trash, &req.commit)?;
             let (_, commits) = full_history(repo)?;
+            let pre = change_id_set(&commits);
+            let anchors = vec![info.change_id_hex()];
             let mv = plan_splice(
                 repo,
                 &commits,
@@ -530,7 +554,7 @@ impl CommeditServer {
             let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {
                 repo.restore_commit(&mv.target, mv.new_parents, mv.new_children, &mv.new_tip)
             })?;
-            Ok(save_result(repo, &outcome))
+            save_result_topo(repo, &outcome, &pre, &anchors)
         })
         .await
         .map(Yaml)
@@ -554,6 +578,8 @@ impl CommeditServer {
                     req.dest
                 ))
             })?;
+            let pre = change_id_set(&commits);
+            let anchors = vec![commits[dest_idx].change_id_hex()];
 
             // History first, then the trash — so after a drop + undo, where
             // the identical commit sits in both, the ref means the live one.
@@ -574,7 +600,7 @@ impl CommeditServer {
                 let outcome = repo
                     .squash_into(&src, &dest, mode, req.message.as_deref())
                     .map_err(internal)?;
-                Ok(save_result(repo, &outcome))
+                save_result_topo(repo, &outcome, &pre, &anchors)
             } else {
                 let trash_entries = trash.entries.iter().map(|c| RefEntry::of(c, c.clone()));
                 let info = resolve_ref(&req.source, trash_entries.collect(), || {
@@ -595,7 +621,7 @@ impl CommeditServer {
                 let outcome = run_staged(repo, trash, PendingTrashOp::Remove(info.id), |repo| {
                     repo.squash_restore_into(&src, &dest, mode, message.as_deref())
                 })?;
-                Ok(save_result(repo, &outcome))
+                save_result_topo(repo, &outcome, &pre, &anchors)
             }
         })
         .await

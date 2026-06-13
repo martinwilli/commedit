@@ -7,14 +7,14 @@ use std::sync::PoisonError;
 
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::graph::compute_graph;
-use commedit_engine::history::{history, history_limited, CommitInfo, ReorderMove};
+use commedit_engine::history::{history, history_limited, CommitInfo, IdAbbrev, ReorderMove};
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::Identity;
 use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::object_id::ObjectId as _;
 use rmcp::ErrorData;
 
-use crate::convert::wc_entry_dto;
+use crate::convert::{save_result_dto, topology_slice, wc_entry_dto};
 use crate::dto::{IdentityFieldsDto, WorkingCopyStatusResp};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -118,9 +118,41 @@ fn head_commit(repo: &Repo) -> Result<CommitId, ErrorData> {
 }
 
 /// A mutation outcome as the response DTO, with the (possibly moved) branch
-/// tip read back after the save.
+/// tip read back after the save. The lean form for plain message/identity/file
+/// edits — no topology slice (see [`save_result_topo`]).
 pub fn save_result(repo: &Repo, outcome: &SaveOutcome) -> crate::dto::SaveResultDto {
-    crate::convert::save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()))
+    save_result_dto(outcome, repo.head_commit_id().map(|id| id.hex()), None)
+}
+
+/// The full-hex change_id set of a history snapshot — a mutation handler
+/// captures this *before* it mutates, so [`save_result_topo`] can find a
+/// freshly-minted commit as `post − pre`.
+pub fn change_id_set(commits: &[CommitInfo]) -> HashSet<String> {
+    commits.iter().map(|c| c.change_id_hex()).collect()
+}
+
+/// Like [`save_result`] but, on a clean save, folds in a [`crate::dto::TopologyDto`]
+/// so a topology-changing mutation is verifiable without a follow-up read. It
+/// re-reads `history()` (reusing [`full_history`]) and inverts parents to derive
+/// children — no `compute_graph`. `anchors` are the full-hex change_ids the tool
+/// knows it touched; `pre_change_ids` is the history's change_id set *before* the
+/// mutation, so a freshly-minted commit is found as `post − pre`. On conflicts
+/// nothing landed (git untouched), so there is no topology.
+pub fn save_result_topo(
+    repo: &Repo,
+    outcome: &SaveOutcome,
+    pre_change_ids: &HashSet<String>,
+    anchors: &[String],
+) -> Result<crate::dto::SaveResultDto, ErrorData> {
+    match outcome {
+        SaveOutcome::Clean => {
+            let (head, commits) = full_history(repo)?;
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let topology = topology_slice(&commits, anchors, pre_change_ids, &abbrev);
+            Ok(save_result_dto(outcome, Some(head.hex()), topology))
+        }
+        SaveOutcome::Conflicts { .. } => Ok(save_result_dto(outcome, None, None)),
+    }
 }
 
 /// Build the working-copy status DTO: snapshot the on-disk state into the leaf

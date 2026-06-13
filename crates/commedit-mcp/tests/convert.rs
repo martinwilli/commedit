@@ -1,7 +1,7 @@
 //! Pure DTO conversion tests — response shapes, serde tags and mode defaults,
 //! without a repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use commedit_engine::conflict::{ConflictedCommit, ConflictedPath, SaveOutcome};
 use commedit_engine::diff::{ChangeKind, FileChange};
@@ -10,7 +10,7 @@ use commedit_engine::squash::SquashMode;
 use commedit_engine::transparency::{RefDecoration, RefKind};
 use commedit_mcp::convert::{
     commit_dto, conflicted_commit_dto, file_change_dto, resolve_squash_mode, save_result_dto,
-    DetailFields, CONFLICT_GUIDANCE,
+    topology_slice, DetailFields, CONFLICT_GUIDANCE,
 };
 use commedit_mcp::dto::{CommitField, SaveResultDto};
 use jj_lib::backend::{ChangeId, CommitId};
@@ -31,6 +31,25 @@ fn ci(id: u8, parents: &[u8]) -> CommitInfo {
         committer_time: "2026-01-02 10:00:00 +0100".into(),
         parents: parents.iter().map(|p| CommitId::new(vec![*p])).collect(),
     }
+}
+
+/// A commit with a DISTINCT commit-id and change-id (disjoint byte ranges), so a
+/// `topology_slice` test catches any change-id/commit-id mix-up. `parents` name
+/// the *commit-id* bytes of the parents (the graph edge keys).
+fn node(commit: u8, change: u8, parents: &[u8]) -> CommitInfo {
+    let mut c = ci(commit, parents);
+    c.change_id = ChangeId::new(vec![change]);
+    c.subject = format!("change {change}");
+    c
+}
+
+fn change_hex(change: u8) -> String {
+    ChangeId::new(vec![change]).hex()
+}
+
+/// The pre-mutation change_id set, as the handlers build it.
+fn pre_set(commits: &[CommitInfo]) -> HashSet<String> {
+    commits.iter().map(|c| c.change_id_hex()).collect()
 }
 
 #[test]
@@ -177,7 +196,7 @@ fn binary_files_carry_no_diff_or_contents() {
 
 #[test]
 fn save_result_serializes_with_a_status_tag() {
-    let clean = save_result_dto(&SaveOutcome::Clean, Some("abc123".into()));
+    let clean = save_result_dto(&SaveOutcome::Clean, Some("abc123".into()), None);
     let json = serde_json::to_value(&clean).unwrap();
     assert_eq!(json["status"], "clean");
     assert_eq!(json["head_sha"], "abc123");
@@ -193,7 +212,7 @@ fn save_result_serializes_with_a_status_tag() {
             }],
         }],
     };
-    let dto = save_result_dto(&conflicted, None);
+    let dto = save_result_dto(&conflicted, None, None);
     let json = serde_json::to_value(&dto).unwrap();
     assert_eq!(json["status"], "conflicts");
     assert_eq!(json["guidance"], CONFLICT_GUIDANCE);
@@ -251,4 +270,88 @@ fn squash_mode_resolution_prefers_explicit_then_prefix_then_fixup() {
         resolve_squash_mode(None, "plain subject"),
         Ok(SquashMode::Fixup)
     );
+}
+
+#[test]
+fn topology_slice_emits_anchor_adjacency_with_children_by_inversion() {
+    // Linear chain, newest first: C -> B -> A (A's parent is the virtual root).
+    let c = node(3, 103, &[2]);
+    let b = node(2, 102, &[1]);
+    let a = node(1, 101, &[0]);
+    let commits = vec![c, b, a];
+    let pre = pre_set(&commits);
+
+    // Anchor the middle commit B (the "moved" commit).
+    let topo = topology_slice(&commits, &[change_hex(102)], &pre, &IdAbbrev::full())
+        .expect("an anchor yields a slice");
+    assert_eq!(topo.affected.len(), 1, "only the anchor is affected");
+    let adj = &topo.affected[0];
+    assert_eq!(adj.change_id, change_hex(102));
+    // B's parent is A and its child (derived by inverting parents) is C.
+    assert_eq!(adj.parents, vec![change_hex(101)]);
+    assert_eq!(adj.children, vec![change_hex(103)]);
+    // A single-parent tip is not a merge.
+    assert!(topo.merge_tip.is_none());
+
+    // The root commit reports no parents (its parent is the virtual root).
+    let topo = topology_slice(&commits, &[change_hex(101)], &pre, &IdAbbrev::full()).unwrap();
+    assert!(topo.affected[0].parents.is_empty());
+    assert_eq!(topo.affected[0].children, vec![change_hex(102)]);
+}
+
+#[test]
+fn topology_slice_sets_merge_tip_and_dedups_it_when_affected() {
+    // A merge M at the tip over two lanes: M(parents = first Y, second X).
+    let m = node(5, 105, &[2, 4]);
+    let x = node(4, 104, &[1]);
+    let y = node(2, 102, &[1]);
+    let z = node(1, 101, &[0]);
+    let commits = vec![m, x, y, z];
+    let pre = pre_set(&commits);
+
+    // No anchor, nothing freshly minted: only the merge tip is reported — the
+    // shape a linear history can't show.
+    let topo = topology_slice(&commits, &[], &pre, &IdAbbrev::full())
+        .expect("a merge tip yields a slice even with no affected commits");
+    assert!(topo.affected.is_empty());
+    let tip = topo.merge_tip.expect("the tip is a merge");
+    assert_eq!(tip.change_id, change_hex(105));
+    // Parents in the merge's own order: first Y, then X.
+    assert_eq!(tip.parents, vec![change_hex(102), change_hex(104)]);
+
+    // When the tip is itself affected, it appears in `affected` and is NOT
+    // duplicated into `merge_tip`.
+    let topo = topology_slice(&commits, &[change_hex(105)], &pre, &IdAbbrev::full()).unwrap();
+    assert_eq!(topo.affected[0].change_id, change_hex(105));
+    assert_eq!(topo.affected[0].parents.len(), 2);
+    assert!(
+        topo.merge_tip.is_none(),
+        "the tip is deduped out of merge_tip"
+    );
+}
+
+#[test]
+fn topology_slice_finds_freshly_minted_and_returns_none_when_empty() {
+    // A freshly created commit N (absent from the pre-mutation history) on top
+    // of C is found via post − pre, with no anchor passed.
+    let n = node(9, 109, &[3]);
+    let c = node(3, 103, &[2]);
+    let b = node(2, 102, &[1]);
+    let commits = vec![n, c, b];
+    // Pre-mutation history did not contain N.
+    let pre: HashSet<String> = [change_hex(103), change_hex(102)].into_iter().collect();
+
+    let topo = topology_slice(&commits, &[], &pre, &IdAbbrev::full())
+        .expect("a post − pre commit is affected");
+    assert_eq!(topo.affected.len(), 1);
+    assert_eq!(topo.affected[0].change_id, change_hex(109));
+    assert_eq!(topo.affected[0].parents, vec![change_hex(103)]);
+    assert!(
+        topo.affected[0].children.is_empty(),
+        "the new tip has no child"
+    );
+
+    // Nothing anchored, nothing minted, a single-parent tip: no slice at all.
+    let full_pre = pre_set(&commits);
+    assert!(topology_slice(&commits, &[], &full_pre, &IdAbbrev::full()).is_none());
 }

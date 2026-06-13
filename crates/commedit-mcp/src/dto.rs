@@ -192,6 +192,36 @@ fn tagged_enum_is_an_object(schema: &mut schemars::Schema) {
         .insert("type".into(), "object".into());
 }
 
+/// How a topology-changing rewrite reshaped the graph, so the result can be
+/// verified without a follow-up read. Present on reorder/restore/squash/split/
+/// drop/create/revert/cherry_pick (and squash_working_copy); absent on plain
+/// message/identity/file edits, whose shape is unchanged.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct TopologyDto {
+    /// The rewritten commit(s) and where they landed: the moved/created/restored
+    /// commit, the squash destination, a split's commit and its new fixup child,
+    /// or the parent a drop's children rebased onto — each with its new parents
+    /// AND children by change_id.
+    pub affected: Vec<AdjacencyDto>,
+    /// Set only when the new branch tip is a merge — the shape a linear history
+    /// can't show: its parents, by change_id. Null for an ordinary single-parent
+    /// tip (and omitted when the tip already appears in `affected`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_tip: Option<AdjacencyDto>,
+}
+
+/// One commit's place in the graph after a rewrite.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AdjacencyDto {
+    /// The commit, by stable change_id — pass it straight back to chain edits.
+    pub change_id: String,
+    pub subject: String,
+    /// Its parents, by change_id (empty for the repository's root commit).
+    pub parents: Vec<String>,
+    /// The commits rebased directly on top of it, by change_id (empty at the tip).
+    pub children: Vec<String>,
+}
+
 /// Outcome of a mutation: either the rewrite is clean and exported to git, or
 /// it is held back with conflicts to resolve.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -202,6 +232,11 @@ pub enum SaveResultDto {
     Clean {
         /// The new branch tip.
         head_sha: Option<String>,
+        /// How the rewrite reshaped the graph — present on topology-changing
+        /// mutations, absent on plain message/identity/file edits. Verify the
+        /// result here instead of a follow-up list_history.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        topology: Option<TopologyDto>,
     },
     /// The rewrite is held back in full — git is untouched — until every
     /// conflict is resolved (`resolve_conflicts`) or the rewrite is aborted.
@@ -282,6 +317,18 @@ pub struct ShowCommitResp {
 pub struct ListTrashResp {
     /// Dropped commits, restorable via `restore_commit` or `squash_commit`.
     pub commits: Vec<CommitDto>,
+}
+
+/// The whole branch as a graph — the standalone read of the same shape a
+/// topology-changing mutation folds into its result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ShowGraphResp {
+    /// The branch tip, or null on a detached/unborn HEAD.
+    pub head_sha: Option<String>,
+    /// Every commit reachable from HEAD (newest first), each with its parents
+    /// and children by change_id — the merge/branch structure at a glance. The
+    /// repository's root has no parents; a tip has no children.
+    pub commits: Vec<AdjacencyDto>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -840,6 +887,7 @@ mod tests {
         let resp = DropCommitResp {
             result: SaveResultDto::Clean {
                 head_sha: Some("abc123".into()),
+                topology: None,
             },
             dropped: CommitDto {
                 sha: "def456".into(),

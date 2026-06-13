@@ -78,6 +78,7 @@ mod tests {
     fn the_result_is_a_single_yaml_block_with_no_structured_content() {
         let dto = SaveResultDto::Clean {
             head_sha: Some("abc123".into()),
+            topology: None,
         };
         let result = Yaml(dto).into_call_tool_result().expect("into result");
 

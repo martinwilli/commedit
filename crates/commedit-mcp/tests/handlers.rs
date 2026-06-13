@@ -4,10 +4,10 @@
 mod common;
 
 use commedit_mcp::dto::{
-    CommitEditDto, CommitField, DropCommitReq, EditCommitsReq, EditIdentityReq, EditMessageReq,
-    FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq, ReplaceFilesReq,
-    ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto, ShowCommitReq,
-    SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq,
+    CommitEditDto, CommitField, CreateCommitReq, DropCommitReq, EditCommitsReq, EditIdentityReq,
+    EditMessageReq, FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq,
+    ReplaceFilesReq, ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto,
+    ShowCommitReq, SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq, TopologyDto,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
@@ -35,11 +35,56 @@ async fn shas(server: &CommeditServer) -> Vec<String> {
 /// Unwrap a clean save, returning the new head sha.
 fn clean_head(result: &SaveResultDto) -> String {
     match result {
-        SaveResultDto::Clean { head_sha } => head_sha.clone().expect("clean save has a head"),
+        SaveResultDto::Clean { head_sha, .. } => head_sha.clone().expect("clean save has a head"),
         SaveResultDto::Conflicts { commits, .. } => {
             panic!("expected a clean save, got conflicts in {commits:?}")
         }
     }
+}
+
+/// The topology slice a topology-changing op must carry (panics otherwise).
+fn topology(result: &SaveResultDto) -> &TopologyDto {
+    match result {
+        SaveResultDto::Clean { topology, .. } => topology
+            .as_ref()
+            .expect("a topology-changing op carries a topology slice"),
+        SaveResultDto::Conflicts { commits, .. } => {
+            panic!("expected a clean save, got conflicts in {commits:?}")
+        }
+    }
+}
+
+/// Assert a clean save carries NO topology — the lean message/identity path.
+fn assert_lean(result: &SaveResultDto) {
+    match result {
+        SaveResultDto::Clean { topology, .. } => {
+            assert!(topology.is_none(), "a lean edit must omit topology");
+        }
+        SaveResultDto::Conflicts { commits, .. } => {
+            panic!("expected a clean save, got conflicts in {commits:?}")
+        }
+    }
+}
+
+/// The (abbreviated) change_id of the commit with this subject, from the current
+/// history — abbreviated the same way the topology slice is, so they compare equal.
+async fn change_id_of(server: &CommeditServer, subject: &str) -> String {
+    server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .iter()
+        .find(|c| c.subject == subject)
+        .unwrap_or_else(|| panic!("no commit with subject {subject:?}"))
+        .change_id
+        .clone()
 }
 
 #[tokio::test]
@@ -1594,4 +1639,255 @@ async fn suggest_squash_targets_points_a_fixup_at_its_match() {
         .0;
     assert!(resp.mode.is_none());
     assert!(resp.targets.is_empty() && resp.siblings.is_empty());
+}
+
+// --- Topology feedback in mutation responses ------------------------------
+
+#[tokio::test]
+async fn reorder_reports_the_moved_commit_with_its_new_parent_and_child() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // Move "third" under "first": it lands between "first" and "second".
+    let shas = shas(&server).await;
+    let result = server
+        .reorder_commit(Parameters(ReorderCommitReq {
+            commit: shas[0].clone(),
+            new_parent: shas[2].clone(),
+            child: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let topo = topology(&result);
+
+    let third = change_id_of(&server, "third").await;
+    let second = change_id_of(&server, "second").await;
+    let first = change_id_of(&server, "first").await;
+    assert_eq!(topo.affected.len(), 1, "only the moved commit is affected");
+    let moved = &topo.affected[0];
+    assert_eq!(moved.change_id, third);
+    assert_eq!(moved.parents, vec![first]);
+    assert_eq!(moved.children, vec![second]);
+    // A linear tip is not a merge.
+    assert!(topo.merge_tip.is_none());
+}
+
+#[tokio::test]
+async fn reorder_onto_a_merge_reports_the_merge_tip_and_its_two_parents() {
+    let dir = TempDir::new().unwrap();
+    init_merge_repo(dir.path());
+    // A commit on top of the merge; moving it down leaves the merge as HEAD —
+    // the `git log --graph` shape a linear response can't convey.
+    std::fs::write(dir.path().join("d.txt"), "top\n").unwrap();
+    git(dir.path(), &["add", "d.txt"]);
+    git(dir.path(), &["commit", "-qm", "top"]);
+    let server = open_server(dir.path());
+
+    let top = change_id_of(&server, "top").await;
+    let base = change_id_of(&server, "base").await;
+    let main1 = change_id_of(&server, "main-1").await;
+
+    // Splice "top" between "base" and "main-1" (the fork needs the child named).
+    let result = server
+        .reorder_commit(Parameters(ReorderCommitReq {
+            commit: top.clone(),
+            new_parent: base.clone(),
+            child: Some(main1.clone()),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let topo = topology(&result);
+
+    // The moved commit now sits on the base → main-1 line.
+    let moved = topo
+        .affected
+        .iter()
+        .find(|a| a.change_id == top)
+        .expect("the moved commit is affected");
+    assert_eq!(moved.parents, vec![base]);
+    assert_eq!(moved.children, vec![main1.clone()]);
+
+    // The merge is the new tip: its two parents are reported as the merge_tip.
+    let merge = change_id_of(&server, "merge").await;
+    let side1 = change_id_of(&server, "side-1").await;
+    let tip = topo.merge_tip.as_ref().expect("the tip is a merge");
+    assert_eq!(tip.change_id, merge);
+    // First parent main-1, second parent side-1 (the merge's own order).
+    assert_eq!(tip.parents, vec![main1, side1]);
+}
+
+#[tokio::test]
+async fn squash_reports_the_destination_carrying_the_rebased_children() {
+    let dir = TempDir::new().unwrap();
+    squash_repo(dir.path()); // target <- follow-up <- third
+    let server = open_server(dir.path());
+
+    // Fold "follow-up" into "target"; "third" rebases onto the folded target.
+    let shas = shas(&server).await;
+    let result = squash(&server, &shas[1], &shas[2], None).await;
+    let topo = topology(&result);
+
+    let target = change_id_of(&server, "target").await;
+    let third = change_id_of(&server, "third").await;
+    let dest = topo
+        .affected
+        .iter()
+        .find(|a| a.change_id == target)
+        .expect("the squash destination is affected");
+    assert_eq!(
+        dest.children,
+        vec![third],
+        "third rebased onto the destination"
+    );
+    assert!(topo.merge_tip.is_none());
+}
+
+#[tokio::test]
+async fn split_reports_the_edited_commit_and_its_new_fixup_child() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "one\n", "first"),
+            ("a.txt", "one\ntwo\nthree\n", "second"),
+            ("b.txt", "x\n", "third"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[1].clone();
+    let result = server
+        .split_commit(Parameters(SplitCommitReq {
+            commit: target,
+            files: vec![FileContentDto {
+                path: "a.txt".into(),
+                content: "one\ntwo\n".into(),
+            }],
+        }))
+        .await
+        .unwrap()
+        .0;
+    let topo = topology(&result);
+
+    // C' (the edited "second", stable change_id) plus a freshly-minted fixup child.
+    let second = change_id_of(&server, "second").await;
+    let fixup = change_id_of(&server, "fixup! second").await;
+    let c_prime = topo
+        .affected
+        .iter()
+        .find(|a| a.change_id == second)
+        .expect("the edited commit is affected");
+    let child = topo
+        .affected
+        .iter()
+        .find(|a| a.change_id == fixup)
+        .expect("the new fixup child is affected");
+    assert!(child.subject.starts_with("fixup!"));
+    // The fixup child sits directly on C'.
+    assert_eq!(child.parents, vec![second]);
+    assert_eq!(c_prime.children, vec![fixup]);
+}
+
+#[tokio::test]
+async fn drop_reports_the_parent_now_carrying_the_dropped_commits_children() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("a.txt", "1\n", "first"),
+            ("b.txt", "2\n", "second"),
+            ("c.txt", "3\n", "third"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // Drop "second"; "third" rebases onto its parent "first".
+    let target = shas(&server).await[1].clone();
+    let resp = server
+        .drop_commit(Parameters(DropCommitReq {
+            commit: target,
+            keep_changes: false,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let topo = topology(&resp.result);
+
+    let first = change_id_of(&server, "first").await;
+    let third = change_id_of(&server, "third").await;
+    let parent = topo
+        .affected
+        .iter()
+        .find(|a| a.change_id == first)
+        .expect("the dropped commit's parent is affected");
+    assert_eq!(parent.children, vec![third], "first now carries third");
+    assert!(topo.merge_tip.is_none());
+}
+
+#[tokio::test]
+async fn create_reports_the_new_commit_with_its_parent() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    // Insert a new commit on top of HEAD ("second").
+    let result = server
+        .create_commit(Parameters(CreateCommitReq {
+            message: "added".into(),
+            files: vec![FileContentDto {
+                path: "c.txt".into(),
+                content: "3\n".into(),
+            }],
+            delete_paths: None,
+            new_parent: None,
+            child: None,
+            identity: IdentityFieldsDto::default(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let topo = topology(&result);
+
+    // The new commit (found via post − pre) sits on "second" with no child.
+    let added = change_id_of(&server, "added").await;
+    let second = change_id_of(&server, "second").await;
+    assert_eq!(topo.affected.len(), 1);
+    assert_eq!(topo.affected[0].change_id, added);
+    assert_eq!(topo.affected[0].parents, vec![second]);
+    assert!(topo.affected[0].children.is_empty());
+    assert!(topo.merge_tip.is_none());
+}
+
+#[tokio::test]
+async fn edit_message_stays_lean_and_omits_topology() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "1\n", "first"), ("b.txt", "2\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let result = server
+        .edit_message(Parameters(EditMessageReq {
+            commit: target,
+            message: "reworded".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_lean(&result);
 }

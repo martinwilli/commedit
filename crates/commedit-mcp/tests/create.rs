@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// Unwrap a clean save, returning the new head sha.
 fn clean_head(result: &SaveResultDto) -> String {
     match result {
-        SaveResultDto::Clean { head_sha } => head_sha.clone().expect("clean save has a head"),
+        SaveResultDto::Clean { head_sha, .. } => head_sha.clone().expect("clean save has a head"),
         SaveResultDto::Conflicts { commits, .. } => {
             panic!("expected a clean save, got conflicts in {commits:?}")
         }

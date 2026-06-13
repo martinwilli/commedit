@@ -66,7 +66,21 @@ unit-testable headless:
   `dto.rs` (`convert.rs` maps engine types; **no jj-lib type crosses**; field
   doc comments are the schema descriptions agents read); mutations return the
   status-tagged `SaveResultDto`, whose schema needs the explicit root
-  `"type": "object"` MCP requires. Every result is wrapped in `Yaml<T>`
+  `"type": "object"` MCP requires. A topology-changing mutation's `Clean` arm
+  also carries a `topology` slice (`save_result_topo` in `session.rs`, built
+  *post-save* by re-reading `history()` and inverting parents into children —
+  **not** `compute_graph`): the affected commits' new parents/children plus a
+  `merge_tip` when the new tip is a merge, all by change_id, so the agent can
+  verify the result without a follow-up `list_history`. Each handler captures
+  the pre-mutation change_id set (`change_id_set`) and its anchor(s) before
+  mutating; a freshly-minted commit (a split's fixup child, a
+  created/reverted/cherry-picked commit, a restored trash commit) is found as
+  `post − pre`. Plain message/identity/file edits stay lean (`save_result`, no
+  slice). The read-only `show_graph` tool exposes that same adjacency for the
+  **whole** branch (`graph_adjacency` in `convert.rs` — the shared
+  `adjacency_tables`/`render_adjacency` the topology slice also uses), so an agent
+  can read the merge/branch shape on demand without a mutation. Every result is
+  wrapped in `Yaml<T>`
   (`wrapper.rs`) — serialized as a single human-readable YAML text block with
   **no** `structured_content`/`outputSchema` (a client that gets structured
   content hides the text block); strings YAML can't render as a literal block

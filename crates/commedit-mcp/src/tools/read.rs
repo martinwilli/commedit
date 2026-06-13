@@ -7,14 +7,14 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::{commit_dto, file_change_dto, DetailFields};
+use crate::convert::{commit_dto, file_change_dto, graph_adjacency, DetailFields};
 
 /// Default `list_history` page size when the caller gives no `limit`. Bounds the
 /// response so an unbounded walk can't blow the tool's token budget; deeper
 /// history is reachable via `limit` or `offset` paging.
 const DEFAULT_HISTORY_LIMIT: usize = 30;
 use crate::dto::{
-    ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp,
+    ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp, ShowGraphResp,
     SuggestSquashReq, SuggestSquashResp,
 };
 use crate::error::{internal, invalid};
@@ -136,6 +136,28 @@ impl CommeditServer {
                     .iter()
                     .map(|c| commit_dto(c, &root, &refs, &abbrev, DetailFields::ALL))
                     .collect(),
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Show the commit graph of the checked-out branch: every commit reachable from HEAD (newest first), each with its parents AND children by change_id — the merge and side-branch structure at a glance, which the newest-first list_history can't convey on its own. This is the standalone, whole-branch read of the same `topology` shape a topology-changing mutation folds into its result. Reach for it to see how merges and side branches connect before reordering, merging out or restoring; list_history stays the source for per-commit detail (messages, identities, diffs, refs)."
+    )]
+    pub async fn show_graph(&self) -> Result<Yaml<ShowGraphResp>, ErrorData> {
+        self.with_session(|repo, _| {
+            let Some(_) = repo.head_commit_id() else {
+                return Ok(ShowGraphResp {
+                    head_sha: None,
+                    commits: Vec::new(),
+                });
+            };
+            let (head, commits) = full_history(repo)?;
+            let abbrev = IdAbbrev::new(&repo.repo);
+            Ok(ShowGraphResp {
+                head_sha: Some(head.hex()),
+                commits: graph_adjacency(&commits, &abbrev),
             })
         })
         .await

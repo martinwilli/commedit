@@ -117,6 +117,15 @@ branch switch, rebase made outside this server) call reload_repo before \
 continuing; it starts a fresh session in place, discarding the trash, the \
 operation log and any pending rewrite.
 
+Verifying a rewrite: a topology-changing mutation (reorder, squash, split, drop, \
+restore, create, revert, cherry_pick, squash_working_copy) returns a `topology` \
+slice on a clean save — the affected commits with their new parents and children \
+by change_id, plus a `merge_tip` when the new branch tip is a merge — so you can \
+confirm the resulting shape in place instead of a follow-up list_history. Plain \
+message/identity/file edits omit it (their shape is unchanged). show_graph reads \
+that same shape for the whole branch on demand — every commit with its parents \
+and children by change_id — to see how merges and side branches connect.
+
 Reading results: every tool result is YAML. Long multi-line strings such as \
 diffs and file contents render as a literal block scalar, or — when a line \
 carries a tab or trailing whitespace — as a YAML sequence with one string per \

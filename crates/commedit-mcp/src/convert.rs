@@ -1,7 +1,7 @@
 //! Pure engine → DTO conversions. Keeping them free of locking and I/O makes
 //! the response shapes unit-testable without a repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use commedit_engine::conflict::{ConflictedCommit, OpEntry, SaveOutcome};
 use commedit_engine::diff::{render_diff, unified_diff, ChangeKind, ContextExpansion, FileChange};
@@ -12,8 +12,8 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use jj_lib::object_id::ObjectId as _;
 
 use crate::dto::{
-    CommitDetailDto, CommitDto, CommitField, ConflictedCommitDto, ConflictedPathDto, FileChangeDto,
-    HunkDto, OpEntryDto, RefDto, SaveResultDto, WorkingCopyEntryDto,
+    AdjacencyDto, CommitDetailDto, CommitDto, CommitField, ConflictedCommitDto, ConflictedPathDto,
+    FileChangeDto, HunkDto, OpEntryDto, RefDto, SaveResultDto, TopologyDto, WorkingCopyEntryDto,
 };
 
 /// Which verbose [`CommitDetailDto`] fields a `commit_dto` should populate.
@@ -240,14 +240,124 @@ pub fn op_entry_dto(index: usize, e: &OpEntry) -> OpEntryDto {
 }
 
 /// Fold a mutation outcome into the tagged response: `head_sha` is the branch
-/// tip after a clean save (read it after the outcome, the save moves it).
-pub fn save_result_dto(outcome: &SaveOutcome, head_sha: Option<String>) -> SaveResultDto {
+/// tip after a clean save (read it after the outcome, the save moves it), and
+/// `topology` the optional graph slice for a topology-changing op.
+pub fn save_result_dto(
+    outcome: &SaveOutcome,
+    head_sha: Option<String>,
+    topology: Option<TopologyDto>,
+) -> SaveResultDto {
     match outcome {
-        SaveOutcome::Clean => SaveResultDto::Clean { head_sha },
+        SaveOutcome::Clean => SaveResultDto::Clean { head_sha, topology },
         SaveOutcome::Conflicts { commits } => SaveResultDto::Conflicts {
             commits: commits.iter().map(conflicted_commit_dto).collect(),
             guidance: CONFLICT_GUIDANCE.to_string(),
         },
+    }
+}
+
+/// Build the [`TopologyDto`] for a topology-changing mutation: locate the
+/// commit(s) it reshaped and emit their new neighbourhood (parents + children),
+/// plus a merge tip when the new branch head is a merge.
+///
+/// `commits` is the post-mutation history (newest first; the virtual root is
+/// already excluded by [`commedit_engine::history::history`]). Affected commits
+/// are those whose stable full-hex change_id is one of `anchors` (the tool knew
+/// it touched them) OR is absent from `pre_change_ids` (freshly minted, found as
+/// `post − pre`). Children are derived by inverting each commit's parents — no
+/// lane geometry needed. Returns `None` when nothing affected and the tip is not
+/// a merge.
+pub fn topology_slice(
+    commits: &[CommitInfo],
+    anchors: &[String],
+    pre_change_ids: &HashSet<String>,
+    abbrev: &IdAbbrev,
+) -> Option<TopologyDto> {
+    let (change_of, children) = adjacency_tables(commits, abbrev);
+    let render = |c: &CommitInfo| render_adjacency(c, &change_of, &children, abbrev);
+
+    let anchor_set: HashSet<&str> = anchors.iter().map(String::as_str).collect();
+    let mut affected = Vec::new();
+    let mut affected_change_hex: HashSet<String> = HashSet::new();
+    for c in commits {
+        let ch = c.change_id_hex();
+        if anchor_set.contains(ch.as_str()) || !pre_change_ids.contains(&ch) {
+            affected.push(render(c));
+            affected_change_hex.insert(ch);
+        }
+    }
+
+    // The tip is a merge whose shape a linear history can't show; skip it when
+    // it's already among the affected commits.
+    let merge_tip = commits.first().filter(|tip| {
+        tip.parents.len() >= 2 && !affected_change_hex.contains(&tip.change_id_hex())
+    });
+    let merge_tip = merge_tip.map(render);
+
+    if affected.is_empty() && merge_tip.is_none() {
+        return None;
+    }
+    Some(TopologyDto {
+        affected,
+        merge_tip,
+    })
+}
+
+/// The whole branch as a graph: every commit (newest first) with its parents and
+/// children by change_id — the full view the `topology` slice gives in miniature.
+/// Backs the read-only `show_graph` query.
+pub fn graph_adjacency(commits: &[CommitInfo], abbrev: &IdAbbrev) -> Vec<AdjacencyDto> {
+    let (change_of, children) = adjacency_tables(commits, abbrev);
+    commits
+        .iter()
+        .map(|c| render_adjacency(c, &change_of, &children, abbrev))
+        .collect()
+}
+
+/// The two tables [`render_adjacency`] reads to emit a commit's neighbourhood:
+/// `change_of` maps a commit-id hex to that commit's (abbreviated) change_id, so a
+/// parent edge resolves to a change_id; `children` inverts parents into each
+/// commit-id hex's children's change_ids, in history order. The virtual root
+/// never appears in `commits`, so it gets no `change_of` entry (parent edges to it
+/// are filtered out) and its `children` bucket is never read.
+fn adjacency_tables(
+    commits: &[CommitInfo],
+    abbrev: &IdAbbrev,
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let change_of: HashMap<String, String> = commits
+        .iter()
+        .map(|c| (c.id_hex(), abbrev.change(&c.change_id)))
+        .collect();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for c in commits {
+        for p in &c.parents {
+            children
+                .entry(p.hex())
+                .or_default()
+                .push(abbrev.change(&c.change_id));
+        }
+    }
+    (change_of, children)
+}
+
+/// One commit's [`AdjacencyDto`] from the [`adjacency_tables`]: its own change_id,
+/// its parents' change_ids (the virtual root filtered out), and the change_ids of
+/// the commits rebased directly on top of it.
+fn render_adjacency(
+    c: &CommitInfo,
+    change_of: &HashMap<String, String>,
+    children: &HashMap<String, Vec<String>>,
+    abbrev: &IdAbbrev,
+) -> AdjacencyDto {
+    AdjacencyDto {
+        change_id: abbrev.change(&c.change_id),
+        subject: c.subject.clone(),
+        parents: c
+            .parents
+            .iter()
+            .filter_map(|p| change_of.get(&p.hex()).cloned())
+            .collect(),
+        children: children.get(&c.id_hex()).cloned().unwrap_or_default(),
     }
 }
 

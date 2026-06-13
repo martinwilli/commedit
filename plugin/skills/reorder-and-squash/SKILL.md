@@ -10,12 +10,14 @@ description: >-
 
 # Reorder, squash & fixup with commedit
 
-> **Delegate each move to the `commedit-operator` subagent.** Decide the target
-> order or fold, then hand it the *what* — "reorder `<id>` before `<id>`", "squash
-> the fixup `<id>` into `<id>`", "drop `<id>`" — and it resolves change_ids, runs
-> the rebase, handles any conflict hold, **verifies**, and reports. The tool detail
-> below is what the operator works from; use these tools directly only when no
-> subagent is available, or when you *are* the operator.
+> **Drive a single move yourself; delegate the multi-step tidy-ups.** A lone
+> `reorder_commit` / `squash_commit` / `drop_commit` you can address by change_id and
+> expect to land clean — make it directly: the result returns the reshaped topology,
+> so it is self-verifying with no follow-up `list_history`. **Delegate to the
+> `commedit-operator` subagent** for the open-ended cases — sequencing a whole branch
+> into logical order, a fold that conflicts, or working out where each fix belongs —
+> work worth keeping out of your context. The tool detail below is what you (or the
+> operator) work from.
 
 This is `git rebase -i` without the editor choreography, on any commit reachable
 from HEAD: each move is a real rebase that carries the descendants with it. Run

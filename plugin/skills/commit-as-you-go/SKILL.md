@@ -11,20 +11,19 @@ description: >-
 
 # Commit as you go with commedit
 
-> **Crystallize each new unit yourself with plain git; hand every *refinement* to
-> the `commedit-operator` subagent.** A fresh commit on top of HEAD needs no rebase,
-> so `git add` + `git commit` is simpler and cheaper than commedit. commedit's
-> strength is changing commits that *already exist* — folding a fix into an earlier
-> commit, rewording, re-dating, reordering, dropping, or inserting a commit below the
-> tip. You own the *plan*; delegate each fold / fix / reorder step to
-> `commedit-operator` as a one-line *what* ("fold this fix into commit
-> `<id-or-subject>`", "reword `<id>`", "reorder Z before W"). It chooses the tool,
-> addresses by change_id, runs it, **verifies** it landed, and reports back — keeping
-> rewrite detail out of your context. (commedit imports git state at startup, so the
-> first time you delegate after committing with git, the operator picks up your new
-> commits with `reload_repo`.) The tool-level guidance below is what the operator
-> works from; drive these tools yourself only when no subagent is available, or when
-> you *are* the operator.
+> **Crystallize each new unit with plain git; refine it with commedit.** A fresh
+> commit on top of HEAD needs no rebase, so `git add` + `git commit` is the simplest
+> way to lay one down. commedit's strength is changing commits that *already exist* —
+> folding a fix into an earlier commit, rewording, re-dating, reordering, dropping,
+> or inserting a commit below the tip. **Drive a single, directly-addressed
+> refinement yourself** (`reword <id>`, `reorder <id> before <id>`, `squash <fixup>
+> into <id>`): each commedit result is self-verifying — it returns the new change_id
+> and reshaped topology — and the session **catches up to your plain `git commit`s
+> automatically**, so no `reload_repo` and no follow-up read. **Delegate to the
+> `commedit-operator` subagent** when the step is a *loop, a search, or a conflict*:
+> resolving a conflict, an open-ended reshuffle, or finding where a fix belongs by
+> reading several diffs — work worth keeping out of your context. The tool-level
+> guidance below is what you (or the operator) work from.
 
 With commedit, **extending or fixing a commit is cheap; splitting a finished pile
 of changes into commits is expensive.** So commit *early and eagerly* at logical
@@ -81,10 +80,11 @@ reorder or drop it later in one call, and descendants rebase automatically.
   all markers, `resolve_conflicts`); fixing the earliest often auto-clears its
   descendants. `abort_rewrite` discards the held rewrite. No other mutation runs
   while one is pending.
-- After any **out-of-band git operation** — including the `git commit`s you make to
-  crystallize units — the commedit session's view goes stale; call `reload_repo`
-  before the next commedit mutation (the operator does this for you on its first
-  call after your commits).
+- A plain `git commit` on top of HEAD needs **no** `reload_repo` — the commedit
+  session catches up to it automatically on the next tool call. Reserve `reload_repo`
+  for out-of-band changes it can't absorb in place: a **branch switch**, or history
+  **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
+  trash and op-log, so don't run it reflexively).
 - The session is a safety net: every landed change is a recorded operation
   (`list_operations`, `undo` / `redo`, `jump_to_operation`). The only
   unrecoverable action is `discard_working_copy`.

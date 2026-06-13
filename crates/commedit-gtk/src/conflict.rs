@@ -526,7 +526,7 @@ pub(crate) fn build_resolve_current(
                 // the restored one leaves it).
                 if let Some(op) = pending_trash_op.borrow_mut().take() {
                     match op {
-                        PendingTrashOp::Drop(info) => trashed.borrow_mut().push(info),
+                        PendingTrashOp::Drop(infos) => trashed.borrow_mut().extend(infos),
                         PendingTrashOp::Restore(info) => trashed
                             .borrow_mut()
                             .retain(|c| c.change_id_hex() != info.change_id_hex()),

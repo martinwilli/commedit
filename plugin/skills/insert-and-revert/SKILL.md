@@ -30,8 +30,10 @@ reference commits by **`change_id`**.
 `create_commit(message, files)` builds a new commit from whole-file contents
 spliced onto the parent's tree (`delete_paths` to remove a path, omit both for an
 empty commit). Use it to author a commit *below* HEAD, or from explicit contents.
-To turn the **current uncommitted changes** into a commit on top of HEAD instead,
-use `commit_working_copy` (see the `commit-as-you-go` skill).
+A new commit on *top* of HEAD needs no rebase, so don't reach for a tool: just
+`git add` / `git commit` the working changes yourself (see the `commit-as-you-go`
+skill) — `commit_working_copy` is only for committing a deterministic *subset* of
+the tree in-session.
 
 ## Revert
 

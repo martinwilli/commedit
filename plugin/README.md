@@ -83,13 +83,15 @@ working-tree files itself, so the main agent stays in charge of *what* while the
 operator handles *how*. Delegate one operation (or a tightly-related batch) per
 call.
 
-Reach for it **instead of driving the commedit MCP tools yourself or running
-git** for any commit or history rewrite — a `commit_working_copy` /
-`create_commit` / `reorder_commit` / `squash_commit` / `edit_message` call from
-the main context counts as "running git yourself", as does `git commit`,
-`git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert` — and
-not just at the tip. Building merge commits and managing
-branches, remotes and pushes stay plain-git tasks.
+Reach for it **instead of driving the commedit MCP tools yourself** for any
+history rewrite, or a commit that lands below the tip — a `create_commit` /
+`reorder_commit` / `squash_commit` / `edit_message` / `squash_working_copy` call
+from the main context belongs here, as does what you'd otherwise do with
+`git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert` — on any
+commit reachable from HEAD, not just the tip. A plain **new commit on top of
+HEAD** needs no rebase, so make it with raw `git add` / `git commit` rather than
+delegating. Building merge commits and managing branches, remotes and pushes stay
+plain-git tasks.
 
 ## Requirements
 

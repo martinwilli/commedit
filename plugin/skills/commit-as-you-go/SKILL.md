@@ -4,20 +4,27 @@ description: >-
   Use when implementing a multi-step task that will produce several git
   commits — a feature, a refactor, or an autonomous run. Establishes the
   commit-as-you-go discipline: crystallize each logical unit into a commit
-  eagerly with commedit, then refine, instead of writing everything and
-  trying to split one big pile at the end.
+  eagerly — plain `git commit` for a new commit on HEAD — then refine it in
+  place with commedit, instead of writing everything and trying to split one
+  big pile at the end.
 ---
 
 # Commit as you go with commedit
 
-> **Hand each commedit call to the `commedit-operator` subagent.** You own the
-> *plan* — which commits to make and when — but delegate every crystallize / fold /
-> fix step to `commedit-operator` as a one-line *what* ("commit this unit as
-> `<message>`", "fold this fix into commit `<id-or-subject>`", "reword `<id>`"). It
-> chooses the tool, addresses by change_id, runs it, **verifies** it landed, and
-> reports back — keeping rewrite detail out of your context. The tool-level guidance
-> below is what the operator works from; drive these tools yourself only when no
-> subagent is available, or when you *are* the operator.
+> **Crystallize each new unit yourself with plain git; hand every *refinement* to
+> the `commedit-operator` subagent.** A fresh commit on top of HEAD needs no rebase,
+> so `git add` + `git commit` is simpler and cheaper than commedit. commedit's
+> strength is changing commits that *already exist* — folding a fix into an earlier
+> commit, rewording, re-dating, reordering, dropping, or inserting a commit below the
+> tip. You own the *plan*; delegate each fold / fix / reorder step to
+> `commedit-operator` as a one-line *what* ("fold this fix into commit
+> `<id-or-subject>`", "reword `<id>`", "reorder Z before W"). It chooses the tool,
+> addresses by change_id, runs it, **verifies** it landed, and reports back — keeping
+> rewrite detail out of your context. (commedit imports git state at startup, so the
+> first time you delegate after committing with git, the operator picks up your new
+> commits with `reload_repo`.) The tool-level guidance below is what the operator
+> works from; drive these tools yourself only when no subagent is available, or when
+> you *are* the operator.
 
 With commedit, **extending or fixing a commit is cheap; splitting a finished pile
 of changes into commits is expensive.** So commit *early and eagerly* at logical
@@ -30,18 +37,18 @@ reorder or drop it later in one call, and descendants rebase automatically.
 1. **Plan the commit sequence first.** Before coding, decide the commits you
    intend — one per logical change or subsystem. Implement them one at a time.
 
-2. **Crystallize each unit the moment it is coherent** (and its tests pass), then
-   move on with a clean tree:
-   - Edits/deletions to existing files → `commit_working_copy(message)`
-     (it is `git commit -a`; leaves the working tree clean for the next unit).
-   - A unit that **introduces new files** → name them in `commit_working_copy`'s
-     `add_paths` (repo-relative paths). The working copy otherwise carries only
-     tracked-file changes, so a file you just created is invisible until named.
-     `add_paths` and tracked edits compose, so "add `foo.rs` + edit `bar.rs`"
-     lands as **one** commit.
-   - To author a commit somewhere other than on top of HEAD, or from explicit
-     contents → `create_commit` (`new_parent` places it; existing descendants
-     rebase onto it).
+2. **Crystallize each unit the moment it is coherent** (and its tests pass) with
+   plain git — a new commit on top of HEAD needs no rebase — then move on with a
+   clean tree:
+   - Edits/deletions to existing files → `git commit -am '<message>'`.
+   - A unit that **introduces new files** → `git add <path…>` first, then
+     `git commit` — the staged new files and tracked edits compose into **one**
+     commit.
+   - To author a commit somewhere *other than* on top of HEAD (below it, at a fork,
+     or at the root), or from explicit contents → that *is* commedit's job:
+     delegate "create a commit from these files below `<id>`" (`create_commit`
+     places it and rebases existing descendants onto it), since git can't without
+     a rebase.
 
 3. **Forgot something that belongs in an earlier commit?** Don't start a new pile.
    Make the edit on disk, then fold it into that commit with
@@ -74,8 +81,10 @@ reorder or drop it later in one call, and descendants rebase automatically.
   all markers, `resolve_conflicts`); fixing the earliest often auto-clears its
   descendants. `abort_rewrite` discards the held rewrite. No other mutation runs
   while one is pending.
-- After any **out-of-band git operation** (a commit, branch switch or rebase made
-  outside the commedit session), call `reload_repo` before continuing.
+- After any **out-of-band git operation** — including the `git commit`s you make to
+  crystallize units — the commedit session's view goes stale; call `reload_repo`
+  before the next commedit mutation (the operator does this for you on its first
+  call after your commits).
 - The session is a safety net: every landed change is a recorded operation
   (`list_operations`, `undo` / `redo`, `jump_to_operation`). The only
   unrecoverable action is `discard_working_copy`.

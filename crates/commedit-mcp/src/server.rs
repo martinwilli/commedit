@@ -47,14 +47,21 @@ reordered, dropped or squashed, and its descendants are rebased automatically. \
 New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
 
-When the task is to edit existing history — reword a message, change an \
-author or date, edit a commit's files, or reorder, squash, split, drop or \
-insert a commit — prefer these tools over raw git (reach for them instead of \
-`git commit --amend`, `git rebase -i` or `git cherry-pick`): they rewrite in \
-place and rebase the descendants for you, on any commit reachable from HEAD, \
-not just the tip. merge_out_commit can introduce a merge above a commit (to \
-organize a linear history into a branchy one); building a merge between two real \
-branches, and managing branches, worktrees or remotes, stay plain-git tasks.
+Raw git vs commedit — the dividing line. A NEW commit on top of HEAD needs no \
+rebase, so commit it with plain `git add` + `git commit`: simpler and cheaper \
+than commit_working_copy, and the right tool for everyday committing. Reach for \
+commedit when the work touches history that ALREADY EXISTS, or lands a commit \
+BELOW the tip — rewording a message, changing an author or date, editing a \
+commit's files, or reordering, squashing, splitting, dropping, reverting, \
+cherry-picking or inserting a commit. commedit rewrites in place and rebases the \
+descendants for you, on any commit reachable from HEAD (not just the tip), so \
+reach for it instead of `git commit --amend`, `git rebase -i`, `git cherry-pick` \
+or `git revert`. merge_out_commit can introduce a merge above a commit, to \
+organize a linear history into a branchy one; building a merge between two real \
+branches, and managing branches, worktrees or remotes, stay plain-git tasks too. \
+(commedit imports git state at startup, so after a raw-git commit — like any \
+out-of-band change — call reload_repo before using these tools again; see the \
+working-tree note below.)
 
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
 full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
@@ -94,9 +101,12 @@ any commit / at root via new_parent. revert_commit inserts the inverse of a \
 commit (like git revert). cherry_pick_commit copies a commit's change in (like \
 git cherry-pick) — the source may be off the current branch, named by its full \
 sha. commit_working_copy turns the current uncommitted changes into a commit on \
-top of HEAD (like git commit -a) — it captures edits to already-tracked files \
-only, so a brand-new (untracked) file is silently skipped unless named in its \
-add_paths (the same holds for squash_working_copy). A mid-history insert, \
+top of HEAD (like git commit -a), but for that whole-tree case prefer plain git \
+(simpler, no rebase); reach for commit_working_copy to commit only a deterministic \
+SUBSET of the tree (its paths/hunks/patches selection) without leaving the \
+session. It captures edits to already-tracked files only, so a brand-new \
+(untracked) file is silently skipped unless named in its add_paths (the same holds \
+for squash_working_copy). A mid-history insert, \
 revert or pick may report conflicts like any rewrite. merge_out_commit \
 introduces a merge directly above a single-parent commit, turning that commit \
 into a one-commit side branch you can then move further commits onto.

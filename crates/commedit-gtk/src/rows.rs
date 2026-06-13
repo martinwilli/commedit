@@ -14,7 +14,7 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 
-use crate::state::{RestoreToWorktreeCallback, RevertCallback};
+use crate::state::{MergeOutCallback, RestoreToWorktreeCallback, RevertCallback};
 
 /// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
 /// (which recomputes it) and every row's drawing area (which reads its own row).
@@ -243,6 +243,66 @@ fn add_revert_button(content: &Overlay, on_revert: &RevertCallback) {
     btn.add_controller(click);
 }
 
+/// Float a merge-out button (a right arrow) over `content`'s right edge, *beside*
+/// the revert button (to its left), revealed on hover with the same
+/// non-measured-overlay pattern as [`add_revert_button`]. Clicking it claims the
+/// press (so it never selects the row) and calls `on_merge_out` with the row's
+/// current display index, which introduces a merge commit directly above that
+/// commit (the commit becomes a side branch the merge folds back). Like the revert
+/// button it stays hidden while `content` is tagged `no-revert` (merge commits, set
+/// by [`set_row_commit`]) — a merge has no single parent to fold out.
+fn add_merge_out_button(content: &Overlay, on_merge_out: &MergeOutCallback) {
+    let btn = gtk::Image::from_icon_name("go-next-symbolic");
+    // An explicit pixel size is required: as a non-measured overlay child the
+    // icon would otherwise request zero size and never show.
+    btn.set_pixel_size(16);
+    btn.set_halign(gtk::Align::End);
+    btn.set_valign(gtk::Align::Center);
+    // Sit just left of the revert button (at margin_end 8): 8 + its 16px icon + a
+    // small gap, so the two line up at the row's right edge without overlapping.
+    btn.set_margin_end(28);
+    btn.set_cursor_from_name(Some("pointer"));
+    btn.set_tooltip_text(Some(
+        "Introduce a merge above this commit (it becomes a side branch)",
+    ));
+    btn.add_css_class("commit-revert");
+    btn.set_visible(false);
+    content.add_overlay(&btn);
+
+    // Reveal the button only while the pointer is over the row content, and never
+    // on a merge row (the `no-revert` class).
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter({
+        let btn = btn.clone();
+        let content = content.clone();
+        move |_, _, _| btn.set_visible(!content.has_css_class("no-revert"))
+    });
+    motion.connect_leave({
+        let btn = btn.clone();
+        move |_| btn.set_visible(false)
+    });
+    content.add_controller(motion);
+
+    // Claim the press so the click stays off the row (it must not select it).
+    let click = gtk::GestureClick::new();
+    click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    click.connect_released({
+        let btn = btn.clone();
+        let on_merge_out = on_merge_out.clone();
+        move |_, _, _, _| {
+            if let Some(row) = btn
+                .ancestor(ListBoxRow::static_type())
+                .and_downcast::<ListBoxRow>()
+            {
+                on_merge_out(row.index());
+            }
+        }
+    });
+    btn.add_controller(click);
+}
+
 /// Float a restore button over a *trash* row's right edge — the same
 /// non-measured-overlay + hover pattern as [`add_revert_button`], so it lines up
 /// down the list. Clicking it claims the press (so it never selects the row) and
@@ -321,6 +381,7 @@ fn commit_row_box(
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
     on_revert: Option<&RevertCallback>,
+    on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
 ) -> GtkBox {
     let short = commit.id_hex().chars().take(8).collect::<String>();
@@ -365,6 +426,9 @@ fn commit_row_box(
     content.set_child(Some(&row_box));
     if let Some(on_revert) = on_revert {
         add_revert_button(&content, on_revert);
+    }
+    if let Some(on_merge_out) = on_merge_out {
+        add_merge_out_button(&content, on_merge_out);
     }
     if let Some(on_restore) = on_restore {
         add_restore_button(&content, on_restore);
@@ -431,6 +495,7 @@ fn set_pills(pills: &GtkBox, refs: &[RefDecoration]) {
 /// Update the content of a row's existing labels in place, without replacing the
 /// child widget — so the labels (and the row) survive a drag-triggered rebuild.
 /// Falls back to building a fresh child if the row has none yet.
+#[allow(clippy::too_many_arguments)]
 fn set_row_commit(
     row: &ListBoxRow,
     commit: &CommitInfo,
@@ -438,6 +503,7 @@ fn set_row_commit(
     refs: &[RefDecoration],
     graph: Option<(&SharedGraph, usize)>,
     on_revert: Option<&RevertCallback>,
+    on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
 ) {
     let short = commit.id_hex().chars().take(8).collect::<String>();
@@ -512,7 +578,13 @@ fn set_row_commit(
         }
         // Older row layout (or a freshly-created empty row): build it whole.
         _ => row.set_child(Some(&commit_row_box(
-            commit, conflicted, refs, graph, on_revert, on_restore,
+            commit,
+            conflicted,
+            refs,
+            graph,
+            on_revert,
+            on_merge_out,
+            on_restore,
         ))),
     }
 }
@@ -539,6 +611,7 @@ fn populate_rows(
     refs: &BTreeMap<String, Vec<RefDecoration>>,
     graph: Option<&SharedGraph>,
     on_revert: Option<&RevertCallback>,
+    on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
 ) {
     for (i, commit) in commits.iter().enumerate() {
@@ -558,6 +631,7 @@ fn populate_rows(
             refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
             graph.map(|g| (g, i)),
             on_revert,
+            on_merge_out,
             on_restore,
         );
     }
@@ -580,6 +654,7 @@ pub(crate) fn populate_list(
     refs: &BTreeMap<String, Vec<RefDecoration>>,
     graph: &SharedGraph,
     on_revert: Option<&RevertCallback>,
+    on_merge_out: Option<&MergeOutCallback>,
 ) {
     populate_rows(
         list,
@@ -589,6 +664,7 @@ pub(crate) fn populate_list(
         refs,
         Some(graph),
         on_revert,
+        on_merge_out,
         None,
     );
 }
@@ -629,15 +705,16 @@ pub(crate) fn populate_trash(
 ) {
     scroll.set_visible(!commits.is_empty());
     // No ref pills and no ancestry graph in the trash: a dropped commit was just
-    // cut out of its branch, so neither applies here. No revert button either — a
-    // trashed commit isn't part of the branch to revert against — but a restore
-    // button (when `on_restore` is given) pulls its changes into the working tree.
+    // cut out of its branch, so neither applies here. No revert or merge-out button
+    // either — a trashed commit isn't part of the branch — but a restore button
+    // (when `on_restore` is given) pulls its changes into the working tree.
     populate_rows(
         list,
         commits,
         false,
         &HashSet::new(),
         &BTreeMap::new(),
+        None,
         None,
         None,
         on_restore,

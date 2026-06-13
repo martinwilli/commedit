@@ -48,20 +48,24 @@ New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
 
 Raw git vs commedit — the dividing line. A NEW commit on top of HEAD needs no \
-rebase, so commit it with plain `git add` + `git commit`: simpler and cheaper \
-than commit_working_copy, and the right tool for everyday committing. Reach for \
-commedit when the work touches history that ALREADY EXISTS, or lands a commit \
-BELOW the tip — rewording a message, changing an author or date, editing a \
-commit's files, or reordering, squashing, splitting, dropping, reverting, \
-cherry-picking or inserting a commit. commedit rewrites in place and rebases the \
-descendants for you, on any commit reachable from HEAD (not just the tip), so \
-reach for it instead of `git commit --amend`, `git rebase -i`, `git cherry-pick` \
-or `git revert`. merge_out_commit can introduce a merge above a commit, to \
-organize a linear history into a branchy one; building a merge between two real \
-branches, and managing branches, worktrees or remotes, stay plain-git tasks too. \
-(commedit imports git state at startup, so after a raw-git commit — like any \
-out-of-band change — call reload_repo before using these tools again; see the \
-working-tree note below.)
+rebase, so for a one-off the simplest tool is plain `git add` + `git commit`. But \
+when you are in a commedit session you will keep editing — crystallizing units as \
+you go, then refining them — commit_working_copy is just as good and often better: \
+it keeps the session coherent and returns the new commit's change_id plus what is \
+left uncommitted, ready to chain the next edit. Reach for commedit whenever the \
+work touches history that ALREADY EXISTS, or lands a commit BELOW the tip — \
+rewording a message, changing an author or date, editing a commit's files, or \
+reordering, squashing, splitting, dropping, reverting, cherry-picking or inserting \
+a commit. commedit rewrites in place and rebases the descendants for you, on any \
+commit reachable from HEAD (not just the tip), so reach for it instead of \
+`git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert`. \
+merge_out_commit can introduce a merge above a commit, to organize a linear \
+history into a branchy one; building a merge between two real branches, and \
+managing branches, worktrees or remotes, stay plain-git tasks too. (commedit \
+imports git state at startup but catches up automatically on the next tool call \
+when you commit on top of HEAD with plain git — so a plain commit needs no reload. \
+reload_repo is only for changes it can't absorb in place: a branch switch, or \
+history rewritten out of band by `git rebase`/`reset`/`commit --amend`.)
 
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
 full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
@@ -101,10 +105,12 @@ any commit / at root via new_parent. revert_commit inserts the inverse of a \
 commit (like git revert). cherry_pick_commit copies a commit's change in (like \
 git cherry-pick) — the source may be off the current branch, named by its full \
 sha. commit_working_copy turns the current uncommitted changes into a commit on \
-top of HEAD (like git commit -a), but for that whole-tree case prefer plain git \
-(simpler, no rebase); reach for commit_working_copy to commit only a deterministic \
-SUBSET of the tree (its paths/hunks/patches selection) without leaving the \
-session. It captures edits to already-tracked files only, so a brand-new \
+top of HEAD (like git commit -a) and returns the new commit (sha + change_id) \
+plus the remaining working copy. For a one-off whole-tree commit plain git is \
+simplest, but inside a session you keep editing it is just as good — it stays \
+coherent and hands back the change_id to chain on — and it is the only way to \
+commit a deterministic SUBSET of the tree (its paths/hunks/patches selection). It \
+captures edits to already-tracked files only, so a brand-new \
 (untracked) file is silently skipped unless named in its add_paths (the same holds \
 for squash_working_copy). A mid-history insert, \
 revert or pick may report conflicts like any rewrite. merge_out_commit \
@@ -122,17 +128,20 @@ discard_working_copy.
 Uncommitted changes in the working tree are first-class: they ride through \
 every rewrite automatically (working_copy_status shows them; session_diff \
 shows everything this session changed, committed and uncommitted, against the \
-session-start tree). Git state is \
-imported only at startup — after any out-of-band git operation (a commit, \
-branch switch, rebase made outside this server) call reload_repo before \
-continuing; it starts a fresh session in place, discarding the trash, the \
-operation log and any pending rewrite.
+session-start tree). Git state is imported only at startup, but the session \
+catches up automatically on the next tool call when you commit on top of HEAD \
+with plain git — so plain commits need no reload. reload_repo is only for \
+out-of-band changes it can't absorb in place: a branch switch, or history \
+rewritten by `git rebase`/`reset`/`commit --amend`; it starts a fresh session, \
+discarding the trash, the operation log and any pending rewrite.
 
 Verifying a rewrite: a topology-changing mutation (reorder, squash, split, drop, \
-restore, create, revert, cherry_pick, squash_working_copy) returns a `topology` \
-slice on a clean save — the affected commits with their new parents and children \
-by change_id, plus a `merge_tip` when the new branch tip is a merge — so you can \
-confirm the resulting shape in place instead of a follow-up list_history. Plain \
+restore, create, revert, cherry_pick, merge_out, squash_working_copy) returns a \
+`topology` slice on a clean save — the affected commits with their new parents and \
+children by change_id, plus a `merge_tip` when the new branch tip is a merge — so \
+you can confirm the resulting shape in place instead of a follow-up list_history. \
+commit_working_copy and squash_working_copy additionally hand back the new commit \
+and/or the remaining working copy. Plain \
 message/identity/file edits omit it (their shape is unchanged). show_graph reads \
 that same shape for the whole branch on demand — every commit with its parents \
 and children by change_id — to see how merges and side branches connect.

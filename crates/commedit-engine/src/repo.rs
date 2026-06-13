@@ -558,6 +558,49 @@ impl Repo {
             pollster::block_on(tx.commit("import git refs")).context("committing import")?;
         Ok(())
     }
+
+    /// Catch the session up to a git HEAD that moved *out of band* — e.g. the
+    /// caller crystallized a unit with a plain `git commit` on top of HEAD while
+    /// this session was open. jj only imports git state at [`Self::open`], so the
+    /// new commit is otherwise absent from jj's view and every read or mutation
+    /// that resolves from the live HEAD fails ("commit … not found in index").
+    /// This re-imports it into the *existing* session, so reads and mutations keep
+    /// working **without** the full reopen that would reset the trash and the
+    /// operation log: the import is just another recorded jj operation, and the
+    /// session's undo floor and trash survive.
+    ///
+    /// Returns whether an import was performed. A no-op when already in sync, on a
+    /// detached HEAD, or while a conflicted rewrite is pending (git is untouched
+    /// then, so the live HEAD is still the pre-rewrite tip jj already knows).
+    /// Refuses a *branch switch*: a session is scoped to the one checked-out
+    /// branch (only its ref is imported), so a different branch genuinely needs a
+    /// fresh [`Self::open`] rather than a catch-up import.
+    pub fn sync_to_git_head(&mut self) -> Result<bool> {
+        if self.is_pending() {
+            return Ok(false);
+        }
+        let live_branch = crate::transparency::head_branch(self.workspace.workspace_root());
+        if live_branch != self.git_head_branch {
+            anyhow::bail!(
+                "the checked-out branch changed outside commedit (now {live_branch:?}, \
+                 was {:?}); reopen the repository to edit it",
+                self.git_head_branch
+            );
+        }
+        let Some(live_head) = self.head_commit() else {
+            return Ok(false); // detached HEAD: nothing branch-scoped to track
+        };
+        // jj's exported branch tip already matches the live git ref → in sync.
+        if self.exported_tip().as_deref() == Some(live_head.as_str()) {
+            return Ok(false);
+        }
+        // jj imports refs from the session-local git dir, not the user's `.git`,
+        // so re-point its branch ref at the user's new tip before importing.
+        let git_dir = self._workdir.path().join("git");
+        crate::transparency::seed_session_head(&git_dir, self.workspace.workspace_root())?;
+        self.import_git()?;
+        Ok(true)
+    }
 }
 
 /// Run a closure that drives jj-lib, turning any panic it raises into an error.

@@ -50,6 +50,13 @@ pub(crate) type MergeOutCallback = Rc<dyn Fn(i32)>;
 /// `rows::add_restore_button`.
 pub(crate) type RestoreToWorktreeCallback = Rc<dyn Fn(i32)>;
 
+/// A history row's commit-style badge calls this with the row's display index when
+/// the commit's summary drifts from the repo's de-facto conventions (see
+/// `crate::msglint`): it auto-fixes the mechanical issues (case, trailing period)
+/// or, when only judgment issues remain, selects the commit for manual editing.
+/// Wired in `build_ui`, captured by each row in `rows::build_lint_badge`.
+pub(crate) type LintFixCallback = Rc<dyn Fn(i32)>;
+
 /// Which list a drag started in, so the shared drop handlers can tell a reorder
 /// (history → history), a drop (history → trash), a restore (trash → history) and
 /// a working-copy fold (working copy → commit) apart. The carried value is just

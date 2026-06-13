@@ -370,8 +370,19 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         let refs = repo.borrow().commit_refs();
         // No revert / merge-out button while resolving conflicts: the rows reuse
         // the buttons built by the normal refresh, and each callback's conflict-mode
-        // guard refuses the action until the pending rewrite settles.
-        populate_list(&list, &commits.borrow(), &badges, &refs, &graph, None, None);
+        // guard refuses the action until the pending rewrite settles. No lint badge
+        // either (`None` style) — message style is irrelevant mid-resolution.
+        populate_list(
+            &list,
+            &commits.borrow(),
+            &badges,
+            &refs,
+            &graph,
+            None,
+            None,
+            None,
+            None,
+        );
         conflict_label.set_text(&format!(
             "Conflicts from the rewrite must be resolved before it applies to git — \
              {n_files} file(s) across {n_commits} commit(s) remaining."

@@ -49,6 +49,7 @@ use crate::identity::*;
 mod conflict;
 use crate::conflict::*;
 mod dragdrop;
+mod msglint;
 mod search;
 
 /// The conflict pane's late-bound "expand hidden lines" action, invoked by buffer
@@ -2251,6 +2252,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // The history rows' commit-style lint badge has the same slot-behind-a-stable-
+    // wrapper shape: the rows capture `on_lint` now, the real handler (which needs
+    // `refresh` etc.) is filled in once everything is built.
+    let on_lint_slot: Rc<RefCell<Option<LintFixCallback>>> = Rc::new(RefCell::new(None));
+    let on_lint: LintFixCallback = {
+        let slot = on_lint_slot.clone();
+        Rc::new(move |idx| {
+            if let Some(handler) = slot.borrow().as_ref() {
+                handler(idx);
+            }
+        })
+    };
+
     // Reload history from the engine, preserving the selected commit by its
     // (rewrite-stable) change id.
     let refresh: Rc<dyn Fn()> = {
@@ -2268,6 +2282,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let refresh_wc = refresh_wc.clone();
         let on_revert = on_revert.clone();
         let on_merge_out = on_merge_out.clone();
+        let on_lint = on_lint.clone();
         let search_query = search_query.clone();
         let search_matches = search_matches.clone();
         let search_cursor = search_cursor.clone();
@@ -2290,6 +2305,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             {
                 let cs = commits.borrow();
                 let refs = repo.borrow().commit_refs();
+                // Learn this repo's de-facto commit-message conventions from its own
+                // history, so the per-row lint badge flags drift from *its* norm.
+                let subjects: Vec<&str> = cs.iter().map(|c| c.subject.as_str()).collect();
+                let style = msglint::RepoStyle::learn(&subjects);
                 populate_list(
                     &list,
                     &cs,
@@ -2298,6 +2317,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     &graph,
                     Some(&on_revert),
                     Some(&on_merge_out),
+                    Some(&on_lint),
+                    Some(&style),
                 );
                 // Harvest the distinct identities seen across history, offered by
                 // the in-field ▼ picker.
@@ -2619,6 +2640,80 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
             });
         }) as RestoreToWorktreeCallback
+    });
+
+    // Fill the lint-badge slot, now that `refresh` / `enter_conflict_mode` exist. The
+    // handler tidies the clicked commit's summary to match the repo's de-facto style:
+    // it auto-fixes the mechanical issues (case, trailing period) in place, and when
+    // only judgment issues remain (a missing prefix, an over-long summary) it selects
+    // the commit and focuses the message editor for a manual fix instead. Deferred to
+    // idle (it rebuilds the very row whose badge fired), like the revert handler.
+    *on_lint_slot.borrow_mut() = Some({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
+        let pane_mode = pane_mode.clone();
+        let refresh = refresh.clone();
+        let enter_conflict_mode = enter_conflict_mode.clone();
+        let show_status = show_status.clone();
+        let message_view = message_view.clone();
+        Rc::new(move |idx: i32| {
+            let repo = repo.clone();
+            let commits = commits.clone();
+            let selected_change = selected_change.clone();
+            let selected_changes = selected_changes.clone();
+            let pane_mode = pane_mode.clone();
+            let refresh = refresh.clone();
+            let enter_conflict_mode = enter_conflict_mode.clone();
+            let show_status = show_status.clone();
+            let message_view = message_view.clone();
+            glib::idle_add_local_once(move || {
+                if pane_mode.borrow().is_conflict() {
+                    show_status("Resolve the pending conflict before editing a message");
+                    return;
+                }
+                // Resolve the clicked commit and re-learn the repo's style (commits
+                // may have changed since the badge was painted).
+                let resolved = {
+                    let cs = commits.borrow();
+                    let Some(commit) = cs.get(idx as usize) else {
+                        return;
+                    };
+                    let subjects: Vec<&str> = cs.iter().map(|c| c.subject.as_str()).collect();
+                    let style = msglint::RepoStyle::learn(&subjects);
+                    (
+                        commit.id.clone(),
+                        commit.change_id_hex(),
+                        commit.description.clone(),
+                        msglint::autofix_subject(&commit.subject, &style),
+                    )
+                };
+                let (commit_id, change, description, fixed) = resolved;
+                // Re-select the clicked commit by its (rewrite-stable) change id
+                // either way, so the pane follows it.
+                *selected_changes.borrow_mut() = vec![change.clone()];
+                *selected_change.borrow_mut() = Some(change);
+                let Some(fixed_subject) = fixed else {
+                    // Only judgment issues remain (or it's already clean): show it for
+                    // a manual edit rather than guessing.
+                    refresh();
+                    message_view.grab_focus();
+                    show_status("Edit the summary to match this repo's commit style");
+                    return;
+                };
+                let new_message = msglint::replace_subject(&description, &fixed_subject);
+                let outcome = repo.borrow_mut().rewrite_message(&commit_id, &new_message);
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        show_status("Tidied the commit summary to match the repo's style");
+                        refresh();
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                    Err(err) => show_status(&format!("Couldn't fix the summary: {err}")),
+                }
+            });
+        }) as LintFixCallback
     });
 
     // The late-bound callbacks the peeled modules invoke. Assembled here, after

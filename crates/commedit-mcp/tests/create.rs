@@ -437,7 +437,7 @@ async fn commit_working_copy_commits_the_dirt() {
         .await
         .unwrap()
         .0;
-    clean_head(&result);
+    clean_head(&result.result);
 
     assert_eq!(
         git_log_subjects(dir.path()),

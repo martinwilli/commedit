@@ -3,14 +3,17 @@
 
 use std::collections::HashSet;
 
+use commedit_engine::history::IdAbbrev;
 use commedit_engine::workcopy::PartialSelection;
+use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
-use crate::convert::file_change_dto;
+use crate::convert::{commit_dto, file_change_dto, DetailFields};
 use crate::dto::{
-    CommitWorkingCopyReq, DiscardWorkingCopyReq, HunkSelectionDto, OkResp, PatchSelectionDto,
-    SaveResultDto, SessionDiffResp, SquashWorkingCopyReq, WorkingCopyStatusResp,
+    CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp,
+    PatchSelectionDto, SaveResultDto, SessionDiffResp, SquashWorkingCopyReq, SquashWorkingCopyResp,
+    WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -51,12 +54,12 @@ impl CommeditServer {
     #[tool(
         description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept by default). Pass `message` to reword the destination in the same call. Only edits/deletions to already-tracked files are folded — a brand-new (untracked) file is SILENTLY skipped unless you name it in `add_paths`; in a partial fold a new file must be listed under BOTH `add_paths` (to track it) and `paths` (to select it). \
 \
-Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-process `git add -p` for a fixup), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to fold everything. The working tree stays byte-identical; an overlap with the commit's content reports conflicts like any rewrite."
+Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-process `git add -p` for a fixup), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to fold everything. The working tree stays byte-identical; an overlap with the commit's content reports conflicts like any rewrite. A clean fold returns the `topology` slice (the destination after the fold) and the remaining `working_copy` — clean for a whole fold, the unselected remainder for a partial one — so it is verifiable without a follow-up read."
     )]
     pub async fn squash_working_copy(
         &self,
         Parameters(req): Parameters<SquashWorkingCopyReq>,
-    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+    ) -> Result<Yaml<SquashWorkingCopyResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             let SquashWorkingCopyReq {
@@ -95,7 +98,18 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
                 repo.squash_working_copy_into(None, &dest_id, message.as_deref())
                     .map_err(internal)?
             };
-            save_result_topo(repo, &outcome, &pre, &anchors)
+            let result = save_result_topo(repo, &outcome, &pre, &anchors)?;
+            // On a clean fold, report what's left uncommitted (clean for a whole
+            // fold, the unselected remainder for a partial one); on conflicts the
+            // working copy is held with the rewrite, so there's nothing to report.
+            let working_copy = match &result {
+                SaveResultDto::Clean { .. } => Some(working_copy_status_resp(repo)?),
+                SaveResultDto::Conflicts { .. } => None,
+            };
+            Ok(SquashWorkingCopyResp {
+                result,
+                working_copy,
+            })
         })
         .await
         .map(Yaml)
@@ -104,12 +118,12 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
     #[tool(
         description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to already-tracked files are committed — a brand-new (untracked) file is SILENTLY skipped unless you name it in `add_paths`; in a partial commit a new file must be listed under BOTH `add_paths` (to track it) and `paths` (to select it). Or use create_commit to author files from explicit contents. \
 \
-Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the in-process `git add -p`), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to commit everything. Refuses when there is nothing tracked to commit, or when the selection commits nothing. To insert a commit from explicit contents elsewhere in history instead, use create_commit."
+Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the in-process `git add -p`), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to commit everything. Refuses when there is nothing tracked to commit, or when the selection commits nothing. To insert a commit from explicit contents elsewhere in history instead, use create_commit. Returns the new `committed` commit (its sha and stable change_id, ready to chain) and the remaining `working_copy` — clean for a whole commit, the unselected remainder for a partial one — so it is verifiable without a follow-up read."
     )]
     pub async fn commit_working_copy(
         &self,
         Parameters(req): Parameters<CommitWorkingCopyReq>,
-    ) -> Result<Yaml<SaveResultDto>, ErrorData> {
+    ) -> Result<Yaml<CommitWorkingCopyResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
             // Track any named new files before checking for changes, so committing a
@@ -137,7 +151,28 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
                 repo.commit_working_copy(&req.message, identity.as_ref())
                     .map_err(internal)?
             };
-            Ok(save_result(repo, &outcome))
+            let result = save_result(repo, &outcome);
+            // On a clean commit, hand back the new commit (its sha + stable
+            // change_id, ready to chain) and the remaining working copy — clean for
+            // a whole commit, the unselected remainder for a partial one.
+            let (committed, working_copy) = match &result {
+                SaveResultDto::Clean { .. } => {
+                    let (_, commits) = full_history(repo)?;
+                    let committed = commits.first().map(|info| {
+                        let refs = repo.commit_refs();
+                        let root = repo.root_commit_id().hex();
+                        let abbrev = IdAbbrev::new(&repo.repo);
+                        commit_dto(info, &root, &refs, &abbrev, DetailFields::ALL)
+                    });
+                    (committed, Some(working_copy_status_resp(repo)?))
+                }
+                SaveResultDto::Conflicts { .. } => (None, None),
+            };
+            Ok(CommitWorkingCopyResp {
+                result,
+                committed,
+                working_copy,
+            })
         })
         .await
         .map(Yaml)

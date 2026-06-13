@@ -25,7 +25,12 @@ an interactive-rebase session.
   patch (not stacked hunks), and a note when the changes overlap so they can't be
   combined. The author/committer fields show the shared value where the commits
   agree and a *(differs)* note where they don't — type a new name or date and
-  **Save** writes it to every selected commit at once.
+  **Save** writes it to every selected commit at once. You can also **drag the
+  whole selection** as a group: drop it in a gap to move the selected commits
+  together (keeping their order while the unselected commits in between stay put),
+  onto another commit to fold them all in — always via the fixup / squash / amend
+  picker, where *amend* takes the newest selected commit's message — or onto the
+  trash to drop them all at once.
 
 - **Structured diff editing** — file changes are an editable unified diff with a
   firewall that keeps the buffer a patch that still applies: typing on a context

@@ -328,6 +328,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // motion can tell whether a hover gap is a real move (vs. the no-op gaps just
     // above/below the row, or an off-chain row).
     let drag_from: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // The selected display indices (newest-first) of a multi-selection being
+    // dragged as a group, captured at drag start; empty for a single-commit drag.
+    let drag_set: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
     // The insertion gap (newest-first index, 0..=len) the placeholder marks.
     let drop_gap: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // The commit display index a squash would drop ONTO (center-zone hover over a
@@ -807,6 +810,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         pending_trash_op: pending_trash_op.clone(),
         wc_entries: wc_entries.clone(),
         selected_change: selected_change.clone(),
+        selected_changes: selected_changes.clone(),
         pane_mode: pane_mode.clone(),
         conflict_view: conflict_view.clone(),
     };
@@ -814,6 +818,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         drag_origin: drag_origin.clone(),
         drag_row: drag_row.clone(),
         drag_from: drag_from.clone(),
+        drag_set: drag_set.clone(),
         drop_gap: drop_gap.clone(),
         drop_onto: drop_onto.clone(),
         post_drag: post_drag.clone(),
@@ -2607,7 +2612,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         // trash removal until the overlap resolves clean (dropped on
                         // abort), and resolve it like any conflict.
                         *pending_trash_op.borrow_mut() =
-                            Some(PendingTrashOp::Restore(info.clone()));
+                            Some(PendingTrashOp::Restore(Box::new(info.clone())));
                         enter_conflict_mode(commits);
                     }
                     Err(err) => show_status(&format!("Restore to working tree failed: {err}")),

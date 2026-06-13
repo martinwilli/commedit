@@ -124,12 +124,13 @@ impl ConflictCtx {
 /// A trash-list change deferred while a dropped/restored commit's rewrite is held
 /// back for conflict resolution. The rewrite isn't applied to git until the
 /// conflicts clear, so the trash list must not change yet either: the op is
-/// applied on a clean resolution and discarded on abort. `Drop` adds the commit
-/// to the trash (a history→trash drop that conflicted); `Restore` removes it (a
-/// trash→history restore that conflicted).
+/// applied on a clean resolution and discarded on abort. `Drop` adds the
+/// commit(s) to the trash (a history→trash drop that conflicted — one entry per
+/// commit for a multi-selection drop); `Restore` removes one (a trash→history
+/// restore that conflicted).
 pub(crate) enum PendingTrashOp {
-    Drop(CommitInfo),
-    Restore(CommitInfo),
+    Drop(Vec<CommitInfo>),
+    Restore(Box<CommitInfo>),
 }
 
 /// Which side(s) of a conflict block a quick-resolve action keeps.
@@ -251,6 +252,10 @@ pub(crate) struct Data {
     pub(crate) pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>>,
     pub(crate) wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>>,
     pub(crate) selected_change: Rc<RefCell<Option<String>>>,
+    /// The full multi-selection as change ids, newest-first (the anchor
+    /// `selected_change` is its first entry). `dragdrop` reads it to drag the
+    /// whole selection as a group; a 0/1-length set is the single-commit case.
+    pub(crate) selected_changes: Rc<RefCell<Vec<String>>>,
     pub(crate) pane_mode: Rc<RefCell<PaneMode>>,
     pub(crate) conflict_view: Rc<RefCell<Vec<ConflictFileView>>>,
 }
@@ -261,6 +266,10 @@ pub(crate) struct DragState {
     pub(crate) drag_origin: Rc<Cell<DragOrigin>>,
     pub(crate) drag_row: Rc<RefCell<Option<ListBoxRow>>>,
     pub(crate) drag_from: Rc<Cell<Option<usize>>>,
+    /// The display indices (newest-first) of a multi-selection being dragged as a
+    /// group, captured at drag start. Empty for an ordinary single-commit drag;
+    /// indices stay valid for the gesture since no rewrite runs until `drag-end`.
+    pub(crate) drag_set: Rc<RefCell<Vec<usize>>>,
     pub(crate) drop_gap: Rc<Cell<Option<usize>>>,
     pub(crate) drop_onto: Rc<Cell<Option<usize>>>,
     pub(crate) post_drag: PostDrag,

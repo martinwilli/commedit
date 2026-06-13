@@ -482,12 +482,11 @@ The history list is `SelectionMode::Multiple` (ctrl/shift-click). One closure,
 `update_selection_pane` (`main.rs`), drives the right pane off `list.selected_rows()`
 on every `selected-rows-changed`, branching **conflict-mode first** (show the anchor's
 conflicted files, never the multi view) then by count: 0 → inert pane; 1 → the usual
-fully-editable single-commit pane; >1 → a read-only batch view. Two selection cells:
-`selected_change` (the `Data` bundle's `Option<String>` **anchor** — the commit the
-single-commit ops target) and the main-local `selected_changes: Vec<String>` (the full
-set, newest-first). `dragdrop`/`conflict` only ever touch the anchor — multi-drag is
-**blocked** (`connect_prepare` refuses while >1 is selected) and conflict resolution is
-per-commit — so the bundle is unchanged. `refresh` re-selects the multi-set when its len
+fully-editable single-commit pane; >1 → a read-only batch view. Two selection cells, both
+in the `Data` bundle: `selected_change` (`Option<String>` **anchor** — the commit the
+single-commit ops target) and `selected_changes: Vec<String>` (the full set, newest-first).
+`conflict` only ever touches the anchor (resolution is per-commit), but `dragdrop` reads
+`selected_changes` to drag the whole selection as a group (see below). `refresh` re-selects the multi-set when its len
 > 1 else the anchor, all guarded by `selection_sync` (so the N programmatic `select_row`s
 don't re-fire the router per row), then calls `update_selection_pane` once. `selected_row()`
 returns null under multiple-selection, so its callers use `selected_rows()` instead, and the
@@ -505,6 +504,28 @@ shared value where the selection agrees, else empty with a "(differs)" italic pl
 (`identity_for_commit` — each field overridden only where the user changed it from the
 baseline, else the commit's own value; an empty field is never written) and applies them in
 one `rewrite_batch`; message/file edits are never collected in this mode.
+
+**Dragging the whole selection** (`dragdrop`). The history drag source no longer refuses a
+multi-selection: `connect_prepare` records the selected display indices (newest-first) in the
+transient `DragState.drag_set` when the grabbed row is part of a >1 selection, else leaves it
+empty (the ordinary single-commit drag). Indices stay valid for the gesture — the rewrite is
+staged to `drag-end` as always. The zone-validation and drop handlers branch on
+`drag_set.len() > 1`: a gap drop plans with `plan_reorder_set_candidates` (the set analogue of
+`plan_reorder_candidates`, yielding `ReorderSetMove`s) and applies `reorder_commits`; a drop
+onto a commit folds the set in with `squash_into_many`, **always** through `show_squash_popover`
+(a group has no single autosquash prefix; *amend* takes the newest selected commit's message);
+a trash drop validates each with `plan_drop` and abandons them in one `abandon_commits` rebase,
+refusing to empty the displayed branch. `show_lane_popover` is generic over the move payload
+(`Vec<(lane, T)>`) so single (`ReorderMove`) and group (`ReorderSetMove`) reorders share it.
+`PendingTrashOp::Drop` carries a `Vec<CommitInfo>` so a conflicted group drop defers all its
+trash entries together (consumed in `conflict.rs`). Working-copy and trash drags stay
+single-commit (the multi-selection lives only in the history list). This drag is **GTK-only**:
+unlike most features it has no MCP counterpart — an agent does the same sequentially via the
+singular tools addressed by stable change_id, so it's the one documented exception to the
+"MCP surface is a superset of the GTK app" rule above. The engine primitives behind it
+(`reorder_commits`/`abandon_commits`/`squash_into_many`, each the `Vec` generalization of its
+singular method, sharing the reverse-topo sort and `op_desc_for_many`) live in the engine
+regardless.
 
 ### Session op-log, revert & review
 

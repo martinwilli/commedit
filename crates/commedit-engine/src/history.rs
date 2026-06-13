@@ -289,6 +289,26 @@ pub struct ReorderCandidate {
     pub lane: usize,
 }
 
+/// A reorder of a *set* of commits, the multi-select generalization of
+/// [`ReorderMove`] (see [`crate::repo::Repo::reorder_commits`]): the moved
+/// commits, the parents/children to splice them between as a group, and which
+/// commit ends up the branch head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorderSetMove {
+    pub targets: Vec<CommitId>,
+    pub new_parents: Vec<CommitId>,
+    pub new_children: Vec<CommitId>,
+    pub new_tip: CommitId,
+}
+
+/// One destination line for a set reorder, the set analogue of
+/// [`ReorderCandidate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorderSetCandidate {
+    pub mv: ReorderSetMove,
+    pub lane: usize,
+}
+
 /// The commits reachable from `head` within the displayed list — the editable
 /// subgraph. The list is a topological prefix of head's ancestry, so every
 /// head-to-commit path is fully on-page and a parent walk over the list finds
@@ -447,6 +467,123 @@ pub fn plan_reorder_candidates(
     splice_candidates(&ctx, &branch, &dragged.id, &new_tip, to)
 }
 
+/// Plan dragging a *set* of commits to the insertion gap `to` as a group — the
+/// multi-select reorder. One [`ReorderSetCandidate`] per ancestry line crossing
+/// the gap that is bounded by commits *outside* the set (lines whose parent is in
+/// the set, or whose only children are in the set, are the set's own slots and
+/// drop out as no-ops); plus the bottom re-root line. Empty when the set has
+/// fewer than two members, contains a merge or off-branch/off-page commit, spans
+/// the whole branch (nothing left to anchor the tip), the gap is out of range, or
+/// `layout` is stale.
+///
+/// `new_tip`: gap 0 makes the set the new tip (its newest member), but is refused
+/// when the head is in the set (it is already the top); for a lower gap the tip
+/// stays `head`, unless the head is itself being moved, in which case it is the
+/// newest commit left behind. The moved `targets` are listed newest-first (the
+/// reverse-topological order `move_commits` wants).
+pub fn plan_reorder_set_candidates(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    layout: &GraphLayout,
+    root: &CommitId,
+    set: &HashSet<CommitId>,
+    to: usize,
+) -> Vec<ReorderSetCandidate> {
+    let n = commits.len();
+    if set.len() < 2 || to > n || layout.boundaries.len() != n {
+        return Vec::new();
+    }
+    let branch = branch_commits(commits, head);
+    // The moved commits in display order (newest-first). Every member must be a
+    // displayed, on-branch, single-parent commit — a merge has no single line to
+    // splice and is never a drag source.
+    let members: Vec<&CommitInfo> = commits.iter().filter(|c| set.contains(&c.id)).collect();
+    if members.len() != set.len()
+        || members
+            .iter()
+            .any(|c| c.parents.len() != 1 || !branch.contains(&c.id))
+    {
+        return Vec::new();
+    }
+    let targets: Vec<CommitId> = members.iter().map(|c| c.id.clone()).collect();
+    let head_in_set = set.contains(head);
+
+    if to == 0 {
+        // Splice the set on top of the head as the new tip. Refused when the head
+        // is itself in the set — it is already the top, so there is nowhere above.
+        if head_in_set {
+            return Vec::new();
+        }
+        return vec![ReorderSetCandidate {
+            mv: ReorderSetMove {
+                targets,
+                new_parents: vec![head.clone()],
+                new_children: Vec::new(),
+                new_tip: members[0].id.clone(),
+            },
+            lane: layout.rows[0].node_lane,
+        }];
+    }
+
+    // Moving the head exposes the newest commit left behind as the tip; any other
+    // move leaves the head in place (rewritten, same change id). No commit left
+    // behind means the whole branch is selected — nothing to anchor.
+    let new_tip = if head_in_set {
+        match commits.iter().find(|c| !set.contains(&c.id)) {
+            Some(c) => c.id.clone(),
+            None => return Vec::new(),
+        }
+    } else {
+        head.clone()
+    };
+
+    let mut out = Vec::new();
+    for e in &layout.boundaries[to - 1] {
+        if set.contains(&e.parent) {
+            continue; // a line descending toward a moved commit
+        }
+        let children: Vec<CommitId> = e
+            .children
+            .iter()
+            .filter(|c| !set.contains(c))
+            .cloned()
+            .collect();
+        if children.is_empty() || children.iter().any(|c| !branch.contains(c)) {
+            continue;
+        }
+        out.push(ReorderSetCandidate {
+            mv: ReorderSetMove {
+                targets: targets.clone(),
+                new_parents: vec![e.parent.clone()],
+                new_children: children,
+                new_tip: new_tip.clone(),
+            },
+            lane: e.lane,
+        });
+    }
+    if to == n {
+        // Re-root: parent the set on the virtual root, with the current bottom
+        // commits (not in the set) rooted on it.
+        let children: Vec<CommitId> = commits
+            .iter()
+            .filter(|c| c.parents.contains(root) && !set.contains(&c.id) && branch.contains(&c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        if !children.is_empty() {
+            out.push(ReorderSetCandidate {
+                mv: ReorderSetMove {
+                    targets: targets.clone(),
+                    new_parents: vec![root.clone()],
+                    new_children: children,
+                    new_tip: new_tip.clone(),
+                },
+                lane: layout.rows[n - 1].node_lane,
+            });
+        }
+    }
+    out
+}
+
 /// Plan grafting a trashed commit (one not currently in `commits`) back into
 /// the history at display gap `to`: like [`plan_reorder_candidates`], one
 /// candidate per destination line, but without the own-line no-op cases (the
@@ -497,10 +634,12 @@ pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Optio
 mod tests {
     use super::{
         format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_reorder_candidates,
-        plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderMove,
+        plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
+        ReorderMove, ReorderSetCandidate, ReorderSetMove,
     };
     use crate::graph::compute_graph;
     use jj_lib::backend::{ChangeId, CommitId};
+    use std::collections::HashSet;
 
     /// A bare [`CommitInfo`] with id `id` and a single parent `parent`, enough to
     /// exercise [`plan_reorder`]'s index arithmetic.
@@ -878,6 +1017,128 @@ mod tests {
     fn restoring_a_commit_already_in_the_history_is_refused() {
         let h = history();
         assert_eq!(restore_cands(&h, 3, &ci(2, 1), 0), vec![]);
+    }
+
+    fn set_of(ids: &[u8]) -> HashSet<CommitId> {
+        ids.iter().map(|&i| cid(i)).collect()
+    }
+
+    /// [`plan_reorder_set_candidates`] over `h`, graph computed on the fly.
+    fn reorder_set_cands(
+        h: &[CommitInfo],
+        head: u8,
+        set: &[u8],
+        to: usize,
+    ) -> Vec<ReorderSetCandidate> {
+        let g = compute_graph(h, &cid(0));
+        plan_reorder_set_candidates(h, &cid(head), &g, &cid(0), &set_of(set), to)
+    }
+
+    fn set_mv(targets: &[u8], parents: &[u8], children: &[u8], tip: u8) -> ReorderSetMove {
+        ReorderSetMove {
+            targets: targets.iter().map(|&t| cid(t)).collect(),
+            new_parents: parents.iter().map(|&p| cid(p)).collect(),
+            new_children: children.iter().map(|&c| cid(c)).collect(),
+            new_tip: cid(tip),
+        }
+    }
+
+    /// Newest-first chain: 4 <- 3 <- 2 <- 1 <- root(0).
+    fn history4() -> Vec<CommitInfo> {
+        vec![ci(4, 3), ci(3, 2), ci(2, 1), ci(1, 0)]
+    }
+
+    #[test]
+    fn a_set_moves_to_the_bottom_as_a_group() {
+        // [3,2,1], move the top two {3,2} to the bottom (onto the root): they
+        // splice between root and 1, and the commit left behind (1) becomes tip.
+        let h = history();
+        assert_eq!(
+            reorder_set_cands(&h, 3, &[3, 2], 3),
+            vec![ReorderSetCandidate {
+                mv: set_mv(&[3, 2], &[0], &[1], 1),
+                lane: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_set_moves_into_a_middle_gap() {
+        // [4,3,2,1], move {4,3} (incl. the head) into the gap above 1: they splice
+        // between 1 and 2, and 2 — the newest commit left behind — becomes tip.
+        let h = history4();
+        assert_eq!(
+            reorder_set_cands(&h, 4, &[4, 3], 3),
+            vec![ReorderSetCandidate {
+                mv: set_mv(&[4, 3], &[1], &[2], 2),
+                lane: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_set_moves_to_the_top_when_the_head_is_not_in_it() {
+        // [3,2,1], move {2,1} to the very top (onto the head 3): the set becomes
+        // the tip (its newest member, 2), 3 drops to the bottom.
+        let h = history();
+        assert_eq!(
+            reorder_set_cands(&h, 3, &[2, 1], 0),
+            vec![ReorderSetCandidate {
+                mv: set_mv(&[2, 1], &[3], &[], 2),
+                lane: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_set_at_the_top_with_the_head_in_it_is_a_no_op() {
+        // The head is already the top; there is nowhere above it for the set.
+        let h = history();
+        assert_eq!(reorder_set_cands(&h, 3, &[3, 2], 0), vec![]);
+    }
+
+    #[test]
+    fn a_contiguous_set_dropped_at_its_own_edges_yields_nothing() {
+        // [4,3,2,1] with {3,2} selected: the gaps just above, within and just
+        // below the block are all the set's own slots — no move.
+        let h = history4();
+        assert_eq!(reorder_set_cands(&h, 4, &[3, 2], 1), vec![]);
+        assert_eq!(reorder_set_cands(&h, 4, &[3, 2], 2), vec![]);
+        assert_eq!(reorder_set_cands(&h, 4, &[3, 2], 3), vec![]);
+    }
+
+    #[test]
+    fn selecting_the_whole_branch_yields_nothing() {
+        // Nothing is left behind to anchor the new tip.
+        let h = history();
+        assert_eq!(reorder_set_cands(&h, 3, &[3, 2, 1], 3), vec![]);
+    }
+
+    #[test]
+    fn a_set_containing_a_merge_is_refused() {
+        // 4 is a merge; a set holding it has no single line to splice.
+        let h = merge_history();
+        assert_eq!(reorder_set_cands(&h, 4, &[4, 3], 2), vec![]);
+    }
+
+    #[test]
+    fn a_set_with_an_offpage_member_is_refused() {
+        // 9 is not a displayed row; the set can't be fully placed.
+        let h = history();
+        assert_eq!(reorder_set_cands(&h, 3, &[3, 9], 3), vec![]);
+    }
+
+    #[test]
+    fn a_set_move_across_parallel_merge_lanes_offers_one_per_line() {
+        // 4 merges 3 and 2 (both off 1). Drag the fork point {1} is single; instead
+        // drag {2,1}? 2 and 1 sit on different lanes. Move {3,2} (one per side)
+        // into the gap below the merge: each side line that isn't a moved commit's
+        // own slot crosses there.
+        let h = merge_history(); // [4(3,2), 3, 2, 1]
+                                 // Gap just below the merge (to=1): lane 0 carries 3 (in the set, its own
+                                 // slot — skipped), lane 1 carries 2 (in the set — skipped). With both
+                                 // sides selected the gap has no outside-bounded line.
+        assert_eq!(reorder_set_cands(&h, 4, &[3, 2], 1), vec![]);
     }
 
     #[test]

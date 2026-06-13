@@ -61,6 +61,15 @@ an interactive-rebase session.
   Unlike dropping a commit into the trash, the original stays and the undo is
   recorded explicitly.
 
+- **Merge a commit out** — beside the revert button, a right-arrow button
+  introduces a new merge commit just above the hovered commit: the commit becomes
+  a one-commit side branch that the merge folds back into the mainline, with a
+  pro-forma message to reword later. It's a way to *add* a merge — turning linear
+  history into a branchy one to organize it — rather than just edit around the
+  merges you already have. Once the merge is there, reorder commits onto its side
+  branch to group them under it. The content is untouched (the merge introduces no
+  change of its own) and the commit's descendants rebase straight onto it.
+
 - **Conflicts never reach your git history** — a reorder, drop or squash is a
   real rebase, so it can conflict. Spurious conflicts (nearby but independent
   edits) are resolved for you automatically; a genuine one is held back — `git`

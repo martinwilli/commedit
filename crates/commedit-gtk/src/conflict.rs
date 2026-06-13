@@ -586,19 +586,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
             // was never optimistically changed, so nothing to repopulate.)
             pending_trash_op.borrow_mut().take();
             exit_conflict_mode();
-            // The aborted commit is still selected, so `refresh` re-selecting it
-            // (rows are reused, not rebuilt) wouldn't re-fire `row-selected` —
-            // leaving the diff pane showing the abandoned conflict markers until
-            // the user clicks away and back. Drop the selection first so the
-            // reselect fires and reloads the now-conflict-free diff.
-            list.unselect_all();
+            // `refresh` re-selects the aborted commit by change id and unconditionally
+            // re-renders the pane (it drives the pane router itself), so the diff
+            // reloads onto the now-conflict-free commit without a manual reselect.
             refresh();
             // The conflict may have been on a commit that abort removed from
             // history — a commit restored from trash that abort sends back to the
             // trash, say — so the reselect matched no row and the pane would keep
             // the conflict markers. Fall back to the branch tip so the diff
             // reloads onto a live commit.
-            if list.selected_row().is_none() {
+            if list.selected_rows().is_empty() {
                 if let Some(row) = list.row_at_index(0) {
                     list.select_row(Some(&row));
                 }

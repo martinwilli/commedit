@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::diff::{
-    apply_patch, commit_changes, reconstruct_conflict_file, render_commit_diff,
+    apply_patch, combined_changes, commit_changes, reconstruct_conflict_file, render_commit_diff,
     render_conflict_snippets, revert_groups, split_combined_patch, CombinedFile, ContextExpansion,
     FileChange, HunkInfo,
 };
@@ -20,7 +20,7 @@ use commedit_engine::patch_edit::{
     EditPlan, Selection,
 };
 use commedit_engine::repo::Repo;
-use commedit_engine::rewrite::Identity;
+use commedit_engine::rewrite::{BatchEdit, Identity};
 use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
 use commedit_engine::tree::FileEdit;
 use commedit_engine::workcopy::WorkingCopyEntry;
@@ -132,6 +132,7 @@ fn main() {
 fn build_diff_buffer_text(
     changes: &[FileChange],
     expansions: &HashMap<String, ContextExpansion>,
+    read_only: bool,
 ) -> (String, Vec<HunkInfo>, Vec<CombinedFile>) {
     let combined = render_commit_diff(changes, expansions);
     let mut lines: Vec<String> = combined.text.split('\n').map(str::to_string).collect();
@@ -153,7 +154,9 @@ fn build_diff_buffer_text(
     };
     let mut all_hunks: Vec<HunkInfo> = Vec::new();
     for file in &combined.files {
-        let hunk_revert = file.editable && revert_hunk_ok(&file.path);
+        // The revert cues imply an edit; the read-only multi-commit combined diff
+        // suppresses them (the harmless "expand context" cues stay).
+        let hunk_revert = !read_only && file.editable && revert_hunk_ok(&file.path);
         for hunk in &file.hunks {
             if let Some(l) = lines.get_mut(hunk.header_line) {
                 match (hunk.can_expand_up, hunk.can_expand_down) {
@@ -171,13 +174,35 @@ fn build_diff_buffer_text(
         // The "revert file" cue rides the `diff --git` separator. A removed file
         // has no hunks but still a change to undo, so this is gated on the change,
         // not on the hunk list.
-        if revert_file_ok(&file.path) {
+        if !read_only && revert_file_ok(&file.path) {
             if let Some(l) = lines.get_mut(file.start_line) {
                 l.push_str(&format!("  {}", pill(REVERT_FILE_LABEL)));
             }
         }
     }
     (lines.join("\n"), all_hunks, combined.files)
+}
+
+/// Show `text` as a dim, italic note filling `buffer` (replacing its contents) —
+/// the standalone notice the multi-commit view uses for "message not editable" and
+/// "combined diff not representable". Creates the `note-italic` tag on first use, so
+/// it works on the plain message buffer and the diff buffer alike. The caller must
+/// guard a firewalled buffer (the diff buffer) with its `editing` flag, since
+/// `set_text` fires the insert/delete signals the firewall watches.
+fn set_note(buffer: &sourceview5::Buffer, text: &str) {
+    let table = buffer.tag_table();
+    let tag = table.lookup("note-italic").unwrap_or_else(|| {
+        let tag = gtk::TextTag::builder()
+            .name("note-italic")
+            .style(gtk::pango::Style::Italic)
+            .foreground("#6e7781")
+            .build();
+        table.add(&tag);
+        tag
+    });
+    buffer.set_text(text);
+    let (start, end) = buffer.bounds();
+    buffer.apply_tag(&tag, &start, &end);
 }
 
 /// The subset of the render baseline `changes` that the diff view actually shows.
@@ -231,7 +256,33 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // the flag; scrolling near the bottom bumps the limit by `HISTORY_PAGE`.
     let history_limit: Rc<Cell<usize>> = Rc::new(Cell::new(HISTORY_PAGE));
     let history_has_more: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // The *anchor* of the selection — the single commit that the single-commit
+    // operations (conflict resolution, drag, revert/merge-out) target. `Some` when
+    // at least one commit is selected. Lives in the shared `Data` bundle.
     let selected_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // The *full* multi-selection as change ids, newest-first (display order). The
+    // anchor is its first entry. With more than one entry the right pane is the
+    // read-only multi-commit view (combined diff, common-or-differing identity, no
+    // message editing). Main-local: only the pane router, refresh and save need it.
+    let selected_changes: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    // Guards `update_selection_pane` against re-entrancy while we drive the list
+    // selection programmatically (refresh re-selecting rows, the working-copy
+    // handler clearing the history selection), so it runs once afterwards rather
+    // than per `selected-rows-changed` emission. Mirrors `nav_sync`.
+    let selection_sync: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // The row a Shift-click extends the selection from — set on each plain/Ctrl
+    // click (see the history list's click handler).
+    let selection_anchor: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+    // Set while the diff pane shows a read-only view (the multi-commit combined
+    // diff): the renderer then suppresses the revert cues and forces the view
+    // non-editable. Cleared for a single commit / working-copy entry.
+    let diff_read_only: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // The value each identity field was populated with when the multi-commit view
+    // was entered (the shared value, or "" for a field that differs across the
+    // selection); the multi-save compares the live entries against it to tell which
+    // fields the user actually changed. Order matches `read_identity`.
+    let multi_identity_baseline: Rc<RefCell<[String; 4]>> =
+        Rc::new(RefCell::new(Default::default()));
     let changes: Rc<RefCell<Vec<FileChange>>> = Rc::new(RefCell::new(Vec::new()));
     // The *render baseline*: `changes` holds the content currently shown, which a
     // revert mutates (a hunk/file dropped back to its old side) so the change
@@ -317,6 +368,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              border: 1px solid rgba(245, 194, 17, 0.8); } \
              .ref-current { background-color: rgba(53, 132, 228, 0.30); \
              border: 1px solid rgba(53, 132, 228, 0.9); font-weight: bold; } \
+             entry.identity-differs text { font-style: italic; } \
+             entry.identity-differs > text > placeholder { font-style: italic; } \
              .history-list row { padding-top: 0; padding-bottom: 0; }",
         );
         gtk::style_context_add_provider_for_display(
@@ -357,6 +410,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     ));
 
     let list = ListBox::new();
+    // Allow ctrl/shift-click multi-selection: editing several commits' identity at
+    // once, or viewing their combined diff (see `update_selection_pane`).
+    list.set_selection_mode(gtk::SelectionMode::Multiple);
     // Strip the theme's vertical row padding: the ancestry-graph lines must run
     // edge-to-edge to connect across rows (the rows' content boxes keep their
     // own margins for breathing space).
@@ -413,10 +469,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Identity fields above the message editor: one combined "Name <email>"
     // field per role (with a built-in ▼ to pick an identity used elsewhere) and
     // a date field with a calendar button to its right.
-    let author_id = identity_entry("Author — Name <email>");
-    let author_date = identity_entry("YYYY-MM-DD HH:MM:SS ±HHMM");
-    let committer_id = identity_entry("Committer — Name <email>");
-    let committer_date = identity_entry("YYYY-MM-DD HH:MM:SS ±HHMM");
+    let author_id = identity_entry(IDENTITY_PLACEHOLDERS[0]);
+    let author_date = identity_entry(IDENTITY_PLACEHOLDERS[1]);
+    let committer_id = identity_entry(IDENTITY_PLACEHOLDERS[2]);
+    let committer_date = identity_entry(IDENTITY_PLACEHOLDERS[3]);
     // The date fields need only fit a formatted "YYYY-MM-DD HH:MM:SS ±HHMM"; pin
     // them to that width and stop them expanding so the grid gives the slack to
     // the identity column instead.
@@ -863,6 +919,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let rendered_hunks = rendered_hunks.clone();
         let highlight = highlight.clone();
+        let diff_read_only = diff_read_only.clone();
         Rc::new(
             move |text: String, all_hunks, files: Vec<CombinedFile>, splice: bool| {
                 editing.set(true);
@@ -876,7 +933,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     file_buffer.set_text(&text);
                     file_buffer.end_irreversible_action();
                 }
-                file_view.set_editable(files.iter().any(|f| f.editable));
+                file_view.set_editable(!diff_read_only.get() && files.iter().any(|f| f.editable));
                 *rendered_hunks.borrow_mut() = all_hunks;
                 *combined_files.borrow_mut() = files;
                 // Highlight in this same main-loop turn, before GTK paints, so the
@@ -895,9 +952,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
+        let diff_read_only = diff_read_only.clone();
         Rc::new(move || {
             let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
-            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
+            let (text, hunks, files) =
+                build_diff_buffer_text(&vis, &expansions.borrow(), diff_read_only.get());
             apply_diff_text(text, hunks, files, false);
         })
     };
@@ -910,9 +969,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
+        let diff_read_only = diff_read_only.clone();
         Rc::new(move || {
             let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
-            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
+            let (text, hunks, files) =
+                build_diff_buffer_text(&vis, &expansions.borrow(), diff_read_only.get());
             apply_diff_text(text, hunks, files, true);
         })
     };
@@ -1830,12 +1891,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Selecting a commit loads its message and changed files.
-    list.connect_row_selected({
+    // Refresh the right pane from the history list's current selection. One commit
+    // is the usual fully-editable pane; several is a read-only batch view (combined
+    // diff, common-or-differing identity that Save writes to all, no message edit);
+    // none is inert. In conflict mode it shows the anchor's conflicted files, never
+    // the multi-commit view. Called on every `selected-rows-changed`, and once by
+    // `refresh` after it re-selects rows (guarded by `selection_sync`).
+    let update_selection_pane: Rc<dyn Fn()> = {
+        let list = list.clone();
         let commits = commits.clone();
         let message_buffer = message_buffer.clone();
         let message_view = message_view.clone();
         let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
+        let selection_sync = selection_sync.clone();
         let load_changes = load_changes.clone();
         let load_conflict_files = load_conflict_files.clone();
         let pane_mode = pane_mode.clone();
@@ -1843,35 +1912,187 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let original_identity = original_identity.clone();
         let viewing_wc = viewing_wc.clone();
         let wc_list = wc_list.clone();
-        move |_list, row| {
-            let Some(row) = row else { return };
-            let idx = row.index();
-            if idx < 0 {
+        let repo = repo.clone();
+        let apply_changes = apply_changes.clone();
+        let file_buffer = file_buffer.clone();
+        let editing = editing.clone();
+        let diff_read_only = diff_read_only.clone();
+        let multi_identity_baseline = multi_identity_baseline.clone();
+        Rc::new(move || {
+            if selection_sync.get() {
                 return;
             }
-            // Leaving the read-only working-copy view: re-enable editing and
-            // drop its (mutually exclusive) selection.
+            // The selected commits in display order (newest first).
+            let mut indices: Vec<usize> = list
+                .selected_rows()
+                .iter()
+                .filter_map(|r| {
+                    let i = r.index();
+                    (i >= 0).then_some(i as usize)
+                })
+                .collect();
+            indices.sort_unstable();
+            let infos: Vec<CommitInfo> = {
+                let cs = commits.borrow();
+                indices.iter().filter_map(|&i| cs.get(i).cloned()).collect()
+            };
+            *selected_changes.borrow_mut() = infos.iter().map(|c| c.change_id_hex()).collect();
+            *selected_change.borrow_mut() = infos.first().map(|c| c.change_id_hex());
+
+            // Leaving the read-only working-copy view (mutually exclusive selection).
             viewing_wc.set(false);
             wc_list.unselect_all();
-            message_view.set_editable(true);
-            for f in identity_fields.iter() {
-                f.set_sensitive(true);
-            }
-            let info = commits.borrow().get(idx as usize).cloned();
-            let Some(info) = info else { return };
-            *selected_change.borrow_mut() = Some(info.change_id_hex());
-            message_buffer.set_text(&info.description);
-            // In conflict mode the dropdown lists the commit's conflicted files,
-            // not its diff; identity editing is disabled until conflicts resolve.
+
+            // Conflict mode is per-commit: show the anchor's conflicted files
+            // regardless of how many rows are selected; never the multi view.
             if pane_mode.borrow().is_conflict() {
-                load_conflict_files(&info);
+                if let Some(info) = infos.first() {
+                    message_buffer.set_text(&info.description);
+                    load_conflict_files(info);
+                }
                 return;
             }
-            set_identity_fields(&identity_fields, &info);
-            *original_identity.borrow_mut() = Some(read_identity(&identity_fields));
-            load_changes(&info);
+
+            match infos.as_slice() {
+                [] => {
+                    // Nothing selected: a neutral, inert pane.
+                    message_view.set_editable(false);
+                    message_buffer.set_text("");
+                    clear_identity_differs(&identity_fields);
+                    for f in identity_fields.iter() {
+                        f.set_text("");
+                        f.set_sensitive(false);
+                    }
+                    *original_identity.borrow_mut() = None;
+                    diff_read_only.set(false);
+                    apply_changes(Vec::new());
+                }
+                [info] => {
+                    // Single commit: the usual fully-editable pane.
+                    message_view.set_editable(true);
+                    clear_identity_differs(&identity_fields);
+                    for f in identity_fields.iter() {
+                        f.set_sensitive(true);
+                    }
+                    message_buffer.set_text(&info.description);
+                    set_identity_fields(&identity_fields, info);
+                    *original_identity.borrow_mut() = Some(read_identity(&identity_fields));
+                    diff_read_only.set(false);
+                    load_changes(info);
+                }
+                infos => {
+                    // Several commits: a read-only batch view.
+                    message_view.set_editable(false);
+                    set_note(
+                        &message_buffer,
+                        "Multiple commits selected — message not editable.",
+                    );
+                    *multi_identity_baseline.borrow_mut() =
+                        set_identity_fields_common(&identity_fields, infos);
+                    for f in identity_fields.iter() {
+                        f.set_sensitive(true);
+                    }
+                    *original_identity.borrow_mut() = None;
+                    // The combined diff over the selection, applied oldest first.
+                    let ids: Vec<_> = infos.iter().rev().map(|c| c.id.clone()).collect();
+                    let combined = {
+                        let r = repo.borrow();
+                        combined_changes(&r.repo, &ids)
+                    };
+                    diff_read_only.set(true);
+                    match combined {
+                        Ok(Some(ch)) => apply_changes(ch),
+                        Ok(None) => {
+                            apply_changes(Vec::new());
+                            editing.set(true);
+                            set_note(
+                                &file_buffer,
+                                "The combined diff of the selected commits is conflicting — \
+                                 not representable as a single diff.",
+                            );
+                            editing.set(false);
+                        }
+                        Err(err) => {
+                            apply_changes(Vec::new());
+                            editing.set(true);
+                            set_note(
+                                &file_buffer,
+                                &format!("Failed to build the combined diff: {err}"),
+                            );
+                            editing.set(false);
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // Selecting commit(s) updates the right pane. This fires for programmatic and
+    // keyboard selection changes; mouse clicks are handled by the gesture below
+    // (which drives selection under `selection_sync`, so this is a no-op for them).
+    list.connect_selected_rows_changed({
+        let update_selection_pane = update_selection_pane.clone();
+        move |_| update_selection_pane()
+    });
+
+    // Own the click→selection mapping. GtkListBox's built-in multiple-selection
+    // *toggles* on a plain click (so clicks accumulate); we want the conventional
+    // plain = select only this row, Ctrl = toggle it, Shift = range from the anchor.
+    // A capture-phase handler does the selection and claims the press, so
+    // GtkListBox's own (bubble-phase) selection never runs. It claims on *release*,
+    // not press, so a drag still begins on motion beforehand (see `dragdrop`).
+    let select_click = gtk::GestureClick::new();
+    select_click.set_button(gdk::BUTTON_PRIMARY);
+    select_click.set_propagation_phase(PropagationPhase::Capture);
+    select_click.connect_released({
+        let list = list.clone();
+        let update_selection_pane = update_selection_pane.clone();
+        let selection_sync = selection_sync.clone();
+        let selection_anchor = selection_anchor.clone();
+        move |gesture, _n, _x, y| {
+            let Some(row) = list.row_at_y(y as i32) else {
+                return;
+            };
+            let i = row.index();
+            let state = gesture.current_event_state();
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            // Drive the selection ourselves under `selection_sync`, then render once.
+            selection_sync.set(true);
+            if shift {
+                // Extend from the anchor (or the current selection's nearest row) to
+                // the clicked row, selecting everything between.
+                let anchor = selection_anchor
+                    .get()
+                    .or_else(|| list.selected_rows().iter().map(|r| r.index()).min())
+                    .unwrap_or(i);
+                list.unselect_all();
+                for j in i.min(anchor)..=i.max(anchor) {
+                    if let Some(r) = list.row_at_index(j) {
+                        list.select_row(Some(&r));
+                    }
+                }
+            } else if ctrl {
+                // Toggle just this row, leaving the rest of the selection.
+                if row.is_selected() {
+                    list.unselect_row(&row);
+                } else {
+                    list.select_row(Some(&row));
+                }
+                selection_anchor.set(Some(i));
+            } else {
+                // Plain click: select only this row.
+                list.unselect_all();
+                list.select_row(Some(&row));
+                selection_anchor.set(Some(i));
+            }
+            selection_sync.set(false);
+            update_selection_pane();
+            // Claim the press so GtkListBox's own selection handling doesn't also run.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
         }
     });
+    list.add_controller(select_click);
 
     // Selecting a working-copy entry shows its diff read-only: there is no
     // message or identity to edit, and Save edits that entry in place (see the
@@ -1886,6 +2107,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let pane_mode = pane_mode.clone();
         let wc_entries = wc_entries.clone();
         let selected_wc_change = selected_wc_change.clone();
+        let selected_changes = selected_changes.clone();
+        let selection_sync = selection_sync.clone();
+        let diff_read_only = diff_read_only.clone();
         move |_wc_list, row| {
             let Some(row) = row else { return };
             if pane_mode.borrow().is_conflict() {
@@ -1902,14 +2126,22 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let Some(change) = change else { return };
             *selected_wc_change.borrow_mut() = Some(change);
             viewing_wc.set(true);
-            // Mutually exclusive with the history selection.
+            // Mutually exclusive with the history selection. Drop the multi-set and
+            // its "(differs)" styling, and clear it under `selection_sync` so the
+            // pane router doesn't fire and clobber the working-copy view below.
+            selected_changes.borrow_mut().clear();
+            clear_identity_differs(&identity_fields);
+            selection_sync.set(true);
             list.unselect_all();
+            selection_sync.set(false);
             message_buffer.set_text("");
             message_view.set_editable(false);
             for f in identity_fields.iter() {
                 f.set_text("");
                 f.set_sensitive(false);
             }
+            // The working-copy diff is editable; clear any multi-select read-only.
+            diff_read_only.set(false);
             load_wc_changes();
         }
     });
@@ -2002,6 +2234,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let graph = graph.clone();
         let list = list.clone();
         let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
+        let selection_sync = selection_sync.clone();
+        let update_selection_pane = update_selection_pane.clone();
         let identities = identities.clone();
         let history_limit = history_limit.clone();
         let history_has_more = history_has_more.clone();
@@ -2052,17 +2287,33 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 ids.sort();
                 *identities.borrow_mut() = ids;
             }
-            let target_row = selected_change.borrow().clone().and_then(|change| {
-                commits
+            // Re-select the previous selection by (rewrite-stable) change id: the
+            // full multi-set when several were selected, otherwise the single anchor
+            // (single-commit ops update only the anchor). Programmatic selection is
+            // guarded so the pane router runs once, at the end, rather than per row.
+            let targets: Vec<String> = {
+                let multi = selected_changes.borrow();
+                if multi.len() > 1 {
+                    multi.clone()
+                } else {
+                    selected_change.borrow().clone().into_iter().collect()
+                }
+            };
+            selection_sync.set(true);
+            list.unselect_all();
+            for change in &targets {
+                let idx = commits
                     .borrow()
                     .iter()
-                    .position(|c| c.change_id_hex() == change)
-            });
-            if let Some(idx) = target_row {
-                if let Some(row) = list.row_at_index(idx as i32) {
-                    list.select_row(Some(&row));
+                    .position(|c| c.change_id_hex() == *change);
+                if let Some(idx) = idx {
+                    if let Some(row) = list.row_at_index(idx as i32) {
+                        list.select_row(Some(&row));
+                    }
                 }
             }
+            selection_sync.set(false);
+            update_selection_pane();
             refresh_wc();
         })
     };
@@ -2114,6 +2365,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let commits = commits.clone();
         let graph = graph.clone();
         let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
         let pane_mode = pane_mode.clone();
         let refresh = refresh.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
@@ -2123,6 +2375,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let commits = commits.clone();
             let graph = graph.clone();
             let selected_change = selected_change.clone();
+            let selected_changes = selected_changes.clone();
             let pane_mode = pane_mode.clone();
             let refresh = refresh.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
@@ -2171,7 +2424,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 );
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
-                        // Re-select the clicked commit; the revert sits above it.
+                        // Re-select just the clicked commit; the revert sits above it.
+                        *selected_changes.borrow_mut() = vec![change.clone()];
                         *selected_change.borrow_mut() = Some(change);
                         refresh();
                     }
@@ -2192,6 +2446,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let commits = commits.clone();
         let graph = graph.clone();
         let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
         let pane_mode = pane_mode.clone();
         let refresh = refresh.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
@@ -2201,6 +2456,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let commits = commits.clone();
             let graph = graph.clone();
             let selected_change = selected_change.clone();
+            let selected_changes = selected_changes.clone();
             let pane_mode = pane_mode.clone();
             let refresh = refresh.clone();
             let enter_conflict_mode = enter_conflict_mode.clone();
@@ -2243,8 +2499,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let outcome = repo.borrow_mut().merge_out_commit(&target, new_children);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
-                        // Re-select the clicked commit; the new merge sits just above
-                        // it, one click away to reword its pro-forma message.
+                        // Re-select just the clicked commit; the new merge sits just
+                        // above it, one click away to reword its pro-forma message.
+                        *selected_changes.borrow_mut() = vec![change.clone()];
                         *selected_change.borrow_mut() = Some(change);
                         refresh();
                     }
@@ -2536,11 +2793,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         &trashed.borrow(),
                         Some(&on_restore),
                     );
-                    // Re-fire `row-selected` (rows are reused) so the diff pane
-                    // reloads the travelled-to content.
-                    list.unselect_all();
+                    // `refresh` re-selects the prior selection by change id and
+                    // re-renders the pane; if it's gone after the jump, select the tip.
                     refresh();
-                    if list.selected_row().is_none() {
+                    if list.selected_rows().is_empty() {
                         if let Some(row) = list.row_at_index(0) {
                             list.select_row(Some(&row));
                         }
@@ -2609,11 +2865,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 Some(&on_restore),
             );
             history_limit.set(HISTORY_PAGE);
-            // Re-fire `row-selected` (rows are reused) so the diff pane
-            // reloads the re-read content.
-            list.unselect_all();
+            // `refresh` re-selects the prior selection by change id and re-renders
+            // the pane; if it's gone after the reload, select the tip.
             refresh();
-            if list.selected_row().is_none() {
+            if list.selected_rows().is_empty() {
                 if let Some(row) = list.row_at_index(0) {
                     list.select_row(Some(&row));
                 }
@@ -2668,6 +2923,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let load_wc_changes = load_wc_changes.clone();
         let refresh_wc = refresh_wc.clone();
         let selected_wc_change = selected_wc_change.clone();
+        let selected_changes = selected_changes.clone();
+        let multi_identity_baseline = multi_identity_baseline.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
@@ -2713,6 +2970,46 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let offset = saved_cursor.min(file_buffer.char_count());
                 file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
                 return;
+            }
+            // Several commits selected: the read-only batch view, whose only editable
+            // part is the identity. Write each field the user changed (vs. the value
+            // it was populated with) to every selected commit in one atomic
+            // transaction; fields left untouched — including the "(differs)" blanks —
+            // keep each commit's own value. No message/file edits in this mode.
+            {
+                let selected = selected_changes.borrow().clone();
+                if selected.len() > 1 {
+                    let baseline = multi_identity_baseline.borrow().clone();
+                    let current: [String; 4] =
+                        std::array::from_fn(|i| identity_fields[i].text().to_string());
+                    let overrides: [Option<String>; 4] = std::array::from_fn(|i| {
+                        (!current[i].trim().is_empty() && current[i] != baseline[i])
+                            .then(|| current[i].clone())
+                    });
+                    if overrides.iter().all(Option::is_none) {
+                        show_status("No identity changes to apply to the selected commits.");
+                        return;
+                    }
+                    let edits: Vec<BatchEdit> = {
+                        let cs = commits.borrow();
+                        selected
+                            .iter()
+                            .filter_map(|ch| cs.iter().find(|c| c.change_id_hex() == *ch))
+                            .map(|info| BatchEdit {
+                                target: info.id.clone(),
+                                message: None,
+                                identity: Some(identity_for_commit(info, &overrides)),
+                            })
+                            .collect()
+                    };
+                    let outcome = repo.borrow_mut().rewrite_batch(edits);
+                    match outcome {
+                        Ok(SaveOutcome::Clean) => refresh(),
+                        Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                        Err(err) => show_status(&format!("Identity save failed: {err}")),
+                    }
+                    return;
+                }
             }
             let Some(change_id) = selected_change.borrow().clone() else {
                 return;
@@ -3017,7 +3314,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Initial population and selection.
     refresh();
-    if selected_change.borrow().is_none() {
+    if list.selected_rows().is_empty() {
         if let Some(row) = list.row_at_index(0) {
             list.select_row(Some(&row));
         }
@@ -3259,7 +3556,7 @@ mod tests {
         let old: String = (1..=12).map(|n| format!("l{n}\n")).collect();
         let new = old.replace("l6\n", "L6\n");
         let (text, hunks, _files) =
-            build_diff_buffer_text(&[modified("f", &old, &new)], &HashMap::new());
+            build_diff_buffer_text(&[modified("f", &old, &new)], &HashMap::new(), false);
         let (li, line) = hunk_line(&text);
         let pills = pills_on_line(&line);
         assert_eq!(pills.len(), 2, "expand + revert");
@@ -3283,8 +3580,11 @@ mod tests {
     fn revert_hunk_pill_present_even_without_an_expand_pill() {
         // A 3-line file with one change has no hidden context: no expand pill, but
         // still a revert pill, and the hit-test resolves it.
-        let (text, hunks, _files) =
-            build_diff_buffer_text(&[modified("f", "a\nb\nc\n", "a\nB\nc\n")], &HashMap::new());
+        let (text, hunks, _files) = build_diff_buffer_text(
+            &[modified("f", "a\nb\nc\n", "a\nB\nc\n")],
+            &HashMap::new(),
+            false,
+        );
         let (li, line) = hunk_line(&text);
         let pills = pills_on_line(&line);
         assert_eq!(pills.len(), 1);
@@ -3298,7 +3598,7 @@ mod tests {
     #[test]
     fn revert_file_cue_rides_the_diff_git_line() {
         let (text, _hunks, files) =
-            build_diff_buffer_text(&[modified("f", "a\nb\n", "a\nB\n")], &HashMap::new());
+            build_diff_buffer_text(&[modified("f", "a\nb\n", "a\nB\n")], &HashMap::new(), false);
         let lines: Vec<&str> = text.split('\n').collect();
         let sep = lines[files[0].start_line];
         assert!(sep.starts_with("diff --git "));
@@ -3316,7 +3616,7 @@ mod tests {
         // An added file's whole change can be dropped (revert file -> delete), but
         // a *hunk* revert needs an old side, so it's not offered.
         let (text, _hunks, files) =
-            build_diff_buffer_text(&[added("new.txt", "x\ny\n")], &HashMap::new());
+            build_diff_buffer_text(&[added("new.txt", "x\ny\n")], &HashMap::new(), false);
         assert!(!text.contains(REVERT_HUNK_LABEL));
         let lines: Vec<&str> = text.split('\n').collect();
         let sep = lines[files[0].start_line];
@@ -3330,7 +3630,7 @@ mod tests {
         // A removed file has no hunks (it renders as a notice) but still a change
         // to undo, so the revert-file cue rides its `diff --git` separator.
         let (text, _hunks, files) =
-            build_diff_buffer_text(&[removed("gone.txt", "a\nb\n")], &HashMap::new());
+            build_diff_buffer_text(&[removed("gone.txt", "a\nb\n")], &HashMap::new(), false);
         assert!(!text.contains(REVERT_HUNK_LABEL));
         let lines: Vec<&str> = text.split('\n').collect();
         let sep = lines[files[0].start_line];
@@ -3351,7 +3651,7 @@ mod tests {
         for c in render.iter_mut() {
             c.new_text = c.old_text.clone();
         }
-        let (text, _h, _f) = build_diff_buffer_text(&render, &HashMap::new());
+        let (text, _h, _f) = build_diff_buffer_text(&render, &HashMap::new(), false);
         collect_file_edits(&text, &render, orig).expect("collect")
     }
 
@@ -3390,7 +3690,7 @@ mod tests {
             added("new.txt", "x\n"),
             removed("gone.txt", "z\n"),
         ];
-        let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new());
+        let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new(), false);
         let edits = collect_file_edits(&text, &orig, &orig).expect("collect");
         assert!(edits.is_empty(), "got {edits:?}");
     }
@@ -3409,7 +3709,7 @@ mod tests {
             vis.iter().all(|c| c.path != "f"),
             "f is hidden from the view"
         );
-        let (text, _h, _f) = build_diff_buffer_text(&vis, &HashMap::new());
+        let (text, _h, _f) = build_diff_buffer_text(&vis, &HashMap::new(), false);
         assert!(!text.contains("a/f b/f"), "f has no buffer section");
 
         let edits = collect_file_edits(&text, &render, &orig).expect("collect");

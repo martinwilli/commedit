@@ -15,6 +15,16 @@ use gtk::{
     ScrolledWindow,
 };
 
+/// The default placeholder of each identity field, in the [`read_identity`] order.
+/// Reused to restore a field's placeholder after the multi-select "(differs)"
+/// marker (see [`clear_identity_differs`]).
+pub(crate) const IDENTITY_PLACEHOLDERS: [&str; 4] = [
+    "Author — Name <email>",
+    "YYYY-MM-DD HH:MM:SS ±HHMM",
+    "Committer — Name <email>",
+    "YYYY-MM-DD HH:MM:SS ±HHMM",
+];
+
 /// A horizontally-expanding text entry with placeholder text, for an identity
 /// name/email/date field.
 pub(crate) fn identity_entry(placeholder: &str) -> Entry {
@@ -188,11 +198,91 @@ pub(crate) fn read_identity(fields: &[Entry; 4]) -> Identity {
 /// Populate the identity entry fields from a commit (see [`read_identity`] for
 /// the field order).
 pub(crate) fn set_identity_fields(fields: &[Entry; 4], commit: &CommitInfo) {
-    fields[0].set_text(&join_name_email(&commit.author_name, &commit.author_email));
-    fields[1].set_text(&commit.author_time);
-    fields[2].set_text(&join_name_email(
-        &commit.committer_name,
-        &commit.committer_email,
-    ));
-    fields[3].set_text(&commit.committer_time);
+    let values = commit_field_values(commit);
+    for (field, value) in fields.iter().zip(values) {
+        field.set_text(&value);
+    }
+}
+
+/// The displayed value of each identity entry field for `commit`, in the
+/// [`read_identity`] order: author "Name <email>", author date, committer
+/// "Name <email>", committer date.
+fn commit_field_values(commit: &CommitInfo) -> [String; 4] {
+    [
+        join_name_email(&commit.author_name, &commit.author_email),
+        commit.author_time.clone(),
+        join_name_email(&commit.committer_name, &commit.committer_email),
+        commit.committer_time.clone(),
+    ]
+}
+
+/// Populate the identity fields for a *multi-commit* selection: each field shows the
+/// value shared by all `commits` if they agree, otherwise it's cleared and shown
+/// with a "(differs)" placeholder and the `identity-differs` style class (italic).
+/// Returns the per-field baseline — the shared value, or `""` for a differing field
+/// — so the save path can tell which fields the user actually changed. `commits`
+/// must be non-empty.
+pub(crate) fn set_identity_fields_common(
+    fields: &[Entry; 4],
+    commits: &[CommitInfo],
+) -> [String; 4] {
+    let per_commit: Vec<[String; 4]> = commits.iter().map(commit_field_values).collect();
+    let mut baseline: [String; 4] = Default::default();
+    for (i, field) in fields.iter().enumerate() {
+        let shared = &per_commit[0][i];
+        if per_commit.iter().all(|v| &v[i] == shared) {
+            field.remove_css_class("identity-differs");
+            field.set_placeholder_text(Some(IDENTITY_PLACEHOLDERS[i]));
+            field.set_text(shared);
+            baseline[i] = shared.clone();
+        } else {
+            field.add_css_class("identity-differs");
+            field.set_placeholder_text(Some("(differs across commits)"));
+            field.set_text("");
+            baseline[i] = String::new();
+        }
+    }
+    baseline
+}
+
+/// Drop the multi-select "(differs)" styling and restore the default placeholders,
+/// for the transition back to a single (or empty) selection.
+pub(crate) fn clear_identity_differs(fields: &[Entry; 4]) {
+    for (field, placeholder) in fields.iter().zip(IDENTITY_PLACEHOLDERS) {
+        field.remove_css_class("identity-differs");
+        field.set_placeholder_text(Some(placeholder));
+    }
+}
+
+/// Build an [`Identity`] for `commit`, overriding each field with the matching
+/// `overrides` entry when present, else keeping the commit's own value — the
+/// multi-select batch edit: a field the user set is applied to every commit, an
+/// unset one is left untouched. `overrides` is in the [`read_identity`] order.
+pub(crate) fn identity_for_commit(
+    commit: &CommitInfo,
+    overrides: &[Option<String>; 4],
+) -> Identity {
+    let (author_name, author_email) = match &overrides[0] {
+        Some(v) => split_name_email(v),
+        None => (commit.author_name.clone(), commit.author_email.clone()),
+    };
+    let (committer_name, committer_email) = match &overrides[2] {
+        Some(v) => split_name_email(v),
+        None => (
+            commit.committer_name.clone(),
+            commit.committer_email.clone(),
+        ),
+    };
+    Identity {
+        author_name,
+        author_email,
+        author_time: overrides[1]
+            .clone()
+            .unwrap_or_else(|| commit.author_time.clone()),
+        committer_name,
+        committer_email,
+        committer_time: overrides[3]
+            .clone()
+            .unwrap_or_else(|| commit.committer_time.clone()),
+    }
 }

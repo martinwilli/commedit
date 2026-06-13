@@ -30,7 +30,7 @@ use gtk::{
     gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown, Entry,
     EventControllerKey, EventControllerScroll, EventControllerScrollFlags, Grid, HeaderBar, Label,
     ListBox, ListBoxRow, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow,
-    Shortcut, ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
+    SearchEntry, Shortcut, ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
 };
 use sourceview5::prelude::ViewExt;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -49,6 +49,7 @@ use crate::identity::*;
 mod conflict;
 use crate::conflict::*;
 mod dragdrop;
+mod search;
 
 /// The conflict pane's late-bound "expand hidden lines" action, invoked by buffer
 /// line; `None` until the conflict renderer (defined below it) binds it.
@@ -270,6 +271,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // handler clearing the history selection), so it runs once afterwards rather
     // than per `selected-rows-changed` emission. Mirrors `nav_sync`.
     let selection_sync: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Header search state. `search_query` is the live text; `search_matches` the
+    // row indices whose subject matches it (ascending, recomputed on each
+    // change and after every refresh); `search_cursor` the index *into*
+    // `search_matches` that Enter last selected (`None` = not yet stepped, so the
+    // next Enter picks the first match). See the search wiring near the shortcuts.
+    let search_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let search_matches: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+    let search_cursor: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // The row a Shift-click extends the selection from — set on each plain/Ctrl
     // click (see the history list's click handler).
     let selection_anchor: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
@@ -723,7 +732,18 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     reload_button.set_tooltip_text(Some(
         "Reload the repository — pick up changes made outside commedit",
     ));
+    // A search box just right of Reload: typing matches commit subjects in the
+    // list below by substring term (highlighting the matched characters and
+    // scrolling to the first hit); Enter selects matches in turn. Focusable with
+    // Ctrl+F. Wired below, once `refresh` & the selection router exist.
+    let search_entry = SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search commits"));
+    search_entry.set_width_request(220);
+    search_entry.set_tooltip_text(Some(
+        "Search commit subjects (Ctrl+F) — Enter jumps to the next match",
+    ));
     header.pack_start(&reload_button);
+    header.pack_start(&search_entry);
     // pack_end fills right-to-left, so packing the history button first leaves
     // "Review" to its left: [ Review ][ ↺ ].
     header.pack_end(&history_button);
@@ -2243,6 +2263,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let refresh_wc = refresh_wc.clone();
         let on_revert = on_revert.clone();
         let on_merge_out = on_merge_out.clone();
+        let search_query = search_query.clone();
+        let search_matches = search_matches.clone();
+        let search_cursor = search_cursor.clone();
         Rc::new(move || {
             let (loaded, has_more) = {
                 let r = repo.borrow();
@@ -2314,6 +2337,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
             selection_sync.set(false);
             update_selection_pane();
+            // populate_list reset the row labels to plain text; re-apply an active
+            // search so its highlights survive the rebuild. The selection was just
+            // restored by change id, so the Enter cursor is stale — reset it.
+            {
+                let query = search_query.borrow();
+                if !query.is_empty() {
+                    *search_matches.borrow_mut() =
+                        rows::apply_search_highlight(&list, &commits.borrow(), &query);
+                    search_cursor.set(None);
+                }
+            }
             refresh_wc();
         })
     };
@@ -3287,6 +3321,64 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         }
     });
 
+    // Search the history by commit subject. Typing matches every commit by
+    // substring term (highlighting the matched characters and scrolling to the
+    // first hit) without touching the selection; Enter then selects matches in turn.
+    search_entry.connect_search_changed({
+        let list = list.clone();
+        let history_scroll = history_scroll.clone();
+        let commits = commits.clone();
+        let search_query = search_query.clone();
+        let search_matches = search_matches.clone();
+        let search_cursor = search_cursor.clone();
+        move |entry| {
+            let query = entry.text().to_string();
+            let matches = rows::apply_search_highlight(&list, &commits.borrow(), &query);
+            let first = matches.first().copied();
+            *search_query.borrow_mut() = query;
+            *search_matches.borrow_mut() = matches;
+            // A new query restarts Enter navigation from the first match.
+            search_cursor.set(None);
+            if let Some(idx) = first {
+                rows::scroll_row_into_view(&history_scroll, &list, idx);
+            }
+        }
+    });
+    // Enter selects the first match, then each subsequent press advances to the
+    // next one, wrapping around. Focus stays in the entry so repeated Enter cycles.
+    search_entry.connect_activate({
+        let list = list.clone();
+        let history_scroll = history_scroll.clone();
+        let search_matches = search_matches.clone();
+        let search_cursor = search_cursor.clone();
+        let selection_sync = selection_sync.clone();
+        let update_selection_pane = update_selection_pane.clone();
+        move |_| {
+            let idx = {
+                let matches = search_matches.borrow();
+                if matches.is_empty() {
+                    return;
+                }
+                let next = match search_cursor.get() {
+                    None => 0,
+                    Some(c) => (c + 1) % matches.len(),
+                };
+                search_cursor.set(Some(next));
+                matches[next]
+            };
+            // Drive the list selection like `refresh` does — guarded so the pane
+            // router runs once at the end rather than on each `select_row`.
+            selection_sync.set(true);
+            list.unselect_all();
+            if let Some(row) = list.row_at_index(idx as i32) {
+                list.select_row(Some(&row));
+            }
+            selection_sync.set(false);
+            update_selection_pane();
+            rows::scroll_row_into_view(&history_scroll, &list, idx);
+        }
+    });
+
     // Ctrl+S triggers the same save.
     let save_shortcut = {
         let save = save.clone();
@@ -3307,9 +3399,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trigger = ShortcutTrigger::parse_string("<Control>q").expect("valid shortcut trigger");
         Shortcut::new(Some(trigger), Some(action))
     };
+    // Ctrl+F focuses the header search box.
+    let find_shortcut = {
+        let search_entry = search_entry.clone();
+        let action = CallbackAction::new(move |_, _| {
+            search_entry.grab_focus();
+            glib::Propagation::Stop
+        });
+        let trigger = ShortcutTrigger::parse_string("<Control>f").expect("valid shortcut trigger");
+        Shortcut::new(Some(trigger), Some(action))
+    };
     let shortcuts = ShortcutController::new();
     shortcuts.add_shortcut(save_shortcut);
     shortcuts.add_shortcut(quit_shortcut);
+    shortcuts.add_shortcut(find_shortcut);
     window.add_controller(shortcuts);
 
     // Initial population and selection.

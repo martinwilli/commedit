@@ -576,3 +576,50 @@ fn folding_the_working_copy_can_reword_the_target() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn squash_into_many_folds_a_set_with_amend_taking_the_newest_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    three_commits(dir); // first <- second <- third
+    let mut repo = Repo::open(dir).expect("open");
+    let first = id_of(&repo, "first");
+    let second = id_of(&repo, "second");
+    let third = id_of(&repo, "third");
+
+    // Fold {third, second} (newest-first) into "first" with Amend: the result
+    // takes the newest source's ("third") message, and carries every file.
+    let outcome = repo
+        .squash_into_many(vec![third, second], &first, SquashMode::Amend, None)
+        .expect("squash set");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    assert_eq!(common::git_log_subjects(dir), vec!["third"]);
+    common::git(dir, &["cat-file", "-e", "HEAD:a.txt"]);
+    common::git(dir, &["cat-file", "-e", "HEAD:b.txt"]);
+    common::git(dir, &["cat-file", "-e", "HEAD:c.txt"]);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn squash_into_many_stacks_messages_oldest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    three_commits(dir); // first <- second <- third
+    let mut repo = Repo::open(dir).expect("open");
+    let first = id_of(&repo, "first");
+    let second = id_of(&repo, "second");
+    let third = id_of(&repo, "third");
+
+    // Squash mode: the destination's message, then each source body appended
+    // chronologically (oldest selected first), regardless of newest-first input.
+    repo.squash_into_many(vec![third, second], &first, SquashMode::Squash, None)
+        .expect("squash set");
+
+    assert_eq!(
+        common::git(dir, &["show", "-s", "--format=%B", "main"]),
+        "first\n\nsecond\n\nthird"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

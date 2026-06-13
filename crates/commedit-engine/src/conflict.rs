@@ -698,6 +698,23 @@ impl Repo {
         }
     }
 
+    /// Build an [`OpDescriptor`] for a mutation acting on several commits at once
+    /// (the multi-select drag operations): an `<action> N commit(s)` label and the
+    /// change ids of all `targets`, for the dropdown's hover-highlight. A single
+    /// target reads as the singular-commit label (the `<action> "<subject>"`
+    /// shape) so it matches [`Self::op_desc_for`].
+    pub(crate) fn op_desc_for_many(&self, action: &str, targets: &[CommitId]) -> OpDescriptor {
+        if let [only] = targets {
+            return self.op_desc_for(action, only);
+        }
+        let affected = targets
+            .iter()
+            .filter_map(|id| self.repo.store().get_commit(id).ok())
+            .map(|c| c.change_id().hex())
+            .collect();
+        OpDescriptor::new(format!("{action} {} commits", targets.len()), affected)
+    }
+
     /// Materialize one conflicted file of the commit with change id `change_id`
     /// to Git-style 2-way conflict-marker text, for display in the editor.
     pub fn read_conflict(&self, change_hex: &str, path: &str) -> Result<ConflictedFile> {

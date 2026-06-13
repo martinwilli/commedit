@@ -16,8 +16,8 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    parse_timestamp, plan_drop, plan_reorder_candidates, plan_restore_candidates, CommitInfo,
-    ReorderCandidate,
+    parse_timestamp, plan_drop, plan_reorder_candidates, plan_reorder_set_candidates,
+    plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderSetCandidate,
 };
 use crate::repo::Repo;
 
@@ -296,6 +296,24 @@ impl Repo {
         plan_reorder_candidates(commits, &head, layout, &self.root_commit_id(), from, to)
     }
 
+    /// All destination lines for dragging the *set* `set` of commits to the
+    /// insertion gap `to` as a group — one candidate per ancestry line crossing
+    /// the gap that is bounded by commits outside the set. Empty for a no-op /
+    /// out-of-range drop, a set containing a merge or the whole branch, or when
+    /// HEAD is unknown. See [`crate::history::plan_reorder_set_candidates`].
+    pub fn plan_reorder_set_candidates(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        set: &std::collections::HashSet<CommitId>,
+        to: usize,
+    ) -> Vec<ReorderSetCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_reorder_set_candidates(commits, &head, layout, &self.root_commit_id(), set, to)
+    }
+
     /// All destination lines for grafting the trashed commit `restored` back
     /// into the history at insertion gap `to`. Empty for an out-of-range drop or
     /// when HEAD is unknown. See [`crate::history::plan_restore_candidates`].
@@ -337,11 +355,37 @@ impl Repo {
     ) -> Result<SaveOutcome> {
         let desc = self.op_desc_for("Reorder", target);
         self.splice_commit(
-            target,
+            vec![target.clone()],
             new_parent_ids,
             new_child_ids,
             new_tip,
             "commedit: reorder commit",
+            SpuriousResolve::CleanTip,
+            desc,
+        )
+    }
+
+    /// Move a *set* of commits to a new slot as a group — the multi-select drag.
+    /// Mechanically identical to [`Self::reorder_commit`] but passes every target
+    /// to jj's `move_commits` at once (`MoveCommitsTarget::Commits`), so the set is
+    /// relocated between `new_parent_ids` and `new_child_ids` preserving its
+    /// internal order while the commits *between* the moved ones stay where they
+    /// are (rebased to fill the gap). `targets` may be in any order — the splice
+    /// re-sorts them reverse-topologically as jj requires.
+    pub fn reorder_commits(
+        &mut self,
+        targets: Vec<CommitId>,
+        new_parent_ids: Vec<CommitId>,
+        new_child_ids: Vec<CommitId>,
+        new_tip: &CommitId,
+    ) -> Result<SaveOutcome> {
+        let desc = self.op_desc_for_many("Reorder", &targets);
+        self.splice_commit(
+            targets,
+            new_parent_ids,
+            new_child_ids,
+            new_tip,
+            "commedit: reorder commits",
             SpuriousResolve::CleanTip,
             desc,
         )
@@ -360,7 +404,7 @@ impl Repo {
     ) -> Result<SaveOutcome> {
         let desc = self.op_desc_for("Restore", target);
         self.splice_commit(
-            target,
+            vec![target.clone()],
             new_parent_ids,
             new_child_ids,
             new_tip,
@@ -372,13 +416,14 @@ impl Repo {
         )
     }
 
-    /// Shared body of [`Self::reorder_commit`] and [`Self::restore_commit`]: move
-    /// `target` between `new_parent_ids` and `new_child_ids`, rebase descendants,
-    /// point the branch at `new_tip`, and export — all in one transaction.
+    /// Shared body of [`Self::reorder_commit`]/[`Self::reorder_commits`] and
+    /// [`Self::restore_commit`]: move `targets` (one or many) between
+    /// `new_parent_ids` and `new_child_ids` as a group, rebase descendants, point
+    /// the branch at `new_tip`, and export — all in one transaction.
     #[allow(clippy::too_many_arguments)]
     fn splice_commit(
         &mut self,
-        target: &CommitId,
+        targets: Vec<CommitId>,
         new_parent_ids: Vec<CommitId>,
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
@@ -388,7 +433,7 @@ impl Repo {
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("moving the commit", || {
             self.splice_commit_inner(
-                target,
+                targets,
                 new_parent_ids,
                 new_child_ids,
                 new_tip,
@@ -402,7 +447,7 @@ impl Repo {
     #[allow(clippy::too_many_arguments)]
     fn splice_commit_inner(
         &mut self,
-        target: &CommitId,
+        targets: Vec<CommitId>,
         new_parent_ids: Vec<CommitId>,
         new_child_ids: Vec<CommitId>,
         new_tip: &CommitId,
@@ -427,10 +472,14 @@ impl Repo {
                 new_child_ids.push(bottom.clone());
             }
         }
+        // jj's `move_commits` wants the targets in reverse topological order
+        // (descendants before ancestors); the UI passes them newest-first already,
+        // but sort defensively so a caller's order can't matter.
+        let targets = self.sort_reverse_topological(targets)?;
         let loc = MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,
-            target: MoveCommitsTarget::Commits(vec![target.clone()]),
+            target: MoveCommitsTarget::Commits(targets),
         };
 
         let mut tx = self.repo.start_transaction();
@@ -455,41 +504,88 @@ impl Repo {
         self.finish_mutation_spurious(tx, op_msg, desc, pre_op, old_head, heads, strategy)
     }
 
+    /// Order commits reverse-topologically (descendants before ancestors), as
+    /// jj's `move_commits` requires of its `MoveCommitsTarget::Commits`. Sorts by
+    /// descending count of in-set ancestors — a descendant has strictly more, so
+    /// this is a valid total order over the subset (ties among unrelated commits
+    /// don't matter).
+    pub(crate) fn sort_reverse_topological(&self, ids: Vec<CommitId>) -> Result<Vec<CommitId>> {
+        if ids.len() < 2 {
+            return Ok(ids);
+        }
+        let index = self.repo.index();
+        let mut anc_count = vec![0usize; ids.len()];
+        for i in 0..ids.len() {
+            for j in 0..ids.len() {
+                if i != j
+                    && index
+                        .is_ancestor(&ids[j], &ids[i])
+                        .context("checking commit ancestry")?
+                {
+                    anc_count[i] += 1;
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(anc_count[i]));
+        Ok(order.into_iter().map(|i| ids[i].clone()).collect())
+    }
+
     /// Drop `target` from history entirely: its descendants are rebased onto its
     /// parent(s) and the branch bookmark follows, in one transaction exported to
     /// git. The commit object itself survives for the session (we never run
     /// `git gc`), so [`Self::restore_commit`] can graft it back.
     pub fn abandon_commit(&mut self, target: &CommitId) -> Result<SaveOutcome> {
-        crate::repo::catch_jj("dropping the commit", || self.abandon_commit_inner(target))
+        self.abandon_commits(vec![target.clone()])
     }
 
-    fn abandon_commit_inner(&mut self, target: &CommitId) -> Result<SaveOutcome> {
+    /// Drop a *set* of commits in one transaction — the multi-select trash drop.
+    /// Each is abandoned (its children re-parent onto its parents) before a single
+    /// `rebase_descendants`, so the whole set leaves history together and its
+    /// commits all survive in the store for a later restore, like [`Self::abandon_commit`].
+    pub fn abandon_commits(&mut self, targets: Vec<CommitId>) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("dropping the commit", || {
+            self.abandon_commits_inner(targets)
+        })
+    }
+
+    fn abandon_commits_inner(&mut self, targets: Vec<CommitId>) -> Result<SaveOutcome> {
+        if targets.is_empty() {
+            bail!("no commits to drop");
+        }
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let heads = self.snapshot_heads();
-        let commit = self
-            .repo
-            .store()
-            .get_commit(target)
-            .context("loading target commit")?;
-        let desc = self.op_desc_for("Drop", target);
+        let store = self.repo.store().clone();
+        let commits: Vec<Commit> = targets
+            .iter()
+            .map(|t| store.get_commit(t).context("loading target commit"))
+            .collect::<Result<_>>()?;
+        let desc = self.op_desc_for_many("Drop", &targets);
+        let op_msg = if targets.len() == 1 {
+            "commedit: drop commit"
+        } else {
+            "commedit: drop commits"
+        };
 
         let mut tx = self.repo.start_transaction();
-        // Record the abandon, then rebase: children re-parent onto the commit's
-        // parents and any bookmark at it moves to the parent (jj's default keeps
-        // abandoned bookmarks rather than deleting them).
-        tx.repo_mut().record_abandoned_commit(&commit);
+        // Record each abandon, then rebase once: children re-parent onto their
+        // commit's parents and any bookmark at one moves to the parent (jj's
+        // default keeps abandoned bookmarks rather than deleting them).
+        for commit in &commits {
+            tx.repo_mut().record_abandoned_commit(commit);
+        }
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
 
-        // Dropping removes the commit's change, so a descendant that edited an
+        // Dropping removes the commits' changes, so a descendant that edited an
         // adjacent-but-independent line conflicts only spuriously — including when
         // that descendant is the tip itself. Auto-resolve it by rebuilding the
         // conflicted range forward from the surviving commits' original changes.
         self.finish_mutation_spurious(
             tx,
-            "commedit: drop commit",
+            op_msg,
             desc,
             pre_op,
             old_head,

@@ -3,10 +3,13 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::{history, history_limited, IdAbbrev};
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::{BatchEdit, Identity};
+use jj_lib::backend::CommitId;
 use jj_lib::object_id::ObjectId as _;
 
 #[test]
@@ -830,6 +833,75 @@ fn revert_all_discards_session_working_copy_edits() {
     assert_eq!(
         common::git(dir, &["symbolic-ref", "HEAD"]),
         "refs/heads/main"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Build the five-commit linear repo first <- second <- third <- fourth <- fifth
+/// (independent files, so reorders/drops rebase clean) and open it.
+fn open_five(dir: &std::path::Path) -> Repo {
+    common::init_repo(
+        dir,
+        &[
+            ("a.txt", "a\n", "first"),
+            ("b.txt", "b\n", "second"),
+            ("c.txt", "c\n", "third"),
+            ("d.txt", "d\n", "fourth"),
+            ("e.txt", "e\n", "fifth"),
+        ],
+    );
+    Repo::open(dir).expect("open")
+}
+
+#[test]
+fn reorder_commits_moves_a_set_keeping_interleaved_commits_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut repo = open_five(dir);
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let by = |s: &str| commits.iter().find(|c| c.subject == s).expect("present");
+
+    // Select the non-adjacent {fourth, second} (third sits between them) and move
+    // the pair to the very top. The unselected fifth/third/first keep their
+    // relative order; the moved pair keeps theirs (fourth newer than second).
+    let set: HashSet<CommitId> = [by("fourth").id.clone(), by("second").id.clone()]
+        .into_iter()
+        .collect();
+    let mv = common::plan_reorder_set_single(&repo, &commits, &set, 0);
+    let outcome = repo
+        .reorder_commits(mv.targets, mv.new_parents, mv.new_children, &mv.new_tip)
+        .expect("reorder set");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["fourth", "second", "fifth", "third", "first"]
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn abandon_commits_drops_a_set_in_one_rebase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut repo = open_five(dir);
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let by = |s: &str| commits.iter().find(|c| c.subject == s).expect("present");
+
+    // Drop the non-adjacent {fourth, second}; the survivors rebase into one chain.
+    let targets = vec![by("fourth").id.clone(), by("second").id.clone()];
+    let outcome = repo.abandon_commits(targets).expect("abandon set");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["fifth", "third", "first"]
     );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);

@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
@@ -208,27 +209,48 @@ fn source_body(source_desc: &str) -> String {
     }
 }
 
-/// Compose the destination commit's new description for a squash:
+/// Compose the destination commit's new description for a squash of one source:
 /// - `Fixup`: keep `dest_desc` unchanged.
 /// - `Squash`: `dest_desc` + blank line + source body (prefix line stripped),
 ///   collapsing to just `dest_desc` when the body is empty.
 /// - `Amend`: the source body (prefix line stripped) replaces `dest_desc`.
 pub fn compose_squash_message(mode: SquashMode, dest_desc: &str, source_desc: &str) -> String {
+    compose_squash_message_multi(mode, dest_desc, &[source_desc])
+}
+
+/// [`compose_squash_message`] generalized to several sources folded into one
+/// destination (the multi-select squash), `sources` ordered newest-first:
+/// - `Fixup`: keep `dest_desc`.
+/// - `Squash`: `dest_desc` followed by each source body (prefix line stripped),
+///   appended **oldest-first** so the merged message reads chronologically;
+///   empty bodies are skipped.
+/// - `Amend`: the **newest** source's body replaces `dest_desc` (the latest
+///   intent wins).
+pub fn compose_squash_message_multi(mode: SquashMode, dest_desc: &str, sources: &[&str]) -> String {
     match mode {
         SquashMode::Fixup => dest_desc.to_string(),
         SquashMode::Squash => {
-            let body = source_body(source_desc);
-            let dest = dest_desc.trim_end();
-            let body = body.trim();
-            if body.is_empty() {
-                dest.to_string()
-            } else if dest.is_empty() {
-                body.to_string()
-            } else {
-                format!("{dest}\n\n{body}")
+            let mut out = dest_desc.trim_end().to_string();
+            // Newest-first in, but append oldest-first so the bodies stack in
+            // chronological order under the destination's own message.
+            for source_desc in sources.iter().rev() {
+                let body = source_body(source_desc);
+                let body = body.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                if out.is_empty() {
+                    out = body.to_string();
+                } else {
+                    out = format!("{out}\n\n{body}");
+                }
             }
+            out
         }
-        SquashMode::Amend => source_body(source_desc).trim().to_string(),
+        SquashMode::Amend => sources
+            .first()
+            .map(|s| source_body(s).trim().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -298,7 +320,26 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(source, dest, mode, message, false, None)
+            self.squash_into_inner(vec![source.clone()], dest, mode, message, false, None)
+        })
+    }
+
+    /// Fold a *set* of sources into one destination in a single transaction — the
+    /// multi-select drag-squash. `sources` are passed newest-first (the display
+    /// order); jj's `squash_commits` merges all their changes into `dest`'s tree
+    /// at once and abandons them, descendants rebasing through the shared pipeline.
+    /// The destination author is preserved (committer re-stamped); the message is
+    /// composed per `mode` over all sources ([`compose_squash_message_multi`]) —
+    /// **Amend takes the newest source's message** — unless `message` overrides it.
+    pub fn squash_into_many(
+        &mut self,
+        sources: Vec<CommitId>,
+        dest: &CommitId,
+        mode: SquashMode,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("squashing the commits", || {
+            self.squash_into_inner(sources, dest, mode, message, false, None)
         })
     }
 
@@ -315,7 +356,7 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit from trash", || {
-            self.squash_into_inner(source, dest, mode, message, true, None)
+            self.squash_into_inner(vec![source.clone()], dest, mode, message, true, None)
         })
     }
 
@@ -369,7 +410,14 @@ impl Repo {
                 .get_commit(source)
                 .context("loading the commit to restore")?;
             let label = format!("Restore {} to working copy", op_subject(&source_commit));
-            self.squash_into_inner(source, &dest, SquashMode::Fixup, None, true, Some(label))
+            self.squash_into_inner(
+                vec![source.clone()],
+                &dest,
+                SquashMode::Fixup,
+                None,
+                true,
+                Some(label),
+            )
         })
     }
 
@@ -494,62 +542,79 @@ impl Repo {
     #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,
-        source: &CommitId,
+        sources: Vec<CommitId>,
         dest: &CommitId,
         mode: SquashMode,
         message: Option<&str>,
         source_is_orphan: bool,
         label: Option<String>,
     ) -> Result<SaveOutcome> {
+        if sources.is_empty() {
+            anyhow::bail!("no commits to squash");
+        }
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.head_commit();
         let heads = self.snapshot_heads();
 
-        let source_commit = self
-            .repo
-            .store()
-            .get_commit(source)
-            .context("loading source commit")?;
-        let dest_commit = self
-            .repo
-            .store()
+        // jj's `squash_commits` wants the sources newest-first (reverse topo); the
+        // UI passes them so already, but sort defensively (a no-op for one source,
+        // and an orphan source — always single — never reaches the index here).
+        let sources = self.sort_reverse_topological(sources)?;
+        let store = self.repo.store().clone();
+        let source_commits: Vec<Commit> = sources
+            .iter()
+            .map(|s| store.get_commit(s).context("loading source commit"))
+            .collect::<Result<_>>()?;
+        let dest_commit = store
             .get_commit(dest)
             .context("loading destination commit")?;
 
-        // A full-commit selection: take all of the source's changes.
-        let selected_tree = source_commit.tree();
-        let parent_tree = pollster::block_on(source_commit.parent_tree(self.repo.as_ref()))
-            .context("loading source parent tree")?;
-        let sel = CommitWithSelection {
-            commit: source_commit.clone(),
-            selected_tree,
-            parent_tree,
-        };
+        // A full-commit selection per source: take all of each source's changes.
+        let sels: Vec<CommitWithSelection> = source_commits
+            .iter()
+            .map(|c| {
+                let parent_tree = pollster::block_on(c.parent_tree(self.repo.as_ref()))
+                    .context("loading source parent tree")?;
+                Ok(CommitWithSelection {
+                    commit: c.clone(),
+                    selected_tree: c.tree(),
+                    parent_tree,
+                })
+            })
+            .collect::<Result<_>>()?;
 
         // Settle the message and capture the author before the borrows move into
-        // the transaction: an explicit override wins, else recompose per `mode`.
+        // the transaction: an explicit override wins, else recompose per `mode`
+        // over every source (newest-first; Amend takes the newest's message).
+        let source_descs: Vec<&str> = source_commits.iter().map(|c| c.description()).collect();
         let new_desc = match message {
             Some(m) => m.to_string(),
-            None => {
-                compose_squash_message(mode, dest_commit.description(), source_commit.description())
-            }
+            None => compose_squash_message_multi(mode, dest_commit.description(), &source_descs),
         };
         let dest_author = dest_commit.author().clone();
-        let desc = OpDescriptor::new(
-            label.unwrap_or_else(|| {
+        let label = label.unwrap_or_else(|| {
+            if let [only] = source_commits.as_slice() {
                 format!(
                     "Squash {} into {}",
-                    op_subject(&source_commit),
+                    op_subject(only),
                     op_subject(&dest_commit)
                 )
-            }),
-            vec![
-                source_commit.change_id().hex(),
-                dest_commit.change_id().hex(),
-            ],
-        );
+            } else {
+                format!(
+                    "Squash {} commits into {}",
+                    source_commits.len(),
+                    op_subject(&dest_commit)
+                )
+            }
+        });
+        let affected: Vec<String> = source_commits
+            .iter()
+            .map(|c| c.change_id().hex())
+            .chain(std::iter::once(dest_commit.change_id().hex()))
+            .collect();
+        let desc = OpDescriptor::new(label, affected);
 
         let mut tx = self.repo.start_transaction();
         if source_is_orphan {
@@ -558,12 +623,14 @@ impl Repo {
             // is_ancestor check finds it instead of panicking on the lookup. The
             // squash abandons it (full selection), so rebase_descendants drops it
             // from the heads again and it leaves no trace.
-            pollster::block_on(tx.repo_mut().add_head(&source_commit))
-                .context("making the trashed commit visible")?;
+            for c in &source_commits {
+                pollster::block_on(tx.repo_mut().add_head(c))
+                    .context("making the trashed commit visible")?;
+            }
         }
         let squashed = pollster::block_on(squash_commits(
             tx.repo_mut(),
-            std::slice::from_ref(&sel),
+            &sels,
             &dest_commit,
             /* keep_emptied = */ false,
         ))

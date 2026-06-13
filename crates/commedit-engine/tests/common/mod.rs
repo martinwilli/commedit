@@ -8,9 +8,12 @@
 use std::path::Path;
 use std::process::Command;
 
+use std::collections::HashSet;
+
 use commedit_engine::graph::compute_graph;
-use commedit_engine::history::{CommitInfo, ReorderMove};
+use commedit_engine::history::{CommitInfo, ReorderMove, ReorderSetMove};
 use commedit_engine::repo::Repo;
+use jj_lib::backend::CommitId;
 
 /// Plan moving display row `from` to insertion gap `to`, expecting exactly one
 /// destination line — the linear shape most tests drop into. Computes the lane
@@ -23,6 +26,24 @@ pub fn plan_reorder_single(
 ) -> ReorderMove {
     let layout = compute_graph(commits, &repo.root_commit_id());
     let mut cands = repo.plan_reorder_candidates(commits, &layout, from, to);
+    assert_eq!(
+        cands.len(),
+        1,
+        "expected exactly one destination line for the gap"
+    );
+    cands.remove(0).mv
+}
+
+/// Plan moving the *set* `set` to insertion gap `to`, expecting exactly one
+/// destination line. The set-move analogue of [`plan_reorder_single`].
+pub fn plan_reorder_set_single(
+    repo: &Repo,
+    commits: &[CommitInfo],
+    set: &HashSet<CommitId>,
+    to: usize,
+) -> ReorderSetMove {
+    let layout = compute_graph(commits, &repo.root_commit_id());
+    let mut cands = repo.plan_reorder_set_candidates(commits, &layout, set, to);
     assert_eq!(
         cands.len(),
         1,

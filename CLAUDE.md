@@ -476,6 +476,36 @@ all. The GTK side recomputes the layout in lockstep with `commits` on every refr
 (`Data.graph`), draws it per row in `rows.rs` (`graph_area`, colors cycled by lane
 via `lane_color`), and plans drops against it.
 
+### Multi-commit selection
+
+The history list is `SelectionMode::Multiple` (ctrl/shift-click). One closure,
+`update_selection_pane` (`main.rs`), drives the right pane off `list.selected_rows()`
+on every `selected-rows-changed`, branching **conflict-mode first** (show the anchor's
+conflicted files, never the multi view) then by count: 0 → inert pane; 1 → the usual
+fully-editable single-commit pane; >1 → a read-only batch view. Two selection cells:
+`selected_change` (the `Data` bundle's `Option<String>` **anchor** — the commit the
+single-commit ops target) and the main-local `selected_changes: Vec<String>` (the full
+set, newest-first). `dragdrop`/`conflict` only ever touch the anchor — multi-drag is
+**blocked** (`connect_prepare` refuses while >1 is selected) and conflict resolution is
+per-commit — so the bundle is unchanged. `refresh` re-selects the multi-set when its len
+> 1 else the anchor, all guarded by `selection_sync` (so the N programmatic `select_row`s
+don't re-fire the router per row), then calls `update_selection_pane` once. `selected_row()`
+returns null under multiple-selection, so its callers use `selected_rows()` instead, and the
+post-rewrite re-render no longer needs a manual `unselect_all` (refresh always drives the
+router).
+
+The batch view is read-only: the message shows a dim italic note (`set_note`, a
+lazily-created `note-italic` tag, reused for the diff's "not representable" note); the diff
+is the `combined_changes` result rendered with `diff_read_only` set — which forces the view
+non-editable and makes `build_diff_buffer_text(read_only)` drop the revert cues (the harmless
+expand cues stay) — or the note when it returns `None`. The four identity fields show the
+shared value where the selection agrees, else empty with a "(differs)" italic placeholder +
+`identity-differs` class (`set_identity_fields_common`, baseline recorded in
+`multi_identity_baseline`). **Save** builds one `BatchEdit` per selected commit
+(`identity_for_commit` — each field overridden only where the user changed it from the
+baseline, else the commit's own value; an empty field is never written) and applies them in
+one `rewrite_batch`; message/file edits are never collected in this mode.
+
 ### Session op-log, revert & review
 
 `Repo::open` captures the session-start operation (`session_op`) and HEAD
@@ -526,6 +556,13 @@ buffer always still applies as a patch. Three pure, GTK-free modules:
   path) splices several files' new content into the tree in one rewrite. The conflict
   pane reuses the same windowing
   (`render_conflict_snippets` / `reconstruct_conflict_file`).
+  `combined_changes(repo, &[CommitId])` (commits **oldest-first**) builds the minimal
+  combined diff for the multi-select view: base = the oldest's parent tree, each
+  commit's delta re-applied onto an accumulator via jj-lib's `MergedTree::merge` (the
+  same primitive `create.rs` cherry-picks/reverts with), then `tree_changes` against
+  the result — `Ok(None)` when a fold leaves a conflicted tree (the selection isn't
+  representable as one diff). A contiguous range telescopes to `parent_of_oldest →
+  newest`; a gapped/divergent one composes a cherry-pick stack.
 - `patch_edit.rs` — `plan_edit(text, selection, gesture)` maps a raw edit gesture
   (Insert/Newline/Backspace/Delete) to a structurally-valid `EditPlan`. Rules: only
   `+` content is freely editable; typing on a context line splits it into a

@@ -288,6 +288,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let drag_from = drag_from.clone();
         let drag_origin = drag_origin.clone();
         move |source, _x, y| {
+            // Dragging several commits at once isn't supported yet: refuse to start a
+            // drag while a multi-selection stands (the drag carries a single row).
+            if list.selected_rows().len() > 1 {
+                return None;
+            }
             let row = list.row_at_y(y as i32)?;
             // Show the dragged row under the cursor for feedback.
             let paintable = gtk::WidgetPaintable::new(Some(&row));

@@ -178,19 +178,13 @@ cargo run -p commedit-gtk -- /path/to/repo  # launch the app against a repo (def
 The same engine is exposed to AI agents through a [Claude Code
 plugin](https://code.claude.com/docs/en/plugins). With it installed, an agent
 edits history the way the GTK app does — and then some: edit any commit's
-message, identity or file contents, split, reorder, drop, restore and squash
-commits, create new commits and revert or cherry-pick existing ones, introduce a
-merge above a commit, fold
-uncommitted changes in or commit them, drop a commit while keeping its changes
-unstaged in the working tree (`drop_commit` with `keep_changes`), walk the
-conflict-resolution loop, and
-undo any of it — all while the repository stays a plain git repo and conflicted
-rewrites are held back from git until they resolve or abort. Every tool
-addresses commits by sha or by jj's stable change id (full or a unique prefix),
-so the agent can chain mutations by change id as shas churn. Alongside the tools
-the plugin ships skills that teach the agent *when* to reach for these workflows
-and a `commedit-operator` subagent that drives them — see
-[`plugin/README.md`](plugin/README.md) for the full description.
+message, identity or file contents; split, reorder, drop, restore or squash
+commits; create, revert or cherry-pick commits and introduce merges; and fold
+uncommitted changes in or commit them — addressing commits by sha or jj's stable
+change id, with descendants rebased automatically, conflicted rewrites held back
+from git until they resolve or abort, and every step undoable. Alongside the
+tools the plugin ships skills that teach the agent *when* to reach for these
+workflows and a `commedit-operator` subagent that drives them.
 
 The plugin is self-contained: each [GitHub release](../../releases) attaches
 `commedit-plugin.zip`, which bundles a prebuilt server for every supported
@@ -198,46 +192,9 @@ target (Linux x86-64, Linux AArch64, macOS Apple Silicon) plus a launcher that
 picks the right one — nothing to compile, and the only requirement is `git` on
 your `PATH` (the GTK runtime libraries are needed only for the desktop app).
 
-### Installing the plugin
-
-**From your organisation.** If an admin uploaded the zip to your claude.ai team
-settings, the plugin appears in members' `/plugin` list and installs per your
-org's policy — none of the steps below are needed.
-
-**For yourself.** Download `commedit-plugin.zip` from the [latest
-release](../../releases) and unpack it into a directory of its own:
-
-```sh
-unzip commedit-plugin.zip -d ~/.local/share/commedit/plugin
-```
-
-Then either load it for a single session, or install it persistently.
-
-*Single session* — point Claude Code at the unpacked plugin as you launch it:
-
-```sh
-claude --plugin-dir ~/.local/share/commedit/plugin /path/to/your/repo
-```
-
-*Persistently, across all sessions* — Claude Code installs plugins from a
-marketplace, so register a one-plugin local marketplace pointing at what you
-unpacked, then install from it:
-
-```sh
-mkdir -p ~/.local/share/commedit/.claude-plugin
-cat > ~/.local/share/commedit/.claude-plugin/marketplace.json <<'JSON'
-{
-  "name": "commedit-local",
-  "owner": { "name": "you" },
-  "plugins": [{ "name": "commedit", "source": "./plugin" }]
-}
-JSON
-claude plugin marketplace add ~/.local/share/commedit
-claude plugin install commedit@commedit-local   # then restart Claude Code
-```
-
-Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
-and ask the agent to list or edit history.
+See [`plugin/README.md`](plugin/README.md) for the full list of what the agent
+can do, the bundled skills and `commedit-operator` subagent, and how to install
+the plugin.
 
 ## How it works
 

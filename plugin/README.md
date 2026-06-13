@@ -26,8 +26,7 @@ Any commit reachable from `HEAD` — not just the tip — is fair game:
   into an existing one, do either for only *part* of the changes (hunk by hunk,
   the in-process `git add -p`), or discard them.
 
-In every case descendants are rebased automatically, and the repository stays a
-plain git repo the whole time — no jujutsu state left behind.
+In every case descendants are rebased automatically.
 
 Dropped commits go to a **session trash** and can be grafted back or folded into
 another commit. A rewrite whose rebase **conflicts** is held back *in full* — git
@@ -63,9 +62,6 @@ main context. They load on the matching intent, or invoke one explicitly (e.g.
   `fixup!`/`squash!`/`amend!` prefixes), or drop a commit.
 - **`insert-and-revert`** — add to history: create a commit and splice it
   anywhere in the graph, revert a commit, or cherry-pick one from another branch.
-
-In every case descendants are rebased automatically, and a rewrite whose rebase
-conflicts is held back in full until you resolve or abort it.
 
 ## Bundled agent
 
@@ -113,18 +109,45 @@ Windows build.
 
 ## Installing
 
-**From your organisation.** If an admin uploaded this plugin to your team, it
-appears in `/plugin` and installs/enables per your org's policy — no manual
-steps.
+**From your organisation.** If an admin uploaded the plugin to your claude.ai
+team settings, it appears in members' `/plugin` list and installs per your org's
+policy — none of the steps below are needed.
 
-**Locally, for testing.** Point Claude Code at the unpacked plugin directory:
+**For yourself.** Download `commedit-plugin.zip` from the [latest
+release](https://github.com/martinwilli/commedit/releases) and unpack it into a
+directory of its own:
 
 ```sh
-claude --plugin-dir /path/to/commedit-plugin /path/to/your/repo
+unzip commedit-plugin.zip -d ~/.local/share/commedit/plugin
 ```
 
-Then confirm the `commedit` tools are available (`/plugin`), open a repo, and ask
-the agent to list or edit history.
+Then either load it for a single session, or install it persistently.
+
+*Single session* — point Claude Code at the unpacked plugin as you launch it:
+
+```sh
+claude --plugin-dir ~/.local/share/commedit/plugin /path/to/your/repo
+```
+
+*Persistently, across all sessions* — Claude Code installs plugins from a
+marketplace, so register a one-plugin local marketplace pointing at what you
+unpacked, then install from it:
+
+```sh
+mkdir -p ~/.local/share/commedit/.claude-plugin
+cat > ~/.local/share/commedit/.claude-plugin/marketplace.json <<'JSON'
+{
+  "name": "commedit-local",
+  "owner": { "name": "you" },
+  "plugins": [{ "name": "commedit", "source": "./plugin" }]
+}
+JSON
+claude plugin marketplace add ~/.local/share/commedit
+claude plugin install commedit@commedit-local   # then restart Claude Code
+```
+
+Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
+and ask the agent to list or edit history.
 
 ## Developing locally
 

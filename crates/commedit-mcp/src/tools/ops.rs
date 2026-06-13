@@ -100,8 +100,10 @@ impl CommeditServer {
     pub async fn reload_repo(&self) -> Result<Yaml<ReloadResp>, ErrorData> {
         let path = self.repo_path.clone();
         // Deliberately not pending-guarded: a held rewrite never touched git,
-        // so dropping it with the session state is safe.
-        self.with_session(move |repo, trash| {
+        // so dropping it with the session state is safe. Skips the out-of-band
+        // catch-up too — reopening from scratch is how reload handles a moved
+        // (or switched) HEAD, so it must not be pre-empted by the catch-up.
+        self.with_session_no_sync(move |repo, trash| {
             // Only swap on success — a failed reload keeps the current session.
             let fresh = Repo::open(&path).map_err(internal)?;
             *repo = fresh;

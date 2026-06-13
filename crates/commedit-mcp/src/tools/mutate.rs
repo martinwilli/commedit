@@ -629,7 +629,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Introduce a merge directly above a commit, to organize a linear history into a branchy one (the GTK app's merge-out button). Given a single-parent commit C with parent P, it inserts a merge M with parents [P, C] — P the mainline first parent, C the merged-out side branch — and M's tree equal to C's, so the merge introduces no change of its own and C's descendants rebase onto it cleanly (Clean absent an overlap with uncommitted changes). C becomes a one-commit side branch you can then move further commits onto (reorder_commit); M carries a pro-forma `Merge \"<subject>\"` message to reword later (edit_message). Merge commits and the repository root cannot be merged out — they have no single parent. This is the inverse of every other tool, which only edits or preserves merges; building a merge between two real branches stays a plain-git task."
+        description = "Introduce a merge directly above a commit, to organize a linear history into a branchy one (the GTK app's merge-out button). Given a single-parent commit C with parent P, it inserts a merge M with parents [P, C] — P the mainline first parent, C the merged-out side branch — and M's tree equal to C's, so the merge introduces no change of its own and C's descendants rebase onto it cleanly (Clean absent an overlap with uncommitted changes). C becomes a one-commit side branch you can then move further commits onto (reorder_commit); M carries a pro-forma `Merge \"<subject>\"` message to reword later (edit_message). Merge commits and the repository root cannot be merged out — they have no single parent. This is the inverse of every other tool, which only edits or preserves merges; building a merge between two real branches stays a plain-git task. The clean result carries a `topology` slice with the new merge M and its two parents, and C gaining M as its child — so you can verify the merge landed without a follow-up read."
     )]
     pub async fn merge_out_commit(
         &self,
@@ -650,6 +650,11 @@ impl CommeditServer {
                 ));
             }
             let target = commits[idx].id.clone();
+            // Anchor the merged-out commit C (so the result shows it gaining the
+            // new merge as its child); the merge M itself is freshly minted and
+            // surfaces via post − pre, carrying its two parents [P, C].
+            let anchor = commits[idx].change_id_hex();
+            let pre = change_id_set(&commits);
             // The merge takes the gap directly above C, so its children are C's
             // current children — the very slot a create_commit with new_parent = C
             // lands in (empty at the tip, where the merge becomes the new HEAD).
@@ -663,7 +668,7 @@ impl CommeditServer {
             let outcome = repo
                 .merge_out_commit(&target, mv.new_children)
                 .map_err(internal)?;
-            Ok(save_result(repo, &outcome))
+            save_result_topo(repo, &outcome, &pre, &[anchor])
         })
         .await
         .map(Yaml)

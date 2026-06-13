@@ -72,6 +72,18 @@ pub fn init_shared_git_dir(git_dir: &Path, workspace_root: &Path) -> Result<()> 
     symlink_dir(&objects, &local_objects)?;
     // Seed the checked-out branch / detached HEAD and its tip (resolvable now via
     // the shared objects) so jj imports the current history.
+    seed_session_head(git_dir, workspace_root)
+}
+
+/// Point the session git dir's checked-out branch ref (and HEAD) at the user
+/// repository's current tip, so a following jj import picks it up. The ODB is
+/// already shared, so the tip is resolvable. Run once by [`init_shared_git_dir`]
+/// at open, and again by the in-session catch-up
+/// ([`crate::repo::Repo::sync_to_git_head`]) when the user moved HEAD out of band
+/// (a plain `git commit`): jj imports refs from *this* session-local dir, not the
+/// user's `.git`, so its branch ref must be re-pointed at the user's new tip
+/// before the import can see the new commit.
+pub fn seed_session_head(git_dir: &Path, workspace_root: &Path) -> Result<()> {
     if let Some(tip) = head_commit(workspace_root) {
         match head_branch(workspace_root) {
             Some(branch) => {

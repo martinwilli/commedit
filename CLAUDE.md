@@ -75,8 +75,14 @@ unit-testable headless:
   the pre-mutation change_id set (`change_id_set`) and its anchor(s) before
   mutating; a freshly-minted commit (a split's fixup child, a
   created/reverted/cherry-picked commit, a restored trash commit) is found as
-  `post − pre`. Plain message/identity/file edits stay lean (`save_result`, no
-  slice). The read-only `show_graph` tool exposes that same adjacency for the
+  `post − pre`. `merge_out_commit` carries the slice too (anchoring its
+  merged-out commit; the new merge is the `post − pre`, surfacing its two
+  parents). `commit_working_copy` and `squash_working_copy` wrap the outcome in a
+  resp DTO (`CommitWorkingCopyResp`/`SquashWorkingCopyResp`) that adds the new
+  commit and/or the remaining working copy, so a *partial* commit/fold is
+  verifiable (what landed + what's left) without a follow-up read. Plain
+  message/identity/file edits stay lean (`save_result`, no slice). The read-only
+  `show_graph` tool exposes that same adjacency for the
   **whole** branch (`graph_adjacency` in `convert.rs` — the shared
   `adjacency_tables`/`render_adjacency` the topology slice also uses), so an agent
   can read the merge/branch shape on demand without a mutation. Every result is
@@ -95,8 +101,13 @@ unit-testable headless:
   are
   refused while a conflicted
   rewrite is pending — the conflict tools (commit-ref-keyed, change id
-  preferred) or `abort_rewrite` settle it first — and `reload_repo` re-opens
-  the repo in place (fresh session) to pick up out-of-band git changes.
+  preferred) or `abort_rewrite` settle it first. Out-of-band git changes are
+  caught up automatically: every tool runs through `with_session`, which calls
+  `Repo::sync_to_git_head` first (a no-op unless the live HEAD moved), so a plain
+  `git commit` on top of HEAD is imported into the *existing* session — trash and
+  op-log intact. `reload_repo` (`with_session_no_sync`, the lone opt-out) is the
+  heavier full reset, reserved for what a fast-forward sync can't absorb: a branch
+  switch or out-of-band history rewrite.
 
 ### The jj-over-git "transparency" model (the central idea)
 
@@ -120,6 +131,20 @@ ordinary, attached-HEAD repo the whole time — is upheld in the code like this:
   a divergent op log. It reuses jj-lib's lower-level init primitives (no
   high-level constructor separates checkout target from state location) — **the
   one place sensitive to a jj-lib bump**.
+- Git state is imported only at `Repo::open`, so a plain `git commit` the user
+  makes on top of HEAD *after* open is absent from jj's view — a read or mutation
+  resolving from the live HEAD would fail ("commit … not found in index").
+  `Repo::sync_to_git_head` catches up **in place**: it re-seeds the throwaway dir's
+  branch ref from the user's repo (`transparency.rs`'s `seed_session_head`, the
+  same seeding `init_shared_git_dir` does at open — jj imports refs from *that* dir,
+  not the user's `.git`) and re-runs `import_git`, preserving the trash and op-log
+  (the import is just a recorded jj op, **not** the full reopen `reload_repo` does).
+  Fast-forward only: a branch switch or out-of-band history rewrite is refused (it
+  bails, pointing at `reload_repo`). Auto-invoked at the head of
+  `snapshot_working_copy` (so every mutation self-heals — the snapshot's
+  `ensure_working_copy_on_head` then re-anchors `@` onto the new tip) and at the MCP
+  `with_session` boundary (so reads self-heal too; `reload_repo` opts out via
+  `with_session_no_sync`).
 - The import is **scoped to the current branch**: commedit only displays/edits
   HEAD's ancestors, so sibling branches/tags are left exactly where git has them
   and no jj-level bookmark confinement is needed. jj exports the moved branch into
@@ -222,7 +247,9 @@ op-log").
   one entry point that *creates a merge* (everything else only edits/preserves
   them). The MCP handler maps the agent's target commit onto the gap-above slot the
   same way `create_commit` does (a `plan_splice` with `new_parent` = the commit,
-  reusing the `child` fork disambiguator) and returns the lean `save_result`.
+  reusing the `child` fork disambiguator) and returns `save_result_topo` (anchoring
+  `C`; the new merge `M` is the `post − pre`, so the slice surfaces `M`'s two
+  parents — verifiable without a follow-up read).
   Given a single-parent commit `C` (parent `P`), it inserts a merge `M` in `C`'s
   gap-above slot with `new_parent_ids = [P, C]` (P first = mainline, C second = the
   merged-out side branch) and `M`'s tree = **`C`'s tree** passed explicitly to

@@ -10,12 +10,13 @@ description: >-
 
 # Insert, revert & cherry-pick with commedit
 
-> **Delegate the insert to the `commedit-operator` subagent.** Hand it the *what* —
-> "create a commit from these files below `<id>`", "revert `<id>`", "cherry-pick
-> `<sha>` from `<branch>`" — and it splices at the right slot, rebases descendants,
-> **verifies**, and reports back. The tool detail below is what the operator works
-> from; drive these tools yourself only when no subagent is available, or when you
-> *are* the operator.
+> **Drive a single insert yourself; delegate when it conflicts or needs scouting.**
+> A lone `create_commit` / `revert_commit` / `cherry_pick_commit` / `merge_out_commit`
+> at a slot you can name — make it directly: the result returns the new commit and
+> reshaped topology, so it is self-verifying with no follow-up read. **Delegate to
+> the `commedit-operator` subagent** when the splice conflicts (a mid-history insert
+> where the slot diverged) or you must hunt down the right source or slot first. The
+> tool detail below is what you (or the operator) work from.
 
 These tools *introduce* a commit and splice it into the graph at a chosen slot.
 The slot is the same everywhere: `new_parent` names the commit that becomes the

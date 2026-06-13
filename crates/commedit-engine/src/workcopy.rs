@@ -125,6 +125,10 @@ impl Repo {
     /// like `git add`, so only this first snapshot needs to name it; a path that is
     /// already tracked or absent on disk is a harmless no-op.
     pub fn snapshot_working_copy_tracking(&mut self, add_paths: &[String]) -> Result<()> {
+        // Catch up first if the caller moved git HEAD out of band (a plain
+        // `git commit`): jj's view must contain the new tip before we can attach
+        // `@` to it or rebase onto it. A no-op when already in sync.
+        self.sync_to_git_head()?;
         // `@` must sit directly on the current tip, or its diff would be the
         // whole history rather than the uncommitted delta.
         self.ensure_working_copy_on_head()?;

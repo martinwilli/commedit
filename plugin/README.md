@@ -45,10 +45,11 @@ server provides its own usage instructions to the agent on connect.
 ## Bundled skills
 
 The plugin also ships skills that teach an agent *when* to reach for these
-workflows — the ones comm(ed)it makes easy — and to **hand the execution to the
-`commedit-operator` subagent** (below) rather than drive the MCP tools from the
-main context. They load on the matching intent, or invoke one explicitly (e.g.
-`/commedit:commit-as-you-go`) to pin it at the start of a run.
+workflows — the ones comm(ed)it makes easy. A single clean edit you can address
+directly, you drive yourself (each result is self-verifying); the heavier work —
+conflicts, multi-step reshuffles, exploration — goes to the **`commedit-operator`
+subagent** (below). They load on the matching intent, or invoke one explicitly
+(e.g. `/commedit:commit-as-you-go`) to pin it at the start of a run.
 
 - **`commit-as-you-go`** — for a multi-step task that will produce several
   commits: commit each logical unit eagerly as you work (extending or fixing a
@@ -65,29 +66,27 @@ main context. They load on the matching intent, or invoke one explicitly (e.g.
 
 ## Bundled agent
 
-The plugin also ships a subagent, **`commedit-operator`**, that takes the
-commedit-interaction burden off the main agent. Hand it *what* to change — "reword
-commit X", "squash the fixup into Y", "reorder Z before W", "re-date this range",
-"create a commit from these files below HEAD", "resolve the pending conflict",
-"undo the last operation" — and it picks the right tool, performs the action,
-**verifies** it landed (through commedit or read-only `git`), and returns a
-compact summary (outcome, affected `change_id`s, what it checked). It owns the
-details the workflows above describe — `change_id` addressing, the smallest-tool
-choice, conflict holds, the undo/abort safety net — and the bundled skills, which
-it consults on demand. It edits history only via commedit and never touches
-working-tree files itself, so the main agent stays in charge of *what* while the
-operator handles *how*. Delegate one operation (or a tightly-related batch) per
-call.
+The plugin also ships a subagent, **`commedit-operator`**, for the history
+editing you *shouldn't* do inline. A single mutation you can address directly
+(you hold the `change_id`) and expect to land clean — a reword, re-date,
+edit-one-file, reorder, squash, drop, create, revert, cherry-pick or merge-out —
+you drive yourself: each result is self-verifying (it returns the new
+`change_id`, the reshaped `topology`, and for working-copy commits the remaining
+uncommitted changes), so no follow-up read is needed. Hand the operator the
+*loops, searches and conflicts* instead — "resolve the pending conflict", "squash
+the fixup into Y across this messy range", "re-date this whole range", "find where
+this fix belongs and fold it in". It picks the tools, performs the action,
+confirms it from the returned result, and returns a compact summary (outcome,
+affected `change_id`s, what it verified). It owns the details the workflows above
+describe — `change_id` addressing, the smallest-tool choice, conflict holds, the
+undo/abort safety net — and the bundled skills, which it consults on demand. It
+edits history only via commedit and never touches working-tree files itself.
+Delegate one operation (or a tightly-related batch) per call.
 
-Reach for it **instead of driving the commedit MCP tools yourself** for any
-history rewrite, or a commit that lands below the tip — a `create_commit` /
-`reorder_commit` / `squash_commit` / `edit_message` / `squash_working_copy` call
-from the main context belongs here, as does what you'd otherwise do with
-`git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert` — on any
-commit reachable from HEAD, not just the tip. A plain **new commit on top of
-HEAD** needs no rebase, so make it with raw `git add` / `git commit` rather than
-delegating. Building merge commits and managing branches, remotes and pushes stay
-plain-git tasks.
+A plain **new commit on top of HEAD** needs no rebase, so make it with raw
+`git add` / `git commit` — or `commit_working_copy` to stay in-session and chain
+on its returned `change_id`. Building merge commits between two real branches and
+managing branches, remotes and pushes stay plain-git tasks.
 
 ## Requirements
 

@@ -59,7 +59,33 @@ impl CommeditServer {
     /// Run `f` against the locked session on the blocking thread pool. The
     /// mutex serializes all tool work (single writer for free); it is taken
     /// inside the blocking task, never across an `.await`.
+    ///
+    /// First catches the session up to a git HEAD that moved out of band (a plain
+    /// `git commit` the caller made on top of HEAD): jj imports git state only at
+    /// open, so without this every tool that reads from the live HEAD would fail
+    /// once the caller commits with raw git — and the catch-up preserves the trash
+    /// and op-log, unlike `reload_repo`. A no-op while in sync or pending.
     pub(crate) async fn with_session<T, F>(&self, f: F) -> Result<T, ErrorData>
+    where
+        F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_session_opt(true, f).await
+    }
+
+    /// Like [`Self::with_session`] but skips the out-of-band catch-up. Used by
+    /// `reload_repo`, which reopens the repository from scratch and so must not be
+    /// pre-empted by the catch-up's branch-switch refusal — reopening is exactly
+    /// how a branch switch is meant to be handled.
+    pub(crate) async fn with_session_no_sync<T, F>(&self, f: F) -> Result<T, ErrorData>
+    where
+        F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_session_opt(false, f).await
+    }
+
+    async fn with_session_opt<T, F>(&self, sync: bool, f: F) -> Result<T, ErrorData>
     where
         F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
         T: Send + 'static,
@@ -69,6 +95,9 @@ impl CommeditServer {
         tokio::task::spawn_blocking(move || {
             let mut repo = repo.lock().unwrap_or_else(PoisonError::into_inner);
             let mut trash = trash.lock().unwrap_or_else(PoisonError::into_inner);
+            if sync {
+                repo.sync_to_git_head().map_err(internal)?;
+            }
             f(&mut repo, &mut trash)
         })
         .await

@@ -10,12 +10,14 @@ description: >-
 
 # Revise an existing commit with commedit
 
-> **Delegate the edit to the `commedit-operator` subagent.** Tell it *what* to
-> revise — "reword commit `<id>` to …", "fix the author/date on `<id>`", "edit
-> `foo.rs` in commit `<id>` to …" — and it picks the smallest tool, runs it,
-> **verifies** the result, and reports back compactly. The mechanics below are what
-> the operator works from; reach for these tools directly only when no subagent is
-> available, or when you *are* the operator.
+> **Drive a single revision yourself; delegate the messy ones.** When you hold the
+> target's change_id and the edit is one clean call — `replace_in_message`,
+> `edit_message`, `edit_identity`, `replace_in_file` — make it directly: the result
+> returns the new head, and a surgical replace fails loudly on a missed match, so it
+> is self-verifying with no follow-up read. **Delegate to the `commedit-operator`
+> subagent** when it turns into a loop or a search — a conflict to resolve, or
+> finding which buried commit to edit by reading several diffs. The mechanics below
+> are what you (or the operator) work from.
 
 `git commit --amend` only reaches the tip. commedit amends **any** commit
 reachable from HEAD — its message, its identity, or the files it changed — and

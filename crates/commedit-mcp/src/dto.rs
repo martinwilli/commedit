@@ -766,6 +766,43 @@ pub struct CommitWorkingCopyReq {
     pub add_paths: Option<Vec<String>>,
 }
 
+/// The result of `commit_working_copy`. The mutation outcome's `status` and
+/// fields are flattened to the top level (uniform with every other mutation);
+/// the new commit and the remaining working copy ride alongside as siblings.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CommitWorkingCopyResp {
+    /// The mutation outcome, flattened in: `status` (always `clean` here — a fresh
+    /// commit on HEAD has no descendants to conflict) and its fields sit at this
+    /// object's top level.
+    #[serde(flatten)]
+    pub result: SaveResultDto,
+    /// The freshly committed commit on HEAD — its sha and stable change_id, so you
+    /// can chain a follow-up edit without a list_history. Present on a clean commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed: Option<CommitDto>,
+    /// The uncommitted changes that remain after the commit: clean for a whole
+    /// commit, the unselected remainder for a partial one — so a partial commit is
+    /// verifiable (what landed + what's left) without a follow-up read. Present on
+    /// a clean commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
+/// The result of `squash_working_copy`. The mutation outcome (including its
+/// `topology` slice) is flattened to the top level; the remaining working copy
+/// rides alongside.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SquashWorkingCopyResp {
+    /// The mutation outcome, flattened in: `status`, `head_sha` and (on a clean
+    /// fold) the `topology` slice showing the destination after the fold.
+    #[serde(flatten)]
+    pub result: SaveResultDto,
+    /// The uncommitted changes that remain after the fold: clean for a whole fold,
+    /// the unselected remainder for a partial one. Present on a clean fold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
 /// Selects whole hunks of one file for a partial commit_working_copy /
 /// squash_working_copy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

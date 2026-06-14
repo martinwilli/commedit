@@ -740,6 +740,24 @@ not in `main.rs`:
   calls (missing prefix, over-long) for a human; `replace_subject` splices a fixed
   summary back into the full description for `rewrite_message`. Drives the `rows.rs`
   lint badge (see above) — the linter is GTK-only, no MCP counterpart.
+- `spelling.rs` — thin **GTK glue** wiring GNOME **libspelling** onto the
+  commit-message editor (`spelling::attach`, called in `build_ui` right after the
+  `message_view`/`message_buffer` are built). libspelling targets `GtkSourceView`
+  directly: its `TextBufferAdapter` attaches to the message `GtkSourceBuffer` (which
+  the field already is) and *itself* drives the misspelling underlines + right-click
+  corrections menu (set as the view's extra menu + a `"spelling"` action group), so
+  there is **no** checker logic of our own — spell quality comes from the system
+  enchant dictionaries. The view retains the adapter, so nothing is stored. Wired
+  only on the **message** field, never the diff/`file_view`. GTK-only, no MCP/engine
+  counterpart (unlike the `msglint` badge this is interactive, not a per-commit scan).
+  It also persists the two preferences libspelling leaves to the app
+  (`SpellSettings` ↔ `~/.config/commedit/spelling.conf`, saved on the adapter's
+  enabled/language notify): the on/off tick, and the **language** — which we **pin**
+  (`Checker::new` with a tag derived once from the locale via `glib::language_names`,
+  validated against `Provider::supports_language`) rather than leaving to
+  `Checker::default()`. The default re-derives per launch and can flip `en`↔`en_US`,
+  which splits enchant's *per-language* personal-dictionary file so "Add to
+  Dictionary" words appear to vanish across sessions; pinning keeps that file stable.
 
 `build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
 diff-pane render/firewall/navigation closures, `save`/`refresh`, the "Edit history"

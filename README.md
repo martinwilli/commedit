@@ -125,6 +125,11 @@ an interactive-rebase session.
   calls remain (a missing prefix, an over-long summary), to jump to the message and
   edit it yourself.
 
+- **Spell-check the message as you type** — the commit-message editor underlines
+  misspelled words; right-click one for correction suggestions or to add it to your
+  dictionary. It uses your system's spell checker (GNOME libspelling over enchant),
+  so it picks up whichever dictionaries you already have installed.
+
 ## Keyboard shortcuts
 
 - `Ctrl+F` — focus the commit search box; `Enter` jumps to the next match.
@@ -144,18 +149,21 @@ dependencies installed first:
 - **`git`** on your `PATH` — comm(ed)it drives the git CLI for working-copy and
   `HEAD` bookkeeping.
 - **GTK 4** (≥ 4.10) and **GtkSourceView 5** (≥ 5.4) shared libraries.
+- **libspelling** (GTK 4 spell-check library) for the message-field spell checker.
+  It checks against your system's enchant dictionaries, so also install a dictionary
+  for your language (e.g. `hunspell-en-us` or `aspell-en`) if you don't have one.
 
 Install the dependencies, then unpack the tarball and run it:
 
 ```sh
 # macOS (Apple Silicon)
-brew install git gtk4 gtksourceview5
+brew install git gtk4 gtksourceview5 libspelling
 tar -xzf commedit-macos-aarch64.tar.gz
 xattr -dr com.apple.quarantine commedit   # the binary is unsigned; clear Gatekeeper
 ./commedit /path/to/repo
 
 # Debian / Ubuntu (24.04+; 22.04 ships GTK 4.6, too old)
-sudo apt install git libgtk-4-1 libgtksourceview-5-0
+sudo apt install git libgtk-4-1 libgtksourceview-5-0 libspelling-1-2
 tar -xzf commedit-linux-x86_64.tar.gz   # or commedit-linux-aarch64.tar.gz on ARM64
 ./commedit /path/to/repo
 ```
@@ -164,9 +172,9 @@ The runtime library packages on other common distributions:
 
 | Distribution    | Install command                                                      |
 | --------------- | -------------------------------------------------------------------- |
-| Fedora          | `sudo dnf install git gtk4 gtksourceview5`                            |
-| Arch Linux      | `sudo pacman -S git gtk4 gtksourceview5`                             |
-| openSUSE        | `sudo zypper install git libgtk-4-1 libgtksourceview-5-0`            |
+| Fedora          | `sudo dnf install git gtk4 gtksourceview5 libspelling`               |
+| Arch Linux      | `sudo pacman -S git gtk4 gtksourceview5 libspelling`                 |
+| openSUSE        | `sudo zypper install git libgtk-4-1 libgtksourceview-5-0 libspelling-1-2` |
 
 Drop the `commedit` binary somewhere on your `PATH` (e.g. `~/.local/bin` or
 `/usr/local/bin`) to launch it from anywhere. There is no Windows release.
@@ -174,9 +182,9 @@ Drop the `commedit` binary somewhere on your `PATH` (e.g. `~/.local/bin` or
 ## Building and running
 
 comm(ed)it is a Rust workspace; you need a Rust toolchain, `git` on your `PATH`,
-and the system GTK4 and libsourceview5 **development** libraries (e.g.
-`libgtk-4-dev` and `libgtksourceview-5-dev` on Debian/Ubuntu, or `gtk4-devel`
-and `gtksourceview5-devel` on Fedora).
+and the system GTK4, libsourceview5 and libspelling **development** libraries (e.g.
+`libgtk-4-dev`, `libgtksourceview-5-dev` and `libspelling-1-dev` on Debian/Ubuntu, or
+`gtk4-devel`, `gtksourceview5-devel` and `libspelling-devel` on Fedora).
 
 ```sh
 cargo build                 # build the workspace

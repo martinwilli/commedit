@@ -51,6 +51,7 @@ use crate::conflict::*;
 mod dragdrop;
 mod msglint;
 mod search;
+mod spelling;
 
 /// The conflict pane's late-bound "expand hidden lines" action, invoked by buffer
 /// line; `None` until the conflict renderer (defined below it) binds it.
@@ -478,6 +479,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     message_view.set_wrap_mode(gtk::WrapMode::WordChar);
     message_view.set_left_margin(8);
     message_view.set_top_margin(8);
+    // Interactive spell checking (red squiggles + right-click suggestions) on
+    // the message editor, via libspelling — it adapts to the GtkSourceBuffer.
+    spelling::attach(&message_view, &message_buffer);
 
     // Identity fields above the message editor: one combined "Name <email>"
     // field per role (with a built-in ▼ to pick an identity used elsewhere) and

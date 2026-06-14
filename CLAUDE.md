@@ -758,6 +758,17 @@ not in `main.rs`:
   `Checker::default()`. The default re-derives per launch and can flip `en`↔`en_US`,
   which splits enchant's *per-language* personal-dictionary file so "Add to
   Dictionary" words appear to vanish across sessions; pinning keeps that file stable.
+- `window_state.rs` — persists the window geometry across sessions, the same
+  hand-rolled `key=value` pattern as `spelling.rs` (`WindowState` ↔
+  `~/.config/commedit/window.conf`, `std::fs` + `glib::user_config_dir()`, no serde):
+  the window size, its maximized state, and the two paned divider positions (the
+  commit-list width and the message-pane height). `build_ui` loads it before building
+  the panes/window (the saved values feed the builders; `maximize()` after build) and
+  saves on the window's `connect_close_request`. `load()` is seeded from `Default` (the
+  old hard-coded literals) and overrides each field only when its line parses, so a
+  missing/partial file degrades gracefully. Window **position** is deliberately *not*
+  stored — GTK4 removed the position APIs and Wayland won't let a client restore its
+  own placement, matching the GNOME HIG. GTK-only, no MCP/engine counterpart.
 
 `build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
 diff-pane render/firewall/navigation closures, `save`/`refresh`, the "Edit history"

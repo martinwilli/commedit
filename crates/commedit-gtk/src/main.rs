@@ -52,6 +52,7 @@ mod dragdrop;
 mod msglint;
 mod search;
 mod spelling;
+mod window_state;
 
 /// The conflict pane's late-bound "expand hidden lines" action, invoked by buffer
 /// line; `None` until the conflict renderer (defined below it) binds it.
@@ -663,6 +664,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     files_box.append(&file_scroll);
     files_box.append(&bottom_bar);
 
+    // Window geometry remembered from the previous session (size + maximized
+    // state + the two divider positions), falling back to the built-in defaults
+    // on a fresh install. Saved on close-request below.
+    let win_state = window_state::WindowState::load();
+
     // The file pane carries the Save action bar at its bottom. A Paned lets
     // either child be shrunk below its minimum by default, so dragging this
     // divider down (or shrinking the window) would squeeze `files_box` until its
@@ -674,7 +680,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .orientation(Orientation::Vertical)
         .start_child(&message_box)
         .end_child(&files_box)
-        .position(200)
+        .position(win_state.message_height)
         .shrink_end_child(false)
         .build();
 
@@ -682,7 +688,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .orientation(Orientation::Horizontal)
         .start_child(&history_box)
         .end_child(&right_paned)
-        .position(480)
+        .position(win_state.list_width)
         .build();
 
     // --- Review view (full-window, read-only session diff) ---
@@ -768,11 +774,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title(format!("Commit editor - {folder}"))
-        .default_width(1400)
-        .default_height(900)
+        .default_width(win_state.width)
+        .default_height(win_state.height)
         .child(&root)
         .build();
     window.set_titlebar(Some(&header));
+    if win_state.maximized {
+        window.maximize();
+    }
 
     // Syntax-highlighting resources (loaded once). A light theme to sit on the
     // light diff line backgrounds, like GitHub/delta.
@@ -3518,6 +3527,27 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     shortcuts.add_shortcut(quit_shortcut);
     shortcuts.add_shortcut(find_shortcut);
     window.add_controller(shortcuts);
+
+    // Remember the window geometry across sessions: on close, persist the size
+    // (`default_size` reports the un-maximized size to restore to), the maximized
+    // state, and the two divider positions (commit-list width, message-pane
+    // height). Position is deliberately not stored — GTK4/Wayland can't restore it.
+    {
+        let paned = paned.clone();
+        let right_paned = right_paned.clone();
+        window.connect_close_request(move |window| {
+            let (width, height) = window.default_size();
+            window_state::WindowState {
+                width,
+                height,
+                maximized: window.is_maximized(),
+                list_width: paned.position(),
+                message_height: right_paned.position(),
+            }
+            .save();
+            glib::Propagation::Proceed
+        });
+    }
 
     // Initial population and selection.
     refresh();

@@ -7,8 +7,8 @@
 # tarballs are NOT self-contained. The end user must have a compatible runtime
 # (and `git` on PATH) installed — see the "Installing a binary release" section
 # of README.md:
-#   - Linux:   apt install git libgtk-4-1 libgtksourceview-5-0  (or distro equivalent)
-#   - macOS:   brew install git gtk4 gtksourceview5
+#   - Linux:   apt install git libgtk-4-1 libgtksourceview-5-0 libspelling-1-2  (or distro equivalent)
+#   - macOS:   brew install git gtk4 gtksourceview5 libspelling
 # The MCP server (and thus the plugin) only needs `git` on PATH.
 #
 # Push a tag like `v0.1.0` to cut a GitHub Release; or run manually via the
@@ -49,12 +49,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgtksourceview-5-dev
+          sudo apt-get install -y libgtk-4-dev libgtksourceview-5-dev libspelling-1-dev
 
       # --- macOS: GTK from Homebrew, Rust from rustup ---------------------
       - name: Install GTK (macOS)
         if: runner.os == 'macOS'
-        run: brew install gtk4 gtksourceview5 pkg-config
+        run: brew install gtk4 gtksourceview5 libspelling pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

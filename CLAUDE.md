@@ -750,6 +750,14 @@ not in `main.rs`:
   enchant dictionaries. The view retains the adapter, so nothing is stored. Wired
   only on the **message** field, never the diff/`file_view`. GTK-only, no MCP/engine
   counterpart (unlike the `msglint` badge this is interactive, not a per-commit scan).
+  It also persists the two preferences libspelling leaves to the app
+  (`SpellSettings` ↔ `~/.config/commedit/spelling.conf`, saved on the adapter's
+  enabled/language notify): the on/off tick, and the **language** — which we **pin**
+  (`Checker::new` with a tag derived once from the locale via `glib::language_names`,
+  validated against `Provider::supports_language`) rather than leaving to
+  `Checker::default()`. The default re-derives per launch and can flip `en`↔`en_US`,
+  which splits enchant's *per-language* personal-dictionary file so "Add to
+  Dictionary" words appear to vanish across sessions; pinning keeps that file stable.
 
 `build_ui` (in `main.rs`) stays the orchestration hub — widget construction, the
 diff-pane render/firewall/navigation closures, `save`/`refresh`, the "Edit history"

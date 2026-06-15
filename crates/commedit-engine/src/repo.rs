@@ -73,6 +73,13 @@ pub struct Repo {
     _workdir: TempDir,
 }
 
+/// The session git dir's location relative to the jj store dir
+/// (`<state_dir>/repo/store` → `<state_dir>/git`), written into the git backend's
+/// `git_target`. Storing it relative (not as the absolute `git_dir`) keeps the
+/// `repo/` tree relocatable: it can be copied to a different `state_dir` and still
+/// resolve its git dir, re-created at the same relative spot.
+const RELATIVE_GIT_DIR: &str = "../../git";
+
 impl Repo {
     /// Open the repository at `workspace_root`: spin up a fresh, throwaway jj
     /// workspace whose metadata lives in a temp dir (see [`Self::init_detached`]),
@@ -169,15 +176,20 @@ impl Repo {
         std::fs::create_dir(&wc_state).context("creating jj working-copy state dir")?;
 
         // The git dir jj writes into: session-local, with an object store shared
-        // with the user's repo but private refs. Absolute (state_dir is), so
-        // GitBackend::init_external's `store_path.join` resolves to it directly.
+        // with the user's repo but private refs.
         let git_dir = state_dir.join("git");
         crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
             .context("setting up the session git dir")?;
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|
          -> Result<Box<dyn Backend>, BackendInitError> {
-            let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
+            // Record the git dir as a path *relative* to the store dir
+            // (`<state_dir>/repo/store` → `<state_dir>/git`) rather than the
+            // absolute `git_dir`, so the `repo/` tree is relocatable: a later
+            // session can copy it elsewhere and re-create `git/` at the same
+            // relative spot. jj joins it onto `store_path` and canonicalizes.
+            let backend =
+                GitBackend::init_external(settings, store_path, Path::new(RELATIVE_GIT_DIR))?;
             Ok(Box::new(backend))
         };
 

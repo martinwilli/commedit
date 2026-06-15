@@ -875,12 +875,12 @@ surplus rows.
 - When integrating a feature worktree/branch into `master` (the
   `work-in-worktree` flow), give the merge commit a body: keep git's
   `Merge branch 'feature/…'` subject, then a blank line, then a short,
-  high-level brief of what the merge introduces — present tense, leading with
-  what it does (for the user or the agent) and following with a concise note of
-  the implementation approach, mentioning the README/CLAUDE.md doc updates when
-  relevant. It reads as a per-feature changelog entry, not a restatement of the
-  individual commits; match the length and tone of the existing merge messages
-  (`git log --merges`). Reword the merge after the fact with commedit's
+  high-level brief of what the merge introduces — **one or two sentences**,
+  present tense, leading with what it does (for the user or the agent) and, only
+  if not obvious, a brief note on the approach. It reads as a one-line-ish
+  per-feature changelog entry, not a restatement of the individual commits — keep
+  it tight: don't recap every commit, list touched files, or call out the
+  README/CLAUDE.md doc updates. Reword the merge after the fact with commedit's
   `edit_message` — it edits a merge commit's message in place and rebases the
   descendants — rather than `git commit --amend`.
 - Engine integration tests build scratch git repos via `tests/common/mod.rs`

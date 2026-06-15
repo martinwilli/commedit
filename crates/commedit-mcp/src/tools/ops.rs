@@ -115,7 +115,11 @@ impl CommeditServer {
                 None => repo.workspace_root().to_path_buf(),
             };
             // Only swap on success — a failed reload keeps the current session.
-            let fresh = Repo::open(&target).map_err(internal)?;
+            // Cached like the initial open; replacing `*repo` drops the old session,
+            // whose `Drop` flushes its index cache.
+            let fresh =
+                Repo::open_with_cache(&target, commedit_engine::index_cache::IndexCache::Default)
+                    .map_err(internal)?;
             *repo = fresh;
             trash.entries.clear();
             trash.staged = None;

@@ -25,14 +25,34 @@ async fn main() -> Result<()> {
 
     let path = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_string()));
 
-    // Repo::open does blocking git/jj work; keep it off the async runtime.
-    let repo = tokio::task::spawn_blocking(move || commedit_engine::repo::Repo::open(&path))
-        .await
-        .context("opening repository")??;
+    // Repo::open does blocking git/jj work; keep it off the async runtime. Use the
+    // index cache so repeated launches against the same repo skip rebuilding jj's
+    // commit index from scratch (see `commedit_engine::index_cache`).
+    let repo = tokio::task::spawn_blocking(move || {
+        commedit_engine::repo::Repo::open_with_cache(
+            &path,
+            commedit_engine::index_cache::IndexCache::Default,
+        )
+    })
+    .await
+    .context("opening repository")??;
     tracing::info!(root = %repo.workspace_root().display(), "repository opened");
 
     let server = commedit_mcp::server::CommeditServer::new(repo);
+    // Grab the repo handle before `serve` consumes the server, so the index cache
+    // can be flushed at clean shutdown (the engine's `Drop` is the backstop).
+    let repo = server.repo_handle();
     let service = server.serve(stdio()).await.context("starting MCP server")?;
     service.waiting().await.context("serving MCP")?;
+
+    // Persist the (now up-to-date) jj index back to the cache. Blocking file IO,
+    // so keep it off the async runtime.
+    tokio::task::spawn_blocking(move || {
+        repo.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush_index_cache();
+    })
+    .await
+    .ok();
     Ok(())
 }

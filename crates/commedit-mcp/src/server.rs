@@ -34,6 +34,13 @@ impl CommeditServer {
                 + Self::router_ops(),
         }
     }
+
+    /// A clone of the session's repo handle. `main` grabs this before `serve`
+    /// consumes the server, so it can flush the index cache at clean shutdown (see
+    /// [`commedit_engine::repo::Repo::flush_index_cache`]).
+    pub fn repo_handle(&self) -> Arc<Mutex<Repo>> {
+        self.repo.clone()
+    }
 }
 
 /// The agent's manual, served as the MCP `instructions` field.

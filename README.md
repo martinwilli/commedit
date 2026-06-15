@@ -231,6 +231,18 @@ tags stay exactly where they are (they simply diverge, as they would after a
 (all repository logic, unit-tested against scratch repos) and a `commedit-gtk`
 crate (the UI), so the rewrite logic carries no GTK dependency.
 
+Opening a large history is fast after the first time. Building jj's commit index
+means reading every commit reachable from `HEAD` — seconds on a huge repo (the
+Linux kernel takes ~35s), and it would otherwise be rebuilt from scratch on every
+launch. So comm(ed)it caches that index per-repository under
+`$XDG_CACHE_HOME/commedit` (i.e. `~/.cache/commedit`) — **outside** your
+repository, never in it — and on the next launch primes from it and indexes only
+the commits added since, turning that ~35s open into ~1s. Several windows (or an
+MCP agent) can share one repo's cache at once. The cache maintains itself: entries
+unused for a month, or beyond a size cap, are evicted automatically, and it is
+always safe to delete `~/.cache/commedit`. It only ever makes opening faster — if
+an entry is ever stale or unreadable, comm(ed)it silently rebuilds from scratch.
+
 That transparency is what keeps conflicts out of your history. While a rewrite is
 conflicted, comm(ed)it moves no git ref, `HEAD` or working-tree file: the
 conflicted commit objects sit unreachable in the object store and plain `git`

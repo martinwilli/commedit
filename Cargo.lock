@@ -251,6 +251,7 @@ dependencies = [
  "jj-lib",
  "jsonc-parser",
  "pollster",
+ "sha2",
  "similar",
  "tempfile",
  "thiserror",

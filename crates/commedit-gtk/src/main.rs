@@ -232,7 +232,12 @@ fn visible_changes(changes: &[FileChange], orig: &[FileChange]) -> Vec<FileChang
 }
 
 fn build_ui(app: &Application, repo_path: PathBuf) {
-    let repo = match Repo::open(&repo_path) {
+    // Use the index cache so repeated launches against the same repo skip
+    // rebuilding jj's commit index from scratch (see `commedit_engine::index_cache`).
+    let repo = match Repo::open_with_cache(
+        &repo_path,
+        commedit_engine::index_cache::IndexCache::Default,
+    ) {
         Ok(repo) => Rc::new(RefCell::new(repo)),
         Err(err) => {
             present_error(
@@ -2991,8 +2996,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         move |_| {
             // Open the new session before dropping the old one, so a failed
             // reload leaves the current state untouched (concurrent sessions
-            // are supported, so the brief overlap is fine).
-            let reopened = match Repo::open(&repo_path) {
+            // are supported, so the brief overlap is fine). Cached like the
+            // initial open; the old session flushes its index as it drops.
+            let reopened = match Repo::open_with_cache(
+                &repo_path,
+                commedit_engine::index_cache::IndexCache::Default,
+            ) {
                 Ok(r) => r,
                 Err(err) => {
                     show_status(&format!("Reload failed: {err:#}"));
@@ -3535,6 +3544,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     {
         let paned = paned.clone();
         let right_paned = right_paned.clone();
+        let repo = repo.clone();
         window.connect_close_request(move |window| {
             let (width, height) = window.default_size();
             window_state::WindowState {
@@ -3545,6 +3555,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 message_height: right_paned.position(),
             }
             .save();
+            // Persist the session's jj index to the cache so the next launch primes
+            // from it (see `commedit_engine::index_cache`). Synchronous — a GTK app
+            // can't rely on `Repo`'s `Drop` running at process exit.
+            repo.borrow_mut().flush_index_cache();
             glib::Propagation::Proceed
         });
     }

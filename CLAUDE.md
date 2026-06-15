@@ -133,10 +133,15 @@ ordinary, attached-HEAD repo the whole time — is upheld in the code like this:
   `Repo::_workdir`, RAII-deleted on session end) whose checkout target is the
   user's worktree but whose state lives outside it — so a real jj user's `.jj` is
   untouched, a non-jj user's tree isn't polluted (not even a transient `refs/jj`),
-  no stale jj state survives between sessions, and concurrent sessions can't share
-  a divergent op log. It reuses jj-lib's lower-level init primitives (no
-  high-level constructor separates checkout target from state location) — **the
-  one place sensitive to a jj-lib bump**.
+  and concurrent sessions can't share a divergent op log (each gets its own
+  `TempDir`, hence its own op log — still true with the index cache, which only
+  *copies* a derived index into each fresh dir). It reuses jj-lib's lower-level
+  init primitives (no high-level constructor separates checkout target from state
+  location) — **the place sensitive to a jj-lib bump**, together with its load
+  twin `load_detached` (the cache's load path). The git backend records its git
+  dir as a path *relative* to the store dir (`RELATIVE_GIT_DIR` = `../../git`),
+  **not** the absolute `git_dir`: that is what makes the `repo/` tree relocatable
+  so the index cache can copy it between sessions' temp dirs (see *Index cache*).
 - Git state is imported only at `Repo::open`, so a plain `git commit` the user
   makes on top of HEAD *after* open is absent from jj's view — a read or mutation
   resolving from the live HEAD would fail ("commit … not found in index").
@@ -168,6 +173,48 @@ ordinary, attached-HEAD repo the whole time — is upheld in the code like this:
   refs, reset the git index to the rewritten tip. The post-rewrite invariant
   tests assert: HEAD symbolic + `git fsck` passes + `git status` shows exactly the
   user's uncommitted changes (clean when there were none).
+
+### Index cache (`index_cache.rs`)
+
+`import_git` builds jj's commit index over **all** of HEAD's ancestry by reading
+every ancestor commit object (jj's git backend reads them serially —
+`GitBackend::concurrency() == 1`), so a huge history is slow (~35s for the Linux
+kernel's 1.4M commits) and, because the jj metadata is a throwaway `TempDir`, it
+was rebuilt from scratch *every launch*. jj's indexer is actually **incremental**
+(`build_index_at_operation` reuses a parent op's on-disk index and reads only the
+not-yet-indexed commits) — a fresh op store just never has such a parent. The
+cache persists the session's `repo/` tree (op store + built index) so the next
+launch primes from it: ~35s cold open → ~1s warm.
+
+- **Prime-and-flush, not operate-in-place.** A session never works *in* the cache.
+  `Repo::open_with_cache` copies the cached `repo/` into its own `TempDir` and
+  loads it (`load_detached`, the `init_detached` twin: re-creates the session-local
+  `git/` + a fresh `working_copy/`, then `RepoLoader::load_at_head`), so the op log
+  stays per-session and isolated — the no-shared-op-log invariant holds. `import_git`
+  then only indexes commits added since (incremental). The plain `Repo::open` passes
+  `IndexCache::Disabled` (cold, no flush) — that's what **tests** use, so they never
+  touch `~/.cache`; the GTK/MCP frontends pass `IndexCache::Default`. On *any* failure
+  of the primed path (corrupt entry, GC'd object, jj-lib format change) it falls back
+  to a clean cold `init_detached` after `invalidate`ing the entry — caching only ever
+  makes an open faster, never fail. The flush (`flush_index_cache`, frontends call it
+  at clean shutdown — GTK `connect_close_request`, MCP after `serve`; `Drop` is the
+  backstop) copies the now-updated `repo/` back.
+- **Keyed** on the SHA-256 of the canonical objects-dir path (`git_objects_dir`), so
+  all worktrees of one repo share one entry — correct, since the index is additive
+  over commit ids. Base: `$XDG_CACHE_HOME/commedit/index` (else `~/.cache/...`).
+- **Concurrency = a shared/exclusive `flock`** on a sibling `<key>.lock` (std
+  `File::try_lock*`). Use takes a **shared** lock held for the session, so any number
+  of views (windows, an MCP agent) prime concurrently. Flush converts that to
+  **exclusive** on the same fd (a `try_lock`, succeeds only when no *other* view is
+  open) then downgrades back — contended → flush skipped (cheap to forgo: the index
+  *base* is already cached, only the small delta since prime is lost, re-indexed next
+  time). Eviction takes try-exclusive on a fresh fd, so a live entry is never deleted.
+- **Maintenance.** Each entry carries a `META` (`stamp` = crate version + format int;
+  `generation`; `last_used`; `size`). A stamp mismatch or `generation >= MAX_GENERATIONS`
+  (bounds op-log growth — one cold rebuild every ~100 launches) invalidates it. `sweep`
+  (opportunistic at open, from `META` only, no tree walks) drops entries past the TTL
+  then LRU-evicts over a size cap, each under try-exclusive so in-use entries are
+  skipped. Deleting `~/.cache/commedit` is always safe.
 
 ### Mutation pipeline (every edit follows the same shape)
 

@@ -8,6 +8,7 @@ pub mod create;
 pub mod diff;
 pub mod graph;
 pub mod history;
+pub mod index_cache;
 pub mod patch_edit;
 pub mod replay;
 pub mod repo;

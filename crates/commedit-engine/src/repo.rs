@@ -68,10 +68,33 @@ pub struct Repo {
     /// The throwaway directory holding jj's metadata (repo store + working-copy
     /// state) for this session. It lives outside the user's repository so
     /// commedit leaves no `.jj` behind and never touches a real jj user's
-    /// metadata; RAII deletes it when the `Repo` drops. Never read — held only
-    /// to keep the directory alive for the session's lifetime.
+    /// metadata; RAII deletes it when the `Repo` drops. Its path is also where the
+    /// index cache primes into and flushes from (and where
+    /// [`Self::sync_to_git_head`] re-seeds the session git dir).
     _workdir: TempDir,
+    /// The held index-cache slot for this session (a shared `flock` over the
+    /// per-repo cache entry, plus its paths), or `None` when caching is disabled
+    /// (the engine default / tests) or unavailable. [`Self::flush_index_cache`]
+    /// persists the built index through it at close; [`Drop`] is the backstop.
+    index_cache: Option<crate::index_cache::Handle>,
 }
+
+impl Drop for Repo {
+    /// Backstop for [`Self::flush_index_cache`]: if a frontend didn't flush the
+    /// index cache at clean shutdown, do it as the session's `Repo` drops. A no-op
+    /// when caching is off or already flushed (the handle is taken on first flush).
+    fn drop(&mut self) {
+        self.flush_index_cache();
+    }
+}
+
+/// The session git dir's location relative to the jj store dir
+/// (`<state_dir>/repo/store` → `<state_dir>/git`), written into the git backend's
+/// `git_target`. Storing it relative (not as the absolute `git_dir`) is what makes
+/// the `repo/` tree relocatable: the index cache copies `repo/` into a different
+/// session's `state_dir`, that session re-creates a fresh `git/` at the same
+/// relative spot, and `git_target` still resolves. See [`Repo::load_detached`].
+const RELATIVE_GIT_DIR: &str = "../../git";
 
 impl Repo {
     /// Open the repository at `workspace_root`: spin up a fresh, throwaway jj
@@ -91,6 +114,25 @@ impl Repo {
     /// not polluted. The temp workspace is discarded when the session ends, so no
     /// stale jj state survives between runs.
     pub fn open(workspace_root: &Path) -> Result<Self> {
+        Self::open_with_cache(workspace_root, crate::index_cache::IndexCache::Disabled)
+    }
+
+    /// Like [`Self::open`], but with an index cache (see [`crate::index_cache`]) so
+    /// repeated launches against the same repo skip rebuilding jj's commit index
+    /// from scratch. The frontends (GTK, MCP) pass [`IndexCache::Default`]; the
+    /// engine's plain [`Self::open`] and the tests pass [`IndexCache::Disabled`] so
+    /// they never touch the user's real cache.
+    ///
+    /// When a valid cached entry exists it is primed into this session's temp dir
+    /// and loaded ([`Self::load_detached`]); otherwise — or if the primed load
+    /// fails for any reason — it falls back to a clean cold [`Self::init_detached`],
+    /// discarding the bad entry. Caching only ever makes the open faster, never
+    /// fail. Either way the session holds a shared lock on the cache entry and
+    /// flushes its (now up-to-date) index back at close.
+    pub fn open_with_cache(
+        workspace_root: &Path,
+        cache: crate::index_cache::IndexCache,
+    ) -> Result<Self> {
         // Resolve a path inside the repo to the repository root that encloses it
         // (walking up to `.git`); bails if there is no git repo above it.
         let workspace_root = find_git_root(workspace_root)?;
@@ -99,12 +141,51 @@ impl Repo {
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
         let git_head_branch = crate::transparency::head_branch(workspace_root);
-        // Put jj's metadata in a throwaway temp dir rather than workspace_root/.jj.
-        let workdir = tempfile::Builder::new()
-            .prefix("commedit-")
-            .tempdir()
-            .context("creating temporary jj workspace")?;
-        let (workspace, repo) = Self::init_detached(&settings, workspace_root, workdir.path())?;
+
+        // Acquire the cache slot (a shared lock held for the session) and run
+        // opportunistic eviction while the base is resolved.
+        let cache_handle = crate::index_cache::resolve_base(cache).and_then(|base| {
+            let objects = crate::transparency::git_objects_dir(workspace_root).ok()?;
+            let handle = crate::index_cache::acquire(&base, &objects);
+            crate::index_cache::sweep(&base);
+            handle
+        });
+
+        let new_workdir = || -> Result<TempDir> {
+            tempfile::Builder::new()
+                .prefix("commedit-")
+                .tempdir()
+                .context("creating temporary jj workspace")
+        };
+
+        // Prime + load from the cache when a valid entry exists; else cold-init.
+        // On any failure of the primed path, discard the entry and cold-init in a
+        // fresh workdir — the cache must never break an open.
+        let (workdir, workspace, repo) = match &cache_handle {
+            Some(handle) if handle.valid => {
+                let workdir = new_workdir()?;
+                let primed = handle
+                    .prime(workdir.path())
+                    .and_then(|()| Self::load_detached(&settings, workspace_root, workdir.path()));
+                match primed {
+                    Ok((workspace, repo)) => (workdir, workspace, repo),
+                    Err(e) => {
+                        eprintln!("commedit: index cache unusable ({e}); rebuilding from scratch");
+                        handle.invalidate();
+                        let workdir = new_workdir()?;
+                        let (workspace, repo) =
+                            Self::init_detached(&settings, workspace_root, workdir.path())?;
+                        (workdir, workspace, repo)
+                    }
+                }
+            }
+            _ => {
+                let workdir = new_workdir()?;
+                let (workspace, repo) =
+                    Self::init_detached(&settings, workspace_root, workdir.path())?;
+                (workdir, workspace, repo)
+            }
+        };
 
         let mut this = Self {
             workspace,
@@ -118,6 +199,7 @@ impl Repo {
             op_cursor: 0,
             pending_op_desc: None,
             _workdir: workdir,
+            index_cache: cache_handle,
         };
         this.import_git()?;
         this.reattach_head()?;
@@ -135,6 +217,19 @@ impl Repo {
         this.session_op = Some(this.repo.operation().clone());
         this.session_head = this.head_commit();
         Ok(this)
+    }
+
+    /// Persist this session's built jj index back into the index cache, so the next
+    /// launch against this repo primes from it instead of rebuilding from scratch
+    /// (see [`crate::index_cache`]). Best-effort and **non-blocking**: it only
+    /// writes when this is the last view on the cache entry, and is a no-op when
+    /// caching is disabled/unavailable. The frontends call this at clean shutdown;
+    /// [`Drop`] is the backstop. The handle is taken on the first call, so a later
+    /// flush (e.g. from `Drop` after an explicit flush) does nothing.
+    pub fn flush_index_cache(&mut self) {
+        if let Some(handle) = self.index_cache.take() {
+            handle.flush(self._workdir.path());
+        }
     }
 
     /// Initialize a fresh jj workspace whose metadata — the repo store and the
@@ -169,15 +264,22 @@ impl Repo {
         std::fs::create_dir(&wc_state).context("creating jj working-copy state dir")?;
 
         // The git dir jj writes into: session-local, with an object store shared
-        // with the user's repo but private refs. Absolute (state_dir is), so
-        // GitBackend::init_external's `store_path.join` resolves to it directly.
+        // with the user's repo but private refs.
         let git_dir = state_dir.join("git");
         crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
             .context("setting up the session git dir")?;
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|
          -> Result<Box<dyn Backend>, BackendInitError> {
-            let backend = GitBackend::init_external(settings, store_path, &git_dir)?;
+            // Record the git dir as a path *relative* to the store dir
+            // (`<state_dir>/repo/store` → `<state_dir>/git`) rather than the
+            // absolute `git_dir`. This is what makes the `repo/` tree
+            // relocatable: the index cache copies it to a different session's
+            // `state_dir` and that session re-creates `git/` at the same
+            // relative spot (see [`Self::load_detached`]), so `git_target` still
+            // resolves. jj joins it onto `store_path` and canonicalizes.
+            let backend =
+                GitBackend::init_external(settings, store_path, Path::new(RELATIVE_GIT_DIR))?;
             Ok(Box::new(backend))
         };
 
@@ -205,6 +307,74 @@ impl Repo {
         let repo = pollster::block_on(tx.commit("add workspace"))
             .context("committing the initial workspace")?;
 
+        let working_copy = LocalWorkingCopyFactory {}
+            .init_working_copy(
+                repo.store().clone(),
+                workspace_root.to_path_buf(),
+                wc_state,
+                repo.op_id().clone(),
+                WorkspaceName::DEFAULT.to_owned(),
+                settings,
+            )
+            .context("initializing the working copy")?;
+
+        let workspace = Workspace::new(
+            workspace_root,
+            repo_dir,
+            working_copy,
+            repo.loader().clone(),
+        )
+        .context("assembling the jj workspace")?;
+        Ok((workspace, repo))
+    }
+
+    /// Load a jj workspace from a `state_dir` whose `repo/` tree was *primed* from
+    /// the index cache (a recursive copy of a previous session's `repo/`, holding
+    /// its already-built commit index — see [`crate::index_cache`]). The
+    /// counterpart to [`Self::init_detached`]: instead of initializing an empty jj
+    /// repo and indexing HEAD's whole ancestry from scratch, it loads the persisted
+    /// index, so the following [`Self::import_git`] only has to index the commits
+    /// added since the cache was written (usually none to a handful) — turning a
+    /// ~30s cold open of a huge history into a ~1s incremental one.
+    ///
+    /// The `repo/` tree is already in place; this re-creates the session-local bits
+    /// that are *not* cached and must be fresh per session: the shared git dir
+    /// (objects symlinked to the user's ODB, HEAD seeded) at the relative location
+    /// `repo/store/git_target` points at, and an empty working-copy state. The open
+    /// tail (`reattach`/`collapse`/`snapshot`) then reconciles `@` onto the user's
+    /// live HEAD exactly as on a cold open, so the rest of the session is identical.
+    ///
+    /// Fallible by design: a corrupt/partial cache, an index referencing an object
+    /// the user has since GC'd, or a jj-lib on-disk format change all surface here
+    /// as an error, and [`Self::open`] falls back to a clean [`Self::init_detached`]
+    /// after discarding the bad entry. Like `init_detached`, this leans on jj-lib's
+    /// lower-level loader primitives, so a jj-lib bump may need it revisited.
+    fn load_detached(
+        settings: &UserSettings,
+        workspace_root: &Path,
+        state_dir: &Path,
+    ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
+        use jj_lib::repo::{RepoLoader, StoreFactories};
+
+        let repo_dir = state_dir.join("repo"); // primed by the caller
+        let wc_state = state_dir.join("working_copy");
+        std::fs::create_dir(&wc_state).context("creating jj working-copy state dir")?;
+
+        // Fresh session-local git dir; the primed `repo/store/git_target` is the
+        // relative `RELATIVE_GIT_DIR`, so it resolves to this newly-created dir.
+        let git_dir = state_dir.join("git");
+        crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
+            .context("setting up the session git dir")?;
+
+        let loader =
+            RepoLoader::init_from_file_system(settings, &repo_dir, &StoreFactories::default())
+                .context("loading the primed jj repo")?;
+        let repo = pollster::block_on(loader.load_at_head())
+            .context("loading the primed jj repo at head")?;
+
+        // Attach a *fresh* working copy at the loaded head op; `Repo::open`'s
+        // collapse + snapshot re-anchor `@` onto the user's current HEAD, so the
+        // primed view's stale `@`/bookmark don't matter.
         let working_copy = LocalWorkingCopyFactory {}
             .init_working_copy(
                 repo.store().clone(),

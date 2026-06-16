@@ -15,11 +15,14 @@
 
 use std::cell::{Cell, RefCell};
 
+use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind, ConflictPiece};
 use gtk::glib;
 use gtk::subclass::prelude::*;
 use sourceview5::prelude::*;
 use sourceview5::subclass::prelude::*;
 use sourceview5::{GutterLines, GutterRendererAlignmentMode};
+
+use crate::state::ConflictFileView;
 
 /// The old-side and new-side line number a single rendered diff line carries.
 /// `None` where that side does not apply (e.g. `new` on a `-` line, both on a
@@ -116,6 +119,85 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
         .parse()
         .ok()?;
     Some((old, new))
+}
+
+/// Per-buffer-line ours/theirs line numbers for the combined conflict-snippet
+/// buffer, mirroring `render_conflict_view`'s assembly so it aligns 1:1 with the
+/// shown lines. Ours maps to the `old` slot, theirs to `new`, so the two diff
+/// [`LineNumberRenderer`]s are reused unchanged. Markers, file headers, the
+/// elision cue and the structural notice get no number.
+///
+/// Numbers come purely from each file's materialized conflict text (no engine
+/// help), the same way the diff view derives old/new from `@@` + line prefixes: a
+/// line of the "ours" side advances only the ours counter, a "theirs" line only
+/// theirs, an unconflicted line both. Elided runs (hidden behind a cue) still
+/// advance the counters by their line count, so numbers stay continuous across an
+/// expand.
+pub(crate) fn conflict_line_numbers(view: &[ConflictFileView]) -> Vec<DiffLineNo> {
+    let mut out = Vec::new();
+    for fv in view {
+        // The `─── path ───` header line.
+        out.push(DiffLineNo::default());
+        if !fv.resolvable {
+            // The structural-conflict notice line (no snippet, no pieces).
+            out.push(DiffLineNo::default());
+            continue;
+        }
+        // Number every line of the file's full conflict text.
+        let mut nums: Vec<DiffLineNo> = Vec::new();
+        let mut ours = 1u32;
+        let mut theirs = 1u32;
+        for kind in classify_conflict_lines(&fv.full_text) {
+            nums.push(match kind {
+                ConflictLineKind::Plain => {
+                    let n = DiffLineNo {
+                        old: Some(ours),
+                        new: Some(theirs),
+                    };
+                    ours += 1;
+                    theirs += 1;
+                    n
+                }
+                ConflictLineKind::Ours => {
+                    let n = DiffLineNo {
+                        old: Some(ours),
+                        new: None,
+                    };
+                    ours += 1;
+                    n
+                }
+                ConflictLineKind::Theirs => {
+                    let n = DiffLineNo {
+                        old: None,
+                        new: Some(theirs),
+                    };
+                    theirs += 1;
+                    n
+                }
+                // Marker and base lines belong to neither side's file.
+                _ => DiffLineNo::default(),
+            });
+        }
+        // Project onto the shown snippet via the pieces recorded at render time: a
+        // shown run copies its numbers; an elided run is skipped (its lines still
+        // advanced the counters) and stands in the buffer as a single cue line.
+        let mut cursor = 0;
+        for piece in &fv.pieces {
+            match piece {
+                ConflictPiece::Shown { lines } => {
+                    for _ in 0..*lines {
+                        out.push(nums.get(cursor).copied().unwrap_or_default());
+                        cursor += 1;
+                    }
+                }
+                ConflictPiece::Elided { lines } => {
+                    cursor += lines.len();
+                    out.push(DiffLineNo::default());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Horizontal padding around a number column, in pixels.
@@ -364,6 +446,103 @@ diff --git a/y b/y
         assert_eq!(
             nums(diff),
             vec![(None, None), (None, Some(1)), (None, Some(2))],
+        );
+    }
+
+    // --- conflict_line_numbers ---
+
+    use commedit_engine::diff::ContextExpansion;
+
+    fn cfv(full_text: &str, pieces: Vec<ConflictPiece>, resolvable: bool) -> ConflictFileView {
+        ConflictFileView {
+            path: "f".to_string(),
+            resolvable,
+            marker_len: 7,
+            full_text: full_text.to_string(),
+            exp: ContextExpansion::default(),
+            pieces,
+            gaps: Vec::new(),
+        }
+    }
+
+    fn conflict_nums(view: &[ConflictFileView]) -> Vec<(Option<u32>, Option<u32>)> {
+        conflict_line_numbers(view)
+            .into_iter()
+            .map(|n| (n.old, n.new))
+            .collect()
+    }
+
+    #[test]
+    fn conflict_numbers_count_each_side() {
+        // ours file: ctx1 ctx2 our1 ctx3 = 1..4; theirs file: ctx1 ctx2 their1
+        // their2 ctx3 = 1..5. Markers and the header carry no number.
+        let ft = "ctx1\nctx2\n<<<<<<<\nour1\n=======\ntheir1\ntheir2\n>>>>>>>\nctx3";
+        let fv = cfv(ft, vec![ConflictPiece::Shown { lines: 9 }], true);
+        assert_eq!(
+            conflict_nums(&[fv]),
+            vec![
+                (None, None),       // ─── header ───
+                (Some(1), Some(1)), // ctx1
+                (Some(2), Some(2)), // ctx2
+                (None, None),       // <<<<<<<
+                (Some(3), None),    // our1
+                (None, None),       // =======
+                (None, Some(3)),    // their1
+                (None, Some(4)),    // their2
+                (None, None),       // >>>>>>>
+                (Some(4), Some(5)), // ctx3
+            ],
+        );
+    }
+
+    #[test]
+    fn conflict_numbers_continue_across_an_elided_run() {
+        // Nine plain lines, the middle three elided behind one cue line: numbers
+        // jump from 3 to 7 across the cue, staying continuous.
+        let ft = (1..=9)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pieces = vec![
+            ConflictPiece::Shown { lines: 3 },
+            ConflictPiece::Elided {
+                lines: vec!["l4".into(), "l5".into(), "l6".into()],
+            },
+            ConflictPiece::Shown { lines: 3 },
+        ];
+        assert_eq!(
+            conflict_nums(&[cfv(&ft, pieces, true)]),
+            vec![
+                (None, None),       // ─── header ───
+                (Some(1), Some(1)), // l1
+                (Some(2), Some(2)), // l2
+                (Some(3), Some(3)), // l3
+                (None, None),       // ↕ elision cue (hidden l4..l6)
+                (Some(7), Some(7)), // l7
+                (Some(8), Some(8)), // l8
+                (Some(9), Some(9)), // l9
+            ],
+        );
+    }
+
+    #[test]
+    fn conflict_numbers_reset_per_file_and_skip_structural() {
+        // First file numbered, second (structural) is just header + notice, third
+        // restarts its counters at 1.
+        let a = cfv("a1\na2", vec![ConflictPiece::Shown { lines: 2 }], true);
+        let b = cfv("", Vec::new(), false);
+        let c = cfv("c1", vec![ConflictPiece::Shown { lines: 1 }], true);
+        assert_eq!(
+            conflict_nums(&[a, b, c]),
+            vec![
+                (None, None),       // header a
+                (Some(1), Some(1)), // a1
+                (Some(2), Some(2)), // a2
+                (None, None),       // header b
+                (None, None),       // structural notice
+                (None, None),       // header c
+                (Some(1), Some(1)), // c1 (counters reset)
+            ],
         );
     }
 }

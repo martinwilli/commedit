@@ -534,17 +534,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let expand_cue = expand_cue.clone();
         let revert_cue = revert_cue.clone();
         let combined_files = combined_files.clone();
+        let conflict_view = conflict_view.clone();
         let changes = changes.clone();
         let diff_read_only = diff_read_only.clone();
         move |buffer| {
             let text = buffer_text(buffer);
-            // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: blank the number
-            // columns and the diff cue buttons. Leaving conflict mode re-sets the
-            // buffer text, firing this handler again to restore them. (Commit 2 fills
-            // the number columns for conflicts.)
+            // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the number
+            // columns show each side's line numbers (ours | theirs), derived from
+            // the conflict-view state, and the diff cue buttons are blank. Leaving
+            // conflict mode re-sets the buffer text, firing this handler again to
+            // restore the diff numbers and cues.
             if pane_mode.borrow().is_conflict() {
-                lineno_old.set_numbers(&[]);
-                lineno_new.set_numbers(&[]);
+                let nums = linenums::conflict_line_numbers(&conflict_view.borrow());
+                lineno_old.set_numbers(&nums);
+                lineno_new.set_numbers(&nums);
                 expand_cue.set_cells(&[]);
                 revert_cue.set_cells(&[]);
             } else {

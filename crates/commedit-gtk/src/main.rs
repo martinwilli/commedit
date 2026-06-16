@@ -506,71 +506,50 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             | sourceview5::SpaceTypeFlags::NBSP,
     );
     space_drawer.set_enable_matrix(true);
-    // Diff-aware line numbers: a left gutter with two columns, old | new. A
-    // context line shows both, a `-` line only old, a `+` line only new; `@@`/
-    // headers/pills are blank. Two renderers (one per column) read a per-line map
-    // recomputed from the buffer text on every change below.
+    // The file gutter: two columns, old | new. Each draws *either* a line number
+    // *or* a clickable cue button per line (the two never coincide — a `@@` header,
+    // a `diff --git` separator or a conflict marker carries no number), so the
+    // action buttons sit at the same level as the numbers rather than in extra
+    // columns (`diff_cues::GutterColumn`). A context line shows both numbers, a
+    // `-` line only old, a `+` line only new. In the diff: expand rides col_old,
+    // revert col_new; in the conflict view: ours/theirs numbers, with the resolve
+    // "keep" button on col_new. Both columns' content is recomputed from the buffer
+    // text on every change below; their click handlers are bound once the render
+    // state exists.
     let line_gutter = sourceview5::prelude::ViewExt::gutter(&file_view, gtk::TextWindowType::Left);
-    let lineno_old = linenums::LineNumberRenderer::new(linenums::NumColumn::Old);
-    let lineno_new = linenums::LineNumberRenderer::new(linenums::NumColumn::New);
-    line_gutter.insert(&lineno_old, 0);
-    line_gutter.insert(&lineno_new, 1);
-    // Clickable cue buttons, just left of the code: an expand-context column and a
-    // revert column — the diff counterpart of the old inline pills (`diff_cues`).
-    // Their per-line cells are recomputed from the buffer text below, alongside the
-    // line numbers; their click handlers are bound once the render state exists.
-    let expand_cue = diff_cues::ActivatableGutterRenderer::new(
-        gtk::gdk::RGBA::parse("#0550ae").expect("valid colour"),
-    );
-    let revert_cue = diff_cues::ActivatableGutterRenderer::new(
-        gtk::gdk::RGBA::parse("#9a6700").expect("valid colour"),
-    );
-    // The conflict view reuses the same renderer for its per-marker "keep" button
-    // (green ✓), drawn only in conflict mode.
-    let resolve_cue = diff_cues::ActivatableGutterRenderer::new(
-        gtk::gdk::RGBA::parse("#1a7f37").expect("valid colour"),
-    );
-    line_gutter.insert(&expand_cue, 2);
-    line_gutter.insert(&revert_cue, 3);
-    line_gutter.insert(&resolve_cue, 4);
+    let col_old = diff_cues::GutterColumn::new(linenums::NumColumn::Old);
+    let col_new = diff_cues::GutterColumn::new(linenums::NumColumn::New);
+    line_gutter.insert(&col_old, 0);
+    line_gutter.insert(&col_new, 1);
     file_buffer.connect_changed({
         let pane_mode = pane_mode.clone();
-        let lineno_old = lineno_old.clone();
-        let lineno_new = lineno_new.clone();
-        let expand_cue = expand_cue.clone();
-        let revert_cue = revert_cue.clone();
-        let resolve_cue = resolve_cue.clone();
+        let col_old = col_old.clone();
+        let col_new = col_new.clone();
         let combined_files = combined_files.clone();
         let conflict_view = conflict_view.clone();
         let changes = changes.clone();
         let diff_read_only = diff_read_only.clone();
         move |buffer| {
             let text = buffer_text(buffer);
-            // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the number
-            // columns show each side's line numbers (ours | theirs) and the resolve
-            // column gets a "keep" button per marker line; the diff cue buttons are
-            // blank. Leaving conflict mode re-sets the buffer text, firing this
-            // handler again to restore the diff numbers and cues.
+            // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the columns show
+            // each side's line numbers (ours | theirs), with the resolve "keep"
+            // button per marker line on col_new. Leaving conflict mode re-sets the
+            // buffer text, firing this handler again to restore the diff numbers and
+            // cues.
             if pane_mode.borrow().is_conflict() {
                 let nums = linenums::conflict_line_numbers(&conflict_view.borrow());
-                lineno_old.set_numbers(&nums);
-                lineno_new.set_numbers(&nums);
-                expand_cue.set_cells(&[]);
-                revert_cue.set_cells(&[]);
-                resolve_cue.set_cells(&conflict_cue_cells(&text));
+                col_old.set_content(&nums, &[]);
+                col_new.set_content(&nums, &conflict_cue_cells(&text));
             } else {
                 let nums = linenums::diff_line_numbers(&text);
-                lineno_old.set_numbers(&nums);
-                lineno_new.set_numbers(&nums);
                 let (exp, rev) = diff_cues::diff_cue_cells(
                     &text,
                     &combined_files.borrow(),
                     &changes.borrow(),
                     diff_read_only.get(),
                 );
-                expand_cue.set_cells(&exp);
-                revert_cue.set_cells(&rev);
-                resolve_cue.set_cells(&[]);
+                col_old.set_content(&nums, &exp);
+                col_new.set_content(&nums, &rev);
             }
         }
     });
@@ -583,6 +562,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .hexpand(true)
         .child(&file_view)
         .build();
+    // The horizontal Paned's ~9px resize handle overlaps the left edge of this
+    // pane, and its drag gesture (capture phase, on the Paned ancestor) claims
+    // presses over that band before they reach the gutter. Flush against the
+    // handle, the leftmost gutter column's buttons lost their left half to it.
+    // Inset the editor clear of the handle band (the analogue of the dropdown's
+    // top margin above).
+    file_scroll.set_margin_start(12);
     let files_box = GtkBox::new(Orientation::Vertical, 0);
     file_dropdown.set_margin_start(8);
     // The vertical Paned overlays its ~9px resize handle on top of the bottom
@@ -1100,15 +1086,23 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             nav_sync.set(false);
         })
     };
-    // Bind the gutter cue columns: the expand column widens a hunk's context, the
-    // revert column drops a hunk's or a file's change. Each maps the clicked line
-    // back to its hunk/file from the live buffer (`diff_cues`), then defers the
-    // mutation to an idle so it runs outside the gutter's click handling.
-    expand_cue.set_on_activate({
+    // Bind the two gutter columns' click handlers. A column means different things
+    // per pane mode, so each dispatches on it. col_old: diff → widen this hunk's
+    // context. col_new: diff → drop this hunk's or file's change; conflict → resolve
+    // this block to the side its marker names. Each maps the clicked line back to
+    // its hunk/file/block from the live buffer, then defers the mutation to an idle
+    // so it runs outside the gutter's click handling.
+    col_old.set_on_activate({
+        let pane_mode = pane_mode.clone();
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let apply_diff_cue = apply_diff_cue.clone();
         Rc::new(move |line: u32| {
+            if pane_mode.borrow().is_conflict() {
+                // No col_old action in the conflict view yet (the elision-expand
+                // button lands here in a follow-up commit).
+                return;
+            }
             let text = buffer_text(&file_buffer);
             let Some((first, last, path)) =
                 diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize)
@@ -1119,11 +1113,31 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
         })
     });
-    revert_cue.set_on_activate({
+    col_new.set_on_activate({
+        let pane_mode = pane_mode.clone();
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let apply_diff_cue = apply_diff_cue.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
         Rc::new(move |line: u32| {
+            // Conflict view: a click on a marker line's "keep" button resolves that
+            // block to the side the marker names. `resolve_conflict_at` is reused
+            // unchanged.
+            if pane_mode.borrow().is_conflict() {
+                let text = buffer_text(&file_buffer);
+                let Some(side) = conflict_side_at_line(&text, line as usize) else {
+                    return;
+                };
+                let file_buffer = file_buffer.clone();
+                let editing = editing.clone();
+                let highlight = highlight.clone();
+                glib::idle_add_local_once(move || {
+                    resolve_conflict_at(&file_buffer, &editing, line as usize, side, &*highlight);
+                });
+                return;
+            }
+            // Diff view: revert this hunk, or — on a `diff --git` line — the file.
             let text = buffer_text(&file_buffer);
             let files = combined_files.borrow();
             let line = line as usize;
@@ -1139,27 +1153,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let apply = apply_diff_cue.clone();
                 glib::idle_add_local_once(move || apply(cue, path));
             }
-        })
-    });
-    // Bind the conflict resolve column: a click on a marker line's "keep" button
-    // resolves that block to the side the marker names (ours / both / theirs).
-    // `resolve_conflict_at` is reused unchanged; the mutation is deferred to an idle
-    // so it runs outside the gutter's click handling.
-    resolve_cue.set_on_activate({
-        let file_buffer = file_buffer.clone();
-        let editing = editing.clone();
-        let highlight = highlight.clone();
-        Rc::new(move |line: u32| {
-            let text = buffer_text(&file_buffer);
-            let Some(side) = conflict_side_at_line(&text, line as usize) else {
-                return;
-            };
-            let file_buffer = file_buffer.clone();
-            let editing = editing.clone();
-            let highlight = highlight.clone();
-            glib::idle_add_local_once(move || {
-                resolve_conflict_at(&file_buffer, &editing, line as usize, side, &*highlight);
-            });
         })
     });
 

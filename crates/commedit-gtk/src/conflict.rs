@@ -81,9 +81,15 @@ pub(crate) fn conflict_cue_cells(text: &str) -> Vec<Option<GutterCue>> {
                     Side::Both => "Keep both".to_string(),
                     Side::Theirs => "Keep their side".to_string(),
                 },
+                color: resolve_color(),
             })
         })
         .collect()
+}
+
+/// Accent for the conflict resolve "keep" button (a confident green).
+pub(crate) fn resolve_color() -> gtk::gdk::RGBA {
+    gtk::gdk::RGBA::parse("#1a7f37").expect("valid colour")
 }
 
 /// Buffer line indices of the conflict-block openers (`<<<<<<<`) in the

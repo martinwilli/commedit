@@ -1,26 +1,21 @@
-//! Diff-aware line numbers for the diff pane's `GtkSourceView`.
+//! Diff- and conflict-aware line numbers for the file pane's `GtkSourceView`.
 //!
-//! Two concerns live here, mirroring the `search.rs` / `msglint.rs` shape:
+//! These are the **pure**, GTK-free, inline-tested cores that map buffer text to
+//! per-line old/new numbers; the gutter renderer that draws them — sharing each
+//! column with the clickable cue buttons — lives in [`crate::diff_cues`].
 //!
-//! * [`diff_line_numbers`] — the **pure**, GTK-free, inline-tested core: it walks
-//!   the rendered unified-diff buffer text and, seeding running old/new counters
-//!   from each `@@` hunk header, reconstructs the old-side and new-side line number
-//!   for every content line. No engine data is needed beyond the text the view
-//!   already shows: the `@@ -a,b +c,d @@` headers carry the base offsets.
-//! * [`LineNumberRenderer`] — a `sourceview5::GutterRenderer` subclass that draws
-//!   one column of those numbers (old *or* new). The diff gutter holds two of them,
-//!   so a context line shows `old | new`, a `-` line `old | ·`, a `+` line `· | new`.
+//! * [`diff_line_numbers`] — walks the rendered unified-diff buffer text and,
+//!   seeding running old/new counters from each `@@` hunk header, reconstructs the
+//!   old-side and new-side line number for every content line. No engine data is
+//!   needed beyond the text the view already shows: the `@@ -a,b +c,d @@` headers
+//!   carry the base offsets.
+//! * [`conflict_line_numbers`] — the conflict-view analogue: ours/theirs numbers
+//!   derived from each file's materialized conflict text and projected onto the
+//!   shown snippet via the recorded pieces.
 //!
 //! GTK-only, no MCP/engine counterpart (the diff viewer is a GTK affordance).
 
-use std::cell::{Cell, RefCell};
-
 use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind, ConflictPiece};
-use gtk::glib;
-use gtk::subclass::prelude::*;
-use sourceview5::prelude::*;
-use sourceview5::subclass::prelude::*;
-use sourceview5::{GutterLines, GutterRendererAlignmentMode};
 
 use crate::state::ConflictFileView;
 
@@ -198,127 +193,6 @@ pub(crate) fn conflict_line_numbers(view: &[ConflictFileView]) -> Vec<DiffLineNo
         }
     }
     out
-}
-
-/// Horizontal padding around a number column, in pixels.
-const XPAD: i32 = 4;
-
-/// The dim gray used for the numbers, matching the diff's "meta" tone (`#6e7781`).
-fn number_color() -> gtk::gdk::RGBA {
-    gtk::gdk::RGBA::new(0.431, 0.467, 0.506, 1.0)
-}
-
-mod imp {
-    use super::*;
-
-    #[derive(Default)]
-    pub struct LineNumberRenderer {
-        /// Per-buffer-line numbers, indexed by line. Refreshed wholesale on every
-        /// buffer change (load, splice, interactive edit).
-        pub(super) numbers: RefCell<Vec<DiffLineNo>>,
-        /// Which side this instance draws.
-        pub(super) column: Cell<NumColumn>,
-        /// Desired column width, driven by the widest number currently shown.
-        pub(super) width_px: Cell<i32>,
-    }
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for LineNumberRenderer {
-        const NAME: &'static str = "CommeditLineNumberRenderer";
-        type Type = super::LineNumberRenderer;
-        type ParentType = sourceview5::GutterRenderer;
-    }
-
-    impl ObjectImpl for LineNumberRenderer {}
-
-    impl WidgetImpl for LineNumberRenderer {
-        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
-            if orientation == gtk::Orientation::Horizontal {
-                let w = self.width_px.get();
-                (w, w, -1, -1)
-            } else {
-                (0, 0, -1, -1)
-            }
-        }
-    }
-
-    impl GutterRendererImpl for LineNumberRenderer {
-        fn snapshot_line(&self, snapshot: &gtk::Snapshot, lines: &GutterLines, line: u32) {
-            let nums = self.numbers.borrow();
-            let Some(entry) = nums.get(line as usize) else {
-                return;
-            };
-            let value = match self.column.get() {
-                NumColumn::Old => entry.old,
-                NumColumn::New => entry.new,
-            };
-            let Some(value) = value else {
-                return;
-            };
-
-            // Match the source view's monospace font by laying out through it.
-            let obj = self.obj();
-            let layout = obj.view().create_pango_layout(Some(&value.to_string()));
-            let (lw, lh) = layout.pixel_size();
-            // The snapshot is shared across all lines (not pre-translated per line),
-            // so position explicitly: the line's own y within the visible area from
-            // `line_yrange`, plus right-alignment within the width and vertical
-            // centering against the line height.
-            let avail = obj.width();
-            let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
-            let x = (avail - lw - XPAD).max(0) as f32;
-            let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
-
-            snapshot.save();
-            snapshot.translate(&gtk::graphene::Point::new(x, y));
-            snapshot.append_layout(&layout, &number_color());
-            snapshot.restore();
-        }
-    }
-}
-
-glib::wrapper! {
-    pub struct LineNumberRenderer(ObjectSubclass<imp::LineNumberRenderer>)
-        @extends sourceview5::GutterRenderer, gtk::Widget,
-        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
-}
-
-impl LineNumberRenderer {
-    pub(crate) fn new(column: NumColumn) -> Self {
-        let obj: Self = glib::Object::builder().build();
-        obj.imp().column.set(column);
-        obj
-    }
-
-    /// Replace the per-line numbers, resize the column to fit the widest one, and
-    /// repaint. An empty `nums` collapses the column to zero width (used to blank
-    /// the gutter when the view shows conflict snippets rather than a diff).
-    pub(crate) fn set_numbers(&self, nums: &[DiffLineNo]) {
-        let imp = self.imp();
-        let col = imp.column.get();
-        let max = nums
-            .iter()
-            .filter_map(|n| match col {
-                NumColumn::Old => n.old,
-                NumColumn::New => n.new,
-            })
-            .max()
-            .unwrap_or(0);
-        *imp.numbers.borrow_mut() = nums.to_vec();
-        let width = if max == 0 {
-            0
-        } else {
-            (max.ilog10() as i32 + 1) * self.digit_width() + 2 * XPAD
-        };
-        imp.width_px.set(width);
-        self.queue_resize();
-        self.queue_draw();
-    }
-
-    /// Pixel width of one digit in the view's monospace font.
-    fn digit_width(&self) -> i32 {
-        self.view().create_pango_layout(Some("0")).pixel_size().0
-    }
 }
 
 #[cfg(test)]

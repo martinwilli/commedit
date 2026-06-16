@@ -1,15 +1,19 @@
-//! Clickable gutter "cue" buttons for the diff and conflict views.
+//! The file pane's gutter column renderer and the diff-view cue geometry.
 //!
-//! [`ActivatableGutterRenderer`] is a `sourceview5::GutterRenderer` subclass that
-//! draws a single glyph per qualifying line and reports clicks on it — the gutter
-//! counterpart of the old inline text "pills". It is deliberately generic: it
-//! knows only a per-line `(glyph, tooltip)` cell vector and an `on_activate(line)`
-//! callback, so the same type drives the diff view's expand / revert columns and
-//! the conflict view's resolve column. Per-line tooltips and a pointer cursor /
-//! prelight on hover come for free because the renderer is itself a `gtk::Widget`.
+//! [`GutterColumn`] is a `sourceview5::GutterRenderer` subclass that draws **one
+//! gutter column**, showing per line *either* a right-aligned line number *or* a
+//! centered, clickable cue glyph — the two never coincide (cue lines, such as a
+//! `@@` header or a conflict marker, carry no number). The file gutter holds two
+//! of them (old|new / ours|theirs); each is fed a per-line number map (it picks
+//! its own slot) plus a per-line cue map, so the action buttons sit at the same
+//! level as the line numbers instead of in extra columns.
 //!
-//! The action a click performs is the caller's concern: `on_activate` is handed
-//! the buffer line, and the caller maps it back to a hunk / file / conflict block.
+//! A cue carries its own colour and tooltip; per-line tooltips and a pointer
+//! cursor / prelight on hover come for free because the renderer is itself a
+//! `gtk::Widget`. The action a click performs is the caller's concern:
+//! `on_activate` is handed the buffer line, and the caller maps it back to a
+//! hunk / file / conflict block (see [`hunk_target`] / [`file_target`] and the
+//! conflict-cue helpers in `conflict.rs`).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -23,63 +27,75 @@ use sourceview5::prelude::*;
 use sourceview5::subclass::prelude::*;
 use sourceview5::{GutterLines, GutterRendererAlignmentMode};
 
+use crate::linenums::{DiffLineNo, NumColumn};
+
 /// The revert glyph (matches the old "⤺ revert" pill).
 const REVERT_GLYPH: &str = "\u{293a}";
+
+/// Horizontal padding around a cue glyph, in pixels.
+const CUE_XPAD: i32 = 6;
+/// Horizontal padding around a line number, in pixels.
+const NUM_XPAD: i32 = 4;
 
 /// A gutter click handler, invoked with the activated buffer line.
 pub(crate) type ActivateFn = Rc<dyn Fn(u32)>;
 
-/// One active gutter cell: the glyph to draw and its hover tooltip.
-#[derive(Clone, Debug, Default)]
+/// One active gutter cell: the glyph to draw, its hover tooltip, and its colour.
+#[derive(Clone, Debug)]
 pub(crate) struct GutterCue {
     pub glyph: String,
     pub tooltip: String,
+    pub color: gdk::RGBA,
 }
 
-/// Horizontal padding around the glyph, in pixels.
-const XPAD: i32 = 6;
+/// The dim gray used for line numbers, matching the diff's "meta" tone (`#6e7781`).
+fn number_color() -> gdk::RGBA {
+    gdk::RGBA::new(0.431, 0.467, 0.506, 1.0)
+}
+
+/// Accent for the expand-context cue (GitHub diff blue). Also used for the
+/// conflict view's elision cue.
+pub(crate) fn expand_color() -> gdk::RGBA {
+    gdk::RGBA::parse("#0550ae").expect("valid colour")
+}
+
+/// Accent for the revert cue (amber).
+pub(crate) fn revert_color() -> gdk::RGBA {
+    gdk::RGBA::parse("#9a6700").expect("valid colour")
+}
 
 mod imp {
     use super::*;
 
-    pub struct ActivatableGutterRenderer {
-        /// Per-buffer-line cells; `None` where the line carries no cue. Indexed by
-        /// line, refreshed wholesale on every buffer change.
-        pub(super) cells: RefCell<Vec<Option<GutterCue>>>,
-        /// The glyph colour.
-        pub(super) color: Cell<gdk::RGBA>,
+    #[derive(Default)]
+    pub struct GutterColumn {
+        /// Per-buffer-line numbers, indexed by line; this column draws its own
+        /// (old or new) slot. Refreshed wholesale on every buffer change.
+        pub(super) numbers: RefCell<Vec<DiffLineNo>>,
+        /// Per-buffer-line cues; `None` where the line carries no button. A cue
+        /// line never also carries a number, so a cue takes precedence when drawn.
+        pub(super) cues: RefCell<Vec<Option<GutterCue>>>,
+        /// Which number slot this column draws.
+        pub(super) column: Cell<NumColumn>,
         /// Line currently under the pointer (for the prelight), or -1.
         pub(super) hover: Cell<i32>,
-        /// Desired column width, driven by the widest active glyph.
+        /// Desired column width, the larger of the widest number and widest glyph.
         pub(super) width_px: Cell<i32>,
         /// Click handler, late-bound by the caller (it needs render state defined
         /// after this renderer is built and inserted).
         pub(super) on_activate: RefCell<Option<ActivateFn>>,
     }
 
-    impl Default for ActivatableGutterRenderer {
-        fn default() -> Self {
-            // `color` is set by `new()`; RGBA has no `Default`, so seed it here.
-            Self {
-                cells: RefCell::new(Vec::new()),
-                color: Cell::new(gdk::RGBA::BLACK),
-                hover: Cell::new(-1),
-                width_px: Cell::new(0),
-                on_activate: RefCell::new(None),
-            }
-        }
-    }
-
     #[glib::object_subclass]
-    impl ObjectSubclass for ActivatableGutterRenderer {
-        const NAME: &'static str = "CommeditActivatableGutterRenderer";
-        type Type = super::ActivatableGutterRenderer;
+    impl ObjectSubclass for GutterColumn {
+        const NAME: &'static str = "CommeditGutterColumn";
+        type Type = super::GutterColumn;
         type ParentType = sourceview5::GutterRenderer;
     }
 
-    impl ObjectImpl for ActivatableGutterRenderer {}
+    impl ObjectImpl for GutterColumn {}
 
-    impl WidgetImpl for ActivatableGutterRenderer {
+    impl WidgetImpl for GutterColumn {
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             if orientation == gtk::Orientation::Horizontal {
                 let w = self.width_px.get();
@@ -90,9 +106,9 @@ mod imp {
         }
     }
 
-    impl GutterRendererImpl for ActivatableGutterRenderer {
+    impl GutterRendererImpl for GutterColumn {
         fn query_activatable(&self, iter: &gtk::TextIter, _area: &gdk::Rectangle) -> bool {
-            self.cells
+            self.cues
                 .borrow()
                 .get(iter.line() as usize)
                 .map(Option::is_some)
@@ -114,10 +130,60 @@ mod imp {
         }
 
         fn snapshot_line(&self, snapshot: &gtk::Snapshot, lines: &GutterLines, line: u32) {
-            let cells = self.cells.borrow();
-            let Some(Some(cue)) = cells.get(line as usize) else {
+            // A cue line carries no number, so a present cue wins outright.
+            if let Some(Some(cue)) = self.cues.borrow().get(line as usize) {
+                self.snapshot_cue(snapshot, lines, line, cue);
+                return;
+            }
+            let nums = self.numbers.borrow();
+            let Some(entry) = nums.get(line as usize) else {
                 return;
             };
+            let value = match self.column.get() {
+                NumColumn::Old => entry.old,
+                NumColumn::New => entry.new,
+            };
+            let Some(value) = value else {
+                return;
+            };
+            self.snapshot_number(snapshot, lines, line, value);
+        }
+    }
+
+    impl GutterColumn {
+        /// Draw a right-aligned, dim line number on `line`.
+        fn snapshot_number(
+            &self,
+            snapshot: &gtk::Snapshot,
+            lines: &GutterLines,
+            line: u32,
+            n: u32,
+        ) {
+            let obj = self.obj();
+            let layout = obj.view().create_pango_layout(Some(&n.to_string()));
+            let (lw, lh) = layout.pixel_size();
+            // The snapshot is shared across all lines (not pre-translated per line),
+            // so position explicitly: the line's own y within the visible area from
+            // `line_yrange`, plus right-alignment within the width and vertical
+            // centering against the line height.
+            let avail = obj.width();
+            let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
+            let x = (avail - lw - NUM_XPAD).max(0) as f32;
+            let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(x, y));
+            snapshot.append_layout(&layout, &number_color());
+            snapshot.restore();
+        }
+
+        /// Draw a clickable cue glyph on `line`, washed behind when hovered.
+        fn snapshot_cue(
+            &self,
+            snapshot: &gtk::Snapshot,
+            lines: &GutterLines,
+            line: u32,
+            cue: &GutterCue,
+        ) {
             let obj = self.obj();
             let avail = obj.width();
             let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
@@ -125,7 +191,7 @@ mod imp {
             // Prelight: a faint wash of the glyph colour behind the hovered cell, so
             // it reads as a button responding to the pointer.
             if self.hover.get() == line as i32 {
-                let mut bg = self.color.get();
+                let mut bg = cue.color;
                 bg.set_alpha(0.18);
                 snapshot.append_color(
                     &bg,
@@ -139,22 +205,22 @@ mod imp {
             let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
             snapshot.save();
             snapshot.translate(&gtk::graphene::Point::new(x, y));
-            snapshot.append_layout(&layout, &self.color.get());
+            snapshot.append_layout(&layout, &cue.color);
             snapshot.restore();
         }
     }
 }
 
 glib::wrapper! {
-    pub struct ActivatableGutterRenderer(ObjectSubclass<imp::ActivatableGutterRenderer>)
+    pub struct GutterColumn(ObjectSubclass<imp::GutterColumn>)
         @extends sourceview5::GutterRenderer, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
-impl ActivatableGutterRenderer {
-    pub(crate) fn new(color: gtk::gdk::RGBA) -> Self {
+impl GutterColumn {
+    pub(crate) fn new(column: NumColumn) -> Self {
         let obj: Self = glib::Object::builder().build();
-        obj.imp().color.set(color);
+        obj.imp().column.set(column);
         obj.imp().hover.set(-1);
         obj.setup_hover();
         obj
@@ -165,21 +231,46 @@ impl ActivatableGutterRenderer {
         *self.imp().on_activate.borrow_mut() = Some(f);
     }
 
-    /// Replace the per-line cells, resize the column to fit the widest active glyph
-    /// (zero width — a collapsed column — when nothing is active), and repaint.
-    pub(crate) fn set_cells(&self, cells: &[Option<GutterCue>]) {
+    /// Replace this column's per-line numbers and cues, resize it to fit the wider
+    /// of the widest number and the widest glyph (zero — a collapsed column — when
+    /// it holds neither), and repaint.
+    pub(crate) fn set_content(&self, numbers: &[DiffLineNo], cues: &[Option<GutterCue>]) {
         let imp = self.imp();
-        let glyph_w = cells
+        let col = imp.column.get();
+        let max_num = numbers
+            .iter()
+            .filter_map(|n| match col {
+                NumColumn::Old => n.old,
+                NumColumn::New => n.new,
+            })
+            .max()
+            .unwrap_or(0);
+        let num_w = if max_num == 0 {
+            0
+        } else {
+            (max_num.ilog10() as i32 + 1) * self.digit_width() + 2 * NUM_XPAD
+        };
+        let glyph_w = cues
             .iter()
             .flatten()
             .map(|c| self.create_pango_layout(Some(&c.glyph)).pixel_size().0)
             .max()
             .unwrap_or(0);
-        let width = if glyph_w == 0 { 0 } else { glyph_w + 2 * XPAD };
-        *imp.cells.borrow_mut() = cells.to_vec();
-        imp.width_px.set(width);
+        let cue_w = if glyph_w == 0 {
+            0
+        } else {
+            glyph_w + 2 * CUE_XPAD
+        };
+        *imp.numbers.borrow_mut() = numbers.to_vec();
+        *imp.cues.borrow_mut() = cues.to_vec();
+        imp.width_px.set(num_w.max(cue_w));
         self.queue_resize();
         self.queue_draw();
+    }
+
+    /// Pixel width of one digit in the view's monospace font.
+    fn digit_width(&self) -> i32 {
+        self.view().create_pango_layout(Some("0")).pixel_size().0
     }
 
     /// Lay out a Pango string through the parent view's monospace font.
@@ -196,12 +287,12 @@ impl ActivatableGutterRenderer {
         Some(iter.line())
     }
 
-    /// Whether buffer `line` carries an active cell.
+    /// Whether buffer `line` carries an active (clickable) cue.
     fn is_active(&self, line: i32) -> bool {
         line >= 0
             && self
                 .imp()
-                .cells
+                .cues
                 .borrow()
                 .get(line as usize)
                 .map(Option::is_some)
@@ -216,8 +307,8 @@ impl ActivatableGutterRenderer {
             let Some(line) = this.line_at_widget_y(y as f64) else {
                 return false;
             };
-            let cells = this.imp().cells.borrow();
-            let Some(Some(cue)) = cells.get(line as usize) else {
+            let cues = this.imp().cues.borrow();
+            let Some(Some(cue)) = cues.get(line as usize) else {
                 return false;
             };
             tooltip.set_text(Some(&cue.tooltip));
@@ -355,12 +446,14 @@ pub(crate) fn diff_cue_cells(
                     expand[i] = Some(GutterCue {
                         glyph: g.to_string(),
                         tooltip: "Expand context".to_string(),
+                        color: expand_color(),
                     });
                 }
                 if !read_only && f.editable && change_for(&f.path).is_some_and(revert_hunk_ok) {
                     revert[i] = Some(GutterCue {
                         glyph: REVERT_GLYPH.to_string(),
                         tooltip: "Revert hunk".to_string(),
+                        color: revert_color(),
                     });
                 }
             }
@@ -371,6 +464,7 @@ pub(crate) fn diff_cue_cells(
                     revert[i] = Some(GutterCue {
                         glyph: REVERT_GLYPH.to_string(),
                         tooltip: "Revert file".to_string(),
+                        color: revert_color(),
                     });
                 }
             }

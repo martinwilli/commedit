@@ -74,21 +74,6 @@ fn paint_pill(buffer: &sourceview5::Buffer, line: i32, raw: &str, cap_tag: &str,
     }
 }
 
-/// Paint every pill on a diff `@@` / `diff --git` line, colouring each by its
-/// label: the revert cues use the warning palette, the "expand context" cue the
-/// blue accent. The single-pill [`paint_pill`] can't handle the two pills a
-/// reverted hunk's header carries.
-fn paint_diff_pills(buffer: &sourceview5::Buffer, line: i32, raw: &str) {
-    for (lc, rc, label) in pills_on_line(raw) {
-        let (cap, body) = if label.contains("revert") {
-            ("revert-cue-cap", "revert-cue")
-        } else {
-            ("expand-cue-cap", "expand-cue")
-        };
-        paint_pill_span(buffer, line, lc as i32, rc as i32, cap, body);
-    }
-}
-
 /// Create the static, named tags used for diff line backgrounds and intra-line
 /// emphasis (idempotent). Per-syntax foreground tags are created lazily in
 /// [`fg_tag`]. Colors follow GitHub's light diff palette.
@@ -155,17 +140,6 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#0550ae"));
         t.set_weight(700);
     });
-    // The "revert hunk"/"revert file" cues — a destructive action, so the warning
-    // amber palette sets them apart from the blue expand cue sharing the line.
-    add("revert-cue", &|t| {
-        t.set_background(Some("#9a6700"));
-        t.set_foreground(Some("#fff8c5"));
-        t.set_weight(700);
-    });
-    add("revert-cue-cap", &|t| {
-        t.set_foreground(Some("#9a6700"));
-        t.set_weight(700);
-    });
 }
 
 /// Look up (or lazily create and cache, via the buffer's tag table) a foreground
@@ -226,9 +200,8 @@ pub(crate) fn highlight_diff(
             DiffLineKind::Hunk => {
                 old_hl = HighlightLines::new(syntax, theme);
                 new_hl = HighlightLines::new(syntax, theme);
-                // Paint the trailing "expand context" / "revert hunk" cues. A hunk
-                // header can carry both, so paint each pill by its label.
-                paint_diff_pills(buffer, li as i32, raw);
+                // Expand / revert actions for this hunk live in the gutter (see
+                // `diff_cues`), so the `@@` header itself needs no inline painting.
                 continue;
             }
             DiffLineKind::Header => {
@@ -241,13 +214,7 @@ pub(crate) fn highlight_diff(
                 }
                 continue;
             }
-            DiffLineKind::Meta => {
-                // The `diff --git` separator carries the "revert file" cue.
-                if raw.starts_with("diff --git ") {
-                    paint_diff_pills(buffer, li as i32, raw);
-                }
-                continue;
-            }
+            DiffLineKind::Meta => continue,
             _ => {}
         }
 
@@ -323,17 +290,7 @@ pub(crate) fn highlight_diff_line(
         apply_line_tag(buffer, li, name);
     }
     match kind {
-        DiffLineKind::Hunk => {
-            paint_diff_pills(buffer, li, raw);
-            return;
-        }
-        DiffLineKind::Meta => {
-            if raw.starts_with("diff --git ") {
-                paint_diff_pills(buffer, li, raw);
-            }
-            return;
-        }
-        DiffLineKind::Header => return,
+        DiffLineKind::Hunk | DiffLineKind::Meta | DiffLineKind::Header => return,
         _ => {}
     }
 

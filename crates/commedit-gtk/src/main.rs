@@ -2166,6 +2166,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
             selection_sync.set(false);
             update_selection_pane();
+            // Focus the clicked row so up/down keep navigating the history list.
+            // Claiming the press (below) suppresses GtkListBox's own click handling,
+            // which would otherwise grab focus here; without this, focus lingers in
+            // whatever pane held it (typically the diff view).
+            row.grab_focus();
             // Claim the press so GtkListBox's own selection handling doesn't also run.
             gesture.set_state(gtk::EventSequenceState::Claimed);
         }

@@ -16,12 +16,11 @@ use commedit_engine::history::history_limited;
 use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
-use crate::diff_cues::GutterCue;
-use crate::highlight::pill;
+use crate::diff_cues::{expand_color, GutterCue};
 use crate::rows::{populate_list, populate_trash};
 use crate::state::{
     Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, RestoreToWorktreeCallback, Side,
-    Widgets, CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, HISTORY_PAGE, SAVE_HINT_CONFLICT,
+    Widgets, CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE, HISTORY_PAGE, SAVE_HINT_CONFLICT,
     SAVE_HINT_DIFF,
 };
 
@@ -42,7 +41,7 @@ pub(crate) fn conflict_header_path(line: &str) -> Option<&str> {
 /// user must not edit, lest the snippet→full-file reconstruction lose its anchors.
 pub(crate) fn is_conflict_protected_line(line: &str) -> bool {
     conflict_header_path(line).is_some()
-        || line == pill(CONFLICT_CUE_LABEL)
+        || line == CONFLICT_ELISION_LINE
         || line == CONFLICT_STRUCTURAL_NOTICE
 }
 
@@ -66,12 +65,14 @@ pub(crate) fn conflict_side_at_line(text: &str, line: usize) -> Option<Side> {
         .and_then(side_for_marker)
 }
 
-/// Per-buffer-line resolve cue cells for the conflict gutter (`diff_cues`): a
-/// "keep" button on each conflict-marker line, its tooltip naming the side kept;
-/// `None` on every other line. The markers themselves stay as plain git-style
-/// markers in the text — the action is the gutter button, not inline cue text.
-pub(crate) fn conflict_cue_cells(text: &str) -> Vec<Option<GutterCue>> {
-    classify_conflict_lines(text)
+/// Per-buffer-line cue cells for the conflict gutter (`diff_cues`), as
+/// `(col_old, col_new)` so they sit at the ours|theirs line-number level. col_old
+/// carries an `↕` "expand hidden lines" button on each elision placeholder;
+/// col_new a "keep" button on each conflict-marker line, its tooltip naming the
+/// side kept. Every other line is `None`. The markers and the elided runs stay
+/// plain in the text — the actions are gutter buttons, not inline cue text.
+pub(crate) fn conflict_cue_cells(text: &str) -> (Vec<Option<GutterCue>>, Vec<Option<GutterCue>>) {
+    let resolve = classify_conflict_lines(text)
         .into_iter()
         .map(|kind| {
             side_for_marker(kind).map(|side| GutterCue {
@@ -84,7 +85,18 @@ pub(crate) fn conflict_cue_cells(text: &str) -> Vec<Option<GutterCue>> {
                 color: resolve_color(),
             })
         })
-        .collect()
+        .collect();
+    let elision = text
+        .split('\n')
+        .map(|l| {
+            (l == CONFLICT_ELISION_LINE).then(|| GutterCue {
+                glyph: "\u{2195}".to_string(), // ↕
+                tooltip: "Expand hidden lines".to_string(),
+                color: expand_color(),
+            })
+        })
+        .collect();
+    (elision, resolve)
 }
 
 /// Accent for the conflict resolve "keep" button (a confident green).
@@ -241,10 +253,9 @@ pub(crate) fn conflict_cue_gap_at(
     buffer: &sourceview5::Buffer,
     line: usize,
 ) -> Option<(usize, usize)> {
-    let cue = pill(CONFLICT_CUE_LABEL);
     let text = buffer_text(buffer);
     let lines: Vec<&str> = text.split('\n').collect();
-    if lines.get(line).copied() != Some(cue.as_str()) {
+    if lines.get(line).copied() != Some(CONFLICT_ELISION_LINE) {
         return None;
     }
     let mut file_idx = 0usize;
@@ -255,7 +266,7 @@ pub(crate) fn conflict_cue_gap_at(
             file_idx = seen_files;
             seen_files += 1;
             k = 0;
-        } else if *l == cue {
+        } else if *l == CONFLICT_ELISION_LINE {
             k += 1;
         }
     }
@@ -689,23 +700,39 @@ mod tests {
 
     #[test]
     fn conflict_cue_cells_button_on_each_marker() {
-        let cells = conflict_cue_cells(CONFLICT);
-        assert_eq!(cells.len(), 7);
+        let (elision, resolve) = conflict_cue_cells(CONFLICT);
+        assert_eq!(resolve.len(), 7);
         assert_eq!(
-            cells[1].as_ref().map(|c| c.tooltip.as_str()),
+            resolve[1].as_ref().map(|c| c.tooltip.as_str()),
             Some("Keep our side")
         );
         assert_eq!(
-            cells[3].as_ref().map(|c| c.tooltip.as_str()),
+            resolve[3].as_ref().map(|c| c.tooltip.as_str()),
             Some("Keep both")
         );
         assert_eq!(
-            cells[5].as_ref().map(|c| c.tooltip.as_str()),
+            resolve[5].as_ref().map(|c| c.tooltip.as_str()),
             Some("Keep their side")
         );
-        // Content lines carry no button.
+        // Content lines carry no button, and there are no elided runs here.
         for i in [0usize, 2, 4, 6] {
-            assert!(cells[i].is_none(), "line {i} should have no cue");
+            assert!(resolve[i].is_none(), "line {i} should have no resolve cue");
         }
+        assert!(elision.iter().all(Option::is_none), "no elision here");
+    }
+
+    #[test]
+    fn conflict_cue_cells_expand_button_on_elision() {
+        let text = format!("ctx\n{CONFLICT_ELISION_LINE}\nmore");
+        let (elision, resolve) = conflict_cue_cells(&text);
+        assert!(elision[1].is_some(), "expand button on the elision line");
+        assert!(
+            elision[0].is_none() && elision[2].is_none(),
+            "only the elision line carries the expand cue"
+        );
+        assert!(
+            resolve.iter().all(Option::is_none),
+            "no markers, so no resolve cues"
+        );
     }
 }

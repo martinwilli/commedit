@@ -148,14 +148,6 @@ pub(crate) enum Side {
     Both,
 }
 
-/// The end-caps that make a cue read as a banner/tag-shaped button. Painted as a
-/// full-height triangle in the button colour against the line background, their
-/// flat (vertical) side sits flush against the solid-fill body between them, so
-/// they align in height and touch the block, giving pointed ends. The left cap
-/// also marks where the clickable button begins.
-pub(crate) const CUE_CAP_L: char = '◀';
-pub(crate) const CUE_CAP_R: char = '▶';
-
 /// Tooltips for the action-bar buttons. The Save button means different things
 /// per pane mode — committing an edit in the diff view, resolving a file in the
 /// conflict view — so its tooltip is swapped when entering/leaving conflict mode.
@@ -190,9 +182,12 @@ pub(crate) enum DiffCue {
     RevertFile,
 }
 
-/// Label of the conflict pane's elision cue — the pill standing in for a hidden
-/// run of unconflicted lines between snippets. Clicking it reveals more context.
-pub(crate) const CONFLICT_CUE_LABEL: &str = "↕ expand hidden lines";
+/// The conflict pane's elision placeholder — a single plain line standing in for
+/// a hidden run of unconflicted lines between snippets. It carries no number and
+/// is not editable; the gutter draws an `↕` "expand" button beside it (see
+/// `conflict_cue_cells`), and clicking that reveals more context. Kept a single
+/// constant so the buffer scanners can recognise it by exact match.
+pub(crate) const CONFLICT_ELISION_LINE: &str = "\u{22ef} hidden lines \u{22ef}";
 
 /// The standalone notice shown for a structural (non-text-resolvable) conflicted
 /// file in the combined conflict view.

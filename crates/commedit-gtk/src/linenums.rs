@@ -28,7 +28,7 @@ pub(crate) struct DiffLineNo {
     pub new: Option<u32>,
 }
 
-/// Which side a [`LineNumberRenderer`] column shows.
+/// Which side a [`crate::diff_cues::GutterColumn`] draws.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum NumColumn {
     Old,
@@ -95,7 +95,7 @@ pub(crate) fn diff_line_numbers(text: &str) -> Vec<DiffLineNo> {
 }
 
 /// Parse the 1-based old/new start lines out of `@@ -a,b +c,d @@`. Tolerates a
-/// missing count (`@@ -a +c @@`) and any trailing section heading or appended pill.
+/// missing count (`@@ -a +c @@`) and any trailing section heading.
 fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
     let rest = line.strip_prefix("@@")?.trim_start();
     let mut parts = rest.split_whitespace();
@@ -118,9 +118,9 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
 
 /// Per-buffer-line ours/theirs line numbers for the combined conflict-snippet
 /// buffer, mirroring `render_conflict_view`'s assembly so it aligns 1:1 with the
-/// shown lines. Ours maps to the `old` slot, theirs to `new`, so the two diff
-/// [`LineNumberRenderer`]s are reused unchanged. Markers, file headers, the
-/// elision cue and the structural notice get no number.
+/// shown lines. Ours maps to the `old` slot, theirs to `new`, so the two gutter
+/// columns are reused unchanged. Markers, file headers, the elision placeholder
+/// and the structural notice get no number.
 ///
 /// Numbers come purely from each file's materialized conflict text (no engine
 /// help), the same way the diff view derives old/new from `@@` + line prefixes: a
@@ -283,11 +283,11 @@ diff --git a/y b/y
     }
 
     #[test]
-    fn no_newline_marker_and_pill_suffixed_header() {
-        // A `\ No newline` line must not consume a number; a pill appended to the
-        // `@@` header must not break parsing.
+    fn no_newline_marker_and_decorated_header() {
+        // A `\ No newline` line must not consume a number; trailing text on the
+        // `@@` header (a section heading) must not break parsing.
         let diff = "\
-@@ -1,1 +1,2 @@ ◀ revert hunk ▶
+@@ -1,1 +1,2 @@ fn main()
 -old
 \\ No newline at end of file
 +new1
@@ -295,7 +295,7 @@ diff --git a/y b/y
         assert_eq!(
             nums(diff),
             vec![
-                (None, None),    // @@ … ◀ revert hunk ▶
+                (None, None),    // @@ … fn main()
                 (Some(1), None), // "-old"
                 (None, None),    // "\ No newline…"
                 (None, Some(1)), // "+new1"

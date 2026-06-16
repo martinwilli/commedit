@@ -532,14 +532,15 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         move |buffer| {
             let text = buffer_text(buffer);
             // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the columns show
-            // each side's line numbers (ours | theirs), with the resolve "keep"
-            // button per marker line on col_new. Leaving conflict mode re-sets the
-            // buffer text, firing this handler again to restore the diff numbers and
-            // cues.
+            // each side's line numbers (ours | theirs), with the elision "expand"
+            // button on col_old and the resolve "keep" button per marker line on
+            // col_new. Leaving conflict mode re-sets the buffer text, firing this
+            // handler again to restore the diff numbers and cues.
             if pane_mode.borrow().is_conflict() {
                 let nums = linenums::conflict_line_numbers(&conflict_view.borrow());
-                col_old.set_content(&nums, &[]);
-                col_new.set_content(&nums, &conflict_cue_cells(&text));
+                let (elision, resolve) = conflict_cue_cells(&text);
+                col_old.set_content(&nums, &elision);
+                col_new.set_content(&nums, &resolve);
             } else {
                 let nums = linenums::diff_line_numbers(&text);
                 let (exp, rev) = diff_cues::diff_cue_cells(
@@ -1097,10 +1098,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let apply_diff_cue = apply_diff_cue.clone();
+        let conflict_expand_cell = conflict_expand_cell.clone();
         Rc::new(move |line: u32| {
             if pane_mode.borrow().is_conflict() {
-                // No col_old action in the conflict view yet (the elision-expand
-                // button lands here in a follow-up commit).
+                // Conflict view: the `↕` button on an elision placeholder reveals
+                // that hidden run (`conflict_expand`, late-bound below).
+                if let Some(expand) = conflict_expand_cell.borrow().clone() {
+                    glib::idle_add_local_once(move || expand(line as usize));
+                }
                 return;
             }
             let text = buffer_text(&file_buffer);
@@ -1156,69 +1161,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     });
 
-    // In conflict mode a click on an elision cue expands that gap; the per-block
-    // resolve action is the gutter "keep" button (see `conflict_cue_cells`), not an
-    // in-text cue. The mutation is deferred to an idle so it runs outside the
-    // gesture's event handling.
-    let expand_click = gtk::GestureClick::new();
-    expand_click.set_button(gdk::BUTTON_PRIMARY);
-    expand_click.set_propagation_phase(PropagationPhase::Capture);
-    expand_click.connect_pressed({
-        let file_view = file_view.clone();
-        let file_buffer = file_buffer.clone();
-        let pane_mode = pane_mode.clone();
-        let conflict_expand_cell = conflict_expand_cell.clone();
-        move |gesture, _n_press, x, y| {
-            // The diff view's affordances are gutter buttons, and so is the conflict
-            // resolve action; only the conflict elision cue is still clickable in
-            // the text. Other clicks fall through so the caret places for edits.
-            if !pane_mode.borrow().is_conflict() {
-                return;
-            }
-            let (bx, by) =
-                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let Some(iter) = file_view.iter_at_location(bx, by) else {
-                return;
-            };
-            let line = iter.line() as usize;
-            if buffer_line_text(&file_buffer, line) == pill(CONFLICT_CUE_LABEL) {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                if let Some(expand) = conflict_expand_cell.borrow().clone() {
-                    glib::idle_add_local_once(move || expand(line));
-                }
-            }
-        }
-    });
-    file_view.add_controller(expand_click);
-
-    // Hover cursor: show a hand over the conflict view's in-text "use …" / elision
-    // cues, and the text I-beam everywhere else. (The diff cues live in the gutter
-    // now, whose renderers set their own pointer cursor.) GtkTextView otherwise
-    // only ever shows the I-beam over content; we override it per the gtk hypertext
-    // pattern (set the widget cursor from the motion handler). A `Cell` tracks the
-    // current state so we only touch the cursor when it actually flips.
-    let hover_hand = Rc::new(Cell::new(false));
-    let hover_motion = gtk::EventControllerMotion::new();
-    hover_motion.connect_motion({
-        let file_view = file_view.clone();
-        let file_buffer = file_buffer.clone();
-        let pane_mode = pane_mode.clone();
-        let hover_hand = hover_hand.clone();
-        move |_, x, y| {
-            let (bx, by) =
-                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let over_button = pane_mode.borrow().is_conflict()
-                && file_view.iter_at_location(bx, by).is_some_and(|iter| {
-                    let line = iter.line() as usize;
-                    buffer_line_text(&file_buffer, line) == pill(CONFLICT_CUE_LABEL)
-                });
-            if over_button != hover_hand.get() {
-                hover_hand.set(over_button);
-                file_view.set_cursor_from_name(Some(if over_button { "pointer" } else { "text" }));
-            }
-        }
-    });
-    file_view.add_controller(hover_motion);
+    // Every diff/conflict affordance now lives in the gutter (`GutterColumn`),
+    // which owns its own click handling, pointer cursor and tooltips — so the text
+    // view needs no in-text click gesture or hover-cursor override any more.
 
     // Jump the (already-rendered) combined diff to the file at dropdown `idx`,
     // pinning its `diff --git` header to the top of the viewport. The whole change
@@ -1453,7 +1398,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let highlight = highlight.clone();
         Rc::new(move |splice: bool| {
-            let cue = pill(CONFLICT_CUE_LABEL);
+            let cue = CONFLICT_ELISION_LINE;
             let mut out: Vec<String> = Vec::new();
             {
                 let mut view = conflict_view.borrow_mut();
@@ -1465,7 +1410,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         fv.gaps.clear();
                         continue;
                     }
-                    let snip = render_conflict_snippets(&fv.full_text, &fv.exp, &cue);
+                    let snip = render_conflict_snippets(&fv.full_text, &fv.exp, cue);
                     for l in snip.text.split('\n') {
                         out.push(l.to_string());
                     }
@@ -1502,7 +1447,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let conflict_view = conflict_view.clone();
         let file_buffer = file_buffer.clone();
         Rc::new(move || {
-            let cue = pill(CONFLICT_CUE_LABEL);
+            let cue = CONFLICT_ELISION_LINE;
             let combined = buffer_text(&file_buffer);
             let buf_lines: Vec<&str> = combined.split('\n').collect();
             let mut sections: Vec<Vec<&str>> = Vec::new();
@@ -1518,7 +1463,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 if fv.resolvable {
                     // Markers carry no inline cue text (the resolve action is a
                     // gutter button), so the section lines reconstruct verbatim.
-                    fv.full_text = reconstruct_conflict_file(section, &fv.pieces, &cue);
+                    fv.full_text = reconstruct_conflict_file(section, &fv.pieces, cue);
                 }
             }
         })

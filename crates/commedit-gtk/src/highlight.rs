@@ -1,7 +1,7 @@
-//! Diff/conflict syntax highlighting and the inline "pill" banner buttons: the
-//! static TextTag palette, syntect language colouring of diff and conflict text
-//! (with parser state reset at each region boundary), and the cue geometry the
-//! painters share with the click/hover hit-tests.
+//! Diff/conflict syntax highlighting: the static TextTag palette and syntect
+//! language colouring of diff and conflict text (with parser state reset at each
+//! region boundary). The diff/conflict *affordances* are gutter buttons now
+//! (`diff_cues`), so no inline "pill" painting lives here any more.
 
 use commedit_engine::diff::{
     classify_conflict_lines, parse_diff_lines, ConflictLineKind, DiffLineKind,
@@ -13,66 +13,7 @@ use syntect::highlighting::{Style, Theme};
 use syntect::parsing::SyntaxSet;
 
 use crate::conflict::conflict_header_path;
-use crate::state::{CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, CUE_CAP_L, CUE_CAP_R};
-
-/// Wrap a cue label in the banner caps, e.g. `↕ expand context` -> `◀ ↕ expand context ▶`.
-pub(crate) fn pill(label: &str) -> String {
-    format!("{CUE_CAP_L} {label} {CUE_CAP_R}")
-}
-
-/// The inline pills (`◀ … ▶`) on `raw`, as `(left_cap, right_cap, label)` where
-/// the caps are *character* offsets (matching GTK's `line_offset`) and `label` is
-/// the trimmed text between them. A diff `@@` line can carry two pills (expand +
-/// revert); a `diff --git` line one (revert file); conflict lines exactly one.
-/// Shared by the painting and the click/hover hit-test so they always agree.
-pub(crate) fn pills_on_line(raw: &str) -> Vec<(usize, usize, String)> {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == CUE_CAP_L {
-            if let Some(off) = chars[i + 1..].iter().position(|&c| c == CUE_CAP_R) {
-                let j = i + 1 + off;
-                let label: String = chars[i + 1..j].iter().collect();
-                out.push((i, j, label.trim().to_string()));
-                i = j + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Paint one inline banner button spanning character columns `[lc, rc]` (the two
-/// caps) on buffer line `line`: the end-caps get `cap_tag` (a coloured triangle on
-/// the line background), the run between them `body_tag` (the solid button fill).
-fn paint_pill_span(
-    buffer: &sourceview5::Buffer,
-    line: i32,
-    lc: i32,
-    rc: i32,
-    cap_tag: &str,
-    body_tag: &str,
-) {
-    let table = buffer.tag_table();
-    let (Some(cap), Some(body)) = (table.lookup(cap_tag), table.lookup(body_tag)) else {
-        return;
-    };
-    apply_cols(buffer, line, lc, lc + 1, &cap);
-    if rc > lc + 1 {
-        apply_cols(buffer, line, lc + 1, rc, &body);
-    }
-    apply_cols(buffer, line, rc, rc + 1, &cap);
-}
-
-/// Paint the first inline banner button on `raw` with the given tags. Used for the
-/// single-pill conflict cues (the "use …" and elision cues). No-op if none.
-fn paint_pill(buffer: &sourceview5::Buffer, line: i32, raw: &str, cap_tag: &str, body_tag: &str) {
-    if let Some((lc, rc, _)) = pills_on_line(raw).into_iter().next() {
-        paint_pill_span(buffer, line, lc as i32, rc as i32, cap_tag, body_tag);
-    }
-}
+use crate::state::{CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE};
 
 /// Create the static, named tags used for diff line backgrounds and intra-line
 /// emphasis (idempotent). Per-syntax foreground tags are created lazily in
@@ -113,21 +54,6 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
     add("conflict-marker", &|t| {
         t.set_paragraph_background(Some("#ffd7d5"));
         t.set_foreground(Some("#cf222e"));
-        t.set_weight(700);
-    });
-    // The conflict view's "expand hidden lines" elision cue, painted as an inline
-    // banner button: a solid body filled in the line's accent colour with the
-    // line's background as text, end-capped by full-height triangles drawn in the
-    // body colour on the bare line background so the ends point outward and stay
-    // flush. Added last so the body's text colour outranks the host line's own
-    // foreground (GTK tag priority follows tag-table insertion order).
-    add("expand-cue", &|t| {
-        t.set_background(Some("#0550ae"));
-        t.set_foreground(Some("#ddf4ff"));
-        t.set_weight(700);
-    });
-    add("expand-cue-cap", &|t| {
-        t.set_foreground(Some("#0550ae"));
         t.set_weight(700);
     });
 }
@@ -361,7 +287,6 @@ pub(crate) fn highlight_conflict(
 
     let raw_lines: Vec<&str> = text.split('\n').collect();
     let kinds = classify_conflict_lines(&text);
-    let cue = pill(CONFLICT_CUE_LABEL);
 
     let pick = |p: &str| {
         std::path::Path::new(p)
@@ -387,10 +312,10 @@ pub(crate) fn highlight_conflict(
             apply_line_tag(buffer, li as i32, "hunk");
             continue;
         }
-        // The elision cue is a pill button standing in for a hidden run.
-        if raw == cue {
-            apply_line_tag(buffer, li as i32, "hunk");
-            paint_pill(buffer, li as i32, raw, "expand-cue-cap", "expand-cue");
+        // The elision placeholder stands in for a hidden run; the gutter draws its
+        // `↕` expand button. Paint it faint so it reads as a fold, not content.
+        if raw == CONFLICT_ELISION_LINE {
+            apply_line_tag(buffer, li as i32, "meta");
             continue;
         }
         if raw == CONFLICT_STRUCTURAL_NOTICE {

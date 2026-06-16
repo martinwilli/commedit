@@ -64,6 +64,29 @@ pub(crate) fn revert_color() -> gdk::RGBA {
     gdk::RGBA::parse("#9a6700").expect("valid colour")
 }
 
+/// How much larger than the view's body font a cue glyph is drawn — a button
+/// reads as a control, not as text, so it is bumped up a notch.
+const CUE_SCALE: f64 = 1.08;
+
+/// Upward nudge (px) applied to the glyph: the arrow/check ink sits low in its
+/// Pango logical box (which reserves descent space), so plain centering reads as
+/// slightly too low.
+const CUE_GLYPH_RISE: f32 = 1.4;
+
+/// Lay out a cue glyph through the view's font, enlarged by [`CUE_SCALE`]. Shared
+/// by the width measurement and the draw so the button is sized to fit its glyph.
+fn cue_layout(view: &sourceview5::View, glyph: &str) -> gtk::pango::Layout {
+    let layout = view.create_pango_layout(Some(glyph));
+    if let Some(mut fd) = view.pango_context().font_description() {
+        let size = fd.size();
+        if size > 0 {
+            fd.set_size((size as f64 * CUE_SCALE) as i32);
+            layout.set_font_description(Some(&fd));
+        }
+    }
+    layout
+}
+
 mod imp {
     use super::*;
 
@@ -176,7 +199,9 @@ mod imp {
             snapshot.restore();
         }
 
-        /// Draw a clickable cue glyph on `line`, washed behind when hovered.
+        /// Draw a clickable cue button on `line`: a rounded, tinted box outlined in
+        /// the accent colour with the enlarged glyph centered in it, intensifying
+        /// when hovered so it clearly reads as a pressable control.
         fn snapshot_cue(
             &self,
             snapshot: &gtk::Snapshot,
@@ -185,24 +210,41 @@ mod imp {
             cue: &GutterCue,
         ) {
             let obj = self.obj();
+            let view = obj.view();
             let avail = obj.width();
             let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
+            let hovered = self.hover.get() == line as i32;
 
-            // Prelight: a faint wash of the glyph colour behind the hovered cell, so
-            // it reads as a button responding to the pointer.
-            if self.hover.get() == line as i32 {
-                let mut bg = cue.color;
-                bg.set_alpha(0.18);
-                snapshot.append_color(
-                    &bg,
-                    &gtk::graphene::Rect::new(0.0, line_y as f32, avail as f32, cell_h as f32),
-                );
-            }
+            // The button box: inset from the cell so neighbouring rows' buttons
+            // don't touch, with rounded corners.
+            let inset_x = 2.0_f32;
+            let inset_y = 1.5_f32;
+            let bx = inset_x;
+            let by = line_y as f32 + inset_y;
+            let bw = (avail as f32 - 2.0 * inset_x).max(1.0);
+            let bh = (cell_h as f32 - 2.0 * inset_y).max(1.0);
+            let rect = gtk::graphene::Rect::new(bx, by, bw, bh);
+            let rrect = gtk::gsk::RoundedRect::from_rect(rect, 4.0);
 
-            let layout = obj.view().create_pango_layout(Some(&cue.glyph));
+            // Fill: a tint of the accent, deepening on hover.
+            let mut fill = cue.color;
+            fill.set_alpha(if hovered { 0.30 } else { 0.12 });
+            snapshot.push_rounded_clip(&rrect);
+            snapshot.append_color(&fill, &rect);
+            snapshot.pop();
+
+            // Border: the accent itself, solid on hover, softened at rest.
+            let mut border = cue.color;
+            border.set_alpha(if hovered { 1.0 } else { 0.6 });
+            let bwidth = if hovered { 1.5 } else { 1.0 };
+            snapshot.append_border(&rrect, &[bwidth; 4], &[border; 4]);
+
+            // Glyph: enlarged, in the accent colour, centered in the button and
+            // nudged up so the arrow/check ink looks optically centred.
+            let layout = cue_layout(&view, &cue.glyph);
             let (lw, lh) = layout.pixel_size();
-            let x = ((avail - lw) / 2).max(0) as f32;
-            let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
+            let x = bx + ((bw - lw as f32) / 2.0).max(0.0);
+            let y = by + ((bh - lh as f32) / 2.0 - CUE_GLYPH_RISE);
             snapshot.save();
             snapshot.translate(&gtk::graphene::Point::new(x, y));
             snapshot.append_layout(&layout, &cue.color);
@@ -253,7 +295,7 @@ impl GutterColumn {
         let glyph_w = cues
             .iter()
             .flatten()
-            .map(|c| self.create_pango_layout(Some(&c.glyph)).pixel_size().0)
+            .map(|c| cue_layout(&self.view(), &c.glyph).pixel_size().0)
             .max()
             .unwrap_or(0);
         let cue_w = if glyph_w == 0 {
@@ -271,11 +313,6 @@ impl GutterColumn {
     /// Pixel width of one digit in the view's monospace font.
     fn digit_width(&self) -> i32 {
         self.view().create_pango_layout(Some("0")).pixel_size().0
-    }
-
-    /// Lay out a Pango string through the parent view's monospace font.
-    fn create_pango_layout(&self, text: Option<&str>) -> gtk::pango::Layout {
-        self.view().create_pango_layout(text)
     }
 
     /// The buffer line under widget-relative `y` (the gutter scrolls with the text,

@@ -48,6 +48,7 @@ mod identity;
 use crate::identity::*;
 mod conflict;
 use crate::conflict::*;
+mod diff_cues;
 mod dragdrop;
 mod linenums;
 mod msglint;
@@ -65,30 +66,6 @@ type ApplyDiffText = Rc<dyn Fn(String, Vec<HunkInfo>, Vec<CombinedFile>, bool)>;
 
 /// Sets the diff view's tab width for the file path now at the top of the view.
 type ApplyTabWidth = Rc<dyn Fn(Option<&str>)>;
-
-/// The [`DiffCue`] a click/hover at buffer `(line, col)` lands on, if it falls on
-/// one of the diff view's inline pills. `line_text` is that line's text; `col` is
-/// a character offset. The single hit test shared by the click gesture (which
-/// acts on it) and the hover cursor (which shows a hand over it), restricting both
-/// to the pill rather than the whole line. A `@@` line may carry two pills
-/// (expand + revert), so the cue is resolved by the clicked pill's label, not its
-/// position.
-fn diff_cue_at(hunks: &[HunkInfo], line_text: &str, line: usize, col: usize) -> Option<DiffCue> {
-    let (_, _, label) = pills_on_line(line_text)
-        .into_iter()
-        .find(|(lc, rc, _)| col >= *lc && col <= *rc)?;
-    if label == REVERT_FILE_LABEL {
-        return Some(DiffCue::RevertFile);
-    }
-    let hunk = hunks.iter().find(|h| h.header_line == line)?;
-    if label == REVERT_HUNK_LABEL {
-        Some(DiffCue::RevertHunk(hunk.first_group, hunk.last_group))
-    } else if hunk.can_expand_up || hunk.can_expand_down {
-        Some(DiffCue::Expand(hunk.first_group, hunk.last_group))
-    } else {
-        None
-    }
-}
 
 /// The index (in `changes`/dropdown order) of the file whose `diff --git`
 /// separator is the last one at or before buffer `line` — i.e. the file the
@@ -129,63 +106,21 @@ fn main() {
 }
 
 /// Build the diff pane's full buffer text — the combined unified diff for
-/// `changes` with each expandable `@@` header's inline "expand context" cue
-/// appended — together with the hunks (for hit-testing the cues) and the per-
-/// file placement. Appending the cue at a line's *end* keeps every `header_line`
-/// valid, so the returned hunks/files match the text exactly. Shared by the full
+/// `changes` — together with the hunks (for context expansion) and the per-file
+/// placement. The expand / revert affordances are gutter buttons now (see
+/// `diff_cues`), so the buffer text is the clean diff itself. Shared by the full
 /// (`set_text`) render and the in-place spliced re-render.
 fn build_diff_buffer_text(
     changes: &[FileChange],
     expansions: &HashMap<String, ContextExpansion>,
-    read_only: bool,
 ) -> (String, Vec<HunkInfo>, Vec<CombinedFile>) {
     let combined = render_commit_diff(changes, expansions);
-    let mut lines: Vec<String> = combined.text.split('\n').map(str::to_string).collect();
-    let change_for = |path: &str| changes.iter().find(|c| c.path == path);
-    // A *hunk* revert is a partial content reversal — meaningful only for a
-    // modified file, where both sides exist as text and the hunk's `-`/`+` groups
-    // can be dropped back to the old side.
-    let revert_hunk_ok =
-        |path: &str| change_for(path).is_some_and(|c| c.old_text.is_some() && c.new_text.is_some());
-    // A *file* revert drops a file's whole change: modify -> unmodify, add ->
-    // delete, remove -> restore. Eligible wherever the two sides differ as text
-    // (so not a mode-only change) and the file is editable as text (not binary /
-    // conflicted-base). The save path expresses the add/remove cases as a
-    // delete / recreate via `FileEdit`.
-    let revert_file_ok = |path: &str| {
-        change_for(path).is_some_and(|c| {
-            !c.is_binary && !c.conflicted_base && c.old_text.as_deref() != c.new_text.as_deref()
-        })
-    };
-    let mut all_hunks: Vec<HunkInfo> = Vec::new();
-    for file in &combined.files {
-        // The revert cues imply an edit; the read-only multi-commit combined diff
-        // suppresses them (the harmless "expand context" cues stay).
-        let hunk_revert = !read_only && file.editable && revert_hunk_ok(&file.path);
-        for hunk in &file.hunks {
-            if let Some(l) = lines.get_mut(hunk.header_line) {
-                match (hunk.can_expand_up, hunk.can_expand_down) {
-                    (true, true) => l.push_str(&format!("  {}", pill("↕ expand context"))),
-                    (true, false) => l.push_str(&format!("  {}", pill("↑ expand context"))),
-                    (false, true) => l.push_str(&format!("  {}", pill("↓ expand context"))),
-                    (false, false) => {}
-                }
-                if hunk_revert {
-                    l.push_str(&format!("  {}", pill(REVERT_HUNK_LABEL)));
-                }
-            }
-            all_hunks.push(hunk.clone());
-        }
-        // The "revert file" cue rides the `diff --git` separator. A removed file
-        // has no hunks but still a change to undo, so this is gated on the change,
-        // not on the hunk list.
-        if !read_only && revert_file_ok(&file.path) {
-            if let Some(l) = lines.get_mut(file.start_line) {
-                l.push_str(&format!("  {}", pill(REVERT_FILE_LABEL)));
-            }
-        }
-    }
-    (lines.join("\n"), all_hunks, combined.files)
+    let all_hunks: Vec<HunkInfo> = combined
+        .files
+        .iter()
+        .flat_map(|f| f.hunks.iter().cloned())
+        .collect();
+    (combined.text, all_hunks, combined.files)
 }
 
 /// Show `text` as a dim, italic note filling `buffer` (replacing its contents) —
@@ -571,30 +506,52 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             | sourceview5::SpaceTypeFlags::NBSP,
     );
     space_drawer.set_enable_matrix(true);
-    // Diff-aware line numbers: a left gutter with two columns, old | new. A
-    // context line shows both, a `-` line only old, a `+` line only new; `@@`/
-    // headers/pills are blank. Two renderers (one per column) read a per-line map
-    // recomputed from the buffer text on every change below.
+    // The file gutter: two columns, old | new. Each draws *either* a line number
+    // *or* a clickable cue button per line (the two never coincide — a `@@` header,
+    // a `diff --git` separator or a conflict marker carries no number), so the
+    // action buttons sit at the same level as the numbers rather than in extra
+    // columns (`diff_cues::GutterColumn`). A context line shows both numbers, a
+    // `-` line only old, a `+` line only new. In the diff: expand rides col_old,
+    // revert col_new; in the conflict view: ours/theirs numbers, with the resolve
+    // "keep" button on col_new. Both columns' content is recomputed from the buffer
+    // text on every change below; their click handlers are bound once the render
+    // state exists.
     let line_gutter = sourceview5::prelude::ViewExt::gutter(&file_view, gtk::TextWindowType::Left);
-    let lineno_old = linenums::LineNumberRenderer::new(linenums::NumColumn::Old);
-    let lineno_new = linenums::LineNumberRenderer::new(linenums::NumColumn::New);
-    line_gutter.insert(&lineno_old, 0);
-    line_gutter.insert(&lineno_new, 1);
+    let col_old = diff_cues::GutterColumn::new(linenums::NumColumn::Old);
+    let col_new = diff_cues::GutterColumn::new(linenums::NumColumn::New);
+    line_gutter.insert(&col_old, 0);
+    line_gutter.insert(&col_new, 1);
     file_buffer.connect_changed({
         let pane_mode = pane_mode.clone();
-        let lineno_old = lineno_old.clone();
-        let lineno_new = lineno_new.clone();
+        let col_old = col_old.clone();
+        let col_new = col_new.clone();
+        let combined_files = combined_files.clone();
+        let conflict_view = conflict_view.clone();
+        let changes = changes.clone();
+        let diff_read_only = diff_read_only.clone();
         move |buffer| {
-            // Blank the gutter while the view shows conflict snippets (`<<<`/`>>>`)
-            // rather than a unified diff. Leaving conflict mode re-sets the buffer
-            // text, which fires this handler again and restores the numbers.
-            let nums = if pane_mode.borrow().is_conflict() {
-                Vec::new()
+            let text = buffer_text(buffer);
+            // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the columns show
+            // each side's line numbers (ours | theirs), with the elision "expand"
+            // button on col_old and the resolve "keep" button per marker line on
+            // col_new. Leaving conflict mode re-sets the buffer text, firing this
+            // handler again to restore the diff numbers and cues.
+            if pane_mode.borrow().is_conflict() {
+                let nums = linenums::conflict_line_numbers(&conflict_view.borrow());
+                let (elision, resolve) = conflict_cue_cells(&text);
+                col_old.set_content(&nums, &elision);
+                col_new.set_content(&nums, &resolve);
             } else {
-                linenums::diff_line_numbers(&buffer_text(buffer))
-            };
-            lineno_old.set_numbers(&nums);
-            lineno_new.set_numbers(&nums);
+                let nums = linenums::diff_line_numbers(&text);
+                let (exp, rev) = diff_cues::diff_cue_cells(
+                    &text,
+                    &combined_files.borrow(),
+                    &changes.borrow(),
+                    diff_read_only.get(),
+                );
+                col_old.set_content(&nums, &exp);
+                col_new.set_content(&nums, &rev);
+            }
         }
     });
     // Set while we mutate the diff buffer ourselves (loading a file, or applying
@@ -606,6 +563,13 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .hexpand(true)
         .child(&file_view)
         .build();
+    // The horizontal Paned's ~9px resize handle overlaps the left edge of this
+    // pane, and its drag gesture (capture phase, on the Paned ancestor) claims
+    // presses over that band before they reach the gutter. Flush against the
+    // handle, the leftmost gutter column's buttons lost their left half to it.
+    // Inset the editor clear of the handle band (the analogue of the dropdown's
+    // top margin above).
+    file_scroll.set_margin_start(12);
     let files_box = GtkBox::new(Orientation::Vertical, 0);
     file_dropdown.set_margin_start(8);
     // The vertical Paned overlays its ~9px resize handle on top of the bottom
@@ -636,15 +600,19 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
     save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
+    // Lit only when there is something to save — a pending diff, message or
+    // identity/date edit vs. the loaded commit (wired by `update_save_sensitivity`);
+    // always lit in conflict mode, where Save resolves the current conflict.
+    save_button.set_sensitive(false);
     // Sits left of Save. Splits the selected commit into the edited diff plus a
     // follow-up "fixup! …" commit; enabled only while the diff has pending edits
     // (wired by `update_split_sensitivity`), never in the conflict/working-copy views.
     let split_button = Button::with_label("Split");
     split_button.set_tooltip_text(Some(SPLIT_HINT));
     split_button.set_sensitive(false);
-    // Conflict-mode quick resolution is driven inline: clicking a block's marker
-    // line (with its "use ours/theirs/both" cue) keeps that side — see
-    // `with_resolve_cues` and the click gesture below. No toolbar buttons.
+    // Conflict-mode quick resolution is driven from the gutter: clicking a marker
+    // line's "keep" button keeps that side — see `conflict_cue_cells` and the
+    // resolve renderer above. No toolbar buttons.
     // Previous/next-conflict navigation jumps the view between blocks; only
     // shown while resolving conflicts.
     let prev_conflict_button = Button::with_label("◀");
@@ -723,31 +691,31 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .position(win_state.list_width)
         .build();
 
-    // --- Review view (full-window, read-only session diff) ---
-    // A second diff surface shown in place of the whole editor while the "Review"
+    // --- Compare view (full-window, read-only session diff) ---
+    // A second diff surface shown in place of the whole editor while the "Compare"
     // toggle is on: the content delta between the current tree and the one the
     // session started with (see `Repo::session_changes`). Its own buffer so the
-    // editable diff pane is left untouched; rendered on demand by `render_review`
+    // editable diff pane is left untouched; rendered on demand by `render_compare`
     // below. Read-only — none of the diff pane's edit wiring applies here.
-    let review_buffer = sourceview5::Buffer::new(None);
-    install_diff_tags(&review_buffer);
-    let review_view = sourceview5::View::with_buffer(&review_buffer);
-    review_view.set_monospace(true);
-    review_view.set_editable(false);
-    review_view.set_left_margin(8);
-    review_view.set_top_margin(8);
-    let review_scroll = ScrolledWindow::builder()
+    let compare_buffer = sourceview5::Buffer::new(None);
+    install_diff_tags(&compare_buffer);
+    let compare_view = sourceview5::View::with_buffer(&compare_buffer);
+    compare_view.set_monospace(true);
+    compare_view.set_editable(false);
+    compare_view.set_left_margin(8);
+    compare_view.set_top_margin(8);
+    let compare_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hexpand(true)
-        .child(&review_view)
+        .child(&compare_view)
         .build();
 
-    // The editor and the review are mutually exclusive full-window pages; the
-    // "Review" header toggle (wired below) flips between them.
+    // The editor and the compare view are mutually exclusive full-window pages;
+    // the "Compare" header toggle (wired below) flips between them.
     paned.set_vexpand(true);
     let content_stack = Stack::new();
     content_stack.add_named(&paned, Some("edit"));
-    content_stack.add_named(&review_scroll, Some("review"));
+    content_stack.add_named(&compare_scroll, Some("compare"));
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&content_stack);
@@ -755,7 +723,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // The header bar keeps the window title and the window controls; the Save
     // action lives in the bottom action bar. The custom controls are the
     // top-right "Revert all" button (rolls the whole session back to the state
-    // the repo was opened in) and a "Review" toggle that shows a read-only,
+    // the repo was opened in) and a "Compare" toggle that shows a read-only,
     // full-window diff of every content change made this session. Both are wired
     // below, once `refresh` & co. exist.
     let header = HeaderBar::new();
@@ -767,9 +735,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     history_button.set_tooltip_text(Some(
         "Edit history — travel to an earlier state from this session",
     ));
-    let review_button = ToggleButton::with_label("Review");
-    review_button.set_tooltip_text(Some(
-        "Review all content changes made this session (current tree vs. the session start)",
+    let compare_button = ToggleButton::with_label("Compare");
+    compare_button.set_tooltip_text(Some(
+        "Compare all content changes made this session (current tree vs. the session start)",
     ));
     // The top-left "Reload" button: re-open the repository from disk to pick up
     // changes made outside commedit — a fresh session in place, same as
@@ -791,9 +759,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     header.pack_start(&reload_button);
     header.pack_start(&search_entry);
     // pack_end fills right-to-left, so packing the history button first leaves
-    // "Review" to its left: [ Review ][ ↺ ].
+    // "Compare" to its left: [ Compare ][ ↺ ].
     header.pack_end(&history_button);
-    header.pack_end(&review_button);
+    header.pack_end(&compare_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -969,31 +937,31 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Hunks of the diff currently in the buffer, so an expand click can hit-test
-    // the cue it lands on and re-render that hunk's widened context.
-    let rendered_hunks: Rc<RefCell<Vec<HunkInfo>>> = Rc::new(RefCell::new(Vec::new()));
     // The conflict pane's "expand hidden lines" action, late-bound (it needs the
     // conflict renderer defined below). The expand-click gesture invokes it by
     // buffer line, mirroring the diff renderer.
     let conflict_expand_cell: ConflictExpand = Rc::new(RefCell::new(None));
     // Push `new_text` (built by `build_diff_buffer_text`) into the buffer and
-    // refresh the derived state + highlighting. `replace` chooses how the text
+    // refresh the derived state + highlighting. `splice` chooses how the text
     // lands: a full `set_text` (used for a fresh load, where resetting the scroll
     // to the top is wanted) or an in-place `splice` (used when widening context,
-    // where the scroll must stay put). The cue is handled by a GestureClick on
-    // the view, not an embedded widget — removing a real widget on the next
-    // render crashes GTK.
+    // where the scroll must stay put). The expand / revert cues are persistent
+    // gutter renderers (`diff_cues`), so no per-line widgets are added or removed.
     let apply_diff_text: ApplyDiffText = {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
         let editing = editing.clone();
-        let rendered_hunks = rendered_hunks.clone();
         let highlight = highlight.clone();
         let diff_read_only = diff_read_only.clone();
         Rc::new(
-            move |text: String, all_hunks, files: Vec<CombinedFile>, splice: bool| {
+            move |text: String, _all_hunks, files: Vec<CombinedFile>, splice: bool| {
                 editing.set(true);
+                // Update the placement *before* the text lands: `set_text`/`splice`
+                // fires `connect_changed`, which rebuilds the gutter cue cells from
+                // `combined_files`, so it must already match the text about to show.
+                file_view.set_editable(!diff_read_only.get() && files.iter().any(|f| f.editable));
+                *combined_files.borrow_mut() = files;
                 if splice {
                     splice_buffer_text(&file_buffer, &text);
                 } else {
@@ -1004,9 +972,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     file_buffer.set_text(&text);
                     file_buffer.end_irreversible_action();
                 }
-                file_view.set_editable(!diff_read_only.get() && files.iter().any(|f| f.editable));
-                *rendered_hunks.borrow_mut() = all_hunks;
-                *combined_files.borrow_mut() = files;
                 // Highlight in this same main-loop turn, before GTK paints, so the
                 // diff appears once fully colored instead of flashing plain first and
                 // then re-highlighting via the debounced `changed` handler (which is
@@ -1023,11 +988,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
-        let diff_read_only = diff_read_only.clone();
         Rc::new(move || {
             let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
-            let (text, hunks, files) =
-                build_diff_buffer_text(&vis, &expansions.borrow(), diff_read_only.get());
+            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
             apply_diff_text(text, hunks, files, false);
         })
     };
@@ -1040,11 +1003,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let orig_changes = orig_changes.clone();
         let expansions = expansions.clone();
         let apply_diff_text = apply_diff_text.clone();
-        let diff_read_only = diff_read_only.clone();
         Rc::new(move || {
             let vis = visible_changes(&changes.borrow(), &orig_changes.borrow());
-            let (text, hunks, files) =
-                build_diff_buffer_text(&vis, &expansions.borrow(), diff_read_only.get());
+            let (text, hunks, files) = build_diff_buffer_text(&vis, &expansions.borrow());
             apply_diff_text(text, hunks, files, true);
         })
     };
@@ -1064,186 +1025,145 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Clicking a @@ header line (anywhere on it, including the "expand context"
-    // cue) widens that hunk's context. In conflict mode the same gesture turns a
-    // click on a block's marker line into the matching quick resolution. The
-    // mutation is deferred to an idle so it runs outside the gesture's event
-    // handling.
-    let expand_click = gtk::GestureClick::new();
-    expand_click.set_button(gdk::BUTTON_PRIMARY);
-    expand_click.set_propagation_phase(PropagationPhase::Capture);
-    expand_click.connect_pressed({
-        let file_view = file_view.clone();
-        let file_buffer = file_buffer.clone();
-        let rendered_hunks = rendered_hunks.clone();
+    // Apply a diff cue (expand context, revert hunk, revert file) for `path` and
+    // re-render in place. The spliced re-render edits only the changed span, so GTK
+    // keeps the scroll where it sat. A revert mutates the *render baseline*
+    // (`changes`) so the dropped change survives later re-renders; Save/Split then
+    // see it as a divergence from the pristine `orig_changes`. Guarded with
+    // `nav_sync` so the settle doesn't flip the file dropdown. Shared by the two
+    // gutter cue columns (`diff_cues`).
+    let apply_diff_cue: Rc<dyn Fn(DiffCue, String)> = {
         let expansions = expansions.clone();
+        let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
         let rerender_diff_spliced = rerender_diff_spliced.clone();
         let rebuild_file_dropdown = rebuild_file_dropdown.clone();
         let file_dropdown = file_dropdown.clone();
-        let combined_files = combined_files.clone();
-        let changes = changes.clone();
-        let orig_changes = orig_changes.clone();
-        let pane_mode = pane_mode.clone();
-        let editing = editing.clone();
-        let highlight = highlight.clone();
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
         let nav_sync = nav_sync.clone();
+        Rc::new(move |cue: DiffCue, path: String| {
+            nav_sync.set(true);
+            match cue {
+                DiffCue::Expand(first, last) => {
+                    expansions
+                        .borrow_mut()
+                        .entry(path.clone())
+                        .or_default()
+                        .expand(first, last);
+                }
+                DiffCue::RevertHunk(first, last) => {
+                    let mut ch = changes.borrow_mut();
+                    if let Some(c) = ch.iter_mut().find(|c| c.path == path) {
+                        let old = c.old_text.clone().unwrap_or_default();
+                        let new = c.new_text.clone().unwrap_or_default();
+                        c.new_text = Some(revert_groups(&old, &new, first, last));
+                    }
+                }
+                DiffCue::RevertFile => {
+                    let mut ch = changes.borrow_mut();
+                    if let Some(c) = ch.iter_mut().find(|c| c.path == path) {
+                        c.new_text = c.old_text.clone();
+                    }
+                }
+            }
+            rerender_diff_spliced();
+            // A revert that drops a file's whole change removes it from the view
+            // (`visible_changes`); rebuild the dropdown to match and re-point it at
+            // the file now at the viewport top. Only when the visible set shrank —
+            // an expand or partial hunk-revert leaves every file in place.
+            let vis_len = visible_changes(&changes.borrow(), &orig_changes.borrow()).len();
+            if file_dropdown.model().map_or(0, |m| m.n_items()) as usize != vis_len {
+                rebuild_file_dropdown();
+                let top = file_view
+                    .vadjustment()
+                    .map(|v| {
+                        let (iter, _) = file_view.line_at_y(v.value() as i32);
+                        diff_file_index_at_line(&file_buffer, iter.line() as usize)
+                    })
+                    .unwrap_or(0);
+                file_dropdown.set_selected(top as u32);
+            }
+            nav_sync.set(false);
+        })
+    };
+    // Bind the two gutter columns' click handlers. A column means different things
+    // per pane mode, so each dispatches on it. col_old: diff → widen this hunk's
+    // context. col_new: diff → drop this hunk's or file's change; conflict → resolve
+    // this block to the side its marker names. Each maps the clicked line back to
+    // its hunk/file/block from the live buffer, then defers the mutation to an idle
+    // so it runs outside the gutter's click handling.
+    col_old.set_on_activate({
+        let pane_mode = pane_mode.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        let apply_diff_cue = apply_diff_cue.clone();
         let conflict_expand_cell = conflict_expand_cell.clone();
-        move |gesture, _n_press, x, y| {
-            let (bx, by) =
-                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let Some(iter) = file_view.iter_at_location(bx, by) else {
+        Rc::new(move |line: u32| {
+            if pane_mode.borrow().is_conflict() {
+                // Conflict view: the `↕` button on an elision placeholder reveals
+                // that hidden run (`conflict_expand`, late-bound below).
+                if let Some(expand) = conflict_expand_cell.borrow().clone() {
+                    glib::idle_add_local_once(move || expand(line as usize));
+                }
+                return;
+            }
+            let text = buffer_text(&file_buffer);
+            let Some((first, last, path)) =
+                diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize)
+            else {
                 return;
             };
-            let line = iter.line() as usize;
-            // Conflict mode: a click on an elision cue expands that gap; a click on
-            // a marker line's inline "➜ use …" cue resolves that block. Clicks
-            // elsewhere fall through so the caret places for free-form edits.
+            let apply = apply_diff_cue.clone();
+            glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
+        })
+    });
+    col_new.set_on_activate({
+        let pane_mode = pane_mode.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        let apply_diff_cue = apply_diff_cue.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
+        Rc::new(move |line: u32| {
+            // Conflict view: a click on a marker line's "keep" button resolves that
+            // block to the side the marker names. `resolve_conflict_at` is reused
+            // unchanged.
             if pane_mode.borrow().is_conflict() {
-                let line_text = buffer_line_text(&file_buffer, line);
-                if line_text == pill(CONFLICT_CUE_LABEL) {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                    if let Some(expand) = conflict_expand_cell.borrow().clone() {
-                        glib::idle_add_local_once(move || expand(line));
-                    }
-                    return;
-                }
                 let text = buffer_text(&file_buffer);
-                let col = iter.line_offset() as usize;
-                let Some(side) = conflict_cue_side_at(&text, line, col) else {
+                let Some(side) = conflict_side_at_line(&text, line as usize) else {
                     return;
                 };
-                // We own this click: don't let the view also place the caret in
-                // the marker line we're about to delete.
-                gesture.set_state(gtk::EventSequenceState::Claimed);
                 let file_buffer = file_buffer.clone();
                 let editing = editing.clone();
                 let highlight = highlight.clone();
                 glib::idle_add_local_once(move || {
-                    resolve_conflict_at(&file_buffer, &editing, line, side, &*highlight);
+                    resolve_conflict_at(&file_buffer, &editing, line as usize, side, &*highlight);
                 });
                 return;
             }
-            // Only the inline pill cues are clickable, not the whole line.
-            let col = iter.line_offset() as usize;
-            let line_text = buffer_line_text(&file_buffer, line);
-            let Some(cue) = diff_cue_at(&rendered_hunks.borrow(), &line_text, line, col) else {
-                return;
+            // Diff view: revert this hunk, or — on a `diff --git` line — the file.
+            let text = buffer_text(&file_buffer);
+            let files = combined_files.borrow();
+            let line = line as usize;
+            let resolved = if let Some((first, last, path)) =
+                diff_cues::hunk_target(&text, &files, line)
+            {
+                Some((DiffCue::RevertHunk(first, last), path))
+            } else {
+                diff_cues::file_target(&text, &files, line).map(|path| (DiffCue::RevertFile, path))
             };
-            // The combined diff holds several files; find which one owns the
-            // clicked line — its `diff --git` separator (revert file) or one of its
-            // `@@` headers (expand / revert hunk). Group indices and reverts are
-            // file-relative.
-            let path = combined_files
-                .borrow()
-                .iter()
-                .find(|f| f.start_line == line || f.hunks.iter().any(|h| h.header_line == line))
-                .map(|f| f.path.clone());
-            let Some(path) = path else { return };
-            // We own this click: don't let the view also place the caret.
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-
-            let expansions = expansions.clone();
-            let rerender_diff_spliced = rerender_diff_spliced.clone();
-            let rebuild_file_dropdown = rebuild_file_dropdown.clone();
-            let file_dropdown = file_dropdown.clone();
-            let file_view = file_view.clone();
-            let file_buffer = file_buffer.clone();
-            let nav_sync = nav_sync.clone();
-            let changes = changes.clone();
-            let orig_changes = orig_changes.clone();
-            glib::idle_add_local_once(move || {
-                // Apply the cue and re-render in place (the spliced re-render edits
-                // only the changed span, so GTK keeps the scroll where it sat — no
-                // jump-to-top flash; see `splice_buffer_text`). Expansion only adds
-                // context. A revert mutates the *render baseline* (`changes`) so the
-                // dropped change survives later re-renders; Save/Split then see it as
-                // a divergence from the pristine `orig_changes`. The re-render fires
-                // `changed`, refreshing Split's sensitivity. Guard with `nav_sync`
-                // so the settle doesn't flip the file dropdown.
-                nav_sync.set(true);
-                match cue {
-                    DiffCue::Expand(first, last) => {
-                        expansions
-                            .borrow_mut()
-                            .entry(path.clone())
-                            .or_default()
-                            .expand(first, last);
-                    }
-                    DiffCue::RevertHunk(first, last) => {
-                        let mut ch = changes.borrow_mut();
-                        if let Some(c) = ch.iter_mut().find(|c| c.path == path) {
-                            let old = c.old_text.clone().unwrap_or_default();
-                            let new = c.new_text.clone().unwrap_or_default();
-                            c.new_text = Some(revert_groups(&old, &new, first, last));
-                        }
-                    }
-                    DiffCue::RevertFile => {
-                        let mut ch = changes.borrow_mut();
-                        if let Some(c) = ch.iter_mut().find(|c| c.path == path) {
-                            c.new_text = c.old_text.clone();
-                        }
-                    }
-                }
-                rerender_diff_spliced();
-                // A revert that drops a file's whole change removes it from the
-                // view (`visible_changes`); rebuild the dropdown to match and
-                // re-point it at the file now at the viewport top so its label and
-                // the buffer stay in sync. Only when the visible set actually shrank
-                // — an expand or a partial hunk-revert leaves every file in place.
-                let vis_len = visible_changes(&changes.borrow(), &orig_changes.borrow()).len();
-                if file_dropdown.model().map_or(0, |m| m.n_items()) as usize != vis_len {
-                    rebuild_file_dropdown();
-                    let top = file_view
-                        .vadjustment()
-                        .map(|v| {
-                            let (iter, _) = file_view.line_at_y(v.value() as i32);
-                            diff_file_index_at_line(&file_buffer, iter.line() as usize)
-                        })
-                        .unwrap_or(0);
-                    file_dropdown.set_selected(top as u32);
-                }
-                nav_sync.set(false);
-            });
-        }
-    });
-    file_view.add_controller(expand_click);
-
-    // Hover cursor: show a hand over the clickable affordances — the conflict
-    // "use …" buttons and the diff "expand context" / "revert" pills — and the
-    // text I-beam everywhere else. GtkTextView otherwise only ever shows the I-beam over
-    // content; we override it per the gtk hypertext pattern (set the widget
-    // cursor from the motion handler). A `Cell` tracks the current state so we
-    // only touch the cursor when it actually flips.
-    let hover_hand = Rc::new(Cell::new(false));
-    let hover_motion = gtk::EventControllerMotion::new();
-    hover_motion.connect_motion({
-        let file_view = file_view.clone();
-        let file_buffer = file_buffer.clone();
-        let rendered_hunks = rendered_hunks.clone();
-        let pane_mode = pane_mode.clone();
-        let hover_hand = hover_hand.clone();
-        move |_, x, y| {
-            let (bx, by) =
-                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let over_button = file_view.iter_at_location(bx, by).is_some_and(|iter| {
-                let line = iter.line() as usize;
-                let col = iter.line_offset() as usize;
-                if pane_mode.borrow().is_conflict() {
-                    let line_text = buffer_line_text(&file_buffer, line);
-                    line_text == pill(CONFLICT_CUE_LABEL)
-                        || conflict_cue_side_at(&buffer_text(&file_buffer), line, col).is_some()
-                } else {
-                    let line_text = buffer_line_text(&file_buffer, line);
-                    diff_cue_at(&rendered_hunks.borrow(), &line_text, line, col).is_some()
-                }
-            });
-            if over_button != hover_hand.get() {
-                hover_hand.set(over_button);
-                file_view.set_cursor_from_name(Some(if over_button { "pointer" } else { "text" }));
+            drop(files);
+            if let Some((cue, path)) = resolved {
+                let apply = apply_diff_cue.clone();
+                glib::idle_add_local_once(move || apply(cue, path));
             }
-        }
+        })
     });
-    file_view.add_controller(hover_motion);
+
+    // Every diff/conflict affordance now lives in the gutter (`GutterColumn`),
+    // which owns its own click handling, pointer cursor and tooltips — so the text
+    // view needs no in-text click gesture or hover-cursor override any more.
 
     // Jump the (already-rendered) combined diff to the file at dropdown `idx`,
     // pinning its `diff --git` header to the top of the viewport. The whole change
@@ -1317,6 +1237,70 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Light the Save button only when there is something to save — mirroring the
+    // `save` closure's per-mode notion of "dirty": pending file edits in any
+    // editable pane, plus (for a single selected commit) a changed message or
+    // identity/date. In conflict mode Save resolves the current conflict, so it is
+    // always actionable. Wired to every input that can change that verdict (the
+    // diff, message and identity buffers below) and re-run after each (re)load, so
+    // it resets to insensitive once a fresh, unedited pane is shown.
+    let update_save_sensitivity: Rc<dyn Fn()> = {
+        let save_button = save_button.clone();
+        let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
+        let multi_identity_baseline = multi_identity_baseline.clone();
+        let identity_fields = identity_fields.clone();
+        let original_identity = original_identity.clone();
+        let commits = commits.clone();
+        let message_buffer = message_buffer.clone();
+        let file_buffer = file_buffer.clone();
+        let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
+        Rc::new(move || {
+            // The diff buffer carries pending file-content edits — the same edits
+            // Save/Split would apply. Shared by every editable pane below.
+            let has_file_edits = || {
+                matches!(
+                    collect_file_edits(
+                        &buffer_text(&file_buffer),
+                        &changes.borrow(),
+                        &orig_changes.borrow(),
+                    ),
+                    Ok(edits) if !edits.is_empty()
+                )
+            };
+            let dirty = if pane_mode.borrow().is_conflict() {
+                // Save resolves the current conflicted file — always actionable.
+                true
+            } else if viewing_wc.get() {
+                // Working-copy entry: only its file content is editable.
+                has_file_edits()
+            } else if selected_changes.borrow().len() > 1 {
+                // Batch view: any identity field set and differing from its baseline.
+                let baseline = multi_identity_baseline.borrow();
+                (0..4).any(|i| {
+                    let cur = identity_fields[i].text();
+                    !cur.trim().is_empty() && cur.as_str() != baseline[i].as_str()
+                })
+            } else if let Some(change_id) = selected_change.borrow().clone() {
+                // Single commit: message, diff or identity changed vs. the loaded state.
+                let message_dirty = commits
+                    .borrow()
+                    .iter()
+                    .find(|c| c.change_id_hex() == change_id)
+                    .is_some_and(|c| buffer_text(&message_buffer) != c.description);
+                let new_identity = read_identity(&identity_fields);
+                let identity_dirty = original_identity.borrow().as_ref() != Some(&new_identity);
+                message_dirty || identity_dirty || has_file_edits()
+            } else {
+                false
+            };
+            save_button.set_sensitive(dirty);
+        })
+    };
+
     file_buffer.connect_changed({
         let collapse = collapse.clone();
         let highlight = highlight.clone();
@@ -1324,10 +1308,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let highlight_gen = highlight_gen.clone();
         let editing = editing.clone();
         let update_split_sensitivity = update_split_sensitivity.clone();
+        let update_save_sensitivity = update_save_sensitivity.clone();
         move |buffer| {
-            // Track Split-button sensitivity on every change, including programmatic
+            // Track Split/Save sensitivity on every change, including programmatic
             // renders (a load leaves an unedited diff -> insensitive).
             update_split_sensitivity();
+            update_save_sensitivity();
             // A full programmatic render highlights itself synchronously; don't
             // also schedule a redundant (and flash-inducing) debounced pass.
             if editing.get() {
@@ -1354,6 +1340,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             });
         }
     });
+
+    // The message and identity inputs feed the same Save verdict as the diff, so a
+    // keystroke in any of them re-evaluates it. (A programmatic repopulation on
+    // load also fires these, but the final diff render settles the verdict against
+    // the now-current baselines.)
+    message_buffer.connect_changed({
+        let update_save_sensitivity = update_save_sensitivity.clone();
+        move |_| update_save_sensitivity()
+    });
+    for field in identity_fields.iter() {
+        field.connect_changed({
+            let update_save_sensitivity = update_save_sensitivity.clone();
+            move |_| update_save_sensitivity()
+        });
+    }
 
     // Show a message in the status line for a few seconds, then clear it (a
     // generation counter coalesces rapid messages so only the latest clears).
@@ -1397,7 +1398,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let highlight = highlight.clone();
         Rc::new(move |splice: bool| {
-            let cue = pill(CONFLICT_CUE_LABEL);
+            let cue = CONFLICT_ELISION_LINE;
             let mut out: Vec<String> = Vec::new();
             {
                 let mut view = conflict_view.borrow_mut();
@@ -1409,7 +1410,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         fv.gaps.clear();
                         continue;
                     }
-                    let snip = render_conflict_snippets(&fv.full_text, &fv.exp, &cue);
+                    let snip = render_conflict_snippets(&fv.full_text, &fv.exp, cue);
                     for l in snip.text.split('\n') {
                         out.push(l.to_string());
                     }
@@ -1417,9 +1418,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     fv.pieces = snip.pieces;
                 }
             }
-            // Build the full text including the inline "use ours/theirs/both" cues
-            // up front, so a splice diffs against the same content set_text yields.
-            let text = with_resolve_cues(&out.join("\n"));
+            // The markers stay as plain git-style markers; the resolve action is a
+            // gutter button (`conflict_cue_cells`), so the buffer text is the
+            // conflict snippets verbatim.
+            let text = out.join("\n");
             editing.set(true);
             if splice {
                 splice_buffer_text(&file_buffer, &text);
@@ -1445,7 +1447,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let conflict_view = conflict_view.clone();
         let file_buffer = file_buffer.clone();
         Rc::new(move || {
-            let cue = pill(CONFLICT_CUE_LABEL);
+            let cue = CONFLICT_ELISION_LINE;
             let combined = buffer_text(&file_buffer);
             let buf_lines: Vec<&str> = combined.split('\n').collect();
             let mut sections: Vec<Vec<&str>> = Vec::new();
@@ -1459,12 +1461,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let mut view = conflict_view.borrow_mut();
             for (fv, section) in view.iter_mut().zip(sections.iter()) {
                 if fv.resolvable {
-                    // Drop the inline resolve cues we appended to marker lines, so
-                    // they don't accrete into the reconstructed text on re-render.
-                    let cleaned: Vec<String> =
-                        section.iter().map(|l| strip_marker_cue(l)).collect();
-                    let refs: Vec<&str> = cleaned.iter().map(String::as_str).collect();
-                    fv.full_text = reconstruct_conflict_file(&refs, &fv.pieces, &cue);
+                    // Markers carry no inline cue text (the resolve action is a
+                    // gutter button), so the section lines reconstruct verbatim.
+                    fv.full_text = reconstruct_conflict_file(section, &fv.pieces, cue);
                 }
             }
         })
@@ -1989,6 +1988,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let diff_read_only = diff_read_only.clone();
         let multi_identity_baseline = multi_identity_baseline.clone();
+        let update_save_sensitivity = update_save_sensitivity.clone();
         Rc::new(move || {
             if selection_sync.get() {
                 return;
@@ -2058,8 +2058,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         &message_buffer,
                         "Multiple commits selected — message not editable.",
                     );
-                    *multi_identity_baseline.borrow_mut() =
-                        set_identity_fields_common(&identity_fields, infos);
+                    // Populate the fields first: their `changed` signals re-enter
+                    // `update_save_sensitivity`, which reads the baseline — so store
+                    // it only once the (now-settled) fields are in place.
+                    let baseline = set_identity_fields_common(&identity_fields, infos);
+                    *multi_identity_baseline.borrow_mut() = baseline;
                     for f in identity_fields.iter() {
                         f.set_sensitive(true);
                     }
@@ -2095,6 +2098,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                 }
             }
+            // Settle the Save verdict against the freshly loaded baselines: the
+            // diff render above already fires it, but an unchanged (e.g. empty)
+            // buffer may not, so re-run it explicitly here.
+            update_save_sensitivity();
         })
     };
 
@@ -2455,8 +2462,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Enter conflict mode with the engine's reported conflicts: show the banner,
     // select the oldest conflicted commit, and render the pending chain. The
-    // quick-resolve affordances are the inline marker-line cues (see
-    // `with_resolve_cues`).
+    // quick-resolve affordances are the gutter "keep" buttons (see
+    // `conflict_cue_cells`).
     let enter_conflict_mode =
         conflict::build_enter_conflict_mode(&widgets, &data, refresh_conflict.clone());
 
@@ -2496,10 +2503,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let Some(commit) = commits.get(idx as usize) else {
                         return;
                     };
-                    if commit.parents.len() > 1 {
-                        show_status("Cannot revert a merge commit");
-                        return;
-                    }
                     let target = commit.id.clone();
                     let change = commit.change_id_hex();
                     // Parent the revert on the clicked commit; its children are the
@@ -2577,10 +2580,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let Some(commit) = commits.get(idx as usize) else {
                         return;
                     };
-                    if commit.parents.len() != 1 {
-                        show_status("Can only introduce a merge above a single-parent commit");
-                        return;
-                    }
                     let target = commit.id.clone();
                     let change = commit.change_id_hex();
                     // The new merge takes the gap just above the clicked commit; its
@@ -2788,14 +2787,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         on_restore.clone(),
     );
 
-    // Render the session "Review" into its (read-only) full-window buffer: the
+    // Render the session "Compare" into its (read-only) full-window buffer: the
     // content delta between the current tree and the one the session started
     // with. Recomputed each time the view is shown — and after "Revert all" — so
     // it always reflects the live tree. A message/identity-only edit changes no
-    // tree, so it produces an empty review; after a revert it empties too.
-    let render_review: Rc<dyn Fn()> = {
+    // tree, so it produces an empty diff; after a revert it empties too.
+    let render_compare: Rc<dyn Fn()> = {
         let repo = repo.clone();
-        let review_buffer = review_buffer.clone();
+        let compare_buffer = compare_buffer.clone();
         let syntax_set = syntax_set.clone();
         let theme = theme.clone();
         let show_status = show_status.clone();
@@ -2803,35 +2802,35 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let changes = match repo.borrow_mut().session_changes() {
                 Ok(changes) => changes,
                 Err(err) => {
-                    show_status(&format!("Review failed: {err}"));
+                    show_status(&format!("Compare failed: {err}"));
                     return;
                 }
             };
             if changes.is_empty() {
-                review_buffer.set_text("No content changes since the session started.");
+                compare_buffer.set_text("No content changes since the session started.");
                 return;
             }
-            // Default context, no expand cues: the review is read-only, so the
-            // diff pane's hunk-expansion wiring deliberately doesn't apply.
+            // Default context, no expand cues: the compare view is read-only, so
+            // the diff pane's hunk-expansion wiring deliberately doesn't apply.
             let combined = render_commit_diff(&changes, &HashMap::new());
-            review_buffer.set_text(&combined.text);
+            compare_buffer.set_text(&combined.text);
             let first = combined.files.first().map(|f| f.path.as_str());
-            highlight_diff(&review_buffer, first, &syntax_set, &theme);
+            highlight_diff(&compare_buffer, first, &syntax_set, &theme);
         })
     };
 
-    // "Review" toggle: swap the whole window between the editor and the
+    // "Compare" toggle: swap the whole window between the editor and the
     // read-only session diff. Computing the diff snapshots the working copy
     // (which can move `@`), so refresh the now-hidden editor to keep its
     // history/`@`-row consistent.
-    review_button.connect_toggled({
+    compare_button.connect_toggled({
         let content_stack = content_stack.clone();
-        let render_review = render_review.clone();
+        let render_compare = render_compare.clone();
         let refresh = refresh.clone();
         move |btn| {
             if btn.is_active() {
-                render_review();
-                content_stack.set_visible_child_name("review");
+                render_compare();
+                content_stack.set_visible_child_name("compare");
                 refresh();
             } else {
                 content_stack.set_visible_child_name("edit");
@@ -2859,8 +2858,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let on_restore = on_restore.clone();
-        let review_button = review_button.clone();
-        let render_review = render_review.clone();
+        let compare_button = compare_button.clone();
+        let render_compare = render_compare.clone();
         move |btn| {
             // Snapshot the dropdown's data: (jump target, label, affected change-ids),
             // newest first, then the session-start floor (target 0). `cursor` marks
@@ -2936,8 +2935,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let trash_list = trash_list.clone();
                 let trash_scroll = trash_scroll.clone();
                 let on_restore = on_restore.clone();
-                let review_button = review_button.clone();
-                let render_review = render_review.clone();
+                let compare_button = compare_button.clone();
+                let render_compare = render_compare.clone();
                 move |_, row| {
                     let Some((target, label, _)) = entries.get(row.index() as usize) else {
                         return;
@@ -2980,8 +2979,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             list.select_row(Some(&row));
                         }
                     }
-                    if review_button.is_active() {
-                        render_review();
+                    if compare_button.is_active() {
+                        render_compare();
                     }
                     show_status(&format!("Travelled to: {label}"));
                 }
@@ -3018,8 +3017,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_scroll = trash_scroll.clone();
         let on_restore = on_restore.clone();
         let history_limit = history_limit.clone();
-        let review_button = review_button.clone();
-        let render_review = render_review.clone();
+        let compare_button = compare_button.clone();
+        let render_compare = render_compare.clone();
         move |_| {
             // Open the new session before dropping the old one, so a failed
             // reload leaves the current state untouched (concurrent sessions
@@ -3056,8 +3055,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     list.select_row(Some(&row));
                 }
             }
-            if review_button.is_active() {
-                render_review();
+            if compare_button.is_active() {
+                render_compare();
             }
             show_status("Repository reloaded");
         }
@@ -3796,96 +3795,67 @@ mod tests {
         }
     }
 
-    /// The `@@` header / `diff --git` line of the first file in a built diff.
-    fn hunk_line(text: &str) -> (usize, String) {
-        text.split('\n')
-            .enumerate()
-            .find(|(_, l)| l.starts_with("@@"))
-            .map(|(i, l)| (i, l.to_string()))
-            .unwrap()
+    /// Buffer line index of the first `@@` header in a built diff.
+    fn first_hunk_line(text: &str) -> usize {
+        text.split('\n').position(|l| l.starts_with("@@")).unwrap()
     }
 
     #[test]
-    fn pills_on_line_finds_both_hunk_pills_with_ordered_ranges() {
-        let line = format!(
-            "@@ -1,3 +1,3 @@  {}  {}",
-            pill("↕ expand context"),
-            pill(REVERT_HUNK_LABEL)
-        );
-        let pills = pills_on_line(&line);
-        assert_eq!(pills.len(), 2);
-        assert_eq!(pills[0].2, "↕ expand context");
-        assert_eq!(pills[1].2, REVERT_HUNK_LABEL);
-        assert!(
-            pills[0].1 < pills[1].0,
-            "pill ranges are disjoint & ordered"
-        );
-        let chars: Vec<char> = line.chars().collect();
-        for &(lc, rc, _) in &pills {
-            assert_eq!(chars[lc], CUE_CAP_L);
-            assert_eq!(chars[rc], CUE_CAP_R);
-        }
-    }
-
-    #[test]
-    fn diff_cue_at_disambiguates_expand_and_revert_on_one_header() {
-        // A 12-line file with one mid edit leaves hidden context both ways, so the
-        // header carries both an expand and a revert pill.
+    fn diff_cue_cells_mark_expand_and_revert_on_one_header() {
+        // A 12-line file with one mid edit leaves hidden context both ways: the @@
+        // header gets both an expand cell and a revert cell, and the click target
+        // resolves to that file's hunk.
         let old: String = (1..=12).map(|n| format!("l{n}\n")).collect();
         let new = old.replace("l6\n", "L6\n");
-        let (text, hunks, _files) =
-            build_diff_buffer_text(&[modified("f", &old, &new)], &HashMap::new(), false);
-        let (li, line) = hunk_line(&text);
-        let pills = pills_on_line(&line);
-        assert_eq!(pills.len(), 2, "expand + revert");
-        assert_eq!(diff_cue_at(&hunks, &line, li, 0), None, "before any pill");
-        assert!(matches!(
-            diff_cue_at(&hunks, &line, li, pills[0].0),
-            Some(DiffCue::Expand(_, _))
-        ));
-        assert!(matches!(
-            diff_cue_at(&hunks, &line, li, pills[1].0),
-            Some(DiffCue::RevertHunk(_, _))
-        ));
-        // A click on the revert pill's right cap still counts (inclusive).
-        assert!(matches!(
-            diff_cue_at(&hunks, &line, li, pills[1].1),
-            Some(DiffCue::RevertHunk(_, _))
-        ));
-    }
-
-    #[test]
-    fn revert_hunk_pill_present_even_without_an_expand_pill() {
-        // A 3-line file with one change has no hidden context: no expand pill, but
-        // still a revert pill, and the hit-test resolves it.
-        let (text, hunks, _files) = build_diff_buffer_text(
-            &[modified("f", "a\nb\nc\n", "a\nB\nc\n")],
-            &HashMap::new(),
-            false,
+        let changes = vec![modified("f", &old, &new)];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (expand, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let li = first_hunk_line(&text);
+        assert!(expand[li].is_some(), "expandable header");
+        assert!(revert[li].is_some(), "revertable hunk");
+        assert!(
+            matches!(diff_cues::hunk_target(&text, &files, li), Some((_, _, ref p)) if p == "f")
         );
-        let (li, line) = hunk_line(&text);
-        let pills = pills_on_line(&line);
-        assert_eq!(pills.len(), 1);
-        assert_eq!(pills[0].2, REVERT_HUNK_LABEL);
-        assert!(matches!(
-            diff_cue_at(&hunks, &line, li, pills[0].0),
-            Some(DiffCue::RevertHunk(_, _))
-        ));
     }
 
     #[test]
-    fn revert_file_cue_rides_the_diff_git_line() {
-        let (text, _hunks, files) =
-            build_diff_buffer_text(&[modified("f", "a\nb\n", "a\nB\n")], &HashMap::new(), false);
-        let lines: Vec<&str> = text.split('\n').collect();
-        let sep = lines[files[0].start_line];
-        assert!(sep.starts_with("diff --git "));
-        let pills = pills_on_line(sep);
-        assert_eq!(pills.len(), 1);
-        assert_eq!(pills[0].2, REVERT_FILE_LABEL);
+    fn diff_cue_cells_revert_without_expand_on_a_full_hunk() {
+        // A 3-line file with one change has no hidden context: no expand cell, but
+        // still a revert cell, on the @@ header.
+        let changes = vec![modified("f", "a\nb\nc\n", "a\nB\nc\n")];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (expand, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let li = first_hunk_line(&text);
+        assert!(expand[li].is_none(), "no hidden context");
+        assert!(revert[li].is_some());
+    }
+
+    #[test]
+    fn diff_cue_cells_revert_file_rides_the_diff_git_line() {
+        let changes = vec![modified("f", "a\nb\n", "a\nB\n")];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (_expand, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let sep = files[0].start_line;
+        assert!(text
+            .split('\n')
+            .nth(sep)
+            .unwrap()
+            .starts_with("diff --git "));
+        assert!(revert[sep].is_some(), "revert-file cell on the separator");
         assert_eq!(
-            diff_cue_at(&[], sep, files[0].start_line, pills[0].0),
-            Some(DiffCue::RevertFile)
+            diff_cues::file_target(&text, &files, sep).as_deref(),
+            Some("f")
+        );
+    }
+
+    #[test]
+    fn diff_cue_cells_read_only_suppresses_reverts() {
+        let changes = vec![modified("f", "a\nb\n", "a\nB\n")];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (_e, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, true);
+        assert!(
+            revert.iter().all(Option::is_none),
+            "no revert cues when read-only"
         );
     }
 
@@ -3893,31 +3863,30 @@ mod tests {
     fn added_file_gets_a_file_revert_cue_but_no_hunk_revert_cue() {
         // An added file's whole change can be dropped (revert file -> delete), but
         // a *hunk* revert needs an old side, so it's not offered.
-        let (text, _hunks, files) =
-            build_diff_buffer_text(&[added("new.txt", "x\ny\n")], &HashMap::new(), false);
-        assert!(!text.contains(REVERT_HUNK_LABEL));
-        let lines: Vec<&str> = text.split('\n').collect();
-        let sep = lines[files[0].start_line];
-        let pills = pills_on_line(sep);
-        assert_eq!(pills.len(), 1);
-        assert_eq!(pills[0].2, REVERT_FILE_LABEL);
+        let changes = vec![added("new.txt", "x\ny\n")];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (_e, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let sep = files[0].start_line;
+        assert!(revert[sep].is_some(), "revert-file on the separator");
+        for (i, l) in text.split('\n').enumerate() {
+            if l.starts_with("@@") {
+                assert!(revert[i].is_none(), "no hunk revert for an added file");
+            }
+        }
     }
 
     #[test]
     fn removed_file_gets_a_file_revert_cue() {
         // A removed file has no hunks (it renders as a notice) but still a change
-        // to undo, so the revert-file cue rides its `diff --git` separator.
-        let (text, _hunks, files) =
-            build_diff_buffer_text(&[removed("gone.txt", "a\nb\n")], &HashMap::new(), false);
-        assert!(!text.contains(REVERT_HUNK_LABEL));
-        let lines: Vec<&str> = text.split('\n').collect();
-        let sep = lines[files[0].start_line];
-        let pills = pills_on_line(sep);
-        assert_eq!(pills.len(), 1);
-        assert_eq!(pills[0].2, REVERT_FILE_LABEL);
+        // to undo, so the revert-file cell rides its `diff --git` separator.
+        let changes = vec![removed("gone.txt", "a\nb\n")];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (_e, revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let sep = files[0].start_line;
+        assert!(revert[sep].is_some());
         assert_eq!(
-            diff_cue_at(&[], sep, files[0].start_line, pills[0].0),
-            Some(DiffCue::RevertFile)
+            diff_cues::file_target(&text, &files, sep).as_deref(),
+            Some("gone.txt")
         );
     }
 
@@ -3929,7 +3898,7 @@ mod tests {
         for c in render.iter_mut() {
             c.new_text = c.old_text.clone();
         }
-        let (text, _h, _f) = build_diff_buffer_text(&render, &HashMap::new(), false);
+        let (text, _h, _f) = build_diff_buffer_text(&render, &HashMap::new());
         collect_file_edits(&text, &render, orig).expect("collect")
     }
 
@@ -3968,7 +3937,7 @@ mod tests {
             added("new.txt", "x\n"),
             removed("gone.txt", "z\n"),
         ];
-        let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new(), false);
+        let (text, _h, _f) = build_diff_buffer_text(&orig, &HashMap::new());
         let edits = collect_file_edits(&text, &orig, &orig).expect("collect");
         assert!(edits.is_empty(), "got {edits:?}");
     }
@@ -3987,7 +3956,7 @@ mod tests {
             vis.iter().all(|c| c.path != "f"),
             "f is hidden from the view"
         );
-        let (text, _h, _f) = build_diff_buffer_text(&vis, &HashMap::new(), false);
+        let (text, _h, _f) = build_diff_buffer_text(&vis, &HashMap::new());
         assert!(!text.contains("a/f b/f"), "f has no buffer section");
 
         let edits = collect_file_edits(&text, &render, &orig).expect("collect");

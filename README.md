@@ -36,14 +36,14 @@ an interactive-rebase session.
   firewall that keeps the buffer a patch that still applies: typing on a context
   line splits it into a removed/added pair, deleting a removed line restores it,
   and `@@` headers stay read-only. It's syntax-highlighted per file type with
-  changed words tinted inline, and each hunk has an *expand context* control to
-  reveal more of the surrounding file. A gutter shows old | new line numbers
-  alongside the diff — the original number on removed lines, the resulting number
-  on context and added lines.
+  changed words tinted inline, and each hunk has an *expand context* button in the
+  gutter to reveal more of the surrounding file. A gutter shows old | new line
+  numbers alongside the diff — the original number on removed lines, the resulting
+  number on context and added lines.
 
-- **Revert hunks or files** — every changed file carries a *revert* control to
-  drop its change from the commit, and every hunk of a modified file one to drop
-  just that hunk. It works whatever the change is: a modified file reverts to its
+- **Revert hunks or files** — every changed file carries a *revert* button in the
+  gutter to drop its change from the commit, and every hunk of a modified file one
+  to drop just that hunk. It works whatever the change is: a modified file reverts to its
   old content, a file the commit *added* is dropped entirely, and one it *removed*
   is restored. Reverting doesn't save on its own; you then **Save** to drop the
   changes or **Split** to peel them off.
@@ -88,9 +88,10 @@ an interactive-rebase session.
   real rebase, so it can conflict. Spurious conflicts (nearby but independent
   edits) are resolved for you automatically; a genuine one is held back — `git`
   keeps seeing your original, untouched history — and shown right in the diff pane
-  with conflict markers and *Use ours / theirs / both* buttons. Resolve them file
-  by file; the rewrite reaches git only once the last is cleared, or you abort and
-  leave history exactly as it was.
+  with standard git conflict markers, a *keep ours / both / theirs* button in the
+  gutter of each marker line, and an ours | theirs line-number gutter. Resolve
+  them file by file; the rewrite reaches git only once the last is cleared, or you
+  abort and leave history exactly as it was.
 
 - **Uncommitted changes are first-class** — whatever you've edited or added on
   disk but not committed appears as its own row above the history, with the same

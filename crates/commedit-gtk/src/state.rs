@@ -141,27 +141,12 @@ pub(crate) enum PendingTrashOp {
 }
 
 /// Which side(s) of a conflict block a quick-resolve action keeps.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Ours,
     Theirs,
     Both,
 }
-
-/// Inline, clickable quick-resolve cues appended to a conflict block's marker
-/// lines — the same idiom as the diff view's "expand context" cue. Clicking the
-/// marker line keeps the indicated side(s) and drops the markers: "use ours"
-/// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
-pub(crate) const CUE_OURS: &str = " ◀ ➜ use ours ▶";
-pub(crate) const CUE_BOTH: &str = " ◀ ➜ use both ▶";
-pub(crate) const CUE_THEIRS: &str = " ◀ ➜ use theirs ▶";
-/// The end-caps that make a cue read as a banner/tag-shaped button. Painted as a
-/// full-height triangle in the button colour against the line background, their
-/// flat (vertical) side sits flush against the solid-fill body between them, so
-/// they align in height and touch the block, giving pointed ends. The left cap
-/// also marks where the clickable button begins.
-pub(crate) const CUE_CAP_L: char = '◀';
-pub(crate) const CUE_CAP_R: char = '▶';
 
 /// Tooltips for the action-bar buttons. The Save button means different things
 /// per pane mode — committing an edit in the diff view, resolving a file in the
@@ -182,30 +167,27 @@ pub(crate) const SPLIT_HINT: &str =
      after it holding the changes you took out — so the two together reproduce the \
      original commit and its descendants stay unchanged.";
 
-/// Inline cues that *drop* changes from the diff — the mirror of "expand
-/// context". `revert hunk` sits on each `@@` header (next to the expand cue),
-/// `revert file` on each `diff --git` separator. Clicking one rewrites the diff
-/// so those changes vanish, leaving a pending edit; the user then Saves (drops
-/// them) or Splits (peels them into a separate commit). Shown only for modified
-/// text files (see `build_diff_buffer_text`).
-pub(crate) const REVERT_HUNK_LABEL: &str = "⤺ revert hunk";
-pub(crate) const REVERT_FILE_LABEL: &str = "⤺ revert file";
-
-/// Which inline cue a click/hover landed on in the (non-conflict) diff view.
+/// A diff-view gutter cue action (`diff_cues`): widen a hunk's context, drop a
+/// hunk's changes, or drop a whole file's changes. The first two carry the hunk's
+/// inclusive change-group range. A revert rewrites the diff so those changes
+/// vanish, leaving a pending edit; the user then Saves (drops them) or Splits
+/// (peels them into a separate commit). Offered only for modified text files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffCue {
-    /// The "expand context" pill on an expandable `@@` header — widen this hunk's
-    /// context (group range to grow on each side).
+    /// Widen this hunk's context (group range to grow on each side).
     Expand(usize, usize),
-    /// The "revert hunk" pill — drop this hunk's changes (its group range).
+    /// Drop this hunk's changes (its group range).
     RevertHunk(usize, usize),
-    /// The "revert file" pill on a `diff --git` line — drop the whole file's changes.
+    /// Drop the whole file's changes.
     RevertFile,
 }
 
-/// Label of the conflict pane's elision cue — the pill standing in for a hidden
-/// run of unconflicted lines between snippets. Clicking it reveals more context.
-pub(crate) const CONFLICT_CUE_LABEL: &str = "↕ expand hidden lines";
+/// The conflict pane's elision placeholder — a single plain line standing in for
+/// a hidden run of unconflicted lines between snippets. It carries no number and
+/// is not editable; the gutter draws an `↕` "expand" button beside it (see
+/// `conflict_cue_cells`), and clicking that reveals more context. Kept a single
+/// constant so the buffer scanners can recognise it by exact match.
+pub(crate) const CONFLICT_ELISION_LINE: &str = "\u{22ef} hidden lines \u{22ef}";
 
 /// The standalone notice shown for a structural (non-text-resolvable) conflicted
 /// file in the combined conflict view.

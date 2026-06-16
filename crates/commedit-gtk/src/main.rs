@@ -636,6 +636,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
     save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
+    // Lit only when there is something to save — a pending diff, message or
+    // identity/date edit vs. the loaded commit (wired by `update_save_sensitivity`);
+    // always lit in conflict mode, where Save resolves the current conflict.
+    save_button.set_sensitive(false);
     // Sits left of Save. Splits the selected commit into the edited diff plus a
     // follow-up "fixup! …" commit; enabled only while the diff has pending edits
     // (wired by `update_split_sensitivity`), never in the conflict/working-copy views.
@@ -1317,6 +1321,70 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
+    // Light the Save button only when there is something to save — mirroring the
+    // `save` closure's per-mode notion of "dirty": pending file edits in any
+    // editable pane, plus (for a single selected commit) a changed message or
+    // identity/date. In conflict mode Save resolves the current conflict, so it is
+    // always actionable. Wired to every input that can change that verdict (the
+    // diff, message and identity buffers below) and re-run after each (re)load, so
+    // it resets to insensitive once a fresh, unedited pane is shown.
+    let update_save_sensitivity: Rc<dyn Fn()> = {
+        let save_button = save_button.clone();
+        let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        let selected_change = selected_change.clone();
+        let selected_changes = selected_changes.clone();
+        let multi_identity_baseline = multi_identity_baseline.clone();
+        let identity_fields = identity_fields.clone();
+        let original_identity = original_identity.clone();
+        let commits = commits.clone();
+        let message_buffer = message_buffer.clone();
+        let file_buffer = file_buffer.clone();
+        let changes = changes.clone();
+        let orig_changes = orig_changes.clone();
+        Rc::new(move || {
+            // The diff buffer carries pending file-content edits — the same edits
+            // Save/Split would apply. Shared by every editable pane below.
+            let has_file_edits = || {
+                matches!(
+                    collect_file_edits(
+                        &buffer_text(&file_buffer),
+                        &changes.borrow(),
+                        &orig_changes.borrow(),
+                    ),
+                    Ok(edits) if !edits.is_empty()
+                )
+            };
+            let dirty = if pane_mode.borrow().is_conflict() {
+                // Save resolves the current conflicted file — always actionable.
+                true
+            } else if viewing_wc.get() {
+                // Working-copy entry: only its file content is editable.
+                has_file_edits()
+            } else if selected_changes.borrow().len() > 1 {
+                // Batch view: any identity field set and differing from its baseline.
+                let baseline = multi_identity_baseline.borrow();
+                (0..4).any(|i| {
+                    let cur = identity_fields[i].text();
+                    !cur.trim().is_empty() && cur.as_str() != baseline[i].as_str()
+                })
+            } else if let Some(change_id) = selected_change.borrow().clone() {
+                // Single commit: message, diff or identity changed vs. the loaded state.
+                let message_dirty = commits
+                    .borrow()
+                    .iter()
+                    .find(|c| c.change_id_hex() == change_id)
+                    .is_some_and(|c| buffer_text(&message_buffer) != c.description);
+                let new_identity = read_identity(&identity_fields);
+                let identity_dirty = original_identity.borrow().as_ref() != Some(&new_identity);
+                message_dirty || identity_dirty || has_file_edits()
+            } else {
+                false
+            };
+            save_button.set_sensitive(dirty);
+        })
+    };
+
     file_buffer.connect_changed({
         let collapse = collapse.clone();
         let highlight = highlight.clone();
@@ -1324,10 +1392,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let highlight_gen = highlight_gen.clone();
         let editing = editing.clone();
         let update_split_sensitivity = update_split_sensitivity.clone();
+        let update_save_sensitivity = update_save_sensitivity.clone();
         move |buffer| {
-            // Track Split-button sensitivity on every change, including programmatic
+            // Track Split/Save sensitivity on every change, including programmatic
             // renders (a load leaves an unedited diff -> insensitive).
             update_split_sensitivity();
+            update_save_sensitivity();
             // A full programmatic render highlights itself synchronously; don't
             // also schedule a redundant (and flash-inducing) debounced pass.
             if editing.get() {
@@ -1354,6 +1424,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             });
         }
     });
+
+    // The message and identity inputs feed the same Save verdict as the diff, so a
+    // keystroke in any of them re-evaluates it. (A programmatic repopulation on
+    // load also fires these, but the final diff render settles the verdict against
+    // the now-current baselines.)
+    message_buffer.connect_changed({
+        let update_save_sensitivity = update_save_sensitivity.clone();
+        move |_| update_save_sensitivity()
+    });
+    for field in identity_fields.iter() {
+        field.connect_changed({
+            let update_save_sensitivity = update_save_sensitivity.clone();
+            move |_| update_save_sensitivity()
+        });
+    }
 
     // Show a message in the status line for a few seconds, then clear it (a
     // generation counter coalesces rapid messages so only the latest clears).
@@ -1989,6 +2074,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let editing = editing.clone();
         let diff_read_only = diff_read_only.clone();
         let multi_identity_baseline = multi_identity_baseline.clone();
+        let update_save_sensitivity = update_save_sensitivity.clone();
         Rc::new(move || {
             if selection_sync.get() {
                 return;
@@ -2058,8 +2144,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         &message_buffer,
                         "Multiple commits selected — message not editable.",
                     );
-                    *multi_identity_baseline.borrow_mut() =
-                        set_identity_fields_common(&identity_fields, infos);
+                    // Populate the fields first: their `changed` signals re-enter
+                    // `update_save_sensitivity`, which reads the baseline — so store
+                    // it only once the (now-settled) fields are in place.
+                    let baseline = set_identity_fields_common(&identity_fields, infos);
+                    *multi_identity_baseline.borrow_mut() = baseline;
                     for f in identity_fields.iter() {
                         f.set_sensitive(true);
                     }
@@ -2095,6 +2184,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     }
                 }
             }
+            // Settle the Save verdict against the freshly loaded baselines: the
+            // diff render above already fires it, but an unchanged (e.g. empty)
+            // buffer may not, so re-run it explicitly here.
+            update_save_sensitivity();
         })
     };
 

@@ -2589,10 +2589,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let Some(commit) = commits.get(idx as usize) else {
                         return;
                     };
-                    if commit.parents.len() > 1 {
-                        show_status("Cannot revert a merge commit");
-                        return;
-                    }
                     let target = commit.id.clone();
                     let change = commit.change_id_hex();
                     // Parent the revert on the clicked commit; its children are the
@@ -2670,10 +2666,6 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     let Some(commit) = commits.get(idx as usize) else {
                         return;
                     };
-                    if commit.parents.len() != 1 {
-                        show_status("Can only introduce a merge above a single-parent commit");
-                        return;
-                    }
                     let target = commit.id.clone();
                     let change = commit.change_id_hex();
                     // The new merge takes the gap just above the clicked commit; its

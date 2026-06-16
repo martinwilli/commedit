@@ -192,8 +192,8 @@ fn set_id_hash(cell: &Overlay, full_hash: &str) {
 /// copy icon. Clicking it claims the press (so it never selects the row) and calls
 /// `on_revert` with the row's current display index, which drops a revert of that
 /// commit directly on top of it. The button stays hidden while `content` is tagged
-/// `no-revert` (merge commits, set by [`set_row_commit`]), since a merge has no
-/// single parent to invert.
+/// `no-revert` (merge commits, set by [`commit_row_box`]/[`set_row_commit`]), since
+/// a merge has no single parent to invert.
 fn add_revert_button(content: &Overlay, on_revert: &RevertCallback) {
     let btn = gtk::Image::from_icon_name("edit-undo-symbolic");
     // An explicit pixel size is required: as a non-measured overlay child the
@@ -249,9 +249,10 @@ fn add_revert_button(content: &Overlay, on_revert: &RevertCallback) {
 /// non-measured-overlay pattern as [`add_revert_button`]. Clicking it claims the
 /// press (so it never selects the row) and calls `on_merge_out` with the row's
 /// current display index, which introduces a merge commit directly above that
-/// commit (the commit becomes a side branch the merge folds back). Like the revert
-/// button it stays hidden while `content` is tagged `no-revert` (merge commits, set
-/// by [`set_row_commit`]) — a merge has no single parent to fold out.
+/// commit (the commit becomes a side branch the merge folds back). It stays hidden
+/// while `content` is tagged `no-merge-out` (merge commits *and* the root, set by
+/// [`commit_row_box`]/[`set_row_commit`]) — only a single-parent commit has a
+/// mainline parent to fold out around.
 fn add_merge_out_button(content: &Overlay, on_merge_out: &MergeOutCallback) {
     let btn = gtk::Image::from_icon_name("go-next-symbolic");
     // An explicit pixel size is required: as a non-measured overlay child the
@@ -271,12 +272,12 @@ fn add_merge_out_button(content: &Overlay, on_merge_out: &MergeOutCallback) {
     content.add_overlay(&btn);
 
     // Reveal the button only while the pointer is over the row content, and never
-    // on a merge row (the `no-revert` class).
+    // on a merge or root row (the `no-merge-out` class).
     let motion = gtk::EventControllerMotion::new();
     motion.connect_enter({
         let btn = btn.clone();
         let content = content.clone();
-        move |_, _, _| btn.set_visible(!content.has_css_class("no-revert"))
+        move |_, _, _| btn.set_visible(!content.has_css_class("no-merge-out"))
     });
     motion.connect_leave({
         let btn = btn.clone();
@@ -561,6 +562,16 @@ fn commit_row_box(
     if let Some(on_restore) = on_restore {
         add_restore_button(&content, on_restore);
     }
+    // Suppress the right-edge buttons where they have no valid target: a merge has
+    // no single parent to invert (revert), and a merge or the root has no mainline
+    // parent to fold out around (merge-out). Mirrored by `set_row_commit`'s in-place
+    // update so a row toggled into/out of a merge by a rewrite stays consistent.
+    if commit.parents.len() > 1 {
+        content.add_css_class("no-revert");
+    }
+    if commit.parents.len() != 1 {
+        content.add_css_class("no-merge-out");
+    }
     let outer = GtkBox::new(Orientation::Horizontal, 0);
     if let Some((graph, index)) = graph {
         // The lane column supplies the leading whitespace; the graph lines must
@@ -689,13 +700,20 @@ fn set_row_commit(
             id_label.set_markup(&format!("<tt>{short}</tt>"));
             set_id_hash(&id_cell, &commit.id_hex());
             subject_label.set_text(subject);
-            // A merge has no single parent to invert: suppress its revert button
-            // (the content overlay hosts it; trash rows have none).
+            // Suppress the right-edge buttons where they have no valid target: a
+            // merge has no single parent to invert (revert), and a merge or the root
+            // has no mainline parent to fold out around (merge-out). The content
+            // overlay hosts both; trash rows have none. Mirrors `commit_row_box`.
             if let Some(content) = &content_overlay {
                 if commit.parents.len() > 1 {
                     content.add_css_class("no-revert");
                 } else {
                     content.remove_css_class("no-revert");
+                }
+                if commit.parents.len() != 1 {
+                    content.add_css_class("no-merge-out");
+                } else {
+                    content.remove_css_class("no-merge-out");
                 }
             }
             // The lint badge is a row_box cell between the id and subject — refresh

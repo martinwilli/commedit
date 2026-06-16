@@ -723,31 +723,31 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .position(win_state.list_width)
         .build();
 
-    // --- Review view (full-window, read-only session diff) ---
-    // A second diff surface shown in place of the whole editor while the "Review"
+    // --- Compare view (full-window, read-only session diff) ---
+    // A second diff surface shown in place of the whole editor while the "Compare"
     // toggle is on: the content delta between the current tree and the one the
     // session started with (see `Repo::session_changes`). Its own buffer so the
-    // editable diff pane is left untouched; rendered on demand by `render_review`
+    // editable diff pane is left untouched; rendered on demand by `render_compare`
     // below. Read-only — none of the diff pane's edit wiring applies here.
-    let review_buffer = sourceview5::Buffer::new(None);
-    install_diff_tags(&review_buffer);
-    let review_view = sourceview5::View::with_buffer(&review_buffer);
-    review_view.set_monospace(true);
-    review_view.set_editable(false);
-    review_view.set_left_margin(8);
-    review_view.set_top_margin(8);
-    let review_scroll = ScrolledWindow::builder()
+    let compare_buffer = sourceview5::Buffer::new(None);
+    install_diff_tags(&compare_buffer);
+    let compare_view = sourceview5::View::with_buffer(&compare_buffer);
+    compare_view.set_monospace(true);
+    compare_view.set_editable(false);
+    compare_view.set_left_margin(8);
+    compare_view.set_top_margin(8);
+    let compare_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hexpand(true)
-        .child(&review_view)
+        .child(&compare_view)
         .build();
 
-    // The editor and the review are mutually exclusive full-window pages; the
-    // "Review" header toggle (wired below) flips between them.
+    // The editor and the compare view are mutually exclusive full-window pages;
+    // the "Compare" header toggle (wired below) flips between them.
     paned.set_vexpand(true);
     let content_stack = Stack::new();
     content_stack.add_named(&paned, Some("edit"));
-    content_stack.add_named(&review_scroll, Some("review"));
+    content_stack.add_named(&compare_scroll, Some("compare"));
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&content_stack);
@@ -755,7 +755,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // The header bar keeps the window title and the window controls; the Save
     // action lives in the bottom action bar. The custom controls are the
     // top-right "Revert all" button (rolls the whole session back to the state
-    // the repo was opened in) and a "Review" toggle that shows a read-only,
+    // the repo was opened in) and a "Compare" toggle that shows a read-only,
     // full-window diff of every content change made this session. Both are wired
     // below, once `refresh` & co. exist.
     let header = HeaderBar::new();
@@ -767,9 +767,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     history_button.set_tooltip_text(Some(
         "Edit history — travel to an earlier state from this session",
     ));
-    let review_button = ToggleButton::with_label("Review");
-    review_button.set_tooltip_text(Some(
-        "Review all content changes made this session (current tree vs. the session start)",
+    let compare_button = ToggleButton::with_label("Compare");
+    compare_button.set_tooltip_text(Some(
+        "Compare all content changes made this session (current tree vs. the session start)",
     ));
     // The top-left "Reload" button: re-open the repository from disk to pick up
     // changes made outside commedit — a fresh session in place, same as
@@ -791,9 +791,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     header.pack_start(&reload_button);
     header.pack_start(&search_entry);
     // pack_end fills right-to-left, so packing the history button first leaves
-    // "Review" to its left: [ Review ][ ↺ ].
+    // "Compare" to its left: [ Compare ][ ↺ ].
     header.pack_end(&history_button);
-    header.pack_end(&review_button);
+    header.pack_end(&compare_button);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -2788,14 +2788,14 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         on_restore.clone(),
     );
 
-    // Render the session "Review" into its (read-only) full-window buffer: the
+    // Render the session "Compare" into its (read-only) full-window buffer: the
     // content delta between the current tree and the one the session started
     // with. Recomputed each time the view is shown — and after "Revert all" — so
     // it always reflects the live tree. A message/identity-only edit changes no
-    // tree, so it produces an empty review; after a revert it empties too.
-    let render_review: Rc<dyn Fn()> = {
+    // tree, so it produces an empty diff; after a revert it empties too.
+    let render_compare: Rc<dyn Fn()> = {
         let repo = repo.clone();
-        let review_buffer = review_buffer.clone();
+        let compare_buffer = compare_buffer.clone();
         let syntax_set = syntax_set.clone();
         let theme = theme.clone();
         let show_status = show_status.clone();
@@ -2803,35 +2803,35 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let changes = match repo.borrow_mut().session_changes() {
                 Ok(changes) => changes,
                 Err(err) => {
-                    show_status(&format!("Review failed: {err}"));
+                    show_status(&format!("Compare failed: {err}"));
                     return;
                 }
             };
             if changes.is_empty() {
-                review_buffer.set_text("No content changes since the session started.");
+                compare_buffer.set_text("No content changes since the session started.");
                 return;
             }
-            // Default context, no expand cues: the review is read-only, so the
-            // diff pane's hunk-expansion wiring deliberately doesn't apply.
+            // Default context, no expand cues: the compare view is read-only, so
+            // the diff pane's hunk-expansion wiring deliberately doesn't apply.
             let combined = render_commit_diff(&changes, &HashMap::new());
-            review_buffer.set_text(&combined.text);
+            compare_buffer.set_text(&combined.text);
             let first = combined.files.first().map(|f| f.path.as_str());
-            highlight_diff(&review_buffer, first, &syntax_set, &theme);
+            highlight_diff(&compare_buffer, first, &syntax_set, &theme);
         })
     };
 
-    // "Review" toggle: swap the whole window between the editor and the
+    // "Compare" toggle: swap the whole window between the editor and the
     // read-only session diff. Computing the diff snapshots the working copy
     // (which can move `@`), so refresh the now-hidden editor to keep its
     // history/`@`-row consistent.
-    review_button.connect_toggled({
+    compare_button.connect_toggled({
         let content_stack = content_stack.clone();
-        let render_review = render_review.clone();
+        let render_compare = render_compare.clone();
         let refresh = refresh.clone();
         move |btn| {
             if btn.is_active() {
-                render_review();
-                content_stack.set_visible_child_name("review");
+                render_compare();
+                content_stack.set_visible_child_name("compare");
                 refresh();
             } else {
                 content_stack.set_visible_child_name("edit");
@@ -2859,8 +2859,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let on_restore = on_restore.clone();
-        let review_button = review_button.clone();
-        let render_review = render_review.clone();
+        let compare_button = compare_button.clone();
+        let render_compare = render_compare.clone();
         move |btn| {
             // Snapshot the dropdown's data: (jump target, label, affected change-ids),
             // newest first, then the session-start floor (target 0). `cursor` marks
@@ -2936,8 +2936,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 let trash_list = trash_list.clone();
                 let trash_scroll = trash_scroll.clone();
                 let on_restore = on_restore.clone();
-                let review_button = review_button.clone();
-                let render_review = render_review.clone();
+                let compare_button = compare_button.clone();
+                let render_compare = render_compare.clone();
                 move |_, row| {
                     let Some((target, label, _)) = entries.get(row.index() as usize) else {
                         return;
@@ -2980,8 +2980,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             list.select_row(Some(&row));
                         }
                     }
-                    if review_button.is_active() {
-                        render_review();
+                    if compare_button.is_active() {
+                        render_compare();
                     }
                     show_status(&format!("Travelled to: {label}"));
                 }
@@ -3018,8 +3018,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let trash_scroll = trash_scroll.clone();
         let on_restore = on_restore.clone();
         let history_limit = history_limit.clone();
-        let review_button = review_button.clone();
-        let render_review = render_review.clone();
+        let compare_button = compare_button.clone();
+        let render_compare = render_compare.clone();
         move |_| {
             // Open the new session before dropping the old one, so a failed
             // reload leaves the current state untouched (concurrent sessions
@@ -3056,8 +3056,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     list.select_row(Some(&row));
                 }
             }
-            if review_button.is_active() {
-                render_review();
+            if compare_button.is_active() {
+                render_compare();
             }
             show_status("Repository reloaded");
         }

@@ -108,7 +108,8 @@ Three pure, GTK-free engine modules:
 - `conflict.rs` — conflict-mode callback builders and `conflict::wire` (abort, prev/next nav).
 - `msglint.rs` — pure commit-message linter; learns repo style from history (`RepoStyle::learn`). GTK-only, no MCP counterpart.
 - `search.rs` — pure substring commit search (`search_match` / `highlight_markup`).
-- `linenums.rs` — old/new line numbers in the diff gutter (`diff_line_numbers` + `LineNumberRenderer` gutter subclass).
+- `linenums.rs` — gutter line numbers (`LineNumberRenderer`): diff old/new (`diff_line_numbers`) and conflict ours/theirs (`conflict_line_numbers`).
+- `diff_cues.rs` — clickable gutter cue buttons (`ActivatableGutterRenderer`): the diff view's expand/revert columns (`diff_cue_cells`) and the conflict view's per-marker resolve column (`conflict_cue_cells`, built in `conflict.rs`).
 - `highlight.rs` — TextTag palette and syntect syntax colouring.
 - `identity.rs` — author/committer identity/date fields and conversions.
 - `spelling.rs` — libspelling glue for the message editor; pins language to keep enchant's personal dictionary stable across sessions.

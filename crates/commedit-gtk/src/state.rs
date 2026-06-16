@@ -141,20 +141,13 @@ pub(crate) enum PendingTrashOp {
 }
 
 /// Which side(s) of a conflict block a quick-resolve action keeps.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Ours,
     Theirs,
     Both,
 }
 
-/// Inline, clickable quick-resolve cues appended to a conflict block's marker
-/// lines — the same idiom as the diff view's "expand context" cue. Clicking the
-/// marker line keeps the indicated side(s) and drops the markers: "use ours"
-/// after `<<<<<<<`, "use theirs" after `>>>>>>>`, "use both" after `=======`.
-pub(crate) const CUE_OURS: &str = " ◀ ➜ use ours ▶";
-pub(crate) const CUE_BOTH: &str = " ◀ ➜ use both ▶";
-pub(crate) const CUE_THEIRS: &str = " ◀ ➜ use theirs ▶";
 /// The end-caps that make a cue read as a banner/tag-shaped button. Painted as a
 /// full-height triangle in the button colour against the line background, their
 /// flat (vertical) side sits flush against the solid-fill body between them, so

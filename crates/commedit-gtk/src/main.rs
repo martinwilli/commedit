@@ -525,14 +525,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let revert_cue = diff_cues::ActivatableGutterRenderer::new(
         gtk::gdk::RGBA::parse("#9a6700").expect("valid colour"),
     );
+    // The conflict view reuses the same renderer for its per-marker "keep" button
+    // (green ✓), drawn only in conflict mode.
+    let resolve_cue = diff_cues::ActivatableGutterRenderer::new(
+        gtk::gdk::RGBA::parse("#1a7f37").expect("valid colour"),
+    );
     line_gutter.insert(&expand_cue, 2);
     line_gutter.insert(&revert_cue, 3);
+    line_gutter.insert(&resolve_cue, 4);
     file_buffer.connect_changed({
         let pane_mode = pane_mode.clone();
         let lineno_old = lineno_old.clone();
         let lineno_new = lineno_new.clone();
         let expand_cue = expand_cue.clone();
         let revert_cue = revert_cue.clone();
+        let resolve_cue = resolve_cue.clone();
         let combined_files = combined_files.clone();
         let conflict_view = conflict_view.clone();
         let changes = changes.clone();
@@ -540,16 +547,17 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         move |buffer| {
             let text = buffer_text(buffer);
             // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the number
-            // columns show each side's line numbers (ours | theirs), derived from
-            // the conflict-view state, and the diff cue buttons are blank. Leaving
-            // conflict mode re-sets the buffer text, firing this handler again to
-            // restore the diff numbers and cues.
+            // columns show each side's line numbers (ours | theirs) and the resolve
+            // column gets a "keep" button per marker line; the diff cue buttons are
+            // blank. Leaving conflict mode re-sets the buffer text, firing this
+            // handler again to restore the diff numbers and cues.
             if pane_mode.borrow().is_conflict() {
                 let nums = linenums::conflict_line_numbers(&conflict_view.borrow());
                 lineno_old.set_numbers(&nums);
                 lineno_new.set_numbers(&nums);
                 expand_cue.set_cells(&[]);
                 revert_cue.set_cells(&[]);
+                resolve_cue.set_cells(&conflict_cue_cells(&text));
             } else {
                 let nums = linenums::diff_line_numbers(&text);
                 lineno_old.set_numbers(&nums);
@@ -562,6 +570,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 );
                 expand_cue.set_cells(&exp);
                 revert_cue.set_cells(&rev);
+                resolve_cue.set_cells(&[]);
             }
         }
     });
@@ -614,9 +623,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let split_button = Button::with_label("Split");
     split_button.set_tooltip_text(Some(SPLIT_HINT));
     split_button.set_sensitive(false);
-    // Conflict-mode quick resolution is driven inline: clicking a block's marker
-    // line (with its "use ours/theirs/both" cue) keeps that side — see
-    // `with_resolve_cues` and the click gesture below. No toolbar buttons.
+    // Conflict-mode quick resolution is driven from the gutter: clicking a marker
+    // line's "keep" button keeps that side — see `conflict_cue_cells` and the
+    // resolve renderer above. No toolbar buttons.
     // Previous/next-conflict navigation jumps the view between blocks; only
     // shown while resolving conflicts.
     let prev_conflict_button = Button::with_label("◀");
@@ -1132,11 +1141,32 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             }
         })
     });
+    // Bind the conflict resolve column: a click on a marker line's "keep" button
+    // resolves that block to the side the marker names (ours / both / theirs).
+    // `resolve_conflict_at` is reused unchanged; the mutation is deferred to an idle
+    // so it runs outside the gutter's click handling.
+    resolve_cue.set_on_activate({
+        let file_buffer = file_buffer.clone();
+        let editing = editing.clone();
+        let highlight = highlight.clone();
+        Rc::new(move |line: u32| {
+            let text = buffer_text(&file_buffer);
+            let Some(side) = conflict_side_at_line(&text, line as usize) else {
+                return;
+            };
+            let file_buffer = file_buffer.clone();
+            let editing = editing.clone();
+            let highlight = highlight.clone();
+            glib::idle_add_local_once(move || {
+                resolve_conflict_at(&file_buffer, &editing, line as usize, side, &*highlight);
+            });
+        })
+    });
 
-    // In conflict mode a click on an elision cue expands that gap, and a click on a
-    // marker line's inline "➜ use …" cue resolves that block. (The diff view's
-    // expand / revert are gutter buttons — see `diff_cues`.) The mutation is
-    // deferred to an idle so it runs outside the gesture's event handling.
+    // In conflict mode a click on an elision cue expands that gap; the per-block
+    // resolve action is the gutter "keep" button (see `conflict_cue_cells`), not an
+    // in-text cue. The mutation is deferred to an idle so it runs outside the
+    // gesture's event handling.
     let expand_click = gtk::GestureClick::new();
     expand_click.set_button(gdk::BUTTON_PRIMARY);
     expand_click.set_propagation_phase(PropagationPhase::Capture);
@@ -1144,13 +1174,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let file_view = file_view.clone();
         let file_buffer = file_buffer.clone();
         let pane_mode = pane_mode.clone();
-        let editing = editing.clone();
-        let highlight = highlight.clone();
         let conflict_expand_cell = conflict_expand_cell.clone();
         move |gesture, _n_press, x, y| {
-            // The diff view's affordances are gutter buttons; only conflict mode
-            // has clickable cues in the text. Other clicks fall through so the
-            // caret places for free-form edits.
+            // The diff view's affordances are gutter buttons, and so is the conflict
+            // resolve action; only the conflict elision cue is still clickable in
+            // the text. Other clicks fall through so the caret places for edits.
             if !pane_mode.borrow().is_conflict() {
                 return;
             }
@@ -1160,28 +1188,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 return;
             };
             let line = iter.line() as usize;
-            let line_text = buffer_line_text(&file_buffer, line);
-            if line_text == pill(CONFLICT_CUE_LABEL) {
+            if buffer_line_text(&file_buffer, line) == pill(CONFLICT_CUE_LABEL) {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 if let Some(expand) = conflict_expand_cell.borrow().clone() {
                     glib::idle_add_local_once(move || expand(line));
                 }
-                return;
             }
-            let text = buffer_text(&file_buffer);
-            let col = iter.line_offset() as usize;
-            let Some(side) = conflict_cue_side_at(&text, line, col) else {
-                return;
-            };
-            // We own this click: don't let the view also place the caret in the
-            // marker line we're about to delete.
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            let file_buffer = file_buffer.clone();
-            let editing = editing.clone();
-            let highlight = highlight.clone();
-            glib::idle_add_local_once(move || {
-                resolve_conflict_at(&file_buffer, &editing, line, side, &*highlight);
-            });
         }
     });
     file_view.add_controller(expand_click);
@@ -1205,10 +1217,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let over_button = pane_mode.borrow().is_conflict()
                 && file_view.iter_at_location(bx, by).is_some_and(|iter| {
                     let line = iter.line() as usize;
-                    let col = iter.line_offset() as usize;
-                    let line_text = buffer_line_text(&file_buffer, line);
-                    line_text == pill(CONFLICT_CUE_LABEL)
-                        || conflict_cue_side_at(&buffer_text(&file_buffer), line, col).is_some()
+                    buffer_line_text(&file_buffer, line) == pill(CONFLICT_CUE_LABEL)
                 });
             if over_button != hover_hand.get() {
                 hover_hand.set(over_button);
@@ -1471,9 +1480,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                     fv.pieces = snip.pieces;
                 }
             }
-            // Build the full text including the inline "use ours/theirs/both" cues
-            // up front, so a splice diffs against the same content set_text yields.
-            let text = with_resolve_cues(&out.join("\n"));
+            // The markers stay as plain git-style markers; the resolve action is a
+            // gutter button (`conflict_cue_cells`), so the buffer text is the
+            // conflict snippets verbatim.
+            let text = out.join("\n");
             editing.set(true);
             if splice {
                 splice_buffer_text(&file_buffer, &text);
@@ -1513,12 +1523,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             let mut view = conflict_view.borrow_mut();
             for (fv, section) in view.iter_mut().zip(sections.iter()) {
                 if fv.resolvable {
-                    // Drop the inline resolve cues we appended to marker lines, so
-                    // they don't accrete into the reconstructed text on re-render.
-                    let cleaned: Vec<String> =
-                        section.iter().map(|l| strip_marker_cue(l)).collect();
-                    let refs: Vec<&str> = cleaned.iter().map(String::as_str).collect();
-                    fv.full_text = reconstruct_conflict_file(&refs, &fv.pieces, &cue);
+                    // Markers carry no inline cue text (the resolve action is a
+                    // gutter button), so the section lines reconstruct verbatim.
+                    fv.full_text = reconstruct_conflict_file(section, &fv.pieces, &cue);
                 }
             }
         })
@@ -2517,8 +2524,8 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
 
     // Enter conflict mode with the engine's reported conflicts: show the banner,
     // select the oldest conflicted commit, and render the pending chain. The
-    // quick-resolve affordances are the inline marker-line cues (see
-    // `with_resolve_cues`).
+    // quick-resolve affordances are the gutter "keep" buttons (see
+    // `conflict_cue_cells`).
     let enter_conflict_mode =
         conflict::build_enter_conflict_mode(&widgets, &data, refresh_conflict.clone());
 

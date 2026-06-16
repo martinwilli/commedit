@@ -1,9 +1,9 @@
 //! Conflict-resolution support. Two layers: the pure conflict-text helpers — the
-//! combined conflict view's header/layout lines, the inline "use ours/theirs/both"
-//! quick-resolve cues, block-finding and resolution, and the buffer scanners that
-//! map a buffer line to a file section / elision gap — and the conflict-mode UI
-//! wiring: the callback builders (`build_*`, called by `build_ui` in dependency
-//! order) and `wire`, which installs the abort/navigation events.
+//! combined conflict view's header/layout lines, the gutter "keep" resolve cues,
+//! block-finding and resolution, and the buffer scanners that map a buffer line to
+//! a file section / elision gap — and the conflict-mode UI wiring: the callback
+//! builders (`build_*`, called by `build_ui` in dependency order) and `wire`,
+//! which installs the abort/navigation events.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -16,12 +16,13 @@ use commedit_engine::history::history_limited;
 use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
+use crate::diff_cues::GutterCue;
 use crate::highlight::pill;
 use crate::rows::{populate_list, populate_trash};
 use crate::state::{
     Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, RestoreToWorktreeCallback, Side,
-    Widgets, CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, CUE_BOTH, CUE_CAP_L, CUE_OURS,
-    CUE_THEIRS, HISTORY_PAGE, SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
+    Widgets, CONFLICT_CUE_LABEL, CONFLICT_STRUCTURAL_NOTICE, HISTORY_PAGE, SAVE_HINT_CONFLICT,
+    SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -45,65 +46,44 @@ pub(crate) fn is_conflict_protected_line(line: &str) -> bool {
         || line == CONFLICT_STRUCTURAL_NOTICE
 }
 
-/// Strip the inline "➜ use ours/theirs/both" cue that [`with_resolve_cues`]
-/// appends to a conflict-marker line, restoring the bare marker. Applied only to
-/// marker lines (so real content containing `◀` is untouched) when reconstructing
-/// the full file, otherwise re-rendering would append a second cue each time.
-pub(crate) fn strip_marker_cue(line: &str) -> String {
-    let is_marker = ['<', '=', '>']
-        .iter()
-        .any(|&c| line.chars().take_while(|&x| x == c).count() >= 7);
-    if is_marker {
-        if let Some(pos) = line.find(CUE_CAP_L) {
-            return line[..pos].trim_end().to_string();
-        }
-    }
-    line.to_string()
-}
-
-/// The inline cue text and the side it resolves to for a marker line, or `None`
-/// for a non-marker (content) line.
-fn resolve_cue(kind: ConflictLineKind) -> Option<(&'static str, Side)> {
+/// The resolve action a conflict-marker line offers: keep our side (`<<<<<<<`),
+/// both (`=======`), or their side (`>>>>>>>`). `None` for a content line.
+pub(crate) fn side_for_marker(kind: ConflictLineKind) -> Option<Side> {
     match kind {
-        ConflictLineKind::MarkerOurs => Some((CUE_OURS, Side::Ours)),
-        ConflictLineKind::MarkerSep => Some((CUE_BOTH, Side::Both)),
-        ConflictLineKind::MarkerTheirs => Some((CUE_THEIRS, Side::Theirs)),
+        ConflictLineKind::MarkerOurs => Some(Side::Ours),
+        ConflictLineKind::MarkerSep => Some(Side::Both),
+        ConflictLineKind::MarkerTheirs => Some(Side::Theirs),
         _ => None,
     }
 }
 
-/// The quick-resolve [`Side`] for a buffer position `(line, col)` if it lands on
-/// a conflict block's inline "➜ use …" cue, else `None`. The single hit test
-/// shared by the click gesture (which acts on it) and the hover cursor (which
-/// shows a hand over it) so the two always agree. `col` is a character offset.
-pub(crate) fn conflict_cue_side_at(text: &str, line: usize, col: usize) -> Option<Side> {
-    let (_, side) = classify_conflict_lines(text)
+/// The quick-resolve [`Side`] for the conflict marker on buffer `line`, or `None`
+/// if that line isn't a marker. Drives the gutter resolve button's click.
+pub(crate) fn conflict_side_at_line(text: &str, line: usize) -> Option<Side> {
+    classify_conflict_lines(text)
         .get(line)
         .copied()
-        .and_then(resolve_cue)?;
-    let line_text = text.split('\n').nth(line).unwrap_or("");
-    let byte = line_text.find(CUE_CAP_L)?;
-    (col >= line_text[..byte].chars().count()).then_some(side)
+        .and_then(side_for_marker)
 }
 
-/// Return `text` with the inline quick-resolve cue appended to each of its
-/// conflict-marker lines (the buffer must hold materialized conflict text).
-/// Appending at a line's end leaves line numbering unchanged, so the cached
-/// classification stays valid; building the full string up front lets the
-/// caller land it with either `set_text` or an in-place splice.
-pub(crate) fn with_resolve_cues(text: &str) -> String {
-    let kinds = classify_conflict_lines(text);
-    let mut out = String::new();
-    for (li, line) in text.split('\n').enumerate() {
-        if li > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-        if let Some((cue, _)) = kinds.get(li).and_then(|k| resolve_cue(*k)) {
-            out.push_str(cue);
-        }
-    }
-    out
+/// Per-buffer-line resolve cue cells for the conflict gutter (`diff_cues`): a
+/// "keep" button on each conflict-marker line, its tooltip naming the side kept;
+/// `None` on every other line. The markers themselves stay as plain git-style
+/// markers in the text — the action is the gutter button, not inline cue text.
+pub(crate) fn conflict_cue_cells(text: &str) -> Vec<Option<GutterCue>> {
+    classify_conflict_lines(text)
+        .into_iter()
+        .map(|kind| {
+            side_for_marker(kind).map(|side| GutterCue {
+                glyph: "\u{2713}".to_string(), // ✓
+                tooltip: match side {
+                    Side::Ours => "Keep our side".to_string(),
+                    Side::Both => "Keep both".to_string(),
+                    Side::Theirs => "Keep their side".to_string(),
+                },
+            })
+        })
+        .collect()
 }
 
 /// Buffer line indices of the conflict-block openers (`<<<<<<<`) in the
@@ -184,8 +164,8 @@ fn resolve_conflict_block(
 }
 
 /// Resolve the conflict block containing buffer `line` by keeping `side` and
-/// dropping its markers (and the inline cues attached to them), as one undo
-/// step. Returns `false` (a no-op) if the line is not inside a conflict block.
+/// dropping its markers, as one undo step. Returns `false` (a no-op) if the line
+/// is not inside a conflict block.
 /// The `editing` guard marks the edit as our own so the conflict pane's free-form
 /// editing path lets it through; `highlight` recolors the now-shrunk buffer.
 pub(crate) fn resolve_conflict_at(
@@ -438,7 +418,7 @@ pub(crate) fn build_exit_conflict_mode(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
 
 /// Build the `enter_conflict_mode` callback: show the banner, select the oldest
 /// conflicted commit, and render the pending chain. The quick-resolve affordances
-/// are the inline marker-line cues (see `with_resolve_cues`).
+/// are the gutter "keep" buttons on each marker line (see `conflict_cue_cells`).
 pub(crate) fn build_enter_conflict_mode(
     w: &Widgets,
     d: &Data,
@@ -666,4 +646,60 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
             next_conflict_button.set_sensitive(blocks.iter().any(|&l| l > caret));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFLICT: &str = "ctx\n<<<<<<<\nour\n=======\ntheir\n>>>>>>>\nend";
+
+    #[test]
+    fn side_for_marker_maps_each_marker() {
+        assert_eq!(
+            side_for_marker(ConflictLineKind::MarkerOurs),
+            Some(Side::Ours)
+        );
+        assert_eq!(
+            side_for_marker(ConflictLineKind::MarkerSep),
+            Some(Side::Both)
+        );
+        assert_eq!(
+            side_for_marker(ConflictLineKind::MarkerTheirs),
+            Some(Side::Theirs)
+        );
+        assert_eq!(side_for_marker(ConflictLineKind::Ours), None);
+        assert_eq!(side_for_marker(ConflictLineKind::Plain), None);
+    }
+
+    #[test]
+    fn conflict_side_at_line_targets_only_markers() {
+        assert_eq!(conflict_side_at_line(CONFLICT, 1), Some(Side::Ours)); // <<<<<<<
+        assert_eq!(conflict_side_at_line(CONFLICT, 3), Some(Side::Both)); // =======
+        assert_eq!(conflict_side_at_line(CONFLICT, 5), Some(Side::Theirs)); // >>>>>>>
+        assert_eq!(conflict_side_at_line(CONFLICT, 0), None); // ctx
+        assert_eq!(conflict_side_at_line(CONFLICT, 2), None); // our
+    }
+
+    #[test]
+    fn conflict_cue_cells_button_on_each_marker() {
+        let cells = conflict_cue_cells(CONFLICT);
+        assert_eq!(cells.len(), 7);
+        assert_eq!(
+            cells[1].as_ref().map(|c| c.tooltip.as_str()),
+            Some("Keep our side")
+        );
+        assert_eq!(
+            cells[3].as_ref().map(|c| c.tooltip.as_str()),
+            Some("Keep both")
+        );
+        assert_eq!(
+            cells[5].as_ref().map(|c| c.tooltip.as_str()),
+            Some("Keep their side")
+        );
+        // Content lines carry no button.
+        for i in [0usize, 2, 4, 6] {
+            assert!(cells[i].is_none(), "line {i} should have no cue");
+        }
+    }
 }

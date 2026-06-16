@@ -115,22 +115,12 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
-    // Inline banner buttons (the conflict "use …" cues and the diff "expand
-    // context" cues). Each is an inverse of its host line: a solid body filled in
-    // the line's accent colour with the line's background colour as text, end-
-    // capped by full-height triangles drawn in the body colour on the bare line
-    // background so the ends point outward and stay flush. Added last so the
-    // body's text colour outranks the host line's own foreground (GTK tag
-    // priority follows tag-table insertion order).
-    add("resolve-cue", &|t| {
-        t.set_background(Some("#cf222e"));
-        t.set_foreground(Some("#ffd7d5"));
-        t.set_weight(700);
-    });
-    add("resolve-cue-cap", &|t| {
-        t.set_foreground(Some("#cf222e"));
-        t.set_weight(700);
-    });
+    // The conflict view's "expand hidden lines" elision cue, painted as an inline
+    // banner button: a solid body filled in the line's accent colour with the
+    // line's background as text, end-capped by full-height triangles drawn in the
+    // body colour on the bare line background so the ends point outward and stay
+    // flush. Added last so the body's text colour outranks the host line's own
+    // foreground (GTK tag priority follows tag-table insertion order).
     add("expand-cue", &|t| {
         t.set_background(Some("#0550ae"));
         t.set_foreground(Some("#ddf4ff"));
@@ -412,10 +402,10 @@ pub(crate) fn highlight_conflict(
         }
         if kind.is_marker() {
             // A marker line is structural; reset the syntax parser so the next
-            // region starts clean, and don't language-color the marker itself.
+            // region starts clean, and don't language-color the marker itself. The
+            // resolve action is a gutter button (`conflict_cue_cells`), so the
+            // marker line stays a plain git-style marker.
             hl = HighlightLines::new(syntax, theme);
-            // Paint the trailing "use ours/theirs/both" cue as a pill button.
-            paint_pill(buffer, li as i32, raw, "resolve-cue-cap", "resolve-cue");
             continue;
         }
         // Unlike a unified diff, conflict lines carry no prefix char — column 0

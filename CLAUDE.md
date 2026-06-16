@@ -762,6 +762,27 @@ not in `main.rs`:
   without changing the selection; `activate` (Enter) steps a cursor through the
   match indices, selecting each via the `refresh` `selection_sync` pattern.
   `refresh` re-applies an active query after it rebuilds the rows.
+- `linenums.rs` — diff-aware line numbers for the diff pane's `file_view`. The
+  **pure**, GTK-free, inline-tested core `diff_line_numbers(text)` walks the
+  rendered diff buffer and, seeding running old/new counters from each `@@ -a,b
+  +c,d @@` header (which already carries the base offsets, so **no engine change**),
+  returns one `DiffLineNo {old, new}` per `\n`-split line — indexable straight by
+  `GtkTextBuffer` line. It classifies by **raw leading char** (not the engine's
+  `classify_line`, whose catch-all would mis-number a synthetic `── … ──` header):
+  `@@` reseeds + blank, `diff `/`--- `/`+++ `/`index `/`\` blank, `+`→new only,
+  `-`→old only, ` `→both, anything else blank. The GTK side is `LineNumberRenderer`,
+  a `sourceview5::GutterRenderer` glib subclass (`GutterRendererText` isn't
+  subclassable in these bindings, so it draws a right-aligned `pango::Layout` per
+  line in `snapshot_line`, in the `#6e7781` "meta" tone, and reports its width via a
+  `measure` override sized to the widest number). Two instances sit in the view's
+  left `Gutter` (old at position 0, new at 1), so a context line reads `old | new`,
+  a `-` line `old | ·`, a `+` line `· | new`. `build_ui` wires them with a dedicated
+  `file_buffer.connect_changed` (separate from the firewall's, which early-returns
+  on programmatic renders) that recomputes both columns on every change — load,
+  splice, interactive edit — and blanks them (empty `set_numbers` → zero width)
+  while `pane_mode.is_conflict()`, since the same view then shows conflict snippets,
+  not a diff. GTK-only, no MCP/engine counterpart (a diff-viewer affordance, like
+  `spelling.rs`).
 - `msglint.rs` — the **pure**, GTK-free commit-message linter, inline-tested, the
   same shape as `search.rs`. commedit is a general tool, so it imposes **no** house
   style: `RepoStyle::learn(subjects)` infers a repo's *own* de-facto conventions from

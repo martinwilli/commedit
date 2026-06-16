@@ -49,6 +49,7 @@ use crate::identity::*;
 mod conflict;
 use crate::conflict::*;
 mod dragdrop;
+mod linenums;
 mod msglint;
 mod search;
 mod spelling;
@@ -570,6 +571,32 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             | sourceview5::SpaceTypeFlags::NBSP,
     );
     space_drawer.set_enable_matrix(true);
+    // Diff-aware line numbers: a left gutter with two columns, old | new. A
+    // context line shows both, a `-` line only old, a `+` line only new; `@@`/
+    // headers/pills are blank. Two renderers (one per column) read a per-line map
+    // recomputed from the buffer text on every change below.
+    let line_gutter = sourceview5::prelude::ViewExt::gutter(&file_view, gtk::TextWindowType::Left);
+    let lineno_old = linenums::LineNumberRenderer::new(linenums::NumColumn::Old);
+    let lineno_new = linenums::LineNumberRenderer::new(linenums::NumColumn::New);
+    line_gutter.insert(&lineno_old, 0);
+    line_gutter.insert(&lineno_new, 1);
+    file_buffer.connect_changed({
+        let pane_mode = pane_mode.clone();
+        let lineno_old = lineno_old.clone();
+        let lineno_new = lineno_new.clone();
+        move |buffer| {
+            // Blank the gutter while the view shows conflict snippets (`<<<`/`>>>`)
+            // rather than a unified diff. Leaving conflict mode re-sets the buffer
+            // text, which fires this handler again and restores the numbers.
+            let nums = if pane_mode.borrow().is_conflict() {
+                Vec::new()
+            } else {
+                linenums::diff_line_numbers(&buffer_text(buffer))
+            };
+            lineno_old.set_numbers(&nums);
+            lineno_new.set_numbers(&nums);
+        }
+    });
     // Set while we mutate the diff buffer ourselves (loading a file, or applying
     // a structured edit) so the firewall signal handlers below let it through
     // instead of treating it as an interactive edit.

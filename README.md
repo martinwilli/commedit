@@ -37,7 +37,9 @@ an interactive-rebase session.
   line splits it into a removed/added pair, deleting a removed line restores it,
   and `@@` headers stay read-only. It's syntax-highlighted per file type with
   changed words tinted inline, and each hunk has an *expand context* control to
-  reveal more of the surrounding file.
+  reveal more of the surrounding file. A gutter shows old | new line numbers
+  alongside the diff — the original number on removed lines, the resulting number
+  on context and added lines.
 
 - **Revert hunks or files** — every changed file carries a *revert* control to
   drop its change from the commit, and every hunk of a modified file one to drop

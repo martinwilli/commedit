@@ -158,6 +158,15 @@ pub(crate) const SAVE_HINT_CONFLICT: &str =
     "Resolve the conflicted file shown above. When a rewrite conflicts across \
      several files you resolve them one at a time — save each in turn; the \
      rewrite is applied to git only once the last conflict is cleared.";
+/// Hover hint for the Save button while a working-copy entry is selected, where
+/// Save's meaning is gated on the commit message: with the message empty it
+/// writes the edited diff back to the working copy in place (leaving it
+/// uncommitted); with a message it crystallizes the uncommitted changes into a
+/// real commit on top of HEAD.
+pub(crate) const SAVE_HINT_WORKCOPY: &str =
+    "With no commit message, save your diff edits back to the working copy, still \
+     uncommitted. Type a message to instead commit the uncommitted changes on top \
+     of HEAD — author/committer default to your git identity unless you set them.";
 pub(crate) const ABORT_HINT: &str =
     "Discard the entire rewrite and roll the repository back to the state it had \
      before you saved, leaving git untouched.";

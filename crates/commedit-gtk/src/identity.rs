@@ -216,6 +216,25 @@ fn commit_field_values(commit: &CommitInfo) -> [String; 4] {
     ]
 }
 
+/// Populate the identity entry fields from a bare [`Identity`] (rather than a
+/// [`CommitInfo`]) — used for the working-copy commit pane, prefilled with the
+/// repo's git-configured identity at "now". Returns the per-field values set, the
+/// baseline the working-copy save compares the live fields against to tell which
+/// the user actually changed (an unchanged set is committed as `None`, letting the
+/// engine stamp git config + a fresh "now"). Field order matches [`read_identity`].
+pub(crate) fn set_identity_fields_from(fields: &[Entry; 4], id: &Identity) -> [String; 4] {
+    let values = [
+        join_name_email(&id.author_name, &id.author_email),
+        id.author_time.clone(),
+        join_name_email(&id.committer_name, &id.committer_email),
+        id.committer_time.clone(),
+    ];
+    for (field, value) in fields.iter().zip(&values) {
+        field.set_text(value);
+    }
+    values
+}
+
 /// Populate the identity fields for a *multi-commit* selection: each field shows the
 /// value shared by all `commits` if they agree, otherwise it's cleared and shown
 /// with a "(differs)" placeholder and the `identity-differs` style class (italic).

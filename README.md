@@ -95,9 +95,12 @@ an interactive-rebase session.
 
 - **Uncommitted changes are first-class** — whatever you've edited or added on
   disk but not committed appears as its own row above the history, with the same
-  editable diff (here **Save** writes back to the working tree). Fold it into a
-  commit, **Split** off a piece, or drop it onto the trash to discard it — and it
-  rides through every rewrite untouched, still uncommitted when you're done.
+  editable diff. With the message left empty, **Save** writes your diff edits
+  back to the working tree; type a commit message and **Save** instead commits
+  the changes on top of `HEAD` (author/committer default to your git identity
+  unless you set them). Fold it into an existing commit, **Split** off a piece,
+  or drop it onto the trash to discard it — and until you commit it, it rides
+  through every rewrite untouched, still uncommitted when you're done.
 
 - **Review before you're done** — the toolbar's **Review** toggle flips the
   window into a read-only, full-window diff of every content change you've made

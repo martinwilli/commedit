@@ -236,6 +236,12 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // fields the user actually changed. Order matches `read_identity`.
     let multi_identity_baseline: Rc<RefCell<[String; 4]>> =
         Rc::new(RefCell::new(Default::default()));
+    // The git-default identity prefilled into the fields when a working-copy entry
+    // is selected (see the `wc_list` row handler); the working-copy commit save
+    // compares the live fields against it to tell whether the user overrode the
+    // author/committer — an unchanged set commits as `None`, letting the engine
+    // stamp git config + a fresh "now". Order matches `read_identity`.
+    let wc_identity_baseline: Rc<RefCell<[String; 4]>> = Rc::new(RefCell::new(Default::default()));
     let changes: Rc<RefCell<Vec<FileChange>>> = Rc::new(RefCell::new(Vec::new()));
     // The *render baseline*: `changes` holds the content currently shown, which a
     // revert mutates (a hunk/file dropped back to its old side) so the change
@@ -293,8 +299,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     // Per-file state of the combined conflict-snippet buffer for the selected
     // commit (rebuilt by `load_conflict_files`, in dropdown/file order).
     let conflict_view: Rc<RefCell<Vec<ConflictFileView>>> = Rc::new(RefCell::new(Vec::new()));
-    // Whether the read-only working-copy (@) row is the current selection, in
-    // which case the diff is shown read-only and Save is inert.
+    // Whether a working-copy (@) row is the current selection, in which case the
+    // diff is editable and the message/identity craft a commit: Save with no
+    // message writes the diff edits back to the working tree, Save with one
+    // commits the changes on HEAD (see the `save` closure).
     let viewing_wc: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // Styling for drag-and-drop reordering: the insertion gap placeholder and the
@@ -361,8 +369,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     let wc_list = ListBox::new();
     wc_list.set_visible(false);
     wc_list.set_tooltip_text(Some(
-        "Uncommitted working-tree changes — edit the diff here (Save writes the working \
-         tree), Split to peel off a piece, or drag a row onto a commit to fold it in",
+        "Uncommitted working-tree changes — edit the diff here, then Save (no commit \
+         message writes back to the working tree, a message commits on HEAD), Split to \
+         peel off a piece, or drag a row onto a commit to fold it in",
     ));
 
     let list = ListBox::new();
@@ -1275,8 +1284,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 // Save resolves the current conflicted file — always actionable.
                 true
             } else if viewing_wc.get() {
-                // Working-copy entry: only its file content is editable.
-                has_file_edits()
+                // Working-copy entry: pending diff edits can be saved back in place,
+                // and a typed commit message turns the uncommitted changes into a
+                // commit on HEAD. Identity edits alone don't count — they only ride
+                // along with a commit, which needs a message.
+                has_file_edits() || !buffer_text(&message_buffer).trim().is_empty()
             } else if selected_changes.borrow().len() > 1 {
                 // Batch view: any identity field set and differing from its baseline.
                 let baseline = multi_identity_baseline.borrow();
@@ -1937,7 +1949,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         })
     };
 
-    // Load the selected working-copy entry's diff into the file pane (read-only).
+    // Load the selected working-copy entry's (editable) diff into the file pane.
     // The entry is named by its stable change id; falls back to the leaf `@` (the
     // first chain entry) when nothing is selected.
     let load_wc_changes: Rc<dyn Fn()> = {
@@ -1989,6 +2001,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let diff_read_only = diff_read_only.clone();
         let multi_identity_baseline = multi_identity_baseline.clone();
         let update_save_sensitivity = update_save_sensitivity.clone();
+        let save_button = save_button.clone();
         Rc::new(move || {
             if selection_sync.get() {
                 return;
@@ -2023,6 +2036,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 }
                 return;
             }
+            // Back on a history selection: restore the ordinary diff-save hint that
+            // the working-copy view swapped out (conflict mode handled above).
+            save_button.set_tooltip_text(Some(SAVE_HINT_DIFF));
 
             match infos.as_slice() {
                 [] => {
@@ -2177,9 +2193,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     });
     list.add_controller(select_click);
 
-    // Selecting a working-copy entry shows its diff read-only: there is no
-    // message or identity to edit, and Save edits that entry in place (see the
-    // `save` closure). The selected entry is tracked by its stable change id.
+    // Selecting a working-copy entry shows its editable diff and opens the
+    // message/identity fields to craft a commit from the uncommitted changes:
+    // Save with an empty message edits the entry in place, Save with a message
+    // commits it on HEAD (see the `save` closure). The identity is prefilled with
+    // the git default. The selected entry is tracked by its stable change id.
     wc_list.connect_row_selected({
         let viewing_wc = viewing_wc.clone();
         let list = list.clone();
@@ -2193,6 +2211,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let selected_changes = selected_changes.clone();
         let selection_sync = selection_sync.clone();
         let diff_read_only = diff_read_only.clone();
+        let repo = repo.clone();
+        let wc_identity_baseline = wc_identity_baseline.clone();
+        let save_button = save_button.clone();
         move |_wc_list, row| {
             let Some(row) = row else { return };
             if pane_mode.borrow().is_conflict() {
@@ -2217,12 +2238,20 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             selection_sync.set(true);
             list.unselect_all();
             selection_sync.set(false);
+            // Craft a commit from the uncommitted changes: the message starts empty
+            // (typing one turns Save from "save the diff in place" into "commit on
+            // HEAD"), and the identity fields are prefilled with the git default so
+            // the author/committer can be overridden — recorded as the baseline the
+            // save compares against to tell an override from the untouched default.
             message_buffer.set_text("");
-            message_view.set_editable(false);
+            message_view.set_editable(true);
+            let baseline =
+                set_identity_fields_from(&identity_fields, &repo.borrow().default_identity());
+            *wc_identity_baseline.borrow_mut() = baseline;
             for f in identity_fields.iter() {
-                f.set_text("");
-                f.set_sensitive(false);
+                f.set_sensitive(true);
             }
+            save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
             // The working-copy diff is editable; clear any multi-select read-only.
             diff_read_only.set(false);
             load_wc_changes();
@@ -3112,19 +3141,25 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         let selected_wc_change = selected_wc_change.clone();
         let selected_changes = selected_changes.clone();
         let multi_identity_baseline = multi_identity_baseline.clone();
+        let wc_identity_baseline = wc_identity_baseline.clone();
+        let list = list.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
                 resolve_current();
                 return;
             }
-            // Viewing a working-copy entry: edit it in place (no message/identity,
-            // and the branch tip doesn't move), then reload the diff and rows.
+            // Viewing a working-copy entry. The commit message gates what Save does:
+            // with no message, the edited diff is written back to the working copy
+            // in place (it stays uncommitted); with a message, the uncommitted
+            // changes are crystallized into a real commit on top of HEAD.
             if viewing_wc.get() {
                 let saved_file = current_file.borrow().clone();
                 let saved_cursor = file_buffer.cursor_position();
-                // Edit each changed file of the selected entry in place (no rebase
-                // that moves the tip, so a loop is fine).
+                // Flush any pending diff edits into the working copy first — both
+                // paths want the on-disk tree to match the shown diff, whether it's
+                // re-rendered (no message) or committed (message). Editing in place
+                // moves no tip, so a per-file loop is fine.
                 let edits = match collect_file_edits(
                     &buffer_text(&file_buffer),
                     &changes.borrow(),
@@ -3147,15 +3182,54 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         return;
                     }
                 }
-                refresh_wc();
-                load_wc_changes();
-                if let Some(path) = saved_file {
-                    if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
-                        file_dropdown.set_selected(idx as u32);
+                let message = buffer_text(&message_buffer);
+                let message = message.trim();
+                if message.is_empty() {
+                    // No message: leave the changes uncommitted, just reload the diff
+                    // and rows where the user was.
+                    refresh_wc();
+                    load_wc_changes();
+                    if let Some(path) = saved_file {
+                        if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
+                            file_dropdown.set_selected(idx as u32);
+                        }
                     }
+                    let offset = saved_cursor.min(file_buffer.char_count());
+                    file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
+                    return;
                 }
-                let offset = saved_cursor.min(file_buffer.char_count());
-                file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
+                // A message was given: commit exactly the displayed diff — the
+                // selected entry's slice — leaving every other "uncommitted changes"
+                // entry untouched (changes the user reverted in the buffer but didn't
+                // Split off were just dropped from the entry above, so they're gone).
+                // Pass the identity only when the user overrode the prefilled git
+                // default; otherwise let the engine stamp git config + a fresh "now".
+                let baseline = wc_identity_baseline.borrow().clone();
+                let current: [String; 4] =
+                    std::array::from_fn(|i| identity_fields[i].text().to_string());
+                let identity = (current != baseline).then(|| read_identity(&identity_fields));
+                let outcome = repo.borrow_mut().commit_working_copy_entry(
+                    change.as_deref(),
+                    message,
+                    identity.as_ref(),
+                );
+                match outcome {
+                    Ok(SaveOutcome::Clean) => {
+                        // The working copy is now clean (refresh hides its row) and
+                        // the new commit is the tip. Drop the working-copy selection
+                        // and select the tip so its just-committed message is shown,
+                        // ready to refine in place.
+                        selected_wc_change.borrow_mut().take();
+                        selected_change.borrow_mut().take();
+                        selected_changes.borrow_mut().clear();
+                        refresh();
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                    }
+                    Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                    Err(err) => show_status(&format!("Commit failed: {err}")),
+                }
                 return;
             }
             // Several commits selected: the read-only batch view, whose only editable

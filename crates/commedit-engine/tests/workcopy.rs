@@ -929,3 +929,88 @@ fn partial_commit_collapses_a_split_working_copy_chain() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+#[test]
+fn commit_working_copy_entry_commits_only_the_selected_slice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // Two uncommitted changes peeled into two entries: the edited entry keeps the
+    // a.txt change, the leaf carries the b.txt change.
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    repo.split_working_copy(None, &[("b.txt".to_string(), "b\n".to_string())])
+        .expect("split working copy");
+    let chain = repo.working_copy_chain();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(
+        chain[0].file_names,
+        ["b.txt"],
+        "leaf carries the b.txt slice"
+    );
+    assert_eq!(
+        chain[1].file_names,
+        ["a.txt"],
+        "edited entry the a.txt slice"
+    );
+
+    // Commit the edited entry (the a.txt slice) — what its diff would display.
+    let a_slice = chain[1].info.change_id_hex();
+    let outcome = repo
+        .commit_working_copy_entry(Some(&a_slice), "commit a slice", None)
+        .expect("commit entry");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // The new commit holds only the a.txt change; b.txt stays at its committed value.
+    assert_eq!(common::git_log_subjects(dir), ["commit a slice", "B", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nAA");
+    assert_eq!(common::git(dir, &["show", "HEAD:b.txt"]), "b");
+
+    // The b.txt slice is still uncommitted — one chain entry left, disk unchanged.
+    let chain = repo.working_copy_chain();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].file_names, ["b.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "b\nBB\n"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M b.txt");
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn commit_working_copy_entry_lone_entry_commits_everything_and_cleans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+
+    // A single uncommitted entry: committing it (leaf fallback, no change id)
+    // crystallizes the whole tree and leaves a clean working copy, exactly like
+    // `commit_working_copy`.
+    std::fs::write(dir.join("a.txt"), "a\nlocal\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "brand new\n").unwrap();
+    let outcome = repo
+        .commit_working_copy_entry(None, "commit it all", None)
+        .expect("commit entry");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    assert_eq!(common::git_log_subjects(dir), ["commit it all", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD:a.txt"]), "a\nlocal");
+    // The untracked b.txt is never auto-tracked, so it stays uncommitted on disk.
+    assert!(repo.working_copy_chain().is_empty(), "working copy clean");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "?? b.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

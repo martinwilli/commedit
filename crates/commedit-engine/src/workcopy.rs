@@ -509,6 +509,147 @@ impl Repo {
         )
     }
 
+    /// Crystallize a single working-copy **entry** (identified by its stable change
+    /// id, or the leaf `@` when `change_hex` is `None`) into a real commit on top of
+    /// HEAD — committing exactly that entry's slice of the uncommitted changes (its
+    /// diff against its own parent) and leaving every *other* entry of the chain
+    /// uncommitted. This is what the GTK working-copy view's Save commits: the diff
+    /// it shows is the selected entry's, so a chain peeled apart with
+    /// [`Self::split_working_copy`] commits one piece at a time, the rest staying as
+    /// "uncommitted changes" rows. The full on-disk tree rides on the new commit as
+    /// the rebuilt `@` (disk stays byte-identical, only git's committed-vs-
+    /// uncommitted line moves), collapsing to a fresh empty `@` when nothing else is
+    /// left — so a lone entry behaves exactly like [`Self::commit_working_copy`].
+    /// Like the partial commit it moves the branch tip and exports through
+    /// `finish_mutation`, always landing clean. Refuses when the tree is clean, HEAD
+    /// is detached/unborn, or the entry commits nothing.
+    pub fn commit_working_copy_entry(
+        &mut self,
+        change_hex: Option<&str>,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("committing a working-copy entry", || {
+            self.commit_working_copy_entry_inner(change_hex, message, identity)
+        })
+    }
+
+    fn commit_working_copy_entry_inner(
+        &mut self,
+        change_hex: Option<&str>,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
+        // turned out clean (nothing to commit).
+        self.snapshot_working_copy()?;
+        if self.working_copy_info().is_none() {
+            bail!("no uncommitted changes to commit");
+        }
+        let Some(head) = self.head_commit_id() else {
+            bail!("the repository has no branch head; cannot commit the working copy");
+        };
+        let entry_id = self
+            .resolve_working_copy_change(change_hex)
+            .context("no working copy entry to commit")?;
+        let leaf_id = self
+            .working_copy_commit_id()
+            .context("no working copy to commit")?;
+        let store = self.repo.store().clone();
+        let entry_tree = store
+            .get_commit(&entry_id)
+            .context("loading the working-copy entry")?
+            .tree();
+        let head_tree = store
+            .get_commit(&head)
+            .context("loading the branch head")?
+            .tree();
+        // The leaf @ holds the full on-disk tree (the whole chain collapsed); it
+        // becomes the remainder riding on the new commit.
+        let full_tree = store
+            .get_commit(&leaf_id)
+            .context("loading the working-copy commit")?
+            .tree();
+
+        // The entry's slice is exactly the paths it changes against its own parent;
+        // splice the entry's content for those paths onto HEAD so the commit holds
+        // only the displayed diff, never the cumulative chain below it.
+        let changed: Vec<String> = crate::diff::commit_changes(&self.repo, &entry_id)
+            .map(|c| c.into_iter().map(|f| f.path).collect())
+            .unwrap_or_default();
+        let t_commit =
+            crate::tree::splice_paths_from_tree(head_tree.clone(), &entry_tree, &changed)?;
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selected entry commits nothing");
+        }
+
+        let name = self.workspace.workspace_name().to_owned();
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.head_commit();
+        let heads = self.snapshot_heads();
+
+        let mut tx = self.repo.start_transaction();
+        // C: the new commit on HEAD, holding just the entry's slice.
+        let mut builder = tx
+            .repo_mut()
+            .new_commit(vec![head.clone()], t_commit.clone())
+            .set_description(message);
+        if let Some(id) = identity {
+            let author = Signature {
+                name: id.author_name.clone(),
+                email: id.author_email.clone(),
+                timestamp: parse_timestamp(&id.author_time).context("author date")?,
+            };
+            let committer = Signature {
+                name: id.committer_name.clone(),
+                email: id.committer_email.clone(),
+                timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
+            };
+            builder = builder.set_author(author).set_committer(committer);
+        }
+        let created = block_on(builder.write()).context("writing the commit")?;
+        let created_id = created.id().clone();
+        let change_hex = created.change_id().hex();
+
+        // The remainder — the full on-disk tree as a child of C, holding every
+        // *other* entry's changes still uncommitted. When the committed entry was
+        // the whole tree (a lone entry), the remainder equals C's tree, so start a
+        // fresh empty @ instead (like `commit_working_copy`); otherwise point @ at
+        // the remainder with `edit` (not `check_out`, which would spawn a fresh
+        // empty @) so disk stays byte-identical and the remainder stays uncommitted.
+        if full_tree.tree_ids() == t_commit.tree_ids() {
+            block_on(tx.repo_mut().check_out(name, &created))
+                .context("starting a fresh working copy")?;
+        } else {
+            let remainder = block_on(
+                tx.repo_mut()
+                    .new_commit(vec![created_id.clone()], full_tree)
+                    .write(),
+            )
+            .context("writing the working-copy remainder")?;
+            block_on(tx.repo_mut().edit(name, &remainder))
+                .context("pointing the working copy at the remainder")?;
+        }
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.set_head_bookmark(tx.repo_mut(), created_id);
+
+        let subject = message.lines().next().unwrap_or("").trim();
+        let label = if subject.is_empty() {
+            "Commit working copy".to_string()
+        } else {
+            format!("Commit \"{subject}\"")
+        };
+        let desc = OpDescriptor::new(label, vec![change_hex]);
+        self.finish_mutation(
+            tx,
+            "commedit: commit working-copy entry",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
+    }
+
     /// Snapshot the disk and resolve a [`PartialSelection`] into the trees a
     /// partial commit/squash needs: the branch `head` id, HEAD's tree, the leaf
     /// `@`'s full on-disk tree, and `t_commit` — HEAD's tree with the selected

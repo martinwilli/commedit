@@ -334,7 +334,9 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
              border: 1px solid rgba(53, 132, 228, 0.9); font-weight: bold; } \
              entry.identity-differs text { font-style: italic; } \
              entry.identity-differs > text > placeholder { font-style: italic; } \
-             .history-list row { padding-top: 0; padding-bottom: 0; }",
+             .history-list row { padding-top: 0; padding-bottom: 0; } \
+             row.squash-blame { background-color: rgba(145, 65, 172, 0.20); \
+             border: 1px dashed rgb(145, 65, 172); border-radius: 5px; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,

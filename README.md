@@ -66,7 +66,10 @@ an interactive-rebase session.
 - **Squash by dragging** — drag a commit *onto* another to fold it in. A commit
   with an autosquash prefix (`fixup!` / `squash!` / `amend!`) highlights its
   matching target while you drag and folds in on drop; an ordinary commit opens a
-  small fixup / squash / amend picker.
+  small fixup / squash / amend picker. While dragging *any* single commit, if
+  every line it removes blames back to one single commit, that commit is
+  highlighted in purple — a content-derived "this is where it belongs", stronger
+  than the subject match.
 
 - **Revert a commit in place** — hover a commit's row in the history list and a
   revert button appears at its right edge (aligned down the list); clicking it

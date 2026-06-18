@@ -376,6 +376,17 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         r.add_css_class("squash-sibling");
                     }
                 }
+                // Purple: every line this commit removes blames to one single
+                // commit — a content-derived "it belongs here", stronger than the
+                // name match. Wins over green/yellow on the same row, so strip
+                // those first to keep the colour unambiguous.
+                if let Some(i) = repo.borrow().blame_single_source(&commits.borrow(), from) {
+                    if let Some(r) = list.row_at_index(i as i32) {
+                        r.remove_css_class("squash-recommended");
+                        r.remove_css_class("squash-sibling");
+                        r.add_css_class("squash-blame");
+                    }
+                }
             }
         }
     });
@@ -399,6 +410,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             while let Some(r) = list.row_at_index(i) {
                 r.remove_css_class("squash-recommended");
                 r.remove_css_class("squash-sibling");
+                r.remove_css_class("squash-blame");
                 i += 1;
             }
             clear_squash_target();
@@ -1052,6 +1064,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             while let Some(r) = list.row_at_index(i) {
                 r.remove_css_class("squash-recommended");
                 r.remove_css_class("squash-sibling");
+                r.remove_css_class("squash-blame");
                 i += 1;
             }
             clear_squash_target();

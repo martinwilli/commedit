@@ -63,6 +63,7 @@ Key operations and their source files:
 - Reorder / drop / restore: `rewrite.rs` + planning in `history.rs`
 - Create / revert / cherry-pick: `create.rs` (shared `insert_new_commit`)
 - Squash and autosquash routing: `squash.rs` (`squash_into`, `squash_recommendations`)
+- Drag-to-squash blame hint: `blame.rs` (`blame_single_source`) — when every line a dragged commit removes blames to one commit, the UI highlights it purple (a scoped line-origin blame; jj-lib has no annotate API)
 - Split: `split.rs` (the `set_rewritten_commit` trick makes descendants follow the split child)
 - Surgical text replace: `tree.rs` (`replace_in_files`)
 - Working-copy commit/fold: `workcopy.rs`

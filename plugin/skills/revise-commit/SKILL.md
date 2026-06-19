@@ -70,5 +70,7 @@ single-commit tools — it's atomic and won't re-stamp committers across the cas
   change_ids are stable, so you can chain edits without re-running `list_history`.
 - **After any out-of-band git operation** (a commit, branch switch or rebase made
   outside the session) call `reload_repo` before continuing.
-- **Safety net:** every landed change is a recorded operation — `list_operations`,
-  `undo` / `redo`, `jump_to_operation` (`0` rolls the session back to its start).
+- **Safety net & review.** Every landed change is a recorded operation you can
+  walk back, dropped commits stay recoverable, and the session is one inspectable
+  diff — stepping back, reviewing, or recovering is the `review-and-recover`
+  skill. (`discard_working_copy` is the one irreversible action.)

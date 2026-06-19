@@ -66,6 +66,9 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
 - **`resolve-conflicts`** — when a rewrite's rebase conflicts, commedit holds it
   back *in full* (nothing conflicted ever reaches git); resolve the deferred
   conflicts file-by-file, oldest commit first, or abort.
+- **`review-and-recover`** — lean on the session safety net: review everything
+  the session changed as one diff, undo or jump back through recorded operations,
+  recover a dropped commit, or orient yourself in the branch graph.
 - **`work-in-worktree`** — reshape a branch's history isolated in a `git
   worktree`, leaving the main checkout untouched: create the worktree and point
   commedit at it with `reload_repo`'s `path` (the server follows the retarget, not

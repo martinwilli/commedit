@@ -83,6 +83,7 @@ reorder or drop it later in one call, and descendants rebase automatically.
   for out-of-band changes it can't absorb in place: a **branch switch**, or history
   **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
   trash and op-log, so don't run it reflexively).
-- The session is a safety net: every landed change is a recorded operation
-  (`list_operations`, `undo` / `redo`, `jump_to_operation`). The only
-  unrecoverable action is `discard_working_copy`.
+- **Safety net & review.** Every landed change is a recorded operation you can
+  walk back, dropped commits stay recoverable, and the session is one inspectable
+  diff — stepping back, reviewing, or recovering is the `review-and-recover`
+  skill. (`discard_working_copy` is the one irreversible action.)

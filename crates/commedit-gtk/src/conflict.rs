@@ -480,6 +480,9 @@ pub(crate) fn build_resolve_current(
     on_restore: RestoreToWorktreeCallback,
 ) -> Rc<dyn Fn()> {
     let repo = d.repo.clone();
+    // Off-worktree there is no working copy, so the trash "restore to working
+    // tree" button is omitted (the engine refuses the operation too).
+    let on_restore = repo.borrow().is_worktree_bound().then_some(on_restore);
     let pane_mode = d.pane_mode.clone();
     let selected_change = d.selected_change.clone();
     let conflict_view = d.conflict_view.clone();
@@ -543,7 +546,7 @@ pub(crate) fn build_resolve_current(
                         &trash_list,
                         &trash_scroll,
                         &trashed.borrow(),
-                        Some(&on_restore),
+                        on_restore.as_ref(),
                     );
                 }
                 exit_conflict_mode();

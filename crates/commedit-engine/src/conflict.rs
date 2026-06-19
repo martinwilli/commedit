@@ -632,7 +632,7 @@ impl Repo {
         self.pending = None;
         // The export tail needs the *current* (rewritten) on-disk state to sync
         // away from; the git-level head backstop holds unrelated branches in place.
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         // jj's recorded git-ref state tracks what it last wrote to git's
         // refs/*; the session's clean saves left it at the current tips. Keep a
@@ -1219,12 +1219,20 @@ impl Repo {
         // precede materialize_after_rewrite, which resets the index to the user's
         // HEAD (now the new tip).
         self.bridge_branch_to_git(old_head.as_deref());
-        self.reattach_head()?;
+        // Off-worktree the user's HEAD, index and worktree belong to a different
+        // branch and must stay frozen: only the edited branch's ref moves (above).
+        // Skip re-attaching HEAD and materializing the working copy — there is no
+        // working copy on a branch that isn't checked out.
+        if self.is_worktree_bound() {
+            self.reattach_head()?;
+        }
         self.protect_unrelated_heads(heads);
-        // Write the rebased working-copy commit @' back to disk (preserving the
-        // user's uncommitted changes through the rewrite), in place of the old
-        // git read-tree sync.
-        self.materialize_after_rewrite(old_head)?;
+        if self.is_worktree_bound() {
+            // Write the rebased working-copy commit @' back to disk (preserving the
+            // user's uncommitted changes through the rewrite), in place of the old
+            // git read-tree sync.
+            self.materialize_after_rewrite(old_head)?;
+        }
         Ok(())
     }
 }

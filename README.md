@@ -199,6 +199,7 @@ and the system GTK4, libsourceview5 and libspelling **development** libraries (e
 cargo build                 # build the workspace
 cargo test                  # run the engine and integration tests
 cargo run -p commedit-gtk -- /path/to/repo  # launch the app against a repo (defaults to ".")
+cargo run -p commedit-gtk -- /path/to/repo feature  # edit a branch you haven't checked out
 ```
 
 ## Use from AI agents (Claude Code plugin)
@@ -239,6 +240,16 @@ tags stay exactly where they are (they simply diverge, as they would after a
 `git commit --amend`). The code is split into a headless `commedit-engine` crate
 (all repository logic, unit-tested against scratch repos) and a `commedit-gtk`
 crate (the UI), so the rewrite logic carries no GTK dependency.
+
+You can also edit a branch you have **not** checked out: pass its name —
+`commedit /path/to/repo <branch>`, or just `commedit <branch>` from inside the
+repo (a lone argument is a path if it's an existing directory, otherwise a
+branch). comm(ed)it then moves only that branch's ref and leaves `HEAD`, the
+index and the working tree completely untouched. Every history edit works as
+usual, but there is no working copy (a branch you haven't checked out has no
+uncommitted changes), so the working-copy features are unavailable. Editing a
+branch that is checked out in *another* worktree is refused — rewriting it would
+desync that worktree; open comm(ed)it in that worktree instead.
 
 Opening a large history is fast after the first time. Building jj's commit index
 means reading every commit reachable from `HEAD` — seconds on a huge repo (the

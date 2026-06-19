@@ -110,22 +110,36 @@ impl CommeditServer {
         self.with_session_no_sync(move |repo, trash| {
             // No-arg reload reopens the live root; a `path` re-homes to a sibling
             // worktree, scope-guarded so it can only target this same repository.
-            let target = match req.path {
-                Some(p) => resolve_worktree_target(repo.workspace_root(), &p)?,
+            let target = match &req.path {
+                Some(p) => resolve_worktree_target(repo.workspace_root(), p)?,
                 None => repo.workspace_root().to_path_buf(),
             };
+            // The branch to edit: an explicit `branch` wins; otherwise keep the
+            // current off-worktree target when reloading in place, but reset to the
+            // worktree's checked-out branch when re-homing to a different one.
+            let branch: Option<String> = req.branch.clone().or_else(|| {
+                req.path
+                    .is_none()
+                    .then(|| repo.target_branch_name().map(str::to_string))
+                    .flatten()
+            });
             // Only swap on success — a failed reload keeps the current session.
             // Cached like the initial open; replacing `*repo` drops the old session,
             // whose `Drop` flushes its index cache.
-            let fresh =
-                Repo::open_with_cache(&target, commedit_engine::index_cache::IndexCache::Default)
-                    .map_err(internal)?;
+            let fresh = Repo::open_branch(
+                &target,
+                commedit_engine::index_cache::IndexCache::Default,
+                branch.as_deref(),
+            )
+            .map_err(internal)?;
             *repo = fresh;
             trash.entries.clear();
             trash.staged = None;
             Ok(ReloadResp {
                 head_sha: repo.head_commit_id().map(|id| id.hex()),
                 root: repo.workspace_root().display().to_string(),
+                branch: repo.target_branch_name().map(str::to_string),
+                worktree_bound: repo.is_worktree_bound(),
             })
         })
         .await

@@ -89,10 +89,10 @@ fn diff_file_index_at_line(buffer: &sourceview5::Buffer, line: usize) -> usize {
 }
 
 fn main() {
-    let repo_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // `commedit [PATH] [BRANCH]`: an optional repo path and an optional branch to
+    // edit (which need not be checked out). See `commedit_engine::cli`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (repo_path, branch) = commedit_engine::cli::parse_repo_and_branch(&args);
 
     // Each invocation targets its own repo path, so GTK's single-instance
     // activation (which would forward a second launch to the primary process
@@ -101,7 +101,7 @@ fn main() {
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_activate(move |app| build_ui(app, repo_path.clone()));
+    app.connect_activate(move |app| build_ui(app, repo_path.clone(), branch.clone()));
     app.run_with_args::<&str>(&[]);
 }
 
@@ -167,12 +167,15 @@ fn visible_changes(changes: &[FileChange], orig: &[FileChange]) -> Vec<FileChang
         .collect()
 }
 
-fn build_ui(app: &Application, repo_path: PathBuf) {
+fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // Use the index cache so repeated launches against the same repo skip
     // rebuilding jj's commit index from scratch (see `commedit_engine::index_cache`).
-    let repo = match Repo::open_with_cache(
+    // `branch`, when given, edits a branch that need not be checked out (an
+    // off-worktree session: only that ref moves, no working copy).
+    let repo = match Repo::open_branch(
         &repo_path,
         commedit_engine::index_cache::IndexCache::Default,
+        branch.as_deref(),
     ) {
         Ok(repo) => Rc::new(RefCell::new(repo)),
         Err(err) => {
@@ -184,6 +187,11 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             return;
         }
     };
+
+    // Off-worktree (editing a branch that isn't checked out): there is no working
+    // copy, so the trash "restore to working tree" button can't work — it is
+    // omitted, and the engine refuses working-copy operations.
+    let worktree_bound = repo.borrow().is_worktree_bound();
 
     // Resolves the display tab width per file from the repo's editor-config files
     // (`.editorconfig` / `.vscode/settings.json` / `.clang-format`), applied to the
@@ -782,9 +790,21 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "commedit".to_string());
+    // Off-worktree, name the edited branch in the title so multiple windows are
+    // distinguishable.
+    let title = if worktree_bound {
+        format!("Commit editor - {folder}")
+    } else {
+        let branch = repo
+            .borrow()
+            .target_branch_name()
+            .unwrap_or("?")
+            .to_string();
+        format!("Commit editor - {folder} [{branch}]")
+    };
     let window = ApplicationWindow::builder()
         .application(app)
-        .title(format!("Commit editor - {folder}"))
+        .title(title)
         .default_width(win_state.width)
         .default_height(win_state.height)
         .child(&root)
@@ -2704,7 +2724,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                             &trash_list,
                             &trash_scroll,
                             &trashed.borrow(),
-                            Some(&on_restore),
+                            worktree_bound.then_some(&on_restore),
                         );
                         show_status("Restored the commit's changes to the working tree");
                     }
@@ -3005,7 +3025,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                         &trash_list,
                         &trash_scroll,
                         &trashed.borrow(),
-                        Some(&on_restore),
+                        worktree_bound.then_some(&on_restore),
                     );
                     // `refresh` re-selects the prior selection by change id and
                     // re-renders the pane; if it's gone after the jump, select the tip.
@@ -3043,6 +3063,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
     reload_button.connect_clicked({
         let repo = repo.clone();
         let repo_path = repo_path.clone();
+        let branch = branch.clone();
         let exit_conflict_mode = exit_conflict_mode.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
@@ -3060,9 +3081,10 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
             // reload leaves the current state untouched (concurrent sessions
             // are supported, so the brief overlap is fine). Cached like the
             // initial open; the old session flushes its index as it drops.
-            let reopened = match Repo::open_with_cache(
+            let reopened = match Repo::open_branch(
                 &repo_path,
                 commedit_engine::index_cache::IndexCache::Default,
+                branch.as_deref(),
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -3080,7 +3102,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
                 &trash_list,
                 &trash_scroll,
                 &trashed.borrow(),
-                Some(&on_restore),
+                worktree_bound.then_some(&on_restore),
             );
             history_limit.set(HISTORY_PAGE);
             // `refresh` re-selects the prior selection by change id and re-renders
@@ -3109,7 +3131,7 @@ fn build_ui(app: &Application, repo_path: PathBuf) {
         &trash_list,
         &trash_scroll,
         &trashed.borrow(),
-        Some(&on_restore),
+        worktree_bound.then_some(&on_restore),
     );
 
     // Save: rewrite the message and/or the selected file's content, then reload.

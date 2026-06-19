@@ -18,8 +18,8 @@ use crate::dto::{
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 use crate::session::{
-    change_id_set, ensure_not_pending, find_commit, full_history, new_commit_identity, save_result,
-    save_result_topo, working_copy_status_resp,
+    change_id_set, ensure_not_pending, ensure_worktree_bound, find_commit, full_history,
+    new_commit_identity, save_result, save_result_topo, working_copy_status_resp,
 };
 use crate::wrapper::Yaml;
 
@@ -62,6 +62,7 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
     ) -> Result<Yaml<SquashWorkingCopyResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
             let SquashWorkingCopyReq {
                 dest,
                 message,
@@ -126,6 +127,7 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
     ) -> Result<Yaml<CommitWorkingCopyResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
             // Track any named new files before checking for changes, so committing a
             // brand-new file alone (no tracked edits) isn't seen as a clean tree.
             repo.snapshot_working_copy_tracking(&req.add_paths.clone().unwrap_or_default())
@@ -187,6 +189,7 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
     ) -> Result<Yaml<OkResp>, ErrorData> {
         self.with_session(move |repo, _| {
             ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
             if !req.confirm {
                 return Err(invalid(
                     "set confirm=true to discard the uncommitted changes; they cannot \

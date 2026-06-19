@@ -53,8 +53,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let refresh = cb.refresh.clone();
     let show_status = cb.show_status.clone();
     let enter_conflict_mode = cb.enter_conflict_mode.clone();
-    // Repopulating the trash after a drag must keep the restore buttons intact.
-    let on_restore = cb.on_restore.clone();
+    // Repopulating the trash after a drag must keep the restore buttons intact —
+    // except off-worktree, where there is no working copy to restore into, so the
+    // "restore to working tree" button is omitted (the engine refuses it too).
+    let on_restore = repo
+        .borrow()
+        .is_worktree_bound()
+        .then(|| cb.on_restore.clone());
 
     // Map a y coordinate to an insertion gap: onto a row's lower half drops below
     // it; past the last row drops at the bottom; above the first, at the top. The
@@ -793,7 +798,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
-                                            Some(&on_restore),
+                                            on_restore.as_ref(),
                                         );
                                         *selected_change.borrow_mut() = Some(dest_change.clone());
                                         refresh();
@@ -806,7 +811,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
-                                            Some(&on_restore),
+                                            on_restore.as_ref(),
                                         );
                                         enter_conflict_mode(commits);
                                     }
@@ -894,7 +899,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                             &trash_list,
                                             &trash_scroll,
                                             &trashed.borrow(),
-                                            Some(&on_restore),
+                                            on_restore.as_ref(),
                                         );
                                     }
                                     Ok(SaveOutcome::Conflicts { commits }) => {
@@ -1245,7 +1250,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 &trash_list,
                                 &trash_scroll,
                                 &trashed.borrow(),
-                                Some(&on_restore),
+                                on_restore.as_ref(),
                             );
                         }
                         Ok(SaveOutcome::Conflicts { commits }) => {
@@ -1294,7 +1299,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             &trash_list,
                             &trash_scroll,
                             &trashed.borrow(),
-                            Some(&on_restore),
+                            on_restore.as_ref(),
                         );
                     }
                     Ok(SaveOutcome::Conflicts { commits }) => {

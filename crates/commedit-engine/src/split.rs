@@ -61,7 +61,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -136,6 +136,7 @@ impl Repo {
         change_hex: Option<&str>,
         edits: &[FileEdit],
     ) -> Result<()> {
+        self.require_worktree("split the working copy")?;
         crate::repo::catch_jj("splitting the working copy", || {
             self.split_working_copy_inner(change_hex, edits)
         })

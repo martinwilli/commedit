@@ -68,6 +68,13 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
   commedit at it with `reload_repo`'s `path` (the server follows the retarget, not
   your working directory), then re-home and tear down afterward.
 
+To edit a branch you have **not** checked out — without a worktree at all — pass
+its name to `reload_repo`'s `branch` (or launch the server as
+`commedit-mcp <path> <branch>`). commedit then moves only that branch's ref and
+leaves `HEAD`, the index and the worktree frozen, so there is no working copy and
+the working-copy tools are refused. A branch checked out in another worktree is
+refused (rewriting it would desync that worktree).
+
 ## Bundled agent
 
 The plugin also ships a subagent, **`commedit-operator`**, for the history

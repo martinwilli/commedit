@@ -71,6 +71,14 @@ when you commit on top of HEAD with plain git — so a plain commit needs no rel
 reload_repo is only for changes it can't absorb in place: a branch switch, or \
 history rewritten out of band by `git rebase`/`reset`/`commit --amend`.)
 
+Off-worktree branches: this session may be editing a branch you have NOT checked \
+out — launched as `commedit-mcp <path> <branch>`, or switched via reload_repo's \
+`branch`. Then every history edit works exactly as above, but ONLY that branch's \
+ref moves: HEAD, the index and the worktree stay frozen, so there is no working \
+copy and the working-copy tools (commit_working_copy, squash_working_copy, \
+split/discard, edit a working-copy file) are refused. reload_repo reports the \
+edited branch and whether the session is worktree_bound.
+
 Addressing: every tool that takes a commit accepts its sha or its change_id, \
 full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
 rewrite the target and its descendants, so shas change constantly; the \

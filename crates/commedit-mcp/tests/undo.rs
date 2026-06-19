@@ -238,7 +238,10 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
     git(dir.path(), &["commit", "-qm", "external"]);
 
     let resp = server
-        .reload_repo(Parameters(ReloadRepoReq { path: None }))
+        .reload_repo(Parameters(ReloadRepoReq {
+            path: None,
+            branch: None,
+        }))
         .await
         .unwrap()
         .0;
@@ -308,7 +311,10 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
 
     // Reload while pending: allowed, the held rewrite is simply dropped.
     server
-        .reload_repo(Parameters(ReloadRepoReq { path: None }))
+        .reload_repo(Parameters(ReloadRepoReq {
+            path: None,
+            branch: None,
+        }))
         .await
         .unwrap();
     assert!(!server.pending_status().await.unwrap().0.pending);

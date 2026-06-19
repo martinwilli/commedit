@@ -20,8 +20,11 @@ cargo test -p commedit-mcp       # MCP server only
 cargo test --test rewrite        # one integration test binary (each tests/*.rs is its own)
 cargo test plan_reorder          # tests matching a name
 cargo run -p commedit-gtk -- /path/to/repo  # launch the GTK app against a repo (defaults to ".")
+cargo run -p commedit-gtk -- /path/to/repo feature  # edit an off-worktree branch (path+branch)
 cargo run -p commedit-mcp -- /path/to/repo  # the MCP server on stdio (defaults to ".")
 ```
+
+Both binaries take `[PATH] [BRANCH]` (parsed by `commedit_engine::cli::parse_repo_and_branch`): a lone arg is a path if it's an existing directory, else a branch in `.`.
 
 Run `cargo fmt` and `cargo clippy --workspace --all-targets` before committing, and keep clippy warning-free; each commit should build and pass tests on its own.
 
@@ -42,6 +45,10 @@ The core invariant: plain `git` always sees an ordinary, attached-HEAD repo. Key
 - `repo.rs` — `Repo::open` attaches jj to a throwaway git dir that shares only the ODB with the user's repo (symlinked `objects`). All jj state (op log, refs, detached HEAD) lives in a `TempDir` (`Repo::_workdir`), never touching the user's `.git`. `init_detached`/`load_detached` are the place sensitive to a jj-lib bump.
 - `transparency.rs` — post-rewrite glue (`reattach_head`, `bridge_branch_to_git`, index reset) and session setup (`init_shared_git_dir`, `seed_session_head`).
 - `Repo::sync_to_git_head` — fast-forward sync for out-of-band `git commit`s on HEAD. `reload_repo` handles branch switches or out-of-band rewrites (heavier full reset).
+
+#### Off-worktree branches
+
+`Repo::open_branch(path, cache, Some(branch))` edits a branch that need *not* be checked out (the GTK/MCP `[PATH] [BRANCH]` arg). `Repo` carries both `git_head_branch` (the *checked-out* branch) and `target_branch` (the *edited* one); `is_worktree_bound()` is `target == git_head`. The edited bookmark is `current_bookmark()` (= target) — imported, rewritten, exported; `head_commit_id()`/`edited_tip()` give the edited tip (target ref off-worktree, else git HEAD), so history/reorder/squash and the `old_head` compare-and-swap all follow the target. Off-worktree, `export_and_sync` does export + `bridge_branch_to_git` only, **skipping** `reattach_head` and `materialize_after_rewrite` (HEAD/index/worktree stay frozen), and `protect_unrelated_heads` exempts the target instead of HEAD's branch. There is no working copy: `snapshot_working_copy` is a no-op, the working-copy readers return empty/`None`, and the mutating WC ops bail via `require_worktree`. Opening a branch live in another worktree is refused (`transparency::worktree_for_branch`).
 
 ### Index cache (`index_cache.rs`)
 

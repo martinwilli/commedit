@@ -65,12 +65,16 @@ reorder or drop it later in one call, and descendants rebase automatically.
 5. **Address commits by `change_id`, not sha.** Shas churn on every rewrite;
    change_ids are stable, so you can chain edits without re-running `list_history`.
 
-6. **Avoid `split_commit`.** It makes you hand over the full retained file
-   contents — error-prone. Needing it is the signal you should have committed more
-   eagerly. If you must carve an existing pile, peel subsets with the
-   `paths` / `hunks` / `patches` selection on `commit_working_copy` /
-   `squash_working_copy` (run `show_commit` on the working-copy entry first to read
-   each file's numbered hunks).
+6. **Splitting — carve forward, don't split back.** Carving a pile you have
+   *not yet committed* is the easy, recommended split: commit part of the working
+   copy now with the `paths` / `hunks` / `patches` selection on
+   `commit_working_copy` (run `show_commit` on the working-copy entry first to read
+   each file's numbered hunks), then commit or fold the rest. That is why eager
+   commits mean you rarely need to split. Splitting a commit *already in history*
+   is the hard case — `split_commit` is the only tool for it, but it makes you
+   hand over the full retained file contents, so it's error-prone. Needing it is
+   the signal you should have carved earlier; avoid it where you can, and delegate
+   it to the `commedit-operator` subagent when you can't.
 
 ## When things go sideways
 
@@ -83,6 +87,13 @@ reorder or drop it later in one call, and descendants rebase automatically.
   for out-of-band changes it can't absorb in place: a **branch switch**, or history
   **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
   trash and op-log, so don't run it reflexively).
+- **Off-worktree, this loop doesn't apply.** When commedit edits a branch you have
+  *not* checked out (`reload_repo`'s `branch`, or launched as `<path> <branch>`),
+  there is **no working copy**: no plain `git commit` to crystallize, and the
+  `commit_working_copy` / `squash_working_copy` / `discard_working_copy` tools are
+  refused. You edit the branch's existing commits directly instead. (This is a
+  different thing from the `work-in-worktree` skill, where you *create* a worktree
+  and keep a live working copy in it.)
 - **Safety net & review.** Every landed change is a recorded operation you can
   walk back, dropped commits stay recoverable, and the session is one inspectable
   diff — stepping back, reviewing, or recovering is the `review-and-recover`

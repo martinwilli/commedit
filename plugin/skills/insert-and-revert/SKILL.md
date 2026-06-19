@@ -59,7 +59,9 @@ so it adds no change of its own and `C` becomes a one-commit side branch you can
 then move further commits onto. It is the one tool that *creates* a merge — a way
 to organize a linear history into a branchy one. A merge commit or the repository
 root can't be merged out (no single parent); `M` carries a pro-forma message to
-reword afterwards.
+reword afterwards. The result is branchy, so read its shape back with `show_graph`
+(the standalone view of the `topology` a restructuring returns) before moving more
+commits onto the new side branch.
 
 ## When things go sideways
 

@@ -513,9 +513,13 @@ pub struct SplitCommitReq {
     /// The commit to split — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.
     pub commit: String,
-    /// The content the commit should keep, per file (like `replace_files`).
-    /// A new `fixup!` child commit receives the remainder, so both combined
-    /// reproduce the original change.
+    /// The whole-file content this commit should KEEP, per path it changes
+    /// (like `replace_files`, spliced onto the original tree). A new `fixup!`
+    /// child commit receives the remainder, so both combined reproduce the
+    /// original change. To move a file's change OUT to the child, list that file
+    /// with its PARENT (pre-commit) content; a changed file you omit stays in
+    /// this commit. Contents that leave the tree unchanged (an empty child) are
+    /// refused.
     pub files: Vec<FileContentDto>,
 }
 

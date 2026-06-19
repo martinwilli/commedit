@@ -402,7 +402,8 @@ pub struct EditMessageReq {
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
     pub commit: String,
-    /// The new full commit message (subject line + body).
+    /// The new full commit message (subject line + body). Stored verbatim and
+    /// not reflowed — wrap the body at ~72 columns; keep the subject one line.
     pub message: String,
 }
 
@@ -426,6 +427,7 @@ pub struct CommitEditDto {
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites.
     pub commit: String,
     /// New full commit message (subject + body). Omit to leave the message.
+    /// Stored verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
     /// New author/committer fields; omitted fields keep their current value.
     #[serde(flatten)]
@@ -536,7 +538,8 @@ pub struct IdentityFieldsDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CreateCommitReq {
-    /// The full commit message (subject line + optional body).
+    /// The full commit message (subject line + optional body). Stored verbatim
+    /// and not reflowed — wrap the body at ~72 columns; keep the subject one line.
     pub message: String,
     /// Files to put in the commit, each with its complete content, spliced onto
     /// the parent's tree. Omit (with no `delete_paths`) for an empty commit.
@@ -676,6 +679,7 @@ pub struct SquashCommitReq {
     /// Optional: the destination's full message after the fold, set verbatim.
     /// Overrides `mode`'s message handling — use it to fold and reword in one
     /// call instead of a follow-up edit_message. Omit to let `mode` decide.
+    /// Stored verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
 }
 
@@ -687,7 +691,8 @@ pub struct SquashWorkingCopyReq {
     /// Optional: the destination's full message after the fold, set verbatim.
     /// The fold is a fixup (the destination's message is kept by default, since
     /// uncommitted changes carry no message of their own); set this to reword the
-    /// destination in the same call instead of a follow-up edit_message.
+    /// destination in the same call instead of a follow-up edit_message. Stored
+    /// verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
     /// Optional partial fold: fold only *part* of the uncommitted changes into
     /// `dest` and leave the rest in the working tree (the in-process `git add -p`
@@ -727,7 +732,8 @@ pub struct SquashWorkingCopyReq {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CommitWorkingCopyReq {
     /// The full commit message (subject line + optional body) for the new commit
-    /// holding the committed changes.
+    /// holding the committed changes. Stored verbatim and not reflowed — wrap the
+    /// body at ~72 columns; keep the subject one line.
     pub message: String,
     #[serde(flatten)]
     pub identity: IdentityFieldsDto,

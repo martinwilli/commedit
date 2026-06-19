@@ -142,7 +142,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place."
+        description = "Discard the pending conflicted rewrite, rolling history back to before it. Git was never touched while it was held back, so the pre-rewrite state is simply still in place — making this the cheap way out when the conflict came from a mutation you just issued (fix the input and redo), as well as the only escape from a structural (resolvable=false) conflict that can't be resolved as text."
     )]
     pub async fn abort_rewrite(&self) -> Result<Yaml<AbortResp>, ErrorData> {
         self.with_session(|repo, trash| {

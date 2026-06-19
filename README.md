@@ -71,6 +71,13 @@ an interactive-rebase session.
   highlighted in purple — a content-derived "this is where it belongs", stronger
   than the subject match.
 
+- **Drag a commit between windows** — open the same repo in two windows (say one
+  per branch) and drag a commit from one onto a gap in the other's history to
+  **cherry-pick** it in. It's a copy: the source window keeps its commit, the
+  target grows a re-applied one (descendants rebase, conflicts held back as
+  usual). Both windows must be on the *same* repository — they share an object
+  store; dragging between two different repos is refused.
+
 - **Revert a commit in place** — hover a commit's row in the history list and a
   revert button appears at its right edge (aligned down the list); clicking it
   drops a `Revert "…"` commit directly on top of that commit, neutralizing its
@@ -250,6 +257,15 @@ usual, but there is no working copy (a branch you haven't checked out has no
 uncommitted changes), so the working-copy features are unavailable. Editing a
 branch that is checked out in *another* worktree is refused — rewriting it would
 desync that worktree; open comm(ed)it in that worktree instead.
+
+Opening several windows on one repository — typically one per branch — lets you
+drag a commit from one onto another to cherry-pick it across branches. The
+windows are separate processes, so the drag travels as text; the receiving
+window recognizes a commit from a sibling window of the *same* repository (they
+share one object store, so the commit is already reachable) and re-applies it at
+the drop gap, leaving the source branch untouched. Two windows on *different*
+repositories can't exchange commits — their object stores never meet, so the drop
+is refused with a note rather than half-done.
 
 Opening a large history is fast after the first time. Building jj's commit index
 means reading every commit reachable from `HEAD` — seconds on a huge repo (the

@@ -50,6 +50,10 @@ The core invariant: plain `git` always sees an ordinary, attached-HEAD repo. Key
 
 `Repo::open_branch(path, cache, Some(branch))` edits a branch that need *not* be checked out (the GTK/MCP `[PATH] [BRANCH]` arg). `Repo` carries both `git_head_branch` (the *checked-out* branch) and `target_branch` (the *edited* one); `is_worktree_bound()` is `target == git_head`. The edited bookmark is `current_bookmark()` (= target) — imported, rewritten, exported; `head_commit_id()`/`edited_tip()` give the edited tip (target ref off-worktree, else git HEAD), so history/reorder/squash and the `old_head` compare-and-swap all follow the target. Off-worktree, `export_and_sync` does export + `bridge_branch_to_git` only, **skipping** `reattach_head` and `materialize_after_rewrite` (HEAD/index/worktree stay frozen), and `protect_unrelated_heads` exempts the target instead of HEAD's branch. There is no working copy: `snapshot_working_copy` is a no-op, the working-copy readers return empty/`None`, and the mutating WC ops bail via `require_worktree`. Opening a branch live in another worktree is refused (`transparency::worktree_for_branch`).
 
+#### Cross-instance commit dragging
+
+Opening one repo in several windows (typically one branch each) lets you drag a commit from one onto another's history to cherry-pick it across branches. Windows are separate processes (`main.rs` uses `ApplicationFlags::NON_UNIQUE`), so the history drag carries a text payload (`commedit-gtk/src/dnd.rs`: pid + `Repo::object_store_key` + dragged commits by sha) GTK ferries across the boundary — an in-process drop reads the same string back and ignores it, working from the live `drag_*` cells. A drop whose payload pid differs from `std::process::id()` is foreign; if its `repo_key` matches ours (same shared ODB, so the commit is reachable) it's cherry-picked at the gap via `lookup_commit_in_store` → `plan_cherry_pick_candidates` → `cherry_pick_commit` (a *copy*, `DragAction::COPY`, source window untouched). Different `repo_key` ⇒ refused with a status note (separate object stores never meet). Both drop targets now read the source row index from `drag_from` (every source sets it), since history travels as text not an `i32`.
+
 ### Index cache (`index_cache.rs`)
 
 `import_git` serializes full ancestry and is slow on large repos. The cache persists the session's jj `repo/` tree so the next launch primes from it (~35s cold → ~1s warm).
@@ -112,7 +116,8 @@ Three pure, GTK-free engine modules:
 
 - `state.rs` — shared enums and the four widget bundles (`Widgets`/`Data`/`DragState`/`Callbacks`).
 - `rows.rs` — commit/WC row build, `populate_*` refreshers (hide-never-unparent discipline), revert/merge-out/restore hover buttons, lint badge.
-- `dragdrop.rs` — zone-based drag-and-drop (`show_zone`), squash/lane popovers, deferred `post_drag` (rewrites staged to `drag-end` to avoid mid-gesture segfaults).
+- `dragdrop.rs` — zone-based drag-and-drop (`show_zone`), squash/lane popovers, deferred `post_drag` (rewrites staged to `drag-end` to avoid mid-gesture segfaults). Also cross-instance drops (foreign payload → cherry-pick at the gap; see *Cross-instance commit dragging*).
+- `dnd.rs` — pure (de)serialization of the cross-window drag payload (`DraggedCommits`); the text form GTK carries between processes.
 - `conflict.rs` — conflict-mode callback builders and `conflict::wire` (abort, prev/next nav).
 - `msglint.rs` — pure commit-message linter; learns repo style from history (`RepoStyle::learn`). GTK-only, no MCP counterpart.
 - `search.rs` — pure substring commit search (`search_match` / `highlight_markup`).

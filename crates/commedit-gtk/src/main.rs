@@ -1215,7 +1215,34 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             let width = path
                 .and_then(|p| tab_resolver.tab_width(p))
                 .unwrap_or(DEFAULT_TAB_WIDTH);
-            file_view.set_tab_width(width);
+            // Each diff line carries the unified-diff marker (`+`/`-`/space) inline
+            // as column 0, so GtkSourceView's `set_tab_width` — which measures tab
+            // stops from the line start — lands every stop one cell too far left and
+            // eats a column of indentation. Instead install a PangoTabArray whose
+            // stops are shifted right by exactly one character cell, so a tab in the
+            // code aligns as it would in a normal editor (just offset past the
+            // marker). Two explicit stops suffice: Pango extrapolates further stops
+            // by repeating the gap between the last two (`get_tab_pos`), yielding an
+            // infinite grid at one cell + k tab-widths for k = 1, 2, 3, ….
+            //
+            // Work in Pango units (1/PANGO_SCALE px), not pixels: a pixel-rounded
+            // interval over-rounds by a fraction that Pango then repeats, drifting
+            // ~0.4px per tab and visibly across a deep indent. Measuring the space
+            // advance with `size()` (sub-pixel exact) and keeping the interval as
+            // exact arithmetic lands the stops on the same sub-pixel grid the
+            // spaces use, so Pango's single per-glyph display rounding matches.
+            let cell = file_view.create_pango_layout(Some(" ")).size().0;
+            if cell <= 0 {
+                // Font metrics not ready (widget not yet styled); fall back to the
+                // built-in unshifted stops rather than installing a degenerate array.
+                file_view.set_tab_width(width);
+                return;
+            }
+            let unit = cell * width as i32;
+            let mut tabs = gtk::pango::TabArray::new(2, false);
+            tabs.set_tab(0, gtk::pango::TabAlign::Left, cell + unit);
+            tabs.set_tab(1, gtk::pango::TabAlign::Left, cell + 2 * unit);
+            file_view.set_tabs(&tabs);
         })
     };
 

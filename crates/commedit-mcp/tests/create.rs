@@ -573,14 +573,16 @@ async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
 
     // Resolving to the picked content settles it and exports.
     let oldest = &commits[0];
-    let file = server
+    let resp = server
         .read_conflict(Parameters(ReadConflictReq {
             commit: oldest.change_id.clone(),
-            path: oldest.files[0].path.clone(),
+            path: Some(oldest.files[0].path.clone()),
+            paths: None,
         }))
         .await
         .unwrap()
         .0;
+    let file = &resp.files[0];
     let result = server
         .resolve_conflicts(Parameters(ResolveConflictsReq {
             commit: oldest.change_id.clone(),

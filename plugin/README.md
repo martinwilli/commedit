@@ -104,8 +104,10 @@ Delegate one operation (or a tightly-related batch) per call.
 
 A plain **new commit on top of HEAD** needs no rebase, so make it with raw
 `git add` / `git commit` — or `commit_working_copy` to stay in-session and chain
-on its returned `change_id`. Building merge commits between two real branches and
-managing branches, remotes and pushes stay plain-git tasks.
+on its returned `change_id`. Editing an *existing* merge — rewording it, squashing
+into it, or moving commits across it — is commedit's; only building a *new* merge
+that joins two divergent branches, and managing branches, remotes and pushes, stay
+plain-git tasks.
 
 ## Requirements
 

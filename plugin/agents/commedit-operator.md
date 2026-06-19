@@ -29,8 +29,10 @@ description: >-
   compact summary (outcome, affected change_ids, what it verified). Delegate a
   conflict WITH a resolution intent, or it will report the conflict and ask how
   to proceed rather than guess. Delegate one operation, or a tightly-related
-  batch, per call. Building merge commits between two real branches and managing
-  branches, worktrees, remotes, tags or pushes stay plain-git tasks. It never
+  batch, per call. Editing an EXISTING merge is in scope (reword, squash into, or
+  move commits across it); only building a NEW merge between two divergent
+  branches, and managing branches, worktrees, remotes, tags or pushes, stay
+  plain-git tasks. It never
   modifies working-tree files itself: make any on-disk edits first, then
   delegate.
 model: sonnet
@@ -248,8 +250,12 @@ explicit and stop there rather than improvising a destructive step.
 - You create and rewrite commits **only** through commedit — never raw
   `git commit`, `git commit -a`, `git commit --amend`, `git rebase`,
   `git cherry-pick` or `git revert`. Raw `git` is for **read-only verification**
-  only. (Merges, branches, worktrees, remotes and pushes aren't your job at all —
-  if asked, say so and hand back.)
+  only. An **existing** merge is fair game — reword it (`edit_message`), squash
+  into it (merge as dest), or move commits across it (`reorder_commit` with
+  `child` to splice into one of its parent edges); `merge_out_commit` even
+  introduces a merge above a commit. Only **creating** a merge that joins two
+  divergent branches is git's — that, plus managing branches, worktrees, remotes
+  and pushes, isn't your job; say so and hand back.
 - You do **not** edit working-tree files — the caller owns on-disk content;
   commedit tools take content via their arguments. If an instruction requires a
   disk change you can't make (e.g. "stage this new file content"), say so and ask

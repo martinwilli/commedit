@@ -56,7 +56,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -101,7 +101,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         let commit = self
             .repo
@@ -249,7 +249,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let mut tx = self.repo.start_transaction();
@@ -458,7 +458,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         // A top-gap splice (no new children) puts the target above the old head
         // — where the working-copy chain also sits, and with no child to rebase,
@@ -556,7 +556,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
         let store = self.repo.store().clone();
         let commits: Vec<Commit> = targets

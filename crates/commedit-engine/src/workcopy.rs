@@ -125,6 +125,13 @@ impl Repo {
     /// like `git add`, so only this first snapshot needs to name it; a path that is
     /// already tracked or absent on disk is a harmless no-op.
     pub fn snapshot_working_copy_tracking(&mut self, add_paths: &[String]) -> Result<()> {
+        // Off-worktree there is no working copy to snapshot: the on-disk tree
+        // belongs to a different (checked-out) branch and must not be folded into
+        // the edited branch's `@`. A silent no-op keeps the callers that snapshot
+        // defensively (open, session_changes, every mutation) working unchanged.
+        if !self.is_worktree_bound() {
+            return Ok(());
+        }
         // Catch up first if the caller moved git HEAD out of band (a plain
         // `git commit`): jj's view must contain the new tip before we can attach
         // `@` to it or rebase onto it. A no-op when already in sync.
@@ -261,6 +268,7 @@ impl Repo {
         path: &str,
         new_content: Option<&str>,
     ) -> Result<()> {
+        self.require_worktree("edit the working copy")?;
         crate::repo::catch_jj("editing the working copy", || {
             self.edit_working_copy_file_inner(change_hex, path, new_content)
         })
@@ -336,6 +344,7 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
+        self.require_worktree("commit the working copy")?;
         crate::repo::catch_jj("committing the working copy", || {
             self.commit_working_copy_inner(message, identity)
         })
@@ -368,7 +377,7 @@ impl Repo {
         let name = self.workspace.workspace_name().to_owned();
 
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let mut tx = self.repo.start_transaction();
@@ -434,6 +443,7 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
+        self.require_worktree("commit part of the working copy")?;
         crate::repo::catch_jj("committing part of the working copy", || {
             self.commit_working_copy_partial_inner(sel, message, identity)
         })
@@ -451,7 +461,7 @@ impl Repo {
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let mut tx = self.repo.start_transaction();
@@ -529,6 +539,7 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
+        self.require_worktree("commit a working-copy entry")?;
         crate::repo::catch_jj("committing a working-copy entry", || {
             self.commit_working_copy_entry_inner(change_hex, message, identity)
         })
@@ -585,7 +596,7 @@ impl Repo {
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let mut tx = self.repo.start_transaction();
@@ -765,6 +776,7 @@ impl Repo {
     /// object to graft back, so — unlike a dropped commit — a discarded entry is
     /// gone for good (not kept in the trash).
     pub fn drop_working_copy(&mut self, change_hex: Option<&str>) -> Result<()> {
+        self.require_worktree("discard the working copy")?;
         crate::repo::catch_jj("dropping the working copy", || {
             self.drop_working_copy_inner(change_hex)
         })
@@ -870,6 +882,11 @@ impl Repo {
     /// plain `git`), this falls back to just the leaf `@`, matching the
     /// pre-chain single-`@` behaviour. Empty when there is no working copy.
     pub(crate) fn working_copy_chain_ids(&self) -> Vec<CommitId> {
+        // Off-worktree there is no working copy on the edited branch: `@` is left
+        // on jj's root commit, which must never surface as uncommitted changes.
+        if !self.is_worktree_bound() {
+            return Vec::new();
+        }
         let Some(leaf) = self.working_copy_commit_id() else {
             return Vec::new();
         };
@@ -960,6 +977,9 @@ impl Repo {
     /// [`crate::history::history`] so the reorder/drop/squash index arithmetic is
     /// unaffected.
     pub fn working_copy_info(&self) -> Option<WorkingCopyInfo> {
+        if !self.is_worktree_bound() {
+            return None;
+        }
         let commit_id = self.working_copy_commit_id()?;
         let commit = self.repo.store().get_commit(&commit_id).ok()?;
         let changed_files = crate::diff::commit_changes(&self.repo, &commit_id)
@@ -979,6 +999,9 @@ impl Repo {
     /// changes". The UI prepends this to the conflict chain so a conflicted `@`
     /// is selectable and resolvable like any other commit.
     pub fn working_copy_commit_info(&self) -> Option<crate::history::CommitInfo> {
+        if !self.is_worktree_bound() {
+            return None;
+        }
         let id = self.working_copy_commit_id()?;
         let commit = self.repo.store().get_commit(&id).ok()?;
         let mut info = crate::history::CommitInfo::from_commit(&commit);

@@ -47,11 +47,16 @@ pub fn export_to_git(mut_repo: &mut MutableRepo) -> Result<()> {
 ///   * every ref jj creates — its `refs/jj/keep/*` GC anchors, its detached
 ///     HEAD, the bookmark it exports — lives here, **out of the user's `.git`**.
 ///
-/// The checked-out branch (or a detached HEAD) and its tip are seeded so jj's
-/// import sees the live history through the shared objects. The one branch ref
-/// jj later moves is mirrored back into the user's repo by
+/// The edited branch — `seed_branch` (the checked-out branch, or a different
+/// branch when editing off-worktree), or a detached HEAD when `None` — and its
+/// tip are seeded so jj's import sees that history through the shared objects.
+/// The one branch ref jj later moves is mirrored back into the user's repo by
 /// [`crate::repo::Repo::bridge_branch_to_git`].
-pub fn init_shared_git_dir(git_dir: &Path, workspace_root: &Path) -> Result<()> {
+pub fn init_shared_git_dir(
+    git_dir: &Path,
+    workspace_root: &Path,
+    seed_branch: Option<&str>,
+) -> Result<()> {
     let objects = git_objects_dir(workspace_root)?;
     // A known-valid bare layout (HEAD, config, refs/, …) for gix to open.
     let out = Command::new("git")
@@ -70,25 +75,35 @@ pub fn init_shared_git_dir(git_dir: &Path, workspace_root: &Path) -> Result<()> 
     std::fs::remove_dir_all(&local_objects)
         .with_context(|| format!("clearing {}", local_objects.display()))?;
     symlink_dir(&objects, &local_objects)?;
-    // Seed the checked-out branch / detached HEAD and its tip (resolvable now via
-    // the shared objects) so jj imports the current history.
-    seed_session_head(git_dir, workspace_root)
+    // Seed the edited branch / detached HEAD and its tip (resolvable now via the
+    // shared objects) so jj imports that history.
+    seed_session_head(git_dir, workspace_root, seed_branch)
 }
 
-/// Point the session git dir's checked-out branch ref (and HEAD) at the user
-/// repository's current tip, so a following jj import picks it up. The ODB is
-/// already shared, so the tip is resolvable. Run once by [`init_shared_git_dir`]
-/// at open, and again by the in-session catch-up
+/// Point the session git dir's edited-branch ref (and HEAD) at that branch's
+/// current tip in the user repository, so a following jj import picks it up. The
+/// ODB is already shared, so the tip is resolvable. `seed_branch` is the full ref
+/// to seed (the checked-out branch, or a different branch when editing
+/// off-worktree); `None` seeds a detached HEAD at the user's HEAD. Run once by
+/// [`init_shared_git_dir`] at open, and again by the in-session catch-up
 /// ([`crate::repo::Repo::sync_to_git_head`]) when the user moved HEAD out of band
 /// (a plain `git commit`): jj imports refs from *this* session-local dir, not the
-/// user's `.git`, so its branch ref must be re-pointed at the user's new tip
-/// before the import can see the new commit.
-pub fn seed_session_head(git_dir: &Path, workspace_root: &Path) -> Result<()> {
-    if let Some(tip) = head_commit(workspace_root) {
-        match head_branch(workspace_root) {
+/// user's `.git`, so its branch ref must be re-pointed at the new tip before the
+/// import can see the new commit.
+pub fn seed_session_head(
+    git_dir: &Path,
+    workspace_root: &Path,
+    seed_branch: Option<&str>,
+) -> Result<()> {
+    let tip = match seed_branch {
+        Some(branch) => ref_commit(workspace_root, branch),
+        None => head_commit(workspace_root),
+    };
+    if let Some(tip) = tip {
+        match seed_branch {
             Some(branch) => {
-                git_in_dir(git_dir, &["update-ref", &branch, &tip])?;
-                git_in_dir(git_dir, &["symbolic-ref", "HEAD", &branch])?;
+                git_in_dir(git_dir, &["update-ref", branch, &tip])?;
+                git_in_dir(git_dir, &["symbolic-ref", "HEAD", branch])?;
             }
             None => git_in_dir(git_dir, &["update-ref", "--no-deref", "HEAD", &tip])?,
         }
@@ -532,6 +547,69 @@ pub fn config_value(workspace_root: &Path, key: &str) -> Option<String> {
     }
     let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// The commit sha `ref_name` resolves to (a full ref like `refs/heads/feature`,
+/// or any rev-parse-able name), or `None` if it doesn't exist.
+pub fn ref_commit(workspace_root: &Path, ref_name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve a user-supplied branch name to its full local ref
+/// (`refs/heads/<name>`), verifying that such a branch exists. Accepts either the
+/// bare name or an already-full ref. Errors clearly when there is no such local
+/// branch, so a typo at open fails up front rather than producing an empty view.
+pub fn resolve_local_branch(workspace_root: &Path, name: &str) -> Result<String> {
+    let full = if name.starts_with("refs/heads/") {
+        name.to_string()
+    } else {
+        format!("refs/heads/{name}")
+    };
+    if ref_commit(workspace_root, &full).is_none() {
+        bail!("no local branch '{name}' in this repository");
+    }
+    Ok(full)
+}
+
+/// The worktree that currently has `branch` (a full ref like `refs/heads/feature`)
+/// checked out, if any — parsed from `git worktree list --porcelain`. commedit
+/// refuses to rewrite a branch that is live in another worktree: moving its ref
+/// would leave that worktree's HEAD/index pointing at an orphaned commit.
+pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("listing git worktrees")?;
+    if !out.status.success() {
+        bail!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            if b == branch {
+                return Ok(current);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The full ref name (e.g. `refs/heads/main`) HEAD symbolically points at, or

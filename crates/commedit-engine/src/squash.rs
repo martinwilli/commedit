@@ -376,6 +376,7 @@ impl Repo {
         dest: &CommitId,
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
+        self.require_worktree("fold the working copy into a commit")?;
         // Snapshot before resolving so the resolved id survives squash_into's own
         // (now no-op) snapshot — otherwise a churned leaf id would go stale.
         self.snapshot_working_copy()?;
@@ -397,6 +398,7 @@ impl Repo {
     /// like any other rewrite. The engine behind the GTK trash-row "restore to
     /// working tree" button and the second half of [`Self::drop_keeping_changes`].
     pub fn restore_to_working_copy(&mut self, source: &CommitId) -> Result<SaveOutcome> {
+        self.require_worktree("restore changes to the working tree")?;
         crate::repo::catch_jj("restoring the changes to the working copy", || {
             // Snapshot before resolving so the leaf id survives squash_into_inner's
             // own (now no-op) snapshot — otherwise a churned leaf id would go stale.
@@ -442,6 +444,7 @@ impl Repo {
         dest: &CommitId,
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
+        self.require_worktree("fold part of the working copy into a commit")?;
         crate::repo::catch_jj("folding part of the working copy", || {
             self.squash_working_copy_partial_into_inner(sel, dest, message)
         })
@@ -459,7 +462,7 @@ impl Repo {
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let store = self.repo.store().clone();
@@ -555,7 +558,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the rewrite.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         // jj's `squash_commits` wants the sources newest-first (reverse topo); the

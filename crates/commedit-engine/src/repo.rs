@@ -39,6 +39,14 @@ pub struct Repo {
     /// colocated layout stays invisible to plain git. `None` if HEAD was already
     /// detached.
     git_head_branch: Option<String>,
+    /// The branch (full ref name) whose history this session edits. Equals
+    /// [`Self::git_head_branch`] in the normal worktree-bound session; differs in
+    /// *off-worktree* mode, where the user opened a branch they have **not**
+    /// checked out. Off-worktree the session moves only this ref and never touches
+    /// HEAD, the index or the worktree (a branch you haven't checked out has no
+    /// working copy). `None` only on a detached HEAD with no branch selected. See
+    /// [`Self::is_worktree_bound`].
+    target_branch: Option<String>,
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
@@ -133,6 +141,24 @@ impl Repo {
         workspace_root: &Path,
         cache: crate::index_cache::IndexCache,
     ) -> Result<Self> {
+        Self::open_branch(workspace_root, cache, None)
+    }
+
+    /// Like [`Self::open_with_cache`], but edits the history of `branch` (a local
+    /// branch name) rather than the branch checked out in the worktree. When
+    /// `branch` is `None`, or names the checked-out branch, this is the ordinary
+    /// worktree-bound session. Otherwise it is an *off-worktree* session: the
+    /// session imports, rewrites and exports only that branch's ref, leaving HEAD,
+    /// the index and the on-disk worktree frozen — so there is no working copy
+    /// (working-copy operations are refused, see [`Self::is_worktree_bound`]).
+    ///
+    /// Refused when `branch` does not exist, or is checked out in *another*
+    /// worktree of this repo (rewriting it there would desync that worktree).
+    pub fn open_branch(
+        workspace_root: &Path,
+        cache: crate::index_cache::IndexCache,
+        branch: Option<&str>,
+    ) -> Result<Self> {
         // Resolve a path inside the repo to the repository root that encloses it
         // (walking up to `.git`); bails if there is no git repo above it.
         let workspace_root = find_git_root(workspace_root)?;
@@ -141,6 +167,33 @@ impl Repo {
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
         let git_head_branch = crate::transparency::head_branch(workspace_root);
+        // The branch this session edits: the explicitly requested one (resolved to
+        // a full ref, verified to exist), else the checked-out branch.
+        let target_branch = match branch {
+            Some(name) => Some(crate::transparency::resolve_local_branch(
+                workspace_root,
+                name,
+            )?),
+            None => git_head_branch.clone(),
+        };
+        // Off-worktree (editing a branch that isn't checked out here): refuse if it
+        // is live in another worktree — moving its ref would orphan that checkout.
+        if target_branch != git_head_branch {
+            if let Some(target) = target_branch.as_deref() {
+                if let Some(other) =
+                    crate::transparency::worktree_for_branch(workspace_root, target)?
+                {
+                    let short = target.strip_prefix("refs/heads/").unwrap_or(target);
+                    anyhow::bail!(
+                        "branch '{short}' is checked out in worktree {}; editing its \
+                         history there would corrupt that worktree. Open commedit in \
+                         that worktree (without a branch argument), or detach its HEAD \
+                         first.",
+                        other.display()
+                    );
+                }
+            }
+        }
 
         // Acquire the cache slot (a shared lock held for the session) and run
         // opportunistic eviction while the base is resolved.
@@ -164,25 +217,38 @@ impl Repo {
         let (workdir, workspace, repo) = match &cache_handle {
             Some(handle) if handle.valid => {
                 let workdir = new_workdir()?;
-                let primed = handle
-                    .prime(workdir.path())
-                    .and_then(|()| Self::load_detached(&settings, workspace_root, workdir.path()));
+                let primed = handle.prime(workdir.path()).and_then(|()| {
+                    Self::load_detached(
+                        &settings,
+                        workspace_root,
+                        workdir.path(),
+                        target_branch.as_deref(),
+                    )
+                });
                 match primed {
                     Ok((workspace, repo)) => (workdir, workspace, repo),
                     Err(e) => {
                         eprintln!("commedit: index cache unusable ({e}); rebuilding from scratch");
                         handle.invalidate();
                         let workdir = new_workdir()?;
-                        let (workspace, repo) =
-                            Self::init_detached(&settings, workspace_root, workdir.path())?;
+                        let (workspace, repo) = Self::init_detached(
+                            &settings,
+                            workspace_root,
+                            workdir.path(),
+                            target_branch.as_deref(),
+                        )?;
                         (workdir, workspace, repo)
                     }
                 }
             }
             _ => {
                 let workdir = new_workdir()?;
-                let (workspace, repo) =
-                    Self::init_detached(&settings, workspace_root, workdir.path())?;
+                let (workspace, repo) = Self::init_detached(
+                    &settings,
+                    workspace_root,
+                    workdir.path(),
+                    target_branch.as_deref(),
+                )?;
                 (workdir, workspace, repo)
             }
         };
@@ -192,6 +258,7 @@ impl Repo {
             repo,
             settings,
             git_head_branch,
+            target_branch,
             pending: None,
             session_op: None,
             session_head: None,
@@ -202,20 +269,26 @@ impl Repo {
             index_cache: cache_handle,
         };
         this.import_git()?;
-        this.reattach_head()?;
-        // A freshly-initialized jj workspace has @ sitting on the empty root
-        // commit; reattach it onto the just-imported git HEAD (a single @ on the
-        // tip) before snapshotting, so the working copy is based on the real
-        // history rather than nothing.
-        this.collapse_working_copy_chain()?;
-        // Record any uncommitted changes into @ so they show in the history and
-        // ride through rewrites from the start.
-        this.snapshot_working_copy()?;
+        // The worktree-bound tail only makes sense when the edited branch *is* the
+        // checked-out one. Off-worktree there is no working copy to anchor and the
+        // user's HEAD must stay put, so skip re-attaching HEAD, collapsing the @
+        // chain, and snapshotting the disk — the session edits commits only.
+        if this.is_worktree_bound() {
+            this.reattach_head()?;
+            // A freshly-initialized jj workspace has @ sitting on the empty root
+            // commit; reattach it onto the just-imported git HEAD (a single @ on
+            // the tip) before snapshotting, so the working copy is based on the
+            // real history rather than nothing.
+            this.collapse_working_copy_chain()?;
+            // Record any uncommitted changes into @ so they show in the history and
+            // ride through rewrites from the start.
+            this.snapshot_working_copy()?;
+        }
         // Remember the fully-initialized session-start state (after the working
         // copy snapshot, so it includes the original uncommitted changes) so
         // `revert_all` can roll the whole session back to it.
         this.session_op = Some(this.repo.operation().clone());
-        this.session_head = this.head_commit();
+        this.session_head = this.edited_tip();
         Ok(this)
     }
 
@@ -257,6 +330,7 @@ impl Repo {
         settings: &UserSettings,
         workspace_root: &Path,
         state_dir: &Path,
+        seed_branch: Option<&str>,
     ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
         let repo_dir = state_dir.join("repo");
         std::fs::create_dir(&repo_dir).context("creating jj repo dir")?;
@@ -266,7 +340,7 @@ impl Repo {
         // The git dir jj writes into: session-local, with an object store shared
         // with the user's repo but private refs.
         let git_dir = state_dir.join("git");
-        crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
+        crate::transparency::init_shared_git_dir(&git_dir, workspace_root, seed_branch)
             .context("setting up the session git dir")?;
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|
@@ -353,6 +427,7 @@ impl Repo {
         settings: &UserSettings,
         workspace_root: &Path,
         state_dir: &Path,
+        seed_branch: Option<&str>,
     ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
         use jj_lib::repo::{RepoLoader, StoreFactories};
 
@@ -363,7 +438,7 @@ impl Repo {
         // Fresh session-local git dir; the primed `repo/store/git_target` is the
         // relative `RELATIVE_GIT_DIR`, so it resolves to this newly-created dir.
         let git_dir = state_dir.join("git");
-        crate::transparency::init_shared_git_dir(&git_dir, workspace_root)
+        crate::transparency::init_shared_git_dir(&git_dir, workspace_root, seed_branch)
             .context("setting up the session git dir")?;
 
         let loader =
@@ -405,13 +480,64 @@ impl Repo {
         Ok(())
     }
 
-    /// The originally checked-out branch as a jj bookmark name (its
-    /// `refs/heads/` prefix stripped), or `None` if HEAD was detached when the
-    /// repo was opened.
+    /// The branch this session edits as a jj bookmark name (its `refs/heads/`
+    /// prefix stripped), or `None` on a detached HEAD with no branch selected.
+    /// This is the bookmark imported, rewritten and exported — the checked-out
+    /// branch in the normal session, a different branch when editing off-worktree.
     pub(crate) fn current_bookmark(&self) -> Option<RefNameBuf> {
-        self.git_head_branch
+        self.target_branch
             .as_ref()
             .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).into())
+    }
+
+    /// Whether this session edits the branch checked out in the worktree — so the
+    /// working copy, HEAD and git index participate in every rewrite. `false` in
+    /// *off-worktree* mode (the user opened a branch they have not checked out),
+    /// where only the edited branch's ref moves and HEAD/index/worktree stay
+    /// frozen, and there is consequently no working copy. A detached-HEAD session
+    /// with no branch argument is worktree-bound (`None == None`).
+    pub fn is_worktree_bound(&self) -> bool {
+        self.target_branch == self.git_head_branch
+    }
+
+    /// The edited branch's short name (its `refs/heads/` prefix stripped), or
+    /// `None` on a detached HEAD with no branch selected. For UI/MCP labelling.
+    pub fn target_branch_name(&self) -> Option<&str> {
+        self.target_branch
+            .as_deref()
+            .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
+    }
+
+    /// Refuse a working-copy operation when editing off-worktree: a branch you
+    /// have not checked out has no working copy, so committing/squashing/splitting
+    /// /discarding uncommitted changes is meaningless. `op` names the action for
+    /// the message (e.g. "commit the working copy").
+    pub(crate) fn require_worktree(&self, op: &str) -> Result<()> {
+        if !self.is_worktree_bound() {
+            let branch = self.target_branch_name().unwrap_or("the selected branch");
+            anyhow::bail!(
+                "branch '{branch}' is not checked out, so it has no working copy; \
+                 cannot {op}. Check out the branch (or open commedit without a branch \
+                 argument) to edit the working copy."
+            );
+        }
+        Ok(())
+    }
+
+    /// The tip commit (hex) of the branch being edited: the target branch's ref
+    /// tip when off-worktree, else git HEAD. This is the pre-rewrite
+    /// compare-and-swap precondition passed as `old_head` into the mutation tail,
+    /// and the basis for [`Self::head_commit_id`]. Tracks the ref as it moves: a
+    /// clean save advances the edited branch (HEAD when bound, the target ref
+    /// off-worktree), so a later read sees the new tip.
+    pub(crate) fn edited_tip(&self) -> Option<String> {
+        if self.is_worktree_bound() {
+            self.head_commit()
+        } else {
+            self.target_branch
+                .as_deref()
+                .and_then(|b| crate::transparency::ref_commit(self.workspace.workspace_root(), b))
+        }
     }
 
     /// Refuse a rewrite whose transaction leaves the checked-out branch's
@@ -439,11 +565,7 @@ impl Repo {
         if !mut_repo.get_local_bookmark(&name).has_conflict() {
             return Ok(());
         }
-        let branch = self
-            .git_head_branch
-            .as_deref()
-            .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
-            .unwrap_or("the current branch");
+        let branch = self.target_branch_name().unwrap_or("the current branch");
         anyhow::bail!(
             "branch '{branch}' is in a conflicted state in jj, so commedit can't \
              rewrite its history: jj cannot export a conflicted bookmark to a git \
@@ -497,28 +619,44 @@ impl Repo {
             return Ok(Vec::new());
         };
         // Fold any on-disk edits into @ so the review reflects the real tree.
+        // (A no-op off-worktree, where there is no working copy.)
         self.snapshot_working_copy()?;
         let store = self.repo.store().clone();
 
-        // Current tree: prefer @ (includes uncommitted changes), else HEAD.
-        let Some(new_id) = self
-            .working_copy_commit_id()
-            .or_else(|| self.head_commit_id())
-        else {
+        // Off-worktree there is no working copy on the edited branch, so compare
+        // the branch tip now against its session-start tip directly. Worktree-bound
+        // prefer @ (it includes uncommitted changes), else HEAD.
+        let (new_id, old_id) = if self.is_worktree_bound() {
+            let Some(new_id) = self
+                .working_copy_commit_id()
+                .or_else(|| self.head_commit_id())
+            else {
+                return Ok(Vec::new());
+            };
+            // Session-start tree: the @ recorded in the session-start view, or its
+            // HEAD where there was none (detached HEAD).
+            let view =
+                pollster::block_on(session_op.view()).context("reading the session-start view")?;
+            let old_id = view
+                .get_wc_commit_id(self.workspace.workspace_name())
+                .cloned()
+                .or_else(|| {
+                    self.session_head
+                        .as_deref()
+                        .and_then(CommitId::try_from_hex)
+                });
+            (Some(new_id), old_id)
+        } else {
+            let new_id = self.current_head_in_jj();
+            let old_id = self
+                .session_head
+                .as_deref()
+                .and_then(CommitId::try_from_hex);
+            (new_id, old_id)
+        };
+        let Some(new_id) = new_id else {
             return Ok(Vec::new());
         };
-        // Session-start tree: the @ recorded in the session-start view, or its
-        // HEAD where there was none (detached HEAD).
-        let view =
-            pollster::block_on(session_op.view()).context("reading the session-start view")?;
-        let old_id = view
-            .get_wc_commit_id(self.workspace.workspace_name())
-            .cloned()
-            .or_else(|| {
-                self.session_head
-                    .as_deref()
-                    .and_then(CommitId::try_from_hex)
-            });
         let Some(old_id) = old_id else {
             return Ok(Vec::new());
         };
@@ -546,24 +684,29 @@ impl Repo {
     /// Logs to stderr when it intervenes, so any remaining leak is visible
     /// rather than silently corrupting an unrelated (e.g. backup) branch.
     pub(crate) fn protect_unrelated_heads(&self, before: &BTreeMap<String, String>) {
+        // Exempt the *edited* branch (the one this session legitimately moves) and
+        // protect every other local branch — including the checked-out one when
+        // editing off-worktree.
         let restored = crate::transparency::restore_unrelated_heads(
             self.workspace.workspace_root(),
-            self.git_head_branch.as_deref(),
+            self.target_branch.as_deref(),
             before,
         );
         if !restored.is_empty() {
             eprintln!(
                 "commedit: reverted unintended move of branch(es) {}; \
-                 only the current branch is rewritten",
+                 only the edited branch is rewritten",
                 restored.join(", ")
             );
         }
     }
 
-    /// HEAD as a [`CommitId`] — the tip of the branch being edited, used to scope
-    /// reordering to the current branch's linear chain.
+    /// The tip of the branch being edited as a [`CommitId`] — git HEAD in the
+    /// normal session, the target branch's ref tip when editing off-worktree —
+    /// used to seed the history walk and scope reordering to that branch's linear
+    /// chain.
     pub fn head_commit_id(&self) -> Option<CommitId> {
-        CommitId::try_from_hex(self.head_commit()?)
+        CommitId::try_from_hex(self.edited_tip()?)
     }
 
     /// The virtual root commit's id — the parent the oldest real commit reports.
@@ -651,7 +794,10 @@ impl Repo {
             return;
         };
         let root = self.workspace.workspace_root();
-        let (ref_name, no_deref) = match self.git_head_branch.as_deref() {
+        // Move the *edited* branch's ref. Off-worktree this is a branch other than
+        // the checked-out one, moved by name (never `HEAD`); worktree-bound it is
+        // the checked-out branch, or `HEAD --no-deref` on a detached HEAD.
+        let (ref_name, no_deref) = match self.target_branch.as_deref() {
             Some(branch) => (branch, false),
             None => ("HEAD", true),
         };
@@ -749,6 +895,12 @@ impl Repo {
         if self.is_pending() {
             return Ok(false);
         }
+        // Off-worktree the live HEAD/worktree belong to a different branch and are
+        // irrelevant to the edited one; an out-of-band move of the edited branch
+        // needs an explicit `reload_repo` rather than a HEAD catch-up.
+        if !self.is_worktree_bound() {
+            return Ok(false);
+        }
         let live_branch = crate::transparency::head_branch(self.workspace.workspace_root());
         if live_branch != self.git_head_branch {
             anyhow::bail!(
@@ -767,7 +919,11 @@ impl Repo {
         // jj imports refs from the session-local git dir, not the user's `.git`,
         // so re-point its branch ref at the user's new tip before importing.
         let git_dir = self._workdir.path().join("git");
-        crate::transparency::seed_session_head(&git_dir, self.workspace.workspace_root())?;
+        crate::transparency::seed_session_head(
+            &git_dir,
+            self.workspace.workspace_root(),
+            self.target_branch.as_deref(),
+        )?;
         self.import_git()?;
         Ok(true)
     }

@@ -324,7 +324,7 @@ impl Repo {
         // Capture the on-disk working copy into @ so it rebases with the insert.
         self.snapshot_working_copy()?;
         let pre_op = self.repo.operation().clone();
-        let old_head = self.head_commit();
+        let old_head = self.edited_tip();
         let head_id = self.head_commit_id();
         let heads = self.snapshot_heads();
 

@@ -584,24 +584,29 @@ pub fn plan_reorder_set_candidates(
     out
 }
 
-/// Plan grafting a trashed commit (one not currently in `commits`) back into
-/// the history at display gap `to`: like [`plan_reorder_candidates`], one
-/// candidate per destination line, but without the own-line no-op cases (the
-/// restored commit has no line in the graph). Empty for an out-of-range drop, a
-/// commit that is in the history after all, or a stale `layout`.
-pub fn plan_restore_candidates(
+/// Plan splicing a commit that is *not* currently in `commits` into the history
+/// at display gap `to`: like [`plan_reorder_candidates`], one candidate per
+/// destination line, but without the own-line no-op cases (the inserted commit
+/// has no line in the graph yet). Used both to graft a trashed commit back
+/// ([`plan_restore_candidates`]) and to cherry-pick a foreign commit — e.g. one
+/// dragged in from another window's branch — at a gap. Empty for an
+/// out-of-range drop, a `target` that is in the history after all, or a stale
+/// `layout`. The candidates carry [`ReorderMove::new_parents`]/`new_children`,
+/// which is all a cherry-pick needs; its `target`/`new_tip` describe a *move*
+/// and are ignored when the apply creates a fresh commit instead.
+pub fn plan_insert_candidates(
     commits: &[CommitInfo],
     head: &CommitId,
     layout: &GraphLayout,
     root: &CommitId,
-    restored: &CommitInfo,
+    target: &CommitId,
     to: usize,
 ) -> Vec<ReorderCandidate> {
     let n = commits.len();
     if n == 0 || to > n || layout.boundaries.len() != n {
         return Vec::new();
     }
-    if commits.iter().any(|c| c.id == restored.id) {
+    if commits.iter().any(|c| c.id == *target) {
         return Vec::new();
     }
     let branch = branch_commits(commits, head);
@@ -611,7 +616,21 @@ pub fn plan_restore_candidates(
         layout,
         root,
     };
-    splice_candidates(&ctx, &branch, &restored.id, head, to)
+    splice_candidates(&ctx, &branch, target, head, to)
+}
+
+/// Plan grafting a trashed commit (one not currently in `commits`) back into
+/// the history at display gap `to`. A thin wrapper over [`plan_insert_candidates`]
+/// keyed on the restored commit's id.
+pub fn plan_restore_candidates(
+    commits: &[CommitInfo],
+    head: &CommitId,
+    layout: &GraphLayout,
+    root: &CommitId,
+    restored: &CommitInfo,
+    to: usize,
+) -> Vec<ReorderCandidate> {
+    plan_insert_candidates(commits, head, layout, root, &restored.id, to)
 }
 
 /// The commit id of the display row `index`, if it can be dropped from history:
@@ -633,9 +652,9 @@ pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Optio
 #[cfg(test)]
 mod tests {
     use super::{
-        format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_reorder_candidates,
-        plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
-        ReorderMove, ReorderSetCandidate, ReorderSetMove,
+        format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_insert_candidates,
+        plan_reorder_candidates, plan_reorder_set_candidates, plan_restore_candidates, CommitInfo,
+        ReorderCandidate, ReorderMove, ReorderSetCandidate, ReorderSetMove,
     };
     use crate::graph::compute_graph;
     use jj_lib::backend::{ChangeId, CommitId};
@@ -1017,6 +1036,27 @@ mod tests {
     fn restoring_a_commit_already_in_the_history_is_refused() {
         let h = history();
         assert_eq!(restore_cands(&h, 3, &ci(2, 1), 0), vec![]);
+    }
+
+    #[test]
+    fn inserting_a_foreign_commit_by_id_plans_the_same_slot() {
+        // The cherry-pick entry point takes a bare id (a commit from elsewhere,
+        // with no row in this graph) and plans the same splice the restore
+        // wrapper does — here grafting `9` between `2` and `1`.
+        let h = history();
+        let g = compute_graph(&h, &cid(0));
+        assert_eq!(
+            plan_insert_candidates(&h, &cid(3), &g, &cid(0), &cid(9), 2),
+            vec![ReorderCandidate {
+                mv: mv(9, &[1], &[2], 3),
+                lane: 0
+            }]
+        );
+        // An id that is already on the branch can't be inserted again.
+        assert_eq!(
+            plan_insert_candidates(&h, &cid(3), &g, &cid(0), &cid(2), 2),
+            vec![]
+        );
     }
 
     fn set_of(ids: &[u8]) -> HashSet<CommitId> {

@@ -600,6 +600,21 @@ impl Repo {
         self.workspace.workspace_root()
     }
 
+    /// A stable identity for this repository's object store, shared by every
+    /// worktree and branch view of it: the SHA-256 of the canonical objects-dir
+    /// path (the same key the index cache uses, see [`crate::index_cache`]). Two
+    /// commedit windows opened on the same repository — whichever branch each
+    /// edits — produce the same key; two different repositories produce different
+    /// keys. A frontend offering cross-instance commit drags compares it to tell a
+    /// sibling-branch window (whose commit lives in the shared ODB and can be
+    /// cherry-picked, see [`Self::lookup_commit_in_store`]) from a foreign repo
+    /// (whose objects this session can't reach). `None` if the object store can't
+    /// be located.
+    pub fn object_store_key(&self) -> Option<String> {
+        let objects = crate::transparency::git_objects_dir(self.workspace_root()).ok()?;
+        Some(crate::index_cache::key_for(&objects))
+    }
+
     /// The git HEAD commit (hex) captured at session start — the state
     /// [`Repo::revert_all`] restores. Shown in the UI's revert confirmation.
     pub fn session_start_head_hex(&self) -> Option<String> {

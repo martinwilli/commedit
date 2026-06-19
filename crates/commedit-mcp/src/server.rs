@@ -64,8 +64,10 @@ a commit. commedit rewrites in place and rebases the descendants for you, on any
 commit reachable from HEAD (not just the tip), so reach for it instead of \
 `git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert`. \
 merge_out_commit can introduce a merge above a commit, to organize a linear \
-history into a branchy one; building a merge between two real branches, and \
-managing branches, worktrees or remotes, stay plain-git tasks too. (commedit \
+history into a branchy one, and an EXISTING merge can be reworded (edit_message), \
+squashed into, or have commits moved across it (reorder_commit, using `child` to \
+splice into a parent edge); only building a NEW merge between two divergent \
+branches, and managing branches, worktrees or remotes, stay plain-git tasks. (commedit \
 imports git state at startup but catches up automatically on the next tool call \
 when you commit on top of HEAD with plain git — so a plain commit needs no reload. \
 reload_repo is only for changes it can't absorb in place: a branch switch, or \

@@ -112,8 +112,9 @@ fn default_base() -> Option<PathBuf> {
 /// the canonical objects-dir path. All worktrees of one repo share the objects dir
 /// (hence one entry), which is exactly right — jj's index is additive over commit
 /// ids, so accumulating several branches' commits in one index just maximizes
-/// reuse.
-fn key_for(objects_dir: &Path) -> String {
+/// reuse. Also the stable cross-process repository identity behind
+/// [`crate::repo::Repo::object_store_key`].
+pub(crate) fn key_for(objects_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(objects_dir.as_os_str().as_encoded_bytes());
     let digest = hasher.finalize();

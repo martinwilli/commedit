@@ -63,6 +63,9 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
   `fixup!`/`squash!`/`amend!` prefixes), or drop a commit.
 - **`insert-and-revert`** — add to history: create a commit and splice it
   anywhere in the graph, revert a commit, or cherry-pick one from another branch.
+- **`resolve-conflicts`** — when a rewrite's rebase conflicts, commedit holds it
+  back *in full* (nothing conflicted ever reaches git); resolve the deferred
+  conflicts file-by-file, oldest commit first, or abort.
 - **`work-in-worktree`** — reshape a branch's history isolated in a `git
   worktree`, leaving the main checkout untouched: create the worktree and point
   commedit at it with `reload_repo`'s `path` (the server follows the retarget, not

@@ -74,12 +74,10 @@ reorder or drop it later in one call, and descendants rebase automatically.
 
 ## When things go sideways
 
-- A rewrite whose rebase conflicts returns `status=conflicts` and is held back **in
-  full** — git history, HEAD and the working tree stay untouched until it settles.
-  Resolve the **oldest** conflicted commit first (`read_conflict` each file, remove
-  all markers, `resolve_conflicts`); fixing the earliest often auto-clears its
-  descendants. `abort_rewrite` discards the held rewrite. No other mutation runs
-  while one is pending.
+- **A conflicting rewrite is held back in full** — `status: conflicts`, with git
+  history, HEAD and the working tree untouched until it settles, and no other
+  mutation running meanwhile. Resolving it oldest-first, the binary/structural
+  cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - A plain `git commit` on top of HEAD needs **no** `reload_repo` — the commedit
   session catches up to it automatically on the next tool call. Reserve `reload_repo`
   for out-of-band changes it can't absorb in place: a **branch switch**, or history

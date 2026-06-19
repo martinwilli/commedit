@@ -127,9 +127,14 @@ reflex.
   default follows source's autosquash prefix. `message` sets dest's message
   verbatim. A merge can be a dest but never a source.
 - Remove: `drop_commit` (goes to trash, recoverable). Restore: `restore_commit`.
-- `split_commit` exists but is **error-prone** (you must hand over full retained
-  file contents) — avoid it; carve with partial `commit_working_copy` /
-  `squash_working_copy` selections instead, and say so if asked to split.
+- `split_commit` splits a commit *already in history* (working-copy carving only
+  helps at the tip). `files` is the whole content to KEEP per changed path — to
+  move a file's change OUT to the new commit, pass that file at its PARENT
+  (pre-commit) content (`show_commit` with `include_contents` gives you that); a
+  changed file you omit stays put. The footgun is listing the kept file at its
+  *current* content: that changes nothing, so it's refused rather than silently
+  leaving the new commit empty. For changes *not yet committed*, carve forward
+  with partial `commit_working_copy` / `squash_working_copy` selections instead.
 
 **Add to history**
 - `create_commit(message, files, new_parent?)` — a new commit from whole-file

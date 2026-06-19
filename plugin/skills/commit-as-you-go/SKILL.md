@@ -71,10 +71,14 @@ reorder or drop it later in one call, and descendants rebase automatically.
    `commit_working_copy` (run `show_commit` on the working-copy entry first to read
    each file's numbered hunks), then commit or fold the rest. That is why eager
    commits mean you rarely need to split. Splitting a commit *already in history*
-   is the hard case — `split_commit` is the only tool for it, but it makes you
-   hand over the full retained file contents, so it's error-prone. Needing it is
-   the signal you should have carved earlier; avoid it where you can, and delegate
-   it to the `commedit-operator` subagent when you can't.
+   is the hard case — `split_commit` is the only tool for it. Its `files` is the
+   whole content to KEEP per changed path: to move a file's change *out* to the
+   new commit, pass that file at its PARENT (pre-commit) content (`show_commit`
+   with `include_contents` gives it); a changed file you omit stays put. The
+   classic mistake — listing the file to keep at its current content — changes
+   nothing and is refused rather than landing an empty split. Needing this at all
+   is the signal you should have carved earlier; delegate it to the
+   `commedit-operator` subagent when the split is non-trivial.
 
 ## When things go sideways
 

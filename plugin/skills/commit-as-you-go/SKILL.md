@@ -65,26 +65,36 @@ reorder or drop it later in one call, and descendants rebase automatically.
 5. **Address commits by `change_id`, not sha.** Shas churn on every rewrite;
    change_ids are stable, so you can chain edits without re-running `list_history`.
 
-6. **Avoid `split_commit`.** It makes you hand over the full retained file
-   contents — error-prone. Needing it is the signal you should have committed more
-   eagerly. If you must carve an existing pile, peel subsets with the
-   `paths` / `hunks` / `patches` selection on `commit_working_copy` /
-   `squash_working_copy` (run `show_commit` on the working-copy entry first to read
-   each file's numbered hunks).
+6. **Splitting — carve forward, don't split back.** Carving a pile you have
+   *not yet committed* is the easy, recommended split: commit part of the working
+   copy now with the `paths` / `hunks` / `patches` selection on
+   `commit_working_copy` (run `show_commit` on the working-copy entry first to read
+   each file's numbered hunks), then commit or fold the rest. That is why eager
+   commits mean you rarely need to split. Splitting a commit *already in history*
+   is the hard case — `split_commit` is the only tool for it, but it makes you
+   hand over the full retained file contents, so it's error-prone. Needing it is
+   the signal you should have carved earlier; avoid it where you can, and delegate
+   it to the `commedit-operator` subagent when you can't.
 
 ## When things go sideways
 
-- A rewrite whose rebase conflicts returns `status=conflicts` and is held back **in
-  full** — git history, HEAD and the working tree stay untouched until it settles.
-  Resolve the **oldest** conflicted commit first (`read_conflict` each file, remove
-  all markers, `resolve_conflicts`); fixing the earliest often auto-clears its
-  descendants. `abort_rewrite` discards the held rewrite. No other mutation runs
-  while one is pending.
+- **A conflicting rewrite is held back in full** — `status: conflicts`, with git
+  history, HEAD and the working tree untouched until it settles, and no other
+  mutation running meanwhile. Resolving it oldest-first, the binary/structural
+  cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - A plain `git commit` on top of HEAD needs **no** `reload_repo` — the commedit
   session catches up to it automatically on the next tool call. Reserve `reload_repo`
   for out-of-band changes it can't absorb in place: a **branch switch**, or history
   **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
   trash and op-log, so don't run it reflexively).
-- The session is a safety net: every landed change is a recorded operation
-  (`list_operations`, `undo` / `redo`, `jump_to_operation`). The only
-  unrecoverable action is `discard_working_copy`.
+- **Off-worktree, this loop doesn't apply.** When commedit edits a branch you have
+  *not* checked out (`reload_repo`'s `branch`, or launched as `<path> <branch>`),
+  there is **no working copy**: no plain `git commit` to crystallize, and the
+  `commit_working_copy` / `squash_working_copy` / `discard_working_copy` tools are
+  refused. You edit the branch's existing commits directly instead. (This is a
+  different thing from the `work-in-worktree` skill, where you *create* a worktree
+  and keep a live working copy in it.)
+- **Safety net & review.** Every landed change is a recorded operation you can
+  walk back, dropped commits stay recoverable, and the session is one inspectable
+  diff — stepping back, reviewing, or recovering is the `review-and-recover`
+  skill. (`discard_working_copy` is the one irreversible action.)

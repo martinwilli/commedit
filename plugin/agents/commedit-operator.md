@@ -2,35 +2,42 @@
 name: commedit-operator
 description: >-
   Delegate COMPLEX history editing here — work that is exploratory, multi-step,
-  conflict-prone, or verbose. For a SINGLE mutation you can address directly (you
-  already hold the change_id or a clear ref) and expect to land clean, drive the
-  commedit MCP tool YOURSELF instead: each result is self-verifying — it returns
-  the new change_id, the reshaped topology, and (for working-copy commits) the
-  remaining uncommitted changes — so a one-shot reword / re-date / edit-one-file /
-  reorder / squash / drop / create / revert / cherry-pick / merge-out needs no
-  subagent and no follow-up read. Reach for THIS agent when the job is a loop, a
-  search, or a conflict: resolving a pending conflict (its signature job); finding
-  the right commit or routing an autosquash by reading several diffs; an open-ended
-  restructuring sequence (tidy a branch for review, re-date a whole range,
-  linearize or branchify); the error-prone split_commit; or any operation that
-  would otherwise dump large diffs or history into your own context. It works on
-  any commit reachable from HEAD (not just the tip), rebases descendants
-  automatically, and verifies the result. A plain new commit on top of HEAD is
-  never for this agent — that needs no rebase (use raw `git add` / `git commit`,
-  or commit_working_copy to stay in-session). Hand it the WHAT — "resolve the
-  pending conflict", "squash the fixup into Y across this messy range", "re-date
-  the whole feature branch", "find where this fix belongs and fold it in", "reorder
-  these four into a logical sequence" — and it picks the tools, addresses by
-  change_id, performs the action, confirms it, and returns a compact summary
-  (outcome, affected change_ids, what it verified). It owns every commedit
-  interaction detail — change_id addressing, the smallest-tool choice, conflict
-  holds, the undo/abort safety net. Delegate one operation, or a tightly-related
-  batch, per call. Building merge commits between two real branches and managing
-  branches, worktrees, remotes, tags or pushes stay plain-git tasks. It never
-  modifies working-tree files itself: make any on-disk edits first, then delegate.
+  conflict-prone, or verbose, or that would otherwise dump large diffs or
+  history into your own context. For a SINGLE mutation you can address directly
+  (you already hold the change_id or a clear ref), drive the commedit MCP tool
+  YOURSELF instead: each result is self-verifying — it returns the new
+  change_id, the reshaped topology, and (for working-copy commits) the remaining
+  uncommitted changes — so a one-shot reword / re-date / edit-one-file / reorder
+  / squash / drop / create / revert / cherry-pick / merge-out needs no subagent
+  and no follow-up read. Self-drive the ATTEMPT, but delegate the FALLOUT: if a
+  mutation you drove comes back `status: conflicts` (held, git frozen), hand the
+  held conflict to THIS agent rather than working the resolution loop in your
+  own context. Reach for it whenever the job is a loop, a search, or a conflict:
+  resolving a pending conflict (its signature job — while one is held no other
+  mutation runs); finding the right commit or routing an autosquash by reading
+  several diffs; an open-ended restructuring sequence (tidy a branch for review,
+  re-date a whole range, linearize or branchify); or splitting a commit (it
+  carves with working-copy selections rather than the error-prone split_commit).
+  It works on any commit reachable from HEAD (not just the tip), rebases
+  descendants automatically, and verifies the result. A plain new commit on top
+  of HEAD is never for this agent — that needs no rebase (use raw `git add` /
+  `git commit`, or commit_working_copy to stay in-session). Hand it the WHAT —
+  "resolve the pending conflict", "squash the fixup into Y across this messy
+  range", "re-date the whole feature branch", "find where this fix belongs and
+  fold it in", "reorder these four into a logical sequence" — and it picks the
+  tools, addresses by change_id, performs the action, confirms it, and returns a
+  compact summary (outcome, affected change_ids, what it verified). Delegate a
+  conflict WITH a resolution intent, or it will report the conflict and ask how
+  to proceed rather than guess. Delegate one operation, or a tightly-related
+  batch, per call. Editing an EXISTING merge is in scope (reword, squash into, or
+  move commits across it); only building a NEW merge between two divergent
+  branches, and managing branches, worktrees, remotes, tags or pushes, stay
+  plain-git tasks. It never
+  modifies working-tree files itself: make any on-disk edits first, then
+  delegate.
 model: sonnet
 color: cyan
-tools: mcp__plugin_commedit_commedit__list_history, mcp__plugin_commedit_commedit__show_commit, mcp__plugin_commedit_commedit__show_graph, mcp__plugin_commedit_commedit__working_copy_status, mcp__plugin_commedit_commedit__session_diff, mcp__plugin_commedit_commedit__list_trash, mcp__plugin_commedit_commedit__list_operations, mcp__plugin_commedit_commedit__pending_status, mcp__plugin_commedit_commedit__suggest_squash_targets, mcp__plugin_commedit_commedit__read_conflict, mcp__plugin_commedit_commedit__edit_message, mcp__plugin_commedit_commedit__replace_in_message, mcp__plugin_commedit_commedit__edit_identity, mcp__plugin_commedit_commedit__replace_in_file, mcp__plugin_commedit_commedit__replace_files, mcp__plugin_commedit_commedit__edit_commits, mcp__plugin_commedit_commedit__reorder_commit, mcp__plugin_commedit_commedit__squash_commit, mcp__plugin_commedit_commedit__split_commit, mcp__plugin_commedit_commedit__drop_commit, mcp__plugin_commedit_commedit__restore_commit, mcp__plugin_commedit_commedit__create_commit, mcp__plugin_commedit_commedit__revert_commit, mcp__plugin_commedit_commedit__cherry_pick_commit, mcp__plugin_commedit_commedit__merge_out_commit, mcp__plugin_commedit_commedit__commit_working_copy, mcp__plugin_commedit_commedit__squash_working_copy, mcp__plugin_commedit_commedit__discard_working_copy, mcp__plugin_commedit_commedit__resolve_conflicts, mcp__plugin_commedit_commedit__abort_rewrite, mcp__plugin_commedit_commedit__undo, mcp__plugin_commedit_commedit__redo, mcp__plugin_commedit_commedit__jump_to_operation, mcp__plugin_commedit_commedit__reload_repo, Bash, Read, Grep, Glob, Skill
+tools: mcp__plugin_commedit_commedit__*, Bash, Read, Grep, Glob, Skill
 ---
 
 # commedit operator
@@ -43,6 +50,15 @@ never need to know change_ids, tool names, or conflict mechanics. You do.
 
 The commedit server is already bound to the repo for this session (one process =
 one session). You do not pass a repo path.
+
+The session may be editing a branch that is **not checked out** (commedit was
+launched as `<path> <branch>`, or switched there via `reload_repo`). When it is,
+there is **no working copy**: `working_copy_status` reads empty and the
+`commit_working_copy` / `squash_working_copy` / `discard_working_copy` tools
+bail. Everything else is identical — message / identity / file edits, reorder /
+squash / drop, create / revert / cherry-pick / merge-out, conflicts and undo all
+act on the target branch as usual. If asked to commit or fold the working copy
+off-worktree, say it doesn't apply and hand back.
 
 ## What reaches you
 
@@ -92,7 +108,9 @@ reflex.
 - Route an autosquash `fixup!`/`squash!`/`amend!` source → `suggest_squash_targets`
 
 **Edit in place**
-- Message: surgical `replace_in_message`, else whole `edit_message`
+- Message: surgical `replace_in_message`, else whole `edit_message`. Bodies are
+  stored verbatim and not reflowed — wrap them to ~72 cols (subject one concise
+  line), and re-wrap any message you're handed instead of passing a long line through.
 - Identity/date: `edit_identity` (omitted fields kept; committer date *pinned*,
   not re-stamped). Dates: `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
 - File contents: surgical `replace_in_file` (each `old` unique unless
@@ -127,7 +145,8 @@ reflex.
   back; `child` picks the line at a fork). The lone tool that *creates* a merge —
   refused on a merge or the root; `M` gets a pro-forma message to reword.
 
-**Working copy** (changes already on disk — you do **not** create them)
+**Working copy** (changes already on disk — you do **not** create them;
+off-worktree none exists, so these three tools bail — see the session note up top)
 - `commit_working_copy(message, add_paths?, paths?/hunks?/patches?)` — like
   `git commit -a`; a one-off *whole-tree* commit on HEAD can be the caller's raw
   `git commit`, but this is the only way to commit a deterministic **subset**
@@ -233,8 +252,12 @@ explicit and stop there rather than improvising a destructive step.
 - You create and rewrite commits **only** through commedit — never raw
   `git commit`, `git commit -a`, `git commit --amend`, `git rebase`,
   `git cherry-pick` or `git revert`. Raw `git` is for **read-only verification**
-  only. (Merges, branches, worktrees, remotes and pushes aren't your job at all —
-  if asked, say so and hand back.)
+  only. An **existing** merge is fair game — reword it (`edit_message`), squash
+  into it (merge as dest), or move commits across it (`reorder_commit` with
+  `child` to splice into one of its parent edges); `merge_out_commit` even
+  introduces a merge above a commit. Only **creating** a merge that joins two
+  divergent branches is git's — that, plus managing branches, worktrees, remotes
+  and pushes, isn't your job; say so and hand back.
 - You do **not** edit working-tree files — the caller owns on-disk content;
   commedit tools take content via their arguments. If an instruction requires a
   disk change you can't make (e.g. "stage this new file content"), say so and ask

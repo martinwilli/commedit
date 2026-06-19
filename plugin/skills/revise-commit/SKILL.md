@@ -62,15 +62,15 @@ single-commit tools — it's atomic and won't re-stamp committers across the cas
 
 ## When things go sideways
 
-- **A conflicting rewrite is held back in full.** It returns `status: conflicts`;
-  git history, HEAD and the working tree stay untouched until it settles. Resolve
-  the **oldest** conflicted commit first (`read_conflict` each file → remove every
-  marker → `resolve_conflicts`); fixing the earliest often auto-clears its
-  descendants. `abort_rewrite` throws the held rewrite away. No other mutation
-  runs while one is pending.
+- **A conflicting rewrite is held back in full** — `status: conflicts`, with git
+  history, HEAD and the working tree untouched until it settles, and no other
+  mutation running meanwhile. Resolving it oldest-first, the binary/structural
+  cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - **Address commits by `change_id`, not sha** — shas churn on every rewrite,
   change_ids are stable, so you can chain edits without re-running `list_history`.
 - **After any out-of-band git operation** (a commit, branch switch or rebase made
   outside the session) call `reload_repo` before continuing.
-- **Safety net:** every landed change is a recorded operation — `list_operations`,
-  `undo` / `redo`, `jump_to_operation` (`0` rolls the session back to its start).
+- **Safety net & review.** Every landed change is a recorded operation you can
+  walk back, dropped commits stay recoverable, and the session is one inspectable
+  diff — stepping back, reviewing, or recovering is the `review-and-recover`
+  skill. (`discard_working_copy` is the one irreversible action.)

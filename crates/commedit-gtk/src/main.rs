@@ -49,6 +49,7 @@ use crate::identity::*;
 mod conflict;
 use crate::conflict::*;
 mod diff_cues;
+mod dnd;
 mod dragdrop;
 mod linenums;
 mod msglint;

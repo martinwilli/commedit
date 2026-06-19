@@ -7,6 +7,7 @@
 //! its closures capture — the same handles `build_ui` holds, so both share one
 //! source of truth.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -19,6 +20,7 @@ use gtk::{
     Popover,
 };
 
+use crate::dnd::{DraggedCommit, DraggedCommits};
 use crate::rows::{lane_color, populate_trash};
 use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, PostDrag, Widgets};
 
@@ -61,6 +63,22 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         .is_worktree_bound()
         .then(|| cb.on_restore.clone());
 
+    // This window's identity, for cross-instance drags: our process (so a drop
+    // can tell our own drag from one started in another window) and our repo's
+    // object-store key (so we can tell a sibling-branch window of the same repo —
+    // whose commit we can cherry-pick from the shared ODB — from a foreign repo).
+    let own_pid = std::process::id();
+    let own_key = repo.borrow().object_store_key();
+    // Set while a foreign commit is hovering this window's history list, so the
+    // motion handler offers only insertion gaps (a cherry-pick, never a squash)
+    // and a copy cursor. The drop itself re-derives this from the payload, so
+    // correctness never rides on the flag — it only steers the hover feedback.
+    let foreign_drag = Rc::new(Cell::new(false));
+    // The single hovering foreign commit's sha, so `show_gap` can gate the
+    // placeholder on a real cherry-pick destination — the dragged commit lives in
+    // another process, so this window's `drag_*` state says nothing about it.
+    let foreign_sha: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
     // Map a y coordinate to an insertion gap: onto a row's lower half drops below
     // it; past the last row drops at the bottom; above the first, at the top. The
     // placeholder must not be inserted when this runs, or row indices are off.
@@ -97,6 +115,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let drag_set = drag_set.clone();
         let drag_origin = drag_origin.clone();
         let trashed = trashed.clone();
+        let foreign_drag = foreign_drag.clone();
+        let foreign_sha = foreign_sha.clone();
         Rc::new(move |y: f64| {
             let n = commits.borrow().len();
             let current = drop_gap.get();
@@ -124,38 +144,68 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             // commit — i.e. at least one ancestry line crossing it is a valid
             // destination. For a history drag the dragged row's own line (and a
             // merge or off-branch row) yields no candidates; for a trash drag
-            // the same gate runs through the restore candidates.
-            let real_move = drag_from.get().is_some_and(|from| match drag_origin.get() {
-                DragOrigin::History => {
-                    let set = drag_set.borrow();
-                    let commits = commits.borrow();
-                    if set.len() > 1 {
-                        // Multi-drag: at least one ancestry line bounded by commits
-                        // outside the set must cross the gap.
-                        let ids: HashSet<_> = set
-                            .iter()
-                            .filter_map(|&i| commits.get(i).map(|c| c.id.clone()))
-                            .collect();
+            // the same gate runs through the restore candidates. A foreign
+            // (cross-window) drag has no row in this process, so gate it on the
+            // cherry-pick candidates for the hovering commit instead.
+            let real_move = if foreign_drag.get() {
+                foreign_sha
+                    .borrow()
+                    .as_ref()
+                    .and_then(|sha| repo.borrow().lookup_commit_in_store(sha))
+                    .is_some_and(|target| {
                         !repo
                             .borrow()
-                            .plan_reorder_set_candidates(&commits, &graph.borrow(), &ids, new_gap)
+                            .plan_cherry_pick_candidates(
+                                &commits.borrow(),
+                                &graph.borrow(),
+                                &target,
+                                new_gap,
+                            )
                             .is_empty()
-                    } else {
-                        !repo
-                            .borrow()
-                            .plan_reorder_candidates(&commits, &graph.borrow(), from, new_gap)
-                            .is_empty()
+                    })
+            } else {
+                drag_from.get().is_some_and(|from| match drag_origin.get() {
+                    DragOrigin::History => {
+                        let set = drag_set.borrow();
+                        let commits = commits.borrow();
+                        if set.len() > 1 {
+                            // Multi-drag: at least one ancestry line bounded by commits
+                            // outside the set must cross the gap.
+                            let ids: HashSet<_> = set
+                                .iter()
+                                .filter_map(|&i| commits.get(i).map(|c| c.id.clone()))
+                                .collect();
+                            !repo
+                                .borrow()
+                                .plan_reorder_set_candidates(
+                                    &commits,
+                                    &graph.borrow(),
+                                    &ids,
+                                    new_gap,
+                                )
+                                .is_empty()
+                        } else {
+                            !repo
+                                .borrow()
+                                .plan_reorder_candidates(&commits, &graph.borrow(), from, new_gap)
+                                .is_empty()
+                        }
                     }
-                }
-                DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
-                    !repo
-                        .borrow()
-                        .plan_restore_candidates(&commits.borrow(), &graph.borrow(), info, new_gap)
-                        .is_empty()
-                }),
-                // A working-copy entry only folds *onto* a commit — never between.
-                DragOrigin::WorkingCopy => false,
-            });
+                    DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
+                        !repo
+                            .borrow()
+                            .plan_restore_candidates(
+                                &commits.borrow(),
+                                &graph.borrow(),
+                                info,
+                                new_gap,
+                            )
+                            .is_empty()
+                    }),
+                    // A working-copy entry only folds *onto* a commit — never between.
+                    DragOrigin::WorkingCopy => false,
+                })
+            };
             if !real_move {
                 if placeholder.parent().is_some() {
                     list.remove(&placeholder);
@@ -270,7 +320,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let clear_squash_target = clear_squash_target.clone();
         let drop_gap = drop_gap.clone();
         let drag_origin = drag_origin.clone();
+        let foreign_drag = foreign_drag.clone();
         Rc::new(move |y: f64| {
+            // A commit dragged in from another window can only be cherry-picked
+            // *between* commits, so it shows insertion gaps and never a squash
+            // target — whatever this process's stale `drag_origin` happens to say.
+            if foreign_drag.get() {
+                clear_squash_target();
+                show_gap(y);
+                return;
+            }
             // A working-copy entry can only be folded *onto* a commit (fixup), so
             // the whole row is a squash target and no reorder gap ever opens.
             let wc_drag = drag_origin.get() == DragOrigin::WorkingCopy;
@@ -318,13 +377,17 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     };
 
     let drag_source = DragSource::new();
-    drag_source.set_actions(gdk::DragAction::MOVE);
+    // MOVE within this window (reorder/squash consume the source); COPY onto
+    // another window (a cherry-pick that leaves our commit in place).
+    drag_source.set_actions(gdk::DragAction::MOVE | gdk::DragAction::COPY);
     drag_source.connect_prepare({
         let list = list.clone();
         let drag_row = drag_row.clone();
         let drag_from = drag_from.clone();
         let drag_set = drag_set.clone();
         let drag_origin = drag_origin.clone();
+        let commits = commits.clone();
+        let own_key = own_key.clone();
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
             let idx = row.index() as usize;
@@ -349,7 +412,38 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             *drag_row.borrow_mut() = Some(row.clone());
             drag_from.set(Some(idx));
             drag_origin.set(DragOrigin::History);
-            Some(gdk::ContentProvider::for_value(&row.index().to_value()))
+            // Carry the dragged commit(s) as a text payload, so a drop onto
+            // another commedit window — a separate process — can cherry-pick
+            // them. An in-process drop reads the very same string back; it just
+            // ignores the commit list and works from the live `drag_*` state.
+            let dragged: Vec<usize> = {
+                let set = drag_set.borrow();
+                if set.is_empty() {
+                    vec![idx]
+                } else {
+                    set.clone()
+                }
+            };
+            let payload = {
+                let c = commits.borrow();
+                DraggedCommits {
+                    pid: std::process::id(),
+                    repo_key: own_key.clone().unwrap_or_default(),
+                    branch: None,
+                    commits: dragged
+                        .iter()
+                        .filter_map(|&i| c.get(i))
+                        .map(|info| DraggedCommit {
+                            sha: info.id_hex(),
+                            change_id: info.change_id_hex(),
+                            subject: info.subject.clone(),
+                        })
+                        .collect(),
+                }
+            };
+            Some(gdk::ContentProvider::for_value(
+                &payload.serialize().to_value(),
+            ))
         }
     });
     drag_source.connect_drag_begin({
@@ -424,25 +518,63 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     });
     list.add_controller(drag_source);
 
-    let drop_target = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
+    // Accept the history payload (text, so it can come from another window) and
+    // the trash/working-copy row index (i32, in-process only). COPY is allowed
+    // for a cross-instance cherry-pick. Preload makes the payload readable during
+    // motion, so the hover feedback can adapt to a foreign drag.
+    let drop_target = DropTarget::new(
+        String::static_type(),
+        gdk::DragAction::MOVE | gdk::DragAction::COPY,
+    );
+    drop_target.set_types(&[String::static_type(), i32::static_type()]);
+    drop_target.set_preload(true);
+    // Reading the foreign payload (preloaded) at enter/motion: light the foreign
+    // flag and stash the hovering commit's sha so `show_zone`/`show_gap` show an
+    // insertion gap and a copy cursor.
+    let mark_foreign = {
+        let foreign_drag = foreign_drag.clone();
+        let foreign_sha = foreign_sha.clone();
+        move |target: &DropTarget| {
+            let sha = foreign_pick_sha(target, own_pid);
+            foreign_drag.set(foreign_payload(target, own_pid).is_some());
+            *foreign_sha.borrow_mut() = sha;
+            foreign_drag.get()
+        }
+    };
     drop_target.connect_enter({
         let show_zone = show_zone.clone();
-        move |_target, _x, y| {
+        let mark_foreign = mark_foreign.clone();
+        move |target, _x, y| {
+            let foreign = mark_foreign(target);
             show_zone(y);
-            gdk::DragAction::MOVE
+            if foreign {
+                gdk::DragAction::COPY
+            } else {
+                gdk::DragAction::MOVE
+            }
         }
     });
     drop_target.connect_motion({
         let show_zone = show_zone.clone();
-        move |_target, _x, y| {
+        let mark_foreign = mark_foreign.clone();
+        move |target, _x, y| {
+            let foreign = mark_foreign(target);
             show_zone(y);
-            gdk::DragAction::MOVE
+            if foreign {
+                gdk::DragAction::COPY
+            } else {
+                gdk::DragAction::MOVE
+            }
         }
     });
     drop_target.connect_leave({
         let clear_gap = clear_gap.clone();
         let clear_squash_target = clear_squash_target.clone();
+        let foreign_drag = foreign_drag.clone();
+        let foreign_sha = foreign_sha.clone();
         move |_target| {
+            foreign_drag.set(false);
+            *foreign_sha.borrow_mut() = None;
             clear_gap();
             clear_squash_target();
         }
@@ -468,20 +600,128 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let drag_set = drag_set.clone();
+        let drag_from = drag_from.clone();
+        let graph = graph.clone();
+        let own_key = own_key.clone();
+        let foreign_drag = foreign_drag.clone();
+        let foreign_sha = foreign_sha.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         move |_target, value, _x, y| {
-            let Ok(from) = value.get::<i32>() else {
-                return false;
-            };
-            // A center-zone hover marks a squash target; snapshot it now, since
-            // `drag-end` clears it before the staged work runs.
-            let onto = drop_onto.get();
+            // History drags (including from another commedit window) arrive as a
+            // text payload; trash and working-copy drags as an i32 row index.
+            let payload = value
+                .get::<String>()
+                .ok()
+                .and_then(|s| DraggedCommits::parse(&s));
             // Prefer the gap the placeholder marked; fall back to the drop point.
             let to = match drop_gap.get() {
                 Some(to) => to,
                 None => gap_at(y),
             };
             clear_gap();
+            foreign_drag.set(false);
+            *foreign_sha.borrow_mut() = None;
+
+            // A commit dragged from another window: copy it in (cherry-pick),
+            // leaving the source window's history untouched. Same-repo only — a
+            // foreign commit's objects only exist in our store when the two
+            // windows share one.
+            if let Some(payload) = payload.as_ref().filter(|p| p.pid != own_pid) {
+                if own_key.as_deref() != Some(payload.repo_key.as_str()) {
+                    show_status("Can't move commits between different repositories");
+                    return true;
+                }
+                let [picked] = payload.commits.as_slice() else {
+                    show_status("Drag a single commit at a time between windows");
+                    return true;
+                };
+                let sha = picked.sha.clone();
+                let repo = repo.clone();
+                let commits = commits.clone();
+                let graph = graph.clone();
+                let refresh = refresh.clone();
+                let show_status = show_status.clone();
+                let enter_conflict_mode = enter_conflict_mode.clone();
+                let list = list.clone();
+                // Unlike an in-process drop, no `drag-end` fires in *this* window
+                // to run a staged `post_drag` (the gesture ended in the source
+                // window's process). Schedule the rewrite at idle directly — the
+                // same below-GDK-event priority that lets pending drop-crossing
+                // events drain before we rebuild the rows, just driven from the
+                // drop itself since there is no local gesture left to ride.
+                glib::idle_add_local_once(move || {
+                    let Some(target) = repo.borrow().lookup_commit_in_store(&sha) else {
+                        show_status("That commit isn't in this repository's object store");
+                        return;
+                    };
+                    let cands = repo.borrow().plan_cherry_pick_candidates(
+                        &commits.borrow(),
+                        &graph.borrow(),
+                        &target,
+                        to,
+                    );
+                    if cands.is_empty() {
+                        show_status("Can't insert the commit here");
+                        return;
+                    }
+                    let apply: Rc<dyn Fn(&ReorderMove)> = {
+                        let repo = repo.clone();
+                        let refresh = refresh.clone();
+                        let show_status = show_status.clone();
+                        let enter_conflict_mode = enter_conflict_mode.clone();
+                        Rc::new(move |mv: &ReorderMove| {
+                            let outcome = repo.borrow_mut().cherry_pick_commit(
+                                &mv.target,
+                                mv.new_parents.clone(),
+                                mv.new_children.clone(),
+                                None,
+                            );
+                            match outcome {
+                                Ok(SaveOutcome::Clean) => refresh(),
+                                Ok(SaveOutcome::Conflicts { commits }) => {
+                                    enter_conflict_mode(commits)
+                                }
+                                Err(err) => show_status(&format!("Cherry-pick failed: {err}")),
+                            }
+                        })
+                    };
+                    match &cands[..] {
+                        [single] => apply(&single.mv),
+                        // A merge gap crosses several lines: ask which to splice
+                        // into. Non-autohide (the `false`) so it never grabs the
+                        // seat — a cross-window drop's compositor drag grab may
+                        // still be releasing, and grabbing into that wedges all
+                        // input. In-process drops show this from `drag-end` (grab
+                        // already gone) and keep autohide.
+                        _ => show_lane_popover(
+                            &list,
+                            to,
+                            cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
+                            &apply,
+                            false,
+                        ),
+                    }
+                });
+                return true;
+            }
+
+            // In-process from here. `from` is the source row index: every drag
+            // source records it in `drag_from` (the history payload doesn't carry
+            // it back), and trash/working-copy also pass it as the i32 value.
+            let from = if payload.is_some() {
+                match drag_from.get() {
+                    Some(i) => i as i32,
+                    None => return false,
+                }
+            } else {
+                match value.get::<i32>() {
+                    Ok(i) => i,
+                    Err(_) => return false, // unrecognized (e.g. plain text)
+                }
+            };
+            // A center-zone hover marks a squash target; snapshot it now, since
+            // `drag-end` clears it before the staged work runs.
+            let onto = drop_onto.get();
             // A multi-selection dragged as a group (history only): its display
             // indices, captured at drag start. Empty for an ordinary single drag.
             let set = drag_set.borrow().clone();
@@ -613,6 +853,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 to,
                                 cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
                                 &apply,
+                                true,
                             ),
                         }
                     }));
@@ -732,6 +973,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 to,
                                 cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
                                 &apply,
+                                true,
                             ),
                         }
                     }));
@@ -924,6 +1166,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 to,
                                 cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
                                 &apply,
+                                true,
                             ),
                         }
                     }));
@@ -1127,7 +1370,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     });
     wc_list.add_controller(wc_drag);
 
-    let trash_drop = DropTarget::new(i32::static_type(), gdk::DragAction::MOVE);
+    // History drags now arrive as a text payload, working-copy drags as an i32;
+    // accept both. (Trash→trash and cross-window drops are rejected in the handler.)
+    let trash_drop = DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+    trash_drop.set_types(&[String::static_type(), i32::static_type()]);
     // Deliberately no widget mutation in enter/leave (no hover highlight): those
     // run inside GTK's drop-crossing synthesis, where touching the widget tree is
     // unsafe. Enter just advertises that the trash accepts the drag.
@@ -1150,7 +1396,18 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
         let drag_set = drag_set.clone();
+        let drag_from = drag_from.clone();
         move |_target, value, _x, _y| {
+            // A commit dragged from another commedit window isn't in this history,
+            // so it can't be abandoned here — reject it.
+            if value
+                .get::<String>()
+                .ok()
+                .and_then(|s| DraggedCommits::parse(&s))
+                .is_some_and(|p| p.pid != own_pid)
+            {
+                return false;
+            }
             // The trash accepts a history commit (abandoned, but kept so it can be
             // dragged back to restore) or an uncommitted-changes entry (discarded
             // outright). A trash→trash drag has nothing to do.
@@ -1158,7 +1415,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             if origin != DragOrigin::History && origin != DragOrigin::WorkingCopy {
                 return false;
             }
-            let Ok(from) = value.get::<i32>() else {
+            // The source row index: history now travels as text, but every source
+            // also records it in `drag_from`.
+            let Some(from) = drag_from.get().map(|i| i as i32) else {
                 return false;
             };
             // A multi-selection dragged as a group (history only); empty otherwise.
@@ -1336,6 +1595,28 @@ fn run_post_drag(post_drag: &PostDrag) {
     }
 }
 
+/// The commit payload `target` currently holds *if* it comes from another
+/// commedit window (`set_preload` makes the value available during motion).
+/// `None` for this window's own drag or a non-commedit drop. Steers the hover
+/// feedback only; the drop handler re-derives this from the dropped value, so
+/// correctness never depends on the preload having landed.
+fn foreign_payload(target: &DropTarget, own_pid: u32) -> Option<DraggedCommits> {
+    target
+        .value()
+        .and_then(|v| v.get::<String>().ok())
+        .and_then(|s| DraggedCommits::parse(&s))
+        .filter(|p| p.pid != own_pid)
+}
+
+/// The single hovering commit's sha for the gap gate: a foreign drag of exactly
+/// one commit (the only shape v1 cherry-picks). `None` otherwise.
+fn foreign_pick_sha(target: &DropTarget, own_pid: u32) -> Option<String> {
+    match foreign_payload(target, own_pid)?.commits.as_slice() {
+        [one] => Some(one.sha.clone()),
+        _ => None,
+    }
+}
+
 /// A small popover anchored at `target_row` letting the user pick how to merge
 /// an unprefixed commit dropped onto another: Fixup / Squash / Amend, or Cancel.
 /// Each verb runs `apply(mode)` and dismisses; Cancel (or a click outside) just
@@ -1419,6 +1700,7 @@ fn show_lane_popover<T: 'static>(
     gap: usize,
     candidates: Vec<(usize, T)>,
     apply: &Rc<dyn Fn(&T)>,
+    autohide: bool,
 ) {
     let popover = Popover::new();
     let hbox = GtkBox::new(Orientation::Horizontal, 0);
@@ -1469,7 +1751,13 @@ fn show_lane_popover<T: 'static>(
     };
     popover.set_parent(list);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(a.x(), y, a.width(), 1)));
-    popover.set_autohide(true);
+    // An autohide popover grabs the seat (so an outside click dismisses it).
+    // After a cross-window drop the compositor's drag grab may still be
+    // releasing, and grabbing into that wedges all input — so the caller asks for
+    // a non-autohide popover there: it never grabs (no dismiss-on-outside-click,
+    // but picking a lane still closes it), trading that for a deterministic
+    // no-freeze. In-process drops keep autohide.
+    popover.set_autohide(autohide);
     popover.connect_closed(|p| p.unparent());
     popover.popup();
 }

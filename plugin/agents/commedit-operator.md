@@ -108,7 +108,9 @@ reflex.
 - Route an autosquash `fixup!`/`squash!`/`amend!` source → `suggest_squash_targets`
 
 **Edit in place**
-- Message: surgical `replace_in_message`, else whole `edit_message`
+- Message: surgical `replace_in_message`, else whole `edit_message`. Bodies are
+  stored verbatim and not reflowed — wrap them to ~72 cols (subject one concise
+  line), and re-wrap any message you're handed instead of passing a long line through.
 - Identity/date: `edit_identity` (omitted fields kept; committer date *pinned*,
   not re-stamped). Dates: `YYYY-MM-DD HH:MM:SS ±HHMM` or RFC 3339.
 - File contents: surgical `replace_in_file` (each `old` unique unless

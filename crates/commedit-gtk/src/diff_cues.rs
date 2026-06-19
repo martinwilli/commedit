@@ -316,11 +316,16 @@ impl GutterColumn {
     }
 
     /// The buffer line under widget-relative `y` (the gutter scrolls with the text,
-    /// so its top aligns with the viewport top), or `None`.
+    /// so its top aligns with the viewport top), or `None`. The view's top margin
+    /// sits above buffer line 0, so subtract it to reach buffer coordinates —
+    /// `line_at_y` expects them. Skipping it makes the hit-test lead the pointer by
+    /// the margin, so the cue prelights (and its cursor) a few pixels *above* the
+    /// drawn button while its bottom edge reads as dead.
     fn line_at_widget_y(&self, y: f64) -> Option<i32> {
         let view = self.view();
         let vadj = view.vadjustment()?;
-        let (iter, _) = view.line_at_y(vadj.value() as i32 + y as i32);
+        let buf_y = vadj.value() as i32 + y as i32 - view.top_margin();
+        let (iter, _) = view.line_at_y(buf_y);
         Some(iter.line())
     }
 

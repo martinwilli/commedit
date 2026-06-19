@@ -26,6 +26,12 @@ impl Repo {
     /// Split commit `target` from `(path, content)` write edits — the write-only
     /// convenience over [`Repo::split_commit_edits`] for the callers that never
     /// delete a path (the MCP tool, tests).
+    ///
+    /// `files` is the *whole-file content the commit should keep* (replace_files
+    /// semantics, spliced onto the original tree); the inserted child receives the
+    /// remainder. So to move a file's change *out* to the child, pass that file
+    /// reverted to its parent content — a changed file you omit stays in `target`.
+    /// Edits that leave the tree unchanged (the child would be empty) are refused.
     pub fn split_commit(
         &mut self,
         target: &CommitId,
@@ -74,6 +80,22 @@ impl Repo {
         let orig_tree = commit.tree();
         // T_edited: the same tree with the user's diff edits spliced in.
         let edited_tree = crate::tree::splice_edits_into_tree(commit.tree(), &store, edits)?;
+        // Guard the silent footgun: the inserted commit holds the *original*
+        // tree, so a split only moves a change out when `edits` actually change
+        // the original tree. If they don't — the classic mistake of handing over
+        // the file(s) to KEEP at their current content, instead of the file(s) to
+        // move OUT reverted to their parent content — the new commit's diff is
+        // empty and nothing splits. Refuse it with a teaching error rather than
+        // landing a no-op split.
+        if edited_tree.tree_ids() == orig_tree.tree_ids() {
+            bail!(
+                "split would move nothing into the new commit: the given `files` leave this \
+                 commit's tree unchanged, so the whole change stays here and the new commit \
+                 would be empty. `files` is the content this commit should KEEP — to move a \
+                 file's change OUT to the new commit, list that file with its PARENT \
+                 (pre-commit) content; a changed file you don't list stays in this commit."
+            );
+        }
         let author = commit.author().clone();
         let message = split_message(commit.description());
         let desc = self.op_desc_for("Split", target);
@@ -165,6 +187,11 @@ impl Repo {
         let store = self.repo.store().clone();
         let orig_tree = commit.tree();
         let edited_tree = crate::tree::splice_edits_into_tree(commit.tree(), &store, edits)?;
+        // As in `split_commit_inner`: a split that doesn't change the entry's
+        // tree would peel off an empty entry. Refuse it rather than churn @.
+        if edited_tree.tree_ids() == orig_tree.tree_ids() {
+            bail!("split would move nothing into the new entry: the given edits leave the tree unchanged");
+        }
 
         let mut tx = self.repo.start_transaction();
         // E': the entry, rewritten to the edited diff (keeps its change id).

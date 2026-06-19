@@ -101,14 +101,16 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
         let path = &oldest.files[0];
         assert!(path.resolvable);
 
-        let file = server
+        let resp = server
             .read_conflict(Parameters(ReadConflictReq {
                 commit: oldest.change_id.clone(),
-                path: path.path.clone(),
+                path: Some(path.path.clone()),
+                paths: None,
             }))
             .await
             .unwrap()
             .0;
+        let file = &resp.files[0];
         assert!(
             file.text.contains("<<<<<<<"),
             "markers present: {}",
@@ -162,7 +164,8 @@ async fn read_conflict_validates_change_and_path() {
         server
             .read_conflict(Parameters(ReadConflictReq {
                 commit: "00".into(),
-                path: "f.txt".into(),
+                path: Some("f.txt".into()),
+                paths: None,
             }))
             .await,
     );
@@ -181,7 +184,8 @@ async fn read_conflict_validates_change_and_path() {
         server
             .read_conflict(Parameters(ReadConflictReq {
                 commit: commits[0].change_id.clone(),
-                path: "nope.txt".into(),
+                path: Some("nope.txt".into()),
+                paths: None,
             }))
             .await,
     );
@@ -190,6 +194,80 @@ async fn read_conflict_validates_change_and_path() {
         "names the real conflicted files: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn read_conflict_reads_every_file_in_one_call() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    git(p, &["-c", "init.defaultBranch=main", "init", "-q"]);
+    // Three commits, each touching the same line of TWO files.
+    for (msg, mid) in [("base", "2"), ("A", "A"), ("B", "B")] {
+        std::fs::write(p.join("f.txt"), format!("1\n{mid}\n3\n")).unwrap();
+        std::fs::write(p.join("g.txt"), format!("x\n{mid}\nz\n")).unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-q", "-m", msg]);
+    }
+    let server = open_server(p);
+
+    // Rewrite "A"'s content for both files so "B"'s rebase conflicts on both.
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            limit: None,
+            offset: None,
+            fields: None,
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
+    let result = server
+        .replace_files(Parameters(ReplaceFilesReq {
+            commit: a.sha.clone(),
+            files: vec![
+                FileContentDto {
+                    path: "f.txt".into(),
+                    content: "1\nX\n3\n".into(),
+                },
+                FileContentDto {
+                    path: "g.txt".into(),
+                    content: "x\nX\nz\n".into(),
+                },
+            ],
+            delete_paths: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let SaveResultDto::Conflicts { commits, .. } = result else {
+        panic!("expected conflicts on both files");
+    };
+    let oldest = &commits[0];
+    assert_eq!(oldest.files.len(), 2, "both files conflict");
+
+    // Omitting both `path` and `paths` reads every resolvable file at once.
+    let resp = server
+        .read_conflict(Parameters(ReadConflictReq {
+            commit: oldest.change_id.clone(),
+            path: None,
+            paths: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(resp.files.len(), 2, "one round-trip returns both files");
+    let mut paths: Vec<&str> = resp.files.iter().map(|f| f.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["f.txt", "g.txt"]);
+    for f in &resp.files {
+        assert!(
+            f.text.contains("<<<<<<<"),
+            "markers present in {}: {}",
+            f.path,
+            f.text
+        );
+    }
 }
 
 #[tokio::test]
@@ -267,14 +345,16 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
 
     // Resolving the conflict settles the drop; now the trash has it.
     let oldest = &commits[0];
-    let file = server
+    let resp = server
         .read_conflict(Parameters(ReadConflictReq {
             commit: oldest.change_id.clone(),
-            path: oldest.files[0].path.clone(),
+            path: Some(oldest.files[0].path.clone()),
+            paths: None,
         }))
         .await
         .unwrap()
         .0;
+    let file = &resp.files[0];
     let result = server
         .resolve_conflicts(Parameters(ResolveConflictsReq {
             commit: oldest.change_id.clone(),
@@ -340,14 +420,16 @@ async fn conflicts_resolve_by_sha_or_prefix() {
         let oldest = &commits[0];
 
         // Read by the commit's current sha, resolve by a change-id prefix.
-        let file = server
+        let resp = server
             .read_conflict(Parameters(ReadConflictReq {
                 commit: oldest.sha.clone(),
-                path: oldest.files[0].path.clone(),
+                path: Some(oldest.files[0].path.clone()),
+                paths: None,
             }))
             .await
             .unwrap()
             .0;
+        let file = &resp.files[0];
         result = server
             .resolve_conflicts(Parameters(ResolveConflictsReq {
                 commit: oldest.change_id[..8].to_string(),

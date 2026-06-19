@@ -8,8 +8,8 @@ use rmcp::{tool, tool_router, ErrorData};
 
 use crate::convert::conflicted_commit_dto;
 use crate::dto::{
-    AbortResp, PendingStatusResp, ReadConflictReq, ReadConflictResp, ResolveConflictsReq,
-    SaveResultDto,
+    AbortResp, ConflictFileContentDto, PendingStatusResp, ReadConflictReq, ReadConflictResp,
+    ResolveConflictsReq, SaveResultDto,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -40,7 +40,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Read one conflicted file of a pending rewrite, materialized with git-style conflict markers. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
+        description = "Read conflicted files of a pending rewrite, each materialized with git-style conflict markers. Pass a single `path`, several `paths`, or omit both to read every resolvable file of the commit in one call. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants."
     )]
     pub async fn read_conflict(
         &self,
@@ -52,38 +52,54 @@ impl CommeditServer {
                 .ok_or_else(|| invalid("no conflicted rewrite is pending"))?;
             let commit = &conflicts[find_conflicted(conflicts, &req.commit)?];
             let change_hex = commit.change_id_hex();
-            let path = commit
-                .files
-                .iter()
-                .find(|f| f.path_str() == req.path)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "{} is not a conflicted path of change {}; its conflicted files are: {}",
-                        req.path,
-                        change_hex,
-                        commit
-                            .files
-                            .iter()
-                            .map(|f| f.path_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                })?;
-            if !path.resolvable {
-                return Err(invalid(format!(
-                    "{} is a structural conflict (not plain file content) and cannot be \
-                     resolved as text; abort_rewrite is the only way out",
-                    req.path
-                )));
+
+            // Resolve the target paths: explicit `path`/`paths`, or — when
+            // neither is given — every resolvable file of the commit.
+            let mut targets: Vec<String> = req.path.into_iter().collect();
+            targets.extend(req.paths.unwrap_or_default());
+            if targets.is_empty() {
+                targets = commit
+                    .files
+                    .iter()
+                    .filter(|f| f.resolvable)
+                    .map(|f| f.path_str())
+                    .collect();
             }
-            let file = repo
-                .read_conflict(&change_hex, &req.path)
-                .map_err(internal)?;
-            Ok(ReadConflictResp {
-                text: file.text,
-                marker_len: file.marker_len,
-                num_sides: file.num_sides,
-            })
+
+            let mut files = Vec::with_capacity(targets.len());
+            for path in targets {
+                let entry = commit
+                    .files
+                    .iter()
+                    .find(|f| f.path_str() == path)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{} is not a conflicted path of change {}; its conflicted files are: {}",
+                            path,
+                            change_hex,
+                            commit
+                                .files
+                                .iter()
+                                .map(|f| f.path_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+                if !entry.resolvable {
+                    return Err(invalid(format!(
+                        "{path} is a structural conflict (not plain file content) and cannot be \
+                         resolved as text; abort_rewrite is the only way out"
+                    )));
+                }
+                let file = repo.read_conflict(&change_hex, &path).map_err(internal)?;
+                files.push(ConflictFileContentDto {
+                    path,
+                    text: file.text,
+                    marker_len: file.marker_len,
+                    num_sides: file.num_sides,
+                });
+            }
+            Ok(ReadConflictResp { files })
         })
         .await
         .map(Yaml)
@@ -142,7 +158,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Discard the pending conflicted rewrite. Git was never touched while it was held back, so the pre-rewrite history is simply still in place."
+        description = "Discard the pending conflicted rewrite, rolling history back to before it. Git was never touched while it was held back, so the pre-rewrite state is simply still in place — making this the cheap way out when the conflict came from a mutation you just issued (fix the input and redo), as well as the only escape from a structural (resolvable=false) conflict that can't be resolved as text."
     )]
     pub async fn abort_rewrite(&self) -> Result<Yaml<AbortResp>, ErrorData> {
         self.with_session(|repo, trash| {

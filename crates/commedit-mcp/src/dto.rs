@@ -845,12 +845,27 @@ pub struct ReadConflictReq {
     /// `pending_status`) — change id or current sha, full or a unique
     /// prefix. Prefer the change id: shas churn on every resolution step.
     pub commit: String,
-    /// The conflicted path to read.
-    pub path: String,
+    /// A single conflicted path to read. Combine with `paths`, or omit both to
+    /// read every resolvable file of the commit at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Several conflicted paths to read in one call (in addition to `path`).
+    /// Omit `path` and `paths` both to read every resolvable file at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReadConflictResp {
+    /// One entry per file read, in request order (or all resolvable files when
+    /// neither `path` nor `paths` was given).
+    pub files: Vec<ConflictFileContentDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConflictFileContentDto {
+    /// The conflicted path.
+    pub path: String,
     /// The file with git-style conflict markers (`<<<<<<<`/`=======`/
     /// `>>>>>>>`). Resolve by producing the file without any markers.
     pub text: String,

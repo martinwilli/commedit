@@ -92,16 +92,21 @@ Surgical edits: for a small change to a long message or file, prefer \
 replace_in_message / replace_in_file — they take an exact `old`→`new` \
 substitution (unique match unless replace_all) instead of the whole text, so \
 the untouched content can't drift and the call stays small. Make `old` long \
-enough to match exactly once; an ambiguous or missing match is rejected. \
+enough to match exactly once; an ambiguous or missing match is rejected — a \
+miss reports the closest text with any whitespace/indentation difference named, \
+so correct `old` from that rather than re-guessing tabs from a rendered diff. \
 edit_message / replace_files remain for wholesale rewrites.
 
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \
-until it settles. Resolve the OLDEST conflicted commit first (read_conflict \
-each resolvable file, remove all markers, resolve_conflicts echoing each \
-file's marker_len); fixing the earliest often auto-clears descendants. \
-abort_rewrite discards the held rewrite (and is the only way out of a \
-structural, resolvable=false conflict). No other mutation runs while pending.
+until it settles. If the conflict came from the mutation you just issued (a \
+mistyped replace_in_file, a wrong edit), abort_rewrite and redo it correctly \
+is usually cheaper than resolving. Otherwise resolve the OLDEST conflicted \
+commit first (read_conflict each resolvable file, remove all markers, \
+resolve_conflicts echoing each file's marker_len); fixing the earliest often \
+auto-clears descendants, so don't hand-resolve every commit. abort_rewrite \
+discards the held rewrite (and is the only way out of a structural, \
+resolvable=false conflict). No other mutation runs while pending.
 
 Creating commits: create_commit makes a new commit from given file contents \
 (empty for an empty commit) and inserts it — on top of HEAD by default, or under \

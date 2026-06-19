@@ -72,7 +72,9 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
 - **`work-in-worktree`** — reshape a branch's history isolated in a `git
   worktree`, leaving the main checkout untouched: create the worktree and point
   commedit at it with `reload_repo`'s `path` (the server follows the retarget, not
-  your working directory), then re-home and tear down afterward.
+  your working directory). The same retarget is required for *any* worktree
+  commedit should act on — including one the harness creates — so the plugin also
+  reminds you on worktree entry. Then re-home and tear down afterward.
 
 To edit a branch you have **not** checked out — without a worktree at all — pass
 its name to `reload_repo`'s `branch` (or launch the server as

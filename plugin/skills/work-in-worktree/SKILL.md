@@ -1,10 +1,15 @@
 ---
 name: work-in-worktree
 description: >-
-  Use when you want to edit a branch's history in an isolated `git worktree` —
-  so the main checkout stays untouched — and have commedit operate on that
-  worktree rather than the original repo. Covers creating the worktree, pointing
-  commedit at it with reload_repo, and re-homing + teardown afterward.
+  Use whenever a `git worktree` is in play for a commedit repo: you want to
+  reshape a branch in isolation so the main checkout stays untouched, OR you (or
+  the harness) created a worktree some other way — Claude Code's own worktree
+  isolation, the `EnterWorktree` tool, or a subagent run with worktree isolation.
+  commedit does NOT follow your working directory; it is one server bound to the
+  repo it opened, so until you `reload_repo(path=<worktree>)` EVERY commedit tool
+  — reads like list_history and show_commit as much as edits — silently operates
+  on the ORIGINAL repo, not the worktree. Covers creating the worktree,
+  retargeting commedit onto it, and re-homing + teardown.
 ---
 
 # Work on history in an isolated worktree
@@ -12,8 +17,10 @@ description: >-
 > **The commedit server follows `reload_repo path=…`, NOT your working directory.**
 > The plugin runs one MCP server bound to the repo it opened. `cd`-ing into a
 > worktree, or running a subagent in its own worktree, moves only the *files* — the
-> commedit tools still rewrite the original repo. To edit a worktree's history,
-> **retarget the server**: `reload_repo(path=<worktree>)`. Because it is the one
+> commedit tools still read and rewrite the original repo (a `list_history` there
+> shows the *wrong* repo's history, just as quietly as a misplaced edit). To read
+> or edit a worktree's history, **retarget the server**: `reload_repo(path=<worktree>)`.
+> Because it is the one
 > shared server, the retarget is global — every later commedit call, including ones
 > from the `commedit-operator` subagent, then operates on the worktree. Drive the
 > worktree setup and the retarget yourself; delegate the history editing inside it
@@ -61,6 +68,10 @@ Do **not** reach for the agent runner's own worktree isolation
 worktree the shared commedit server knows nothing about, so the subagent's commedit
 tools still hit whatever repo the server is pointed at — not that worktree. Always
 pair an explicit `git worktree add` with `reload_repo(path=…)`.
+
+The plugin ships a `PostToolUse:EnterWorktree` hook that reminds you to retarget
+when a worktree is entered — treat it as a backstop, not a substitute for pairing
+the worktree with `reload_repo` yourself.
 
 ## Merge back and tear down (ordinary git)
 

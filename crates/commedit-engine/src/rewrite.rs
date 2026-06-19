@@ -16,8 +16,9 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    parse_timestamp, plan_drop, plan_reorder_candidates, plan_reorder_set_candidates,
-    plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderSetCandidate,
+    parse_timestamp, plan_drop, plan_insert_candidates, plan_reorder_candidates,
+    plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
+    ReorderSetCandidate,
 };
 use crate::repo::Repo;
 
@@ -328,6 +329,26 @@ impl Repo {
             return Vec::new();
         };
         plan_restore_candidates(commits, &head, layout, &self.root_commit_id(), restored, to)
+    }
+
+    /// All destination lines for cherry-picking the commit `target` — any commit
+    /// in the shared object store, e.g. one dragged in from another window's
+    /// branch and resolved via [`Self::lookup_commit_in_store`] — into the
+    /// history at insertion gap `to`. This plans the slot only; the apply is
+    /// [`Self::cherry_pick_commit`] with the chosen candidate's
+    /// `new_parents`/`new_children`. Empty when HEAD is unknown or `target` is
+    /// already in the history. See [`crate::history::plan_insert_candidates`].
+    pub fn plan_cherry_pick_candidates(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        target: &CommitId,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        let Some(head) = self.head_commit_id() else {
+            return Vec::new();
+        };
+        plan_insert_candidates(commits, &head, layout, &self.root_commit_id(), target, to)
     }
 
     /// The id of the commit at display `index` if it can be dropped to the trash,

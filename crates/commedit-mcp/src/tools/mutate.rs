@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use commedit_engine::diff::closest_match_hint;
 use commedit_engine::history::IdAbbrev;
 use commedit_engine::rewrite::{BatchEdit, Identity};
 use commedit_engine::tree::{replace_checked, FileEdit, ReplaceError, StrReplace};
@@ -285,7 +286,10 @@ impl CommeditServer {
             )
             .map_err(|count| {
                 invalid(match count {
-                    0 => "`old` was not found in the message".to_string(),
+                    0 => format!(
+                        "`old` was not found in the message{}",
+                        closest_match_hint(&commits[idx].description, &req.old)
+                    ),
                     n => format!(
                         "`old` matched {n} times in the message; make it unique or set replace_all"
                     ),

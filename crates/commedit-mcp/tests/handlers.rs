@@ -747,6 +747,43 @@ async fn replace_in_file_rejects_an_ambiguous_match() {
 }
 
 #[tokio::test]
+async fn replace_in_file_miss_hints_the_whitespace_difference() {
+    let dir = TempDir::new().unwrap();
+    // The file's body line is indented with 7 tabs.
+    init_repo(
+        dir.path(),
+        &[("a.rs", "fn f() {\n\t\t\t\t\t\t\treturn x;\n}\n", "first")],
+    );
+    let server = open_server(dir.path());
+
+    let target = shas(&server).await[0].clone();
+    let err = expect_err(
+        server
+            .replace_in_file(Parameters(ReplaceInFileReq {
+                commit: target,
+                edits: vec![StrReplaceDto {
+                    path: "a.rs".into(),
+                    // Eight tabs — one too many to match the file.
+                    old: "\t\t\t\t\t\t\t\treturn x;".into(),
+                    new: "\t\t\t\t\t\t\t\treturn y;".into(),
+                    replace_all: None,
+                }],
+            }))
+            .await,
+    );
+    // The miss names the indentation difference instead of leaving the caller to
+    // count tabs in a rendered diff.
+    assert!(err.message.contains("not found"), "{}", err.message);
+    assert!(
+        err.message.contains("indentation")
+            && err.message.contains("7 tabs")
+            && err.message.contains("8 tabs"),
+        "miss should hint the whitespace difference: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn replace_in_message_fixes_a_typo() {
     let dir = TempDir::new().unwrap();
     init_repo(

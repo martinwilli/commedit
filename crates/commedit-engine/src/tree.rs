@@ -65,8 +65,8 @@ pub struct StrReplace {
 /// layer downcasts these onto an `invalid` response rather than `internal`.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplaceError {
-    #[error("{path}: `old` was not found")]
-    NotFound { path: String },
+    #[error("{path}: `old` was not found{hint}")]
+    NotFound { path: String, hint: String },
     #[error(
         "{path}: `old` matched {count} times; extend it with surrounding text \
          to make it unique, or set replace_all"
@@ -211,6 +211,7 @@ impl Repo {
                 if count == 0 {
                     ReplaceError::NotFound {
                         path: r.path.clone(),
+                        hint: crate::diff::closest_match_hint(&current, &r.old),
                     }
                 } else {
                     ReplaceError::Ambiguous {

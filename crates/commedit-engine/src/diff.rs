@@ -1254,12 +1254,124 @@ pub(crate) fn read_text(
     }
 }
 
+/// Build a one-line hint for a failed `old`-text search: locate the region of
+/// `current` most similar to the not-found `old` and describe how it differs.
+/// The common slip is an indentation mismatch (e.g. 7 vs 8 leading tabs) that is
+/// near-impossible to read back from a rendered diff — so when the closest region
+/// matches `old` after stripping leading whitespace, the indents are named
+/// explicitly; otherwise the region is shown with whitespace escaped (`{:?}`), so
+/// no character ever has to be counted by eye. Returns an empty string when
+/// there is nothing to anchor against.
+pub fn closest_match_hint(current: &str, old: &str) -> String {
+    let current_lines: Vec<&str> = current.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    if current_lines.is_empty() || old_lines.is_empty() {
+        return String::new();
+    }
+    // Slide a window the height of `old` over the file, keeping the region whose
+    // lines are individually most similar to `old`'s. Score per line at character
+    // granularity (cheap, bounded per line) — a whole-window diff would rank a
+    // whitespace-only slip no better than chance, since no line matches exactly.
+    let window = old_lines.len().min(current_lines.len());
+    let mut best_start = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    for start in 0..=(current_lines.len() - window) {
+        let score: f32 = (0..window)
+            .map(|i| TextDiff::from_chars(current_lines[start + i], old_lines[i]).ratio())
+            .sum();
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+    let win = &current_lines[best_start..best_start + window];
+    let loc = if window == 1 {
+        format!("line {}", best_start + 1)
+    } else {
+        format!("lines {}\u{2013}{}", best_start + 1, best_start + window)
+    };
+
+    // Pure indentation/whitespace slip: every window line equals its `old`
+    // counterpart once leading whitespace is stripped, yet at least one differs
+    // verbatim. Name the indents so no tab-counting is needed.
+    if old_lines.len() == window {
+        let lead_matches = win
+            .iter()
+            .zip(old_lines.iter())
+            .all(|(c, o)| c.trim_start() == o.trim_start());
+        let first_diff = win.iter().zip(old_lines.iter()).position(|(c, o)| c != o);
+        if lead_matches {
+            if let Some(i) = first_diff {
+                let (file_indent, old_indent) =
+                    (describe_indent(win[i]), describe_indent(old_lines[i]));
+                if window == 1 {
+                    return format!(
+                        ". The closest line ({loc}) is identical except for indentation — \
+                         it uses {file_indent}, but your `old` used {old_indent}"
+                    );
+                }
+                return format!(
+                    ". The closest text is at {loc}, identical except for indentation — \
+                     line {} uses {file_indent}, but your `old` used {old_indent}",
+                    best_start + i + 1,
+                );
+            }
+        }
+    }
+
+    // Otherwise show the closest region with all whitespace escaped, so the
+    // exact difference is unambiguous (capped to keep the error compact).
+    const MAX_SNIPPET: usize = 8;
+    let mut snippet = win
+        .iter()
+        .take(MAX_SNIPPET)
+        .map(|l| format!("{l:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if win.len() > MAX_SNIPPET {
+        snippet.push_str("\n\u{2026}");
+    }
+    format!(". The closest text is at {loc} (whitespace shown escaped):\n{snippet}")
+}
+
+/// Describe a line's leading whitespace in words — "7 tabs", "4 spaces",
+/// "2 tabs + 1 space", or "no indentation" — so a tab-count slip is legible
+/// without counting escaped characters.
+fn describe_indent(line: &str) -> String {
+    let tabs = line
+        .chars()
+        .take_while(|&c| c == '\t' || c == ' ')
+        .filter(|&c| c == '\t')
+        .count();
+    let spaces = line
+        .chars()
+        .take_while(|&c| c == '\t' || c == ' ')
+        .filter(|&c| c == ' ')
+        .count();
+    let mut parts = Vec::new();
+    if tabs > 0 {
+        parts.push(format!("{tabs} tab{}", if tabs == 1 { "" } else { "s" }));
+    }
+    if spaces > 0 {
+        parts.push(format!(
+            "{spaces} space{}",
+            if spaces == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        "no indentation".to_string()
+    } else {
+        parts.join(" + ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_patch, parse_diff_lines, reconstruct_conflict_file, render_commit_diff,
-        render_conflict_snippets, render_diff, revert_groups, select_groups, split_combined_patch,
-        unified_diff, ChangeKind, ContextExpansion, DiffLineKind, FileChange,
+        apply_patch, closest_match_hint, describe_indent, parse_diff_lines,
+        reconstruct_conflict_file, render_commit_diff, render_conflict_snippets, render_diff,
+        revert_groups, select_groups, split_combined_patch, unified_diff, ChangeKind,
+        ContextExpansion, DiffLineKind, FileChange,
     };
     use std::collections::{BTreeSet, HashMap};
 
@@ -1828,5 +1940,42 @@ mod tests {
         assert!(rebuilt.contains("mine\n"));
         assert!(!rebuilt.contains("<<<<<<<"));
         assert!(!rebuilt.contains("yours"));
+    }
+
+    #[test]
+    fn closest_match_hint_names_an_indentation_slip() {
+        // The reported failure: the file's continuation line is indented with 7
+        // tabs, the search string used 8 — same content, off by one tab.
+        let file = "fn f() {\n\t\t\t\t\t\t\treturn x;\n}\n";
+        let old = "\t\t\t\t\t\t\t\treturn x;";
+        let hint = closest_match_hint(file, old);
+        assert!(hint.contains("indentation"), "hint: {hint}");
+        assert!(hint.contains("7 tabs"), "hint: {hint}");
+        assert!(hint.contains("8 tabs"), "hint: {hint}");
+        assert!(hint.contains("line 2"), "hint: {hint}");
+    }
+
+    #[test]
+    fn closest_match_hint_escapes_whitespace_in_a_general_miss() {
+        // No line matches even after trimming, so the closest region is shown
+        // with whitespace escaped rather than left for the caller to guess.
+        let file = "alpha beta\n\tgamma delta\nepsilon\n";
+        let old = "gamma zeta";
+        let hint = closest_match_hint(file, old);
+        assert!(hint.contains("whitespace shown escaped"), "hint: {hint}");
+        assert!(hint.contains("\\tgamma delta"), "tab is escaped: {hint}");
+    }
+
+    #[test]
+    fn closest_match_hint_is_empty_without_anchor() {
+        assert!(closest_match_hint("", "anything").is_empty());
+    }
+
+    #[test]
+    fn describe_indent_reports_tabs_and_spaces() {
+        assert_eq!(describe_indent("\t\t\t\t\t\t\tx"), "7 tabs");
+        assert_eq!(describe_indent("    x"), "4 spaces");
+        assert_eq!(describe_indent("\t x"), "1 tab + 1 space");
+        assert_eq!(describe_indent("x"), "no indentation");
     }
 }

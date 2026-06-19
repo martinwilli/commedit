@@ -934,6 +934,13 @@ pub struct ReloadRepoReq {
     /// a git common dir). Omit to reload the current repository in place. A path
     /// outside this repository's worktrees is refused.
     pub path: Option<String>,
+    /// Optional branch to edit, which need NOT be checked out: reopens the
+    /// session editing this branch's history, moving only its ref and leaving
+    /// HEAD/index/worktree frozen (so working-copy tools are then unavailable).
+    /// Omit to keep editing the current branch (or, when re-homing via `path`,
+    /// the branch checked out in that worktree). Refused if the branch doesn't
+    /// exist or is checked out in another worktree.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -942,6 +949,13 @@ pub struct ReloadResp {
     pub head_sha: Option<String>,
     /// The repository root the session is now pointed at.
     pub root: String,
+    /// The branch whose history the session now edits (its short name), or null
+    /// on a detached HEAD with no branch selected.
+    pub branch: Option<String>,
+    /// Whether the edited branch is the one checked out in the worktree. `false`
+    /// means an off-worktree session: only the branch ref moves, there is no
+    /// working copy, and working-copy tools are refused.
+    pub worktree_bound: bool,
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 //! commedit-mcp — an MCP (Model Context Protocol) stdio server over the
 //! commedit engine, exposing history editing to AI agents.
 //!
-//! Launched per repository: `commedit-mcp [path]` (default `.`, resolved like
-//! the GTK app via the engine's `find_git_root`). The MCP client owns the
-//! process lifecycle — one server instance is one editing session.
-
-use std::path::PathBuf;
+//! Launched per repository: `commedit-mcp [path] [branch]` (path defaults to
+//! `.`, resolved like the GTK app via the engine's `find_git_root`; an optional
+//! branch edits a branch that need not be checked out — see
+//! `commedit_engine::cli`). The MCP client owns the process lifecycle — one
+//! server instance is one editing session.
 
 use anyhow::{Context, Result};
 use rmcp::transport::stdio;
@@ -23,15 +23,17 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    let path = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_string()));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (path, branch) = commedit_engine::cli::parse_repo_and_branch(&args);
 
     // Repo::open does blocking git/jj work; keep it off the async runtime. Use the
     // index cache so repeated launches against the same repo skip rebuilding jj's
     // commit index from scratch (see `commedit_engine::index_cache`).
     let repo = tokio::task::spawn_blocking(move || {
-        commedit_engine::repo::Repo::open_with_cache(
+        commedit_engine::repo::Repo::open_branch(
             &path,
             commedit_engine::index_cache::IndexCache::Default,
+            branch.as_deref(),
         )
     })
     .await

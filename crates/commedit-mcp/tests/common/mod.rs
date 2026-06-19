@@ -19,6 +19,19 @@ pub fn open_server(dir: &Path) -> CommeditServer {
     CommeditServer::new(Repo::open(dir).expect("opening the scratch repo"))
 }
 
+/// Open a server session editing `branch` (which need not be checked out), the
+/// off-worktree way `main` does with a branch argument.
+pub fn open_server_branch(dir: &Path, branch: &str) -> CommeditServer {
+    CommeditServer::new(
+        Repo::open_branch(
+            dir,
+            commedit_engine::index_cache::IndexCache::Disabled,
+            Some(branch),
+        )
+        .expect("opening the scratch repo on a branch"),
+    )
+}
+
 /// Unwrap a tool result's error side (the `Yaml` result wrapper carries no
 /// `Debug`, so `unwrap_err` can't).
 pub fn expect_err<T>(result: Result<T, rmcp::ErrorData>) -> rmcp::ErrorData {

@@ -120,6 +120,23 @@ pub fn ensure_not_pending(repo: &Repo) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Refuse a working-copy mutation when the session edits an off-worktree branch:
+/// a branch that isn't checked out has no working copy. Surfaces the engine's
+/// refusal as a clear up-front error, before the "clean — nothing to commit"
+/// check the working-copy tools would otherwise hit (the off-worktree `@` has no
+/// changes).
+pub fn ensure_worktree_bound(repo: &Repo) -> Result<(), ErrorData> {
+    if !repo.is_worktree_bound() {
+        let branch = repo.target_branch_name().unwrap_or("the selected branch");
+        return Err(invalid(format!(
+            "branch '{branch}' is not checked out, so this session has no working copy; \
+             working-copy tools are unavailable. Edit its committed history instead, or \
+             reload_repo without a branch to edit the checked-out branch."
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that `requested` is the main checkout or a linked worktree of the
 /// repository currently rooted at `current_root` — they share a git *common
 /// dir* — and return its canonical toplevel for [`Repo::open`]. Refused

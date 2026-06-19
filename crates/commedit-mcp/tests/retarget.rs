@@ -19,7 +19,7 @@ fn s(p: &Path) -> String {
 
 async fn reload(server: &CommeditServer, path: Option<String>) -> commedit_mcp::dto::ReloadResp {
     server
-        .reload_repo(Parameters(ReloadRepoReq { path }))
+        .reload_repo(Parameters(ReloadRepoReq { path, branch: None }))
         .await
         .unwrap()
         .0
@@ -137,6 +137,7 @@ async fn a_path_outside_the_repository_is_refused_and_the_session_is_unaffected(
         server
             .reload_repo(Parameters(ReloadRepoReq {
                 path: Some(s(other.path())),
+                branch: None,
             }))
             .await,
     );
@@ -154,6 +155,7 @@ async fn a_path_outside_the_repository_is_refused_and_the_session_is_unaffected(
         server
             .reload_repo(Parameters(ReloadRepoReq {
                 path: Some(s(plain.path())),
+                branch: None,
             }))
             .await,
     );

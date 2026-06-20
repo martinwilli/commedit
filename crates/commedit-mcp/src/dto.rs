@@ -249,10 +249,30 @@ pub enum SaveResultDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session addressing
+
+/// The session a tool operates on. The server hosts several independent editing
+/// sessions over one repository, so every session-operating tool names which one
+/// — there is no implicit default. Flattened into the request DTOs that already
+/// carry arguments, and used standalone as the whole request of the otherwise
+/// argument-less tools.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SessionSel {
+    /// The session to operate on: the short name of the branch it edits — its id
+    /// as returned by `list_sessions` / `open_session` (e.g. `main`, `feature`).
+    /// Use the reserved id `HEAD` for a detached/unborn-HEAD session. A branch
+    /// short-name is stable across rewrites (unlike shas), so it is always a safe
+    /// handle. Required on every session-operating tool.
+    pub session: String,
+}
+
+// ---------------------------------------------------------------------------
 // Requests / responses per tool
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListHistoryReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// Maximum number of commits to return, newest first. Omit for the default
     /// (30). Raise it (or page with `offset`) to see deeper history.
     pub limit: Option<usize>,
@@ -298,6 +318,8 @@ pub struct ListHistoryResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShowCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to show — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive — from the history, the working copy
     /// (an uncommitted entry) or the trash.
@@ -333,6 +355,8 @@ pub struct ShowGraphResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SuggestSquashReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit you intend to fold, from the history or the trash — sha or
     /// change id, full or a unique prefix. Its leading `fixup!`/`squash!`/`amend!`
     /// subject token names the target whose matching branch commit(s) are
@@ -398,6 +422,8 @@ pub struct PendingStatusResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditMessageReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to edit — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
@@ -409,6 +435,8 @@ pub struct EditMessageReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditIdentityReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to edit — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
@@ -436,6 +464,8 @@ pub struct CommitEditDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditCommitsReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The per-commit edits, applied together in ONE transaction with a single
     /// rebase. Prefer this over many edit_identity/edit_message calls for bulk
     /// changes: it's atomic (a conflict holds the whole batch back) and avoids
@@ -454,6 +484,8 @@ pub struct FileContentDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceFilesReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to edit — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
@@ -485,6 +517,8 @@ pub struct StrReplaceDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceInFileReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to edit — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
     /// so they chain across mutations without re-listing.
@@ -495,6 +529,8 @@ pub struct ReplaceInFileReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceInMessageReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit whose message to edit — sha or change id, full or a unique
     /// prefix (>= 4 chars), case-insensitive. Change ids are stable across
     /// rewrites.
@@ -510,6 +546,8 @@ pub struct ReplaceInMessageReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SplitCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to split — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.
     pub commit: String,
@@ -542,6 +580,8 @@ pub struct IdentityFieldsDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CreateCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The full commit message (subject line + optional body). Stored verbatim
     /// and not reflowed — wrap the body at ~72 columns; keep the subject one line.
     pub message: String,
@@ -566,6 +606,8 @@ pub struct CreateCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RevertCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to revert — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive. Merge commits cannot be reverted.
     pub commit: String,
@@ -580,6 +622,8 @@ pub struct RevertCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CherryPickCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to cherry-pick. A commit in the current branch history takes
     /// a sha or change id, full or a unique prefix (>= 4 chars). A commit from
     /// *outside* the history (e.g. on another branch) takes its full 40-char
@@ -597,6 +641,8 @@ pub struct CherryPickCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DropCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to drop — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.
     pub commit: String,
@@ -631,6 +677,8 @@ pub struct DropCommitResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReorderCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to move — sha or change id, full or a unique prefix
     /// (>= 4 chars), case-insensitive.
     pub commit: String,
@@ -645,6 +693,8 @@ pub struct ReorderCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RestoreCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The trashed commit to graft back (see `list_trash`) — sha or change
     /// id, full or a unique prefix (>= 4 chars), case-insensitive.
     pub commit: String,
@@ -656,6 +706,8 @@ pub struct RestoreCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MergeOutReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The single-parent commit C to merge out — sha or change id, full or a
     /// unique prefix (>= 4 chars), case-insensitive. A merge M is introduced
     /// directly above it; merge commits and the repository root (which have no
@@ -669,6 +721,8 @@ pub struct MergeOutReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SquashCommitReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit to fold, from the history or the trash — sha or change id,
     /// full or a unique prefix. A ref present in both resolves to the
     /// history commit.
@@ -689,6 +743,8 @@ pub struct SquashCommitReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SquashWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The commit the uncommitted changes should be folded into — sha or
     /// change id, full or a unique prefix.
     pub dest: String,
@@ -735,6 +791,8 @@ pub struct SquashWorkingCopyReq {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CommitWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The full commit message (subject line + optional body) for the new commit
     /// holding the committed changes. Stored verbatim and not reflowed — wrap the
     /// body at ~72 columns; keep the subject one line.
@@ -838,6 +896,8 @@ pub struct PatchSelectionDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DiscardWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// Must be true. Discarded uncommitted changes cannot be recovered
     /// through this server — undo steps over the discard but restores only
     /// previously recorded states, which never contain them.
@@ -851,6 +911,8 @@ pub struct OkResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadConflictReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The conflicted commit (from the mutation's `conflicts` response or
     /// `pending_status`) — change id or current sha, full or a unique
     /// prefix. Prefer the change id: shas churn on every resolution step.
@@ -907,6 +969,8 @@ pub struct ConflictFileEditDto {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictsReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// The conflicted commit being resolved — change id or current sha, full
     /// or a unique prefix. Prefer the change id: shas churn on every
     /// resolution step.
@@ -924,6 +988,8 @@ pub struct AbortResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct JumpToOperationReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// Target position: 0 = session start, the `index` of an entry from
     /// `list_operations` = the state right after that operation.
     pub index: usize,
@@ -939,6 +1005,8 @@ pub struct TimeTravelResp {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReloadRepoReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
     /// Optional path to re-home this session to a *different worktree of the
     /// same repository* — its main checkout or any linked worktree (they share
     /// a git common dir). Omit to reload the current repository in place. A path
@@ -949,12 +1017,18 @@ pub struct ReloadRepoReq {
     /// HEAD/index/worktree frozen (so working-copy tools are then unavailable).
     /// Omit to keep editing the current branch (or, when re-homing via `path`,
     /// the branch checked out in that worktree). Refused if the branch doesn't
-    /// exist or is checked out in another worktree.
+    /// exist or is checked out in another worktree. NOTE: switching the branch
+    /// re-keys the session — its id becomes the new branch's short-name (returned
+    /// in `session`); refused if a session for that branch is already open.
     pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReloadResp {
+    /// The session id after the reload — its branch short-name (or `HEAD`). It
+    /// changes when `branch` switched the edited branch; pass this id to later
+    /// tools, not the one you reloaded.
+    pub session: String,
     /// The branch tip after the fresh import.
     pub head_sha: Option<String>,
     /// The repository root the session is now pointed at.
@@ -966,6 +1040,69 @@ pub struct ReloadResp {
     /// means an off-worktree session: only the branch ref moves, there is no
     /// working copy, and working-copy tools are refused.
     pub worktree_bound: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Session registry tools
+
+/// One open editing session in the registry. The server hosts several at once,
+/// each over a distinct branch of the one repository it launched against.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SessionInfoDto {
+    /// The session id: the short name of the branch this session edits (or the
+    /// reserved `HEAD` for a detached/unborn-HEAD session). Pass it as the
+    /// `session` selector on every session-operating tool.
+    pub session: String,
+    /// The worktree this session is anchored at (absolute path).
+    pub root: String,
+    /// The branch whose history this session edits (short name), or null on a
+    /// detached HEAD. Equal to `session` except for the reserved `HEAD` id.
+    pub branch: Option<String>,
+    /// Whether the edited branch is the one checked out at `root`. `false` is an
+    /// off-worktree session: only the branch ref moves and working-copy tools are
+    /// refused (there is no working copy).
+    pub worktree_bound: bool,
+    /// The branch tip this session currently sits on, or null on a detached/unborn
+    /// HEAD.
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ListSessionsResp {
+    /// Every open session, by id. Use a session's id as the `session` selector on
+    /// the other tools. Never empty — the launch session can't be closed away.
+    pub sessions: Vec<SessionInfoDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OpenSessionReq {
+    /// The branch to open an editing session over (short name or full
+    /// `refs/heads/…`). git's branch→worktree mapping decides the anchor: a
+    /// branch checked out in a worktree opens worktree-bound there (live working
+    /// copy); a branch checked out nowhere opens off-worktree (only its ref moves,
+    /// no working copy). The branch must exist; a branch already open as a session,
+    /// or checked out in a worktree commedit can't bind, is refused.
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct OpenSessionResp {
+    /// The id of the new session (the branch short-name) — its `session` selector.
+    pub session: String,
+    /// Whether it opened worktree-bound (live working copy) or off-worktree.
+    pub worktree_bound: bool,
+    /// The branch tip the new session sits on.
+    pub head_sha: Option<String>,
+    /// The full session list after opening, for orientation.
+    pub sessions: Vec<SessionInfoDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CloseSessionResp {
+    /// The id of the session that was closed.
+    pub closed: String,
+    /// The remaining open sessions after closing.
+    pub sessions: Vec<SessionInfoDto>,
 }
 
 #[cfg(test)]

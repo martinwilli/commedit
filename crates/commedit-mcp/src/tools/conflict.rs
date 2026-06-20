@@ -9,7 +9,7 @@ use rmcp::{tool, tool_router, ErrorData};
 use crate::convert::conflicted_commit_dto;
 use crate::dto::{
     AbortResp, ConflictFileContentDto, PendingStatusResp, ReadConflictReq, ReadConflictResp,
-    ResolveConflictsReq, SaveResultDto,
+    ResolveConflictsReq, SaveResultDto, SessionSel,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -21,8 +21,11 @@ impl CommeditServer {
     #[tool(
         description = "Whether a conflicted rewrite is pending. While pending, git still shows the pre-rewrite history (git_head_sha) and the held rewrite's tip is jj_head_sha; no other mutation is allowed until the conflicts resolve or the rewrite is aborted."
     )]
-    pub async fn pending_status(&self) -> Result<Yaml<PendingStatusResp>, ErrorData> {
-        self.with_session(|repo, _| {
+    pub async fn pending_status(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<PendingStatusResp>, ErrorData> {
+        self.with_session(req.session, |repo, _| {
             Ok(PendingStatusResp {
                 pending: repo.is_pending(),
                 git_head_sha: repo.head_commit_id().map(|id| id.hex()),
@@ -46,7 +49,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ReadConflictReq>,
     ) -> Result<Yaml<ReadConflictResp>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             let conflicts = repo
                 .pending_conflicts()
                 .ok_or_else(|| invalid("no conflicted rewrite is pending"))?;
@@ -112,7 +115,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ResolveConflictsReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             if !repo.is_pending() {
                 return Err(invalid("no conflicted rewrite is pending"));
             }
@@ -160,8 +163,11 @@ impl CommeditServer {
     #[tool(
         description = "Discard the pending conflicted rewrite, rolling history back to before it. Git was never touched while it was held back, so the pre-rewrite state is simply still in place — making this the cheap way out when the conflict came from a mutation you just issued (fix the input and redo), as well as the only escape from a structural (resolvable=false) conflict that can't be resolved as text."
     )]
-    pub async fn abort_rewrite(&self) -> Result<Yaml<AbortResp>, ErrorData> {
-        self.with_session(|repo, trash| {
+    pub async fn abort_rewrite(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<AbortResp>, ErrorData> {
+        self.with_session(req.session, |repo, trash| {
             if !repo.is_pending() {
                 return Err(invalid("no conflicted rewrite is pending"));
             }

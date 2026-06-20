@@ -8,25 +8,28 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler};
 
-use crate::session::TrashState;
+use crate::session::SessionRegistry;
 
-/// One editing session over one repository. Cheap to clone — all state is
-/// behind `Arc`s; the `std::sync::Mutex` serializes every tool body (each runs
-/// in `spawn_blocking` and takes the lock inside, never across an `.await`).
-/// `reload_repo` re-opens the live `repo.workspace_root()` (and can re-home to a
-/// sibling worktree), so no separate repo-path needs keeping.
+/// A multi-tenant server over one repository: it hosts several independent
+/// editing sessions (one per branch/worktree), each addressed by id on every
+/// tool call. Cheap to clone — all state is behind the registry `Arc`. See
+/// [`SessionRegistry`] for the locking model.
 #[derive(Clone)]
 pub struct CommeditServer {
-    pub(crate) repo: Arc<Mutex<Repo>>,
-    pub(crate) trash: Arc<Mutex<TrashState>>,
+    pub(crate) sessions: Arc<Mutex<SessionRegistry>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl CommeditServer {
+    /// Build the server around an initial (launch) session over `repo`. The launch
+    /// session is registered like any other — discoverable via `list_sessions`,
+    /// addressable by its branch short-name — and carries no implicit-default
+    /// status. Further sessions are opened with `open_session`. The repository the
+    /// server is scoped to is the one `repo` belongs to.
     pub fn new(repo: Repo) -> Self {
+        let root = repo.workspace_root().to_path_buf();
         Self {
-            repo: Arc::new(Mutex::new(repo)),
-            trash: Arc::new(Mutex::new(TrashState::default())),
+            sessions: Arc::new(Mutex::new(SessionRegistry::with_launch_session(root, repo))),
             tool_router: Self::router_read()
                 + Self::router_mutate()
                 + Self::router_workcopy()
@@ -35,11 +38,11 @@ impl CommeditServer {
         }
     }
 
-    /// A clone of the session's repo handle. `main` grabs this before `serve`
-    /// consumes the server, so it can flush the index cache at clean shutdown (see
-    /// [`commedit_engine::repo::Repo::flush_index_cache`]).
-    pub fn repo_handle(&self) -> Arc<Mutex<Repo>> {
-        self.repo.clone()
+    /// A clone of the session registry handle. `main` grabs this before `serve`
+    /// consumes the server, so it can flush every session's index cache at clean
+    /// shutdown (see [`SessionRegistry::flush_all_caches`]).
+    pub fn sessions_handle(&self) -> Arc<Mutex<SessionRegistry>> {
+        self.sessions.clone()
     }
 }
 
@@ -50,6 +53,20 @@ reachable from HEAD can be edited (message, identity, file contents), split, \
 reordered, dropped or squashed, and its descendants are rebased automatically. \
 New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
+
+Sessions: this server hosts SEVERAL independent editing sessions over the one \
+repository it launched against — one per branch — so you can edit several \
+branches at once and they run in parallel. EVERY tool that operates on a session \
+takes a required `session` selector naming which one; there is no implicit \
+default. The selector is the SESSION ID: the short name of the branch that \
+session edits (e.g. `main`, `feature`), or the reserved id `HEAD` for a \
+detached/unborn-HEAD session. A branch short-name is stable across rewrites \
+(unlike shas/change_ids, which churn), so it is always a safe handle. Start with \
+list_sessions to see what's open (the launch session is already there, named like \
+any other); open_session(branch) starts a new session over another branch \
+(worktree-bound if that branch is checked out in a worktree, else off-worktree); \
+close_session(session) drops one (the last session can't be closed). Two sessions \
+can never edit the same branch — open_session refuses a branch already open.
 
 Raw git vs commedit — the dividing line. A NEW commit on top of HEAD needs no \
 rebase, so for a one-off the simplest tool is plain `git add` + `git commit`. But \
@@ -149,10 +166,12 @@ every rewrite automatically (working_copy_status shows them; session_diff \
 shows everything this session changed, committed and uncommitted, against the \
 session-start tree). Git state is imported only at startup, but the session \
 catches up automatically on the next tool call when you commit on top of HEAD \
-with plain git — so plain commits need no reload. reload_repo is only for \
-out-of-band changes it can't absorb in place: a branch switch, or history \
-rewritten by `git rebase`/`reset`/`commit --amend`; it starts a fresh session, \
-discarding the trash, the operation log and any pending rewrite.
+with plain git — so plain commits need no reload. reload_repo(session, …) is only \
+for out-of-band changes one session can't absorb in place: a branch switch, or \
+history rewritten by `git rebase`/`reset`/`commit --amend`; it restarts THAT \
+session fresh, discarding its trash, operation log and any pending rewrite \
+(other sessions are untouched). Switching its branch re-keys the session — its \
+id becomes the new branch's short-name, returned in the result.
 
 Verifying a rewrite: a topology-changing mutation (reorder, squash, split, drop, \
 restore, create, revert, cherry_pick, merge_out, squash_working_copy) returns a \

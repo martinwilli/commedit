@@ -14,8 +14,8 @@ use crate::convert::{commit_dto, file_change_dto, graph_adjacency, DetailFields}
 /// history is reachable via `limit` or `offset` paging.
 const DEFAULT_HISTORY_LIMIT: usize = 30;
 use crate::dto::{
-    ListHistoryReq, ListHistoryResp, ListTrashResp, ShowCommitReq, ShowCommitResp, ShowGraphResp,
-    SuggestSquashReq, SuggestSquashResp,
+    ListHistoryReq, ListHistoryResp, ListTrashResp, SessionSel, ShowCommitReq, ShowCommitResp,
+    ShowGraphResp, SuggestSquashReq, SuggestSquashResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -33,7 +33,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ListHistoryReq>,
     ) -> Result<Yaml<ListHistoryResp>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             let trash_count = trash.entries.len();
             // Opt-in working-copy block (snapshots the disk), folded in to save a
             // separate working_copy_status round-trip.
@@ -85,7 +85,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ShowCommitReq>,
     ) -> Result<Yaml<ShowCommitResp>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             let (_, commits) = crate::session::full_history(repo)?;
             // One union in precedence order — history, working copy, trash —
             // so a ref present in several sets resolves to the history commit.
@@ -125,8 +125,11 @@ impl CommeditServer {
     #[tool(
         description = "List the commits dropped to the session trash. They stay restorable (restore_commit, or squash_commit with a trashed source) until the session ends."
     )]
-    pub async fn list_trash(&self) -> Result<Yaml<ListTrashResp>, ErrorData> {
-        self.with_session(|repo, trash| {
+    pub async fn list_trash(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<ListTrashResp>, ErrorData> {
+        self.with_session(req.session, |repo, trash| {
             let refs = repo.commit_refs();
             let root = repo.root_commit_id().hex();
             let abbrev = IdAbbrev::new(&repo.repo);
@@ -145,8 +148,11 @@ impl CommeditServer {
     #[tool(
         description = "Show the commit graph of the checked-out branch: every commit reachable from HEAD (newest first), each with its parents AND children by change_id — the merge and side-branch structure at a glance, which the newest-first list_history can't convey on its own. This is the standalone, whole-branch read of the same `topology` shape a topology-changing mutation folds into its result. Reach for it to see how merges and side branches connect before reordering, merging out or restoring; list_history stays the source for per-commit detail (messages, identities, diffs, refs)."
     )]
-    pub async fn show_graph(&self) -> Result<Yaml<ShowGraphResp>, ErrorData> {
-        self.with_session(|repo, _| {
+    pub async fn show_graph(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<ShowGraphResp>, ErrorData> {
+        self.with_session(req.session, |repo, _| {
             let Some(_) = repo.head_commit_id() else {
                 return Ok(ShowGraphResp {
                     head_sha: None,
@@ -171,7 +177,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<SuggestSquashReq>,
     ) -> Result<Yaml<SuggestSquashResp>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             let (_, commits) = full_history(repo)?;
             // Resolve the source: history first, then the trash (so a ref in both
             // means the live commit), and pick the matching recommendation walk.

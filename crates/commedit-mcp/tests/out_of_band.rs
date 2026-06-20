@@ -7,13 +7,14 @@ mod common;
 
 use commedit_mcp::dto::{DropCommitReq, ListHistoryReq};
 use commedit_mcp::server::CommeditServer;
-use common::{git, init_repo, open_server};
+use common::{git, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 async fn subjects(server: &CommeditServer) -> Vec<String> {
     server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -65,6 +66,7 @@ async fn the_catch_up_preserves_the_session_trash() {
     // Drop B into the session trash, then commit out of band on top of the new tip.
     let b = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -80,6 +82,7 @@ async fn the_catch_up_preserves_the_session_trash() {
         .change_id;
     server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: b,
             keep_changes: false,
         }))
@@ -97,7 +100,11 @@ async fn the_catch_up_preserves_the_session_trash() {
         "history reflects the dropped B and the out-of-band D"
     );
     // ...and the trash still holds B — a full reload would have cleared it.
-    let trash = server.list_trash().await.expect("list_trash").0;
+    let trash = server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .expect("list_trash")
+        .0;
     let trashed: Vec<String> = trash.commits.iter().map(|c| c.subject.clone()).collect();
     assert_eq!(trashed, vec!["B"], "the catch-up preserved the trash");
 }

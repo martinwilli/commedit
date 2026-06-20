@@ -2,9 +2,9 @@
 //! wrapper, commit-ref addressing against a fresh history read, the session
 //! trash, and the reorder/restore splice planner.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
@@ -17,7 +17,7 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::ErrorData;
 
 use crate::convert::{save_result_dto, topology_slice, wc_entry_dto};
-use crate::dto::{IdentityFieldsDto, WorkingCopyStatusResp};
+use crate::dto::{IdentityFieldsDto, SessionInfoDto, WorkingCopyStatusResp};
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
 
@@ -57,49 +57,156 @@ impl TrashState {
     }
 }
 
+/// One independent editing session: a [`Repo`] and its session [`TrashState`],
+/// each behind its own lock so different sessions run fully in parallel — only
+/// same-session tool calls serialize on the per-session repo mutex. Cheap to
+/// share via `Arc`.
+pub struct SessionSlot {
+    pub(crate) repo: Mutex<Repo>,
+    pub(crate) trash: Mutex<TrashState>,
+}
+
+impl SessionSlot {
+    pub(crate) fn new(repo: Repo) -> Self {
+        Self {
+            repo: Mutex::new(repo),
+            trash: Mutex::new(TrashState::default()),
+        }
+    }
+}
+
+/// The server's session registry: every open editing session keyed by its id,
+/// plus the repository root used to resolve branches and enumerate worktrees when
+/// a session is opened. All sessions are branches/worktrees of the *one*
+/// repository the server launched against, so a branch short-name is a unique key
+/// across them.
+///
+/// **Three-tiered locking** keeps a long mutation in one session from blocking an
+/// unrelated one: the registry lock is held only to look up + clone a slot's
+/// `Arc` (short), the per-session repo mutex is held across the blocking jj work
+/// (single-writer-per-session), and git-level safety is the engine's — with one
+/// added rule, that a (repo, branch) already live in a slot can't be opened twice
+/// (mirroring the engine's "branch is checked out in another worktree" refusal).
+pub struct SessionRegistry {
+    /// A path of the repository (the launch worktree). Used to resolve branch
+    /// refs and enumerate worktrees in `open_session`; valid from any worktree,
+    /// so it need not move when individual sessions re-home.
+    pub(crate) root: PathBuf,
+    /// Open sessions, keyed by id (branch short-name, or `HEAD`).
+    pub(crate) slots: HashMap<String, Arc<SessionSlot>>,
+}
+
+impl SessionRegistry {
+    /// A registry holding a single session — the launch session — keyed by its
+    /// derived id.
+    pub(crate) fn with_launch_session(root: PathBuf, repo: Repo) -> Self {
+        let id = session_id_for(&repo);
+        let mut slots = HashMap::new();
+        slots.insert(id, Arc::new(SessionSlot::new(repo)));
+        Self { root, slots }
+    }
+
+    /// Flush the index cache of every open session. The frontend calls this at
+    /// clean shutdown; each [`Repo`]'s `Drop` is the backstop.
+    pub fn flush_all_caches(&self) {
+        for slot in self.slots.values() {
+            slot.repo
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .flush_index_cache();
+        }
+    }
+}
+
+/// The id a session is keyed by: the short name of the branch it edits, or the
+/// reserved `HEAD` for a detached/unborn-HEAD session (which edits no branch).
+pub(crate) fn session_id_for(repo: &Repo) -> String {
+    repo.target_branch_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Look up the slot for session `id`, cloning its `Arc`. Errors listing the open
+/// sessions when `id` names none — the registry is never empty (closing the last
+/// session is refused), so the list is never blank.
+pub(crate) fn resolve_slot(
+    registry: &SessionRegistry,
+    id: &str,
+) -> Result<Arc<SessionSlot>, ErrorData> {
+    registry.slots.get(id).cloned().ok_or_else(|| {
+        let mut open: Vec<&str> = registry.slots.keys().map(String::as_str).collect();
+        open.sort_unstable();
+        invalid(format!(
+            "no open session '{id}'; open sessions are: [{}]. Use list_sessions to see \
+             them, or open_session(branch) to start a new one.",
+            open.join(", ")
+        ))
+    })
+}
+
+/// Build the registry-listing DTO for one session from its (already-locked) repo.
+pub(crate) fn session_info(id: &str, repo: &Repo) -> SessionInfoDto {
+    SessionInfoDto {
+        session: id.to_string(),
+        root: repo.workspace_root().display().to_string(),
+        branch: repo.target_branch_name().map(str::to_string),
+        worktree_bound: repo.is_worktree_bound(),
+        head_sha: repo.head_commit_id().map(|c| c.hex()),
+    }
+}
+
+/// Snapshot the whole session list, id-sorted. Locks each session's repo only
+/// briefly and **never** while holding the registry lock (snapshot the `Arc`s
+/// under the registry lock, release it, then lock each repo) — so it can't
+/// deadlock against a long mutation or block unrelated sessions. Safe on the
+/// blocking pool; never call it while already holding one of the listed slots'
+/// repo locks (the std mutex is not reentrant).
+pub(crate) fn sessions_view(registry: &Mutex<SessionRegistry>) -> Vec<SessionInfoDto> {
+    let snapshot: Vec<(String, Arc<SessionSlot>)> = {
+        let reg = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        reg.slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), slot.clone()))
+            .collect()
+    };
+    let mut out: Vec<SessionInfoDto> = snapshot
+        .iter()
+        .map(|(id, slot)| {
+            let repo = slot.repo.lock().unwrap_or_else(PoisonError::into_inner);
+            session_info(id, &repo)
+        })
+        .collect();
+    out.sort_by(|a, b| a.session.cmp(&b.session));
+    out
+}
+
 impl CommeditServer {
-    /// Run `f` against the locked session on the blocking thread pool. The
-    /// mutex serializes all tool work (single writer for free); it is taken
-    /// inside the blocking task, never across an `.await`.
+    /// Run `f` against the named session on the blocking thread pool. The
+    /// per-session repo mutex serializes that session's tool work (single writer
+    /// for free) without blocking other sessions; the registry lock is held only
+    /// to resolve + clone the slot, never across the blocking work or an `.await`.
     ///
     /// First catches the session up to a git HEAD that moved out of band (a plain
     /// `git commit` the caller made on top of HEAD): jj imports git state only at
     /// open, so without this every tool that reads from the live HEAD would fail
     /// once the caller commits with raw git — and the catch-up preserves the trash
     /// and op-log, unlike `reload_repo`. A no-op while in sync or pending.
-    pub(crate) async fn with_session<T, F>(&self, f: F) -> Result<T, ErrorData>
+    pub(crate) async fn with_session<T, F>(&self, id: String, f: F) -> Result<T, ErrorData>
     where
         F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
         T: Send + 'static,
     {
-        self.with_session_opt(true, f).await
-    }
-
-    /// Like [`Self::with_session`] but skips the out-of-band catch-up. Used by
-    /// `reload_repo`, which reopens the repository from scratch and so must not be
-    /// pre-empted by the catch-up's branch-switch refusal — reopening is exactly
-    /// how a branch switch is meant to be handled.
-    pub(crate) async fn with_session_no_sync<T, F>(&self, f: F) -> Result<T, ErrorData>
-    where
-        F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.with_session_opt(false, f).await
-    }
-
-    async fn with_session_opt<T, F>(&self, sync: bool, f: F) -> Result<T, ErrorData>
-    where
-        F: FnOnce(&mut Repo, &mut TrashState) -> Result<T, ErrorData> + Send + 'static,
-        T: Send + 'static,
-    {
-        let repo = self.repo.clone();
-        let trash = self.trash.clone();
+        let sessions = self.sessions.clone();
         tokio::task::spawn_blocking(move || {
-            let mut repo = repo.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut trash = trash.lock().unwrap_or_else(PoisonError::into_inner);
-            if sync {
-                repo.sync_to_git_head().map_err(internal)?;
-            }
+            // Short registry lock: resolve + clone the slot, then release it before
+            // the (long) per-session work so other sessions run in parallel.
+            let slot = {
+                let registry = sessions.lock().unwrap_or_else(PoisonError::into_inner);
+                resolve_slot(&registry, &id)?
+            };
+            let mut repo = slot.repo.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut trash = slot.trash.lock().unwrap_or_else(PoisonError::into_inner);
+            repo.sync_to_git_head().map_err(internal)?;
             f(&mut repo, &mut trash)
         })
         .await

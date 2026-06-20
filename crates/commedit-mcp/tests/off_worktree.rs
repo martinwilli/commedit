@@ -5,7 +5,7 @@
 mod common;
 
 use commedit_mcp::dto::{CommitWorkingCopyReq, EditMessageReq, IdentityFieldsDto, ReloadRepoReq};
-use common::{expect_err, git, init_repo, open_server, open_server_branch};
+use common::{expect_err, git, init_repo, open_server, open_server_branch, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use std::path::Path;
 use tempfile::TempDir;
@@ -49,6 +49,7 @@ async fn editing_an_off_worktree_branch_moves_only_its_ref() {
     let b = git(dir, &["rev-parse", "feature~2"]);
     server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("feature"),
             commit: b,
             message: "B (edited)".to_string(),
         }))
@@ -70,6 +71,7 @@ async fn working_copy_tools_are_refused_off_worktree() {
     let err = expect_err(
         server
             .commit_working_copy(Parameters(CommitWorkingCopyReq {
+                session: sel("feature"),
                 message: "x".to_string(),
                 identity: IdentityFieldsDto::default(),
                 paths: None,
@@ -94,12 +96,14 @@ async fn reload_repo_can_switch_to_an_off_worktree_branch() {
 
     let resp = server
         .reload_repo(Parameters(ReloadRepoReq {
+            session: sel("main"),
             path: None,
             branch: Some("feature".to_string()),
         }))
         .await
         .expect("reload onto feature")
         .0;
+    assert_eq!(resp.session, "feature", "the session re-keyed to feature");
     assert_eq!(resp.branch.as_deref(), Some("feature"));
     assert!(!resp.worktree_bound, "feature is not checked out");
 }

@@ -9,16 +9,26 @@ The design is teacher↔student: a controlling agent (the "teacher") defines tas
 **answer key**, hands each task to a **student** subagent, then verifies the result out-of-band
 and scores it. **Three** students run per task:
 - the shipped **`commedit-operator`** (Sonnet, all skills loaded);
-- a skill-less **`general-purpose`** **control** that drives the `mcp__…__*` tools directly;
-- a **`general-purpose`** **plain-git** baseline given *only* Bash/git — no MCP, no skills.
+- a skill-less **`general-purpose`** **control** (Sonnet) that drives the `mcp__…__*` tools directly;
+- a **`general-purpose`** **plain-git** baseline (Sonnet) given *only* Bash/git — no MCP, no skills.
 
 So each run yields two deltas: operator↔control (*does the operator prompt + skills help on top
 of the MCP?*) and (operator|control)↔git (*does the MCP help at all over the tool everyone
 already has?* — the headline that justifies the project). Each run also records **token cost and
 wall-clock per student** (§5) — the only effort metric comparable across all three.
 
-> Run history (Opus teacher, Sonnet students). Each run's scorecard and findings live under
-> [`runs/`](runs/), newest first.
+> An **Opus** plain-git baseline (`gito`) ran a model-only A/B in [run 4](runs/4.md) and was then
+> **retired**: Opus barely moved the plain-git baseline (≈ equal correctness/score to the Sonnet
+> `git` student) at ~2.6× the cost — cost without signal. Plain git's losses are the non-interactive
+> tooling friction, not the model.
+
+> [Run 5](runs/5.md) ran the complementary **operator** model A/B — the shipped `commedit-operator`
+> on **Sonnet 4.6** vs **Haiku 4.5** (two students, no control/git baseline). Haiku came out **~2.5×
+> cheaper and ~30% faster at near-equal call count**, tying Sonnet on most tasks, but with a **lower
+> correctness floor**: on T6's silent untracked-file trap it *fabricated* file content (9/10 vs 10/10).
+
+> Run history (Opus teacher; students on Sonnet unless a run says otherwise — run 5 added a Haiku
+> operator). Each run's scorecard and findings live under [`runs/`](runs/), newest first.
 
 ---
 
@@ -26,32 +36,38 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 
 These are *load-bearing* — verified in the source. Don't fight them; design around them.
 
-1. **The MCP server is single-tenant, global state.** It's one `Arc<Mutex<Repo>>`
-   (`crates/commedit-mcp/src/server.rs`); `reload_repo` does `*repo = fresh`
-   (`crates/commedit-mcp/src/tools/ops.rs`). Every subagent you spawn shares the **one**
-   session server. ⇒ **Students must run strictly serially.** Two concurrent students would
-   clobber each other's bound repo. (No worktree isolation, no `Agent(isolation:"worktree")`,
-   no parallel students — they'd all hit the same server.)
-2. **`reload_repo` is repo-scoped.** `resolve_worktree_target` (`crates/commedit-mcp/src/session.rs`)
-   compares the git *common dir* and refuses any path that isn't a worktree of the repo the
-   server launched against (the plugin binds `${CLAUDE_PROJECT_DIR}`). ⇒ You **cannot** point a
-   running session at a standalone scratch repo. The fixture must live as **orphan branches +
-   linked worktrees inside this repo** (`stress/*`, under `.worktrees/`), so `reload_repo` can
-   re-home onto each one.
+1. **The MCP server is multi-tenant.** One server hosts several independent editing **sessions**
+   over the one repo it launched against — one session per branch, each with its own `Repo`, trash
+   and op-log (`SessionRegistry` in `crates/commedit-mcp/src/session.rs`, wired in
+   `crates/commedit-mcp/src/server.rs`). Sessions run in **parallel**; only calls on the **same**
+   session serialize. The teacher opens one session per stress worktree via
+   `open_session(branch=stress/<task>)` — each `.worktrees/<task>` has its `stress/<task>` branch
+   checked out, so the session opens **worktree-bound** there — and each student addresses **its own**
+   session by that branch id. ⇒ **Students CAN now run in parallel** (independent sessions share no
+   state). A strictly-serial run remains the comparison **baseline**: the goal of going parallel is to
+   reproduce the serial scorecard (same correctness) at lower wall-clock.
+2. **Sessions are repo-scoped.** `resolve_worktree_target` (`crates/commedit-mcp/src/session.rs`)
+   compares the git *common dir* and refuses any `reload_repo` path that isn't a worktree of the repo
+   the server launched against (the plugin binds `${CLAUDE_PROJECT_DIR}`); likewise `open_session`
+   only opens a branch of that same repo. ⇒ You **cannot** point a session at a standalone scratch
+   repo. The fixture must live as **orphan branches + linked worktrees inside this repo** (`stress/*`,
+   under `.worktrees/`), so each session opens (or `reload_repo` re-homes) onto one of them.
 3. **Grading needs out-of-band ground truth.** The operator returns a compact 5-field summary
    and is told *not* to dump traces. So: (a) require each student to append a `## Tool Log`, and
-   (b) verify yourself from the *teacher* session — `list_operations` (landed mutations, bound to
-   the student's worktree **before** the next `reload_repo`, which resets the op-log), plus plain
-   `git -C <wt> log/show/diff/fsck/status`. **`list_operations` undercounts effort** — `undo`
+   (b) verify yourself from the *teacher* session — `list_operations(session=<id>)` (landed
+   mutations on that session **before** its next `reload_repo`, which resets that session's op-log),
+   plus plain `git -C <wt> log/show/diff/fsck/status`. **`list_operations` undercounts effort** — `undo`
    prunes failed attempts from the chain — so combine it with the self-reported Tool Log.
 4. **commedit does NOT follow the shell cwd.** It only follows `reload_repo(path=…)`. A plain
    `git` command in the teacher (or a student) runs in whatever cwd the shell happens to hold —
    which bit both a student and the teacher during the first run. **Always use `git -C <abs-path>`.**
-5. **The plain-git student bypasses the MCP server entirely.** It never calls `reload_repo`,
-   shares nothing with the `Arc<Mutex<Repo>>`, and works on its worktree purely via
-   `git -C <wt>` (constraint #4 bites it hardest). It is therefore the *one* student that could
-   run in parallel — but **keep it serial** for a clean grading slate. ⚠️ The harness **forbids
-   interactive git** (`rebase -i`, `add -i`), so it must do non-interactive surgery:
+5. **The plain-git student bypasses the MCP server entirely.** The Sonnet `git` baseline never calls
+   `open_session`; it shares no session state and works on its own worktree purely via
+   `git -C <wt>` (constraint #4 bites it hardest). All **three** students can now run in parallel —
+   op/ctl because each drives its **own** session, the git student because it touches no session at
+   all — so parallelism is no longer the git student's alone.
+   ⚠️ The harness **forbids interactive git** (`rebase -i`, `add -i`), so they
+   must do non-interactive surgery:
    `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash`, `rebase --onto`, scripted `--exec`,
    `commit --amend`, hand-resolved conflicts (+ `rerere`). That mirrors commedit's own
    non-interactive pitch, so the comparison is fair — and how hard this turns out to be is itself
@@ -263,43 +279,72 @@ re-date batch stays tree-identical, and T10's reorder actually *holds* a conflic
 `abort_rewrite` leaves the region identical to `stress/base`). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
-`git -C <cal> reset --hard stress/base && reload_repo` between tasks.
+Open the calibration session once with `open_session(branch=stress/cal)` (worktree-bound at
+`<cal>`); between tasks `git -C <cal> reset --hard stress/base && reload_repo(session=<cal id>)`
+(scoped — does not disturb other sessions).
 
 ---
 
-## 5. Execution protocol (strictly serial)
+## 5. Execution protocol (per-session, parallelizable)
 
-For each task T (1→10), each solver S (operator, then control, then git):
+For each task T (1→10), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for
    every solver). The other tasks start from a clean tree; T6 starts dirty — that's its whole point.
-2. **op/ctl only:** `reload_repo(path=<wt>)` — bind the server to this worktree (also resets the
-   op-log → clean grading slate). **git student:** skip this — it never touches the server.
-3. Launch **one** student and **await it fully** (never two at once — op/ctl share the server;
-   keep git serial too for a clean slate):
-   - operator: `Agent(subagent_type="commedit:commedit-operator", …)`
-   - control: `Agent(subagent_type="general-purpose", …)` — tell it the server is already bound, do **not** `reload_repo`, do **not** spawn agents, drive the `mcp__plugin_commedit_commedit__*` tools directly.
-   - git: `Agent(subagent_type="general-purpose", …)` — give it **only** Bash/git; **forbid** MCP
+2. **op/ctl only:** `open_session(branch=stress/<task>)` **once per worktree** — `stress/<task>` is
+   checked out at `.worktrees/<task>`, so the session opens **worktree-bound** there. The returned id
+   (= the branch short-name) is the session selector for every later MCP call on this task. **git
+   student:** skip this — it never touches the server.
+3. Launch the student(s) and **await fully**. Students for **different** tasks/sessions may run
+   **concurrently**: op/ctl on distinct sessions share no state, and the git student shares nothing
+   (it touches no session at all, working only on its own `stress/t<task>-git` worktree).
+   (Two students on the **same** session must not overlap — but normally each task → its own session,
+   so this is moot.)
+   - operator: `Agent(subagent_type="commedit:commedit-operator", …)` (Sonnet)
+   - control: `Agent(subagent_type="general-purpose", …)` (Sonnet) — do **not** spawn agents; drive the `mcp__plugin_commedit_commedit__*` tools directly.
+   - git: `Agent(subagent_type="general-purpose", …)` (Sonnet) — give it **only** Bash/git; **forbid** MCP
      tools, commedit skills, and spawning agents; non-interactive git only (see §4 baseline).
    - All prompts: give the intent (incl. conflict-resolution intent for T3 — otherwise a
      conflict-aware operator correctly stops and asks), and **require a `## Tool Log`** appended.
-4. **Verify out-of-band**: for op/ctl, while still bound to `<wt>`, `list_operations` then
+     **op/ctl prompts must state the session id** and instruct the student to pass `session=<id>` on
+     **every** MCP tool call (the server's own MCP instructions document the required selector).
+4. **Verify out-of-band**: for op/ctl, `list_operations(session=<id>)` then
    `git -C <wt> log --graph / show / diff stress/base / fsck / status`; for the git student,
    verify **purely from `git -C <wt>`** (`list_operations` is N/A — it never touched the server).
    Compare to the answer key.
-5. **Capture metrics** (before the next `reload_repo` resets anything): record the student's
-   **tokens + wall-clock** from its transcript (recipe below).
+5. **Capture metrics** (before the next `reload_repo(session=<id>)` resets that session's op-log):
+   record the student's **tokens + wall-clock** from its transcript (recipe below).
 6. **Score** (rubric below). If correctness fails or there's a clear teachable miss, `SendMessage`
    the same student with targeted feedback and let it retry (cap: 1 round; 2 for T3). A held
-   conflict left dangling is discarded by the next `reload_repo` (it's not pending-guarded).
+   conflict left dangling in a session is discarded by reloading **that** session
+   (`reload_repo(session=<id>)`; it's not pending-guarded).
+
+> ⚠️ **Ref-write race under full parallelism (run-4 finding).** Running all 40 students at once puts
+> ~40 git ref-writers (the plain-git rebases/commits **and** the MCP sessions' git-export bookkeeping)
+> on the **one shared `.git` common-dir** simultaneously. A concurrent `pack-refs`/`gc --auto` can then
+> silently drop a freshly-written loose ref, **reverting a student's correct result to an earlier value
+> after it finished** (run 4 lost 3 of 40 this way; 3 more self-recovered from reflog). The object store
+> is safe (append-only); only **ref updates** race. Before a fully-parallel run, prefer one of: a
+> separate clone/common-dir per student; `git config gc.auto 0` (+ `maintenance.auto false`) on the
+> repo; or capped concurrency. Either way, **verify out-of-band from `git` after the run settles** — the
+> revert can land post-completion, so student self-reports are not authoritative. See [run 4](runs/4.md).
+
+### Between repeats of a task on the same worktree
+`git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**
+disturb other sessions running other tasks. A held conflict left in the session is discarded by the
+same reload.
 
 ### Metrics capture (tokens + wall-clock, per student)
-Each subagent writes its own transcript; serial execution makes "newest file" unambiguous. Run
-this **right after** the student returns, naming the *teacher's* session dir:
+Each subagent writes its own transcript. ⚠️ **Under parallel execution the "newest file" shortcut is
+ambiguous** — several students write transcripts at once, so identify each student's transcript by
+its **Agent id / return correlation** (the id the `Agent(…)` call returns), not by recency. The
+`ls -t … | head -1` shortcut below is valid **only for a strictly-serial run**, where the newest
+file is unambiguously the student you just awaited. Run this **right after** the student returns,
+naming the *teacher's* session dir:
 ```bash
 SUB=~/.claude/projects/-home-mwilli-repos-commedit/<TEACHER_SESSION>/subagents
-F=$(ls -t "$SUB"/agent-*.jsonl | head -1)   # newest = the student just awaited (serial!)
+F=$(ls -t "$SUB"/agent-*.jsonl | head -1)   # newest = the student just awaited — SERIAL RUNS ONLY
 python3 - "$F" <<'PY'
 import sys, json
 inp=out=cc=cr=0; first=last=None
@@ -309,12 +354,12 @@ for line in open(sys.argv[1]):
     if u:
         inp+=u.get("input_tokens",0);  out+=u.get("output_tokens",0)
         cc+=u.get("cache_creation_input_tokens",0); cr+=u.get("cache_read_input_tokens",0)
-# $/Mtok by component — students run on Sonnet 4.6: input 3.00, output 15.00,
-# 5-min cache WRITE 3.75 (1.25x input), cache READ 0.30 (0.1x input). Pricing each
-# component at its own rate is the whole point: it stops the operator's one-time
-# cache_create tax from being double-counted and surfaces git's cache_read volume.
-# (Teacher runs on Opus 4.8 — 5.00 / 25.00 / 6.25 / 0.50 — if you ever price it.)
-IN,OUT,CW,CR = 3.00, 15.00, 3.75, 0.30
+# $/Mtok by component. All three students run on Sonnet 4.6: input 3.00, output
+# 15.00, 5-min cache WRITE 3.75 (1.25x input), cache READ 0.30 (0.1x input).
+# Pricing each component at its own rate is the whole point: it stops the
+# operator's one-time cache_create tax from being double-counted and surfaces
+# git's cache_read volume.
+IN,OUT,CW,CR = 3.00, 15.00, 3.75, 0.30        # Sonnet
 cost = (inp*IN + out*OUT + cc*CW + cr*CR) / 1e6
 print(f"in={inp} out={out} cache_create={cc} cache_read={cr} "
       f"billable~={inp+out+cc} cost=${cost:.4f} span={first} -> {last}")
@@ -337,7 +382,9 @@ component at its true rate, which is what makes the one-time/repetition split ho
   excluding it, as `billable~` does) is what makes the operator's efficiency edge come out *larger*
   in dollars than `billable~` suggests — so always report `cost`, not just `billable~`.
 
-When done: `reload_repo(path=<this repo root>)` to rebind reads back to the checked-out branch.
+When done: `close_session(session=<id>)` each per-task session (the registry refuses to drop the
+**last** one, so leave the launch session — or just `reload_repo(session=<launch id>)` it back to the
+checked-out branch).
 
 ### Grading rubric (1–5 each + overall)
 correctness (gate) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
@@ -381,6 +428,19 @@ So always report `cache_create` vs `cache_read` **separately**, and fold them in
 `cost=$…` (rates + recipe under *Metrics capture*) — that dollar figure is the headline efficiency
 number in each scorecard, the only one comparable across all three solvers.
 
+**Warming is organic; the lever is fewer turns, not a prefetch (run-4 finding).** Cross-spawn warming
+of the shared prompt prefix happens on its own — in a fan-out the *first* spawn of each cache prefix
+(keyed per agent-def × tool-set × model) pays the full `cache_create`, and every sibling within the
+~5-min TTL reads it back as cheap `cache_read` (run 4: first operator 85k `cache_create`, the nine
+siblings ~30k). So an explicit **warmup student buys little**: it only shifts that one cold spike to
+`cache_read` (~$0.2 for the operator class) and **cannot reduce `cache_read`**, which is the dominant
+component (~58% of operator cost) because every turn re-reads the whole always-on prefix. And it does
+nothing for the non-operator students, whose `cache_create` is intrinsic task work (the control's
+`ToolSearch` discovery; plain-git's long bash context), not a cold shared prefix. To actually cut cost,
+cut **turns**, **shrink the always-on prefix** (every turn's `cache_read` shrinks with it), or **reuse
+a warm session** across tasks — the per-task cold spawn here is the deliberate pessimistic case. See
+[run 4](runs/4.md) Headline 3.
+
 ---
 
 ## 6. Re-run checklist (as the MCP evolves)
@@ -401,11 +461,12 @@ number in each scorecard, the only one comparable across all three solvers.
 - If tools were **added/renamed**: update the minimal paths in §4 and the rubric's tool-fit notes.
   Re-check whether the footguns recorded under [`runs/`](runs/) are fixed (does `split_commit` now
   warn on an empty child? does the interior-drop auto-resolve fire?).
-- Keep students on the **shipped** operator + a skill-less MCP control + a **git-only** baseline,
-  so all three deltas stay comparable across runs. The `reposetup.sh` provisioning loop already
-  creates the `*-git` worktrees; teardown globs them.
+- Keep students on the **shipped** operator + a skill-less MCP control + a Sonnet **git-only**
+  baseline (`git`), so both deltas stay comparable across runs. The `reposetup.sh` provisioning loop
+  creates the `*-git` worktrees; teardown globs them (the `commedit-stress` / `stress/*` prefixes).
 - **Capture per-student metrics** every run (§5 step 5): tokens (components — esp. `cache_read`
   vs `cache_create`) + wall-clock from each `subagents/agent-*.jsonl`. Judge efficiency by token
   cost across MCP versions, not call counts.
-- 🔒 **Never** run a commedit *mutation* while the server is bound to anything but a `stress/*`
-  worktree, and keep all test refs under `stress/*`. Use `git -C <abs>` everywhere.
+- 🔒 **Never** run a commedit *mutation* on a session other than a `stress/*` one (don't open or
+  mutate the launch session's real branch), and keep all test refs under `stress/*`. Use
+  `git -C <abs>` everywhere.

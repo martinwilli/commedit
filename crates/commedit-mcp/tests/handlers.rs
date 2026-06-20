@@ -10,7 +10,7 @@ use commedit_mcp::dto::{
     ShowCommitReq, SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq, TopologyDto,
 };
 use commedit_mcp::server::CommeditServer;
-use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server};
+use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -18,6 +18,7 @@ use tempfile::TempDir;
 async fn shas(server: &CommeditServer) -> Vec<String> {
     server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -71,6 +72,7 @@ fn assert_lean(result: &SaveResultDto) {
 async fn change_id_of(server: &CommeditServer, subject: &str) -> String {
     server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -102,6 +104,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
 
     let resp = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -158,6 +161,7 @@ async fn list_history_honours_the_limit() {
 
     let resp = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: Some(2),
             offset: None,
             fields: None,
@@ -186,6 +190,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
     // `fields: []` keeps only the header — every verbose field is omitted.
     let header = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![]),
@@ -208,6 +213,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
     // An explicit subset includes exactly those fields and nothing else.
     let subset = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![CommitField::AuthorTime, CommitField::CommitterTime]),
@@ -223,6 +229,7 @@ async fn list_history_fields_selects_the_verbose_detail() {
     // Omitting `fields` carries the full detail, including the message body.
     let full = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -250,6 +257,7 @@ async fn list_history_marks_merges() {
 
     let resp = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -279,6 +287,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -291,6 +300,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
 
     let resp = server
         .show_commit(Parameters(ShowCommitReq {
+            session: sel("main"),
             commit: sha.clone(),
             include_contents: None,
         }))
@@ -307,6 +317,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
 
     let with = server
         .show_commit(Parameters(ShowCommitReq {
+            session: sel("main"),
             commit: sha,
             include_contents: Some(true),
         }))
@@ -326,6 +337,7 @@ async fn show_commit_rejects_an_unknown_ref() {
     let err = expect_err(
         server
             .show_commit(Parameters(ShowCommitReq {
+                session: sel("main"),
                 commit: "0123456789abcdef0123456789abcdef01234567".into(),
                 include_contents: None,
             }))
@@ -344,7 +356,7 @@ async fn list_trash_starts_empty() {
     init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
     let server = open_server(dir.path());
 
-    let resp = server.list_trash().await.unwrap().0;
+    let resp = server.list_trash(Parameters(sel("main"))).await.unwrap().0;
     assert!(resp.commits.is_empty());
 }
 
@@ -354,13 +366,21 @@ async fn working_copy_status_reflects_dirty_tracked_files() {
     init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
     let server = open_server(dir.path());
 
-    let clean = server.working_copy_status().await.unwrap().0;
+    let clean = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(clean.clean);
     assert!(clean.entries.is_empty());
     assert!(clean.session_start_head_sha.is_some());
 
     std::fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
-    let dirty = server.working_copy_status().await.unwrap().0;
+    let dirty = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!dirty.clean);
     assert_eq!(dirty.entries.len(), 1);
     assert_eq!(dirty.entries[0].files, vec!["a.txt".to_string()]);
@@ -369,6 +389,7 @@ async fn working_copy_status_reflects_dirty_tracked_files() {
     // The entry's sha reads as a commit: its diff is the uncommitted change.
     let shown = server
         .show_commit(Parameters(ShowCommitReq {
+            session: sel("main"),
             commit: dirty.entries[0].sha.clone(),
             include_contents: None,
         }))
@@ -384,15 +405,27 @@ async fn session_diff_and_operations_start_empty() {
     init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
     let server = open_server(dir.path());
 
-    let diff = server.session_diff().await.unwrap().0;
+    let diff = server
+        .session_diff(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(diff.files.is_empty());
 
-    let ops = server.list_operations().await.unwrap().0;
+    let ops = server
+        .list_operations(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(ops.ops.is_empty());
     assert_eq!(ops.cursor, 0);
     assert!(!ops.can_undo && !ops.can_redo && !ops.pending);
 
-    let pending = server.pending_status().await.unwrap().0;
+    let pending = server
+        .pending_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!pending.pending);
     assert!(pending.conflicts.is_empty());
     assert_eq!(pending.git_head_sha, pending.jj_head_sha);
@@ -418,6 +451,7 @@ async fn edit_message_rewrites_any_commit_and_exports_to_git() {
     let target = shas(&server).await[1].clone();
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: target,
             message: "second, edited\n\nwith a body".into(),
         }))
@@ -446,6 +480,7 @@ async fn edit_identity_prefills_omitted_fields() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -459,6 +494,7 @@ async fn edit_identity_prefills_omitted_fields() {
 
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
+            session: sel("main"),
             commit: target.sha.clone(),
             identity: IdentityFieldsDto {
                 author_name: Some("New Author".into()),
@@ -482,6 +518,7 @@ async fn edit_identity_prefills_omitted_fields() {
     );
     let listed = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -513,6 +550,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
     // round-trip back as refs.
     let hist = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -537,6 +575,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
     // the tip ("third") — all in a single transaction / rebase.
     let result = server
         .edit_commits(Parameters(EditCommitsReq {
+            session: sel("main"),
             edits: vec![
                 dated(id(2), "2026-06-11 18:00:00 +0200"),
                 dated(id(1), "2026-06-11 18:30:00 +0200"),
@@ -558,6 +597,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
     );
     let listed = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -592,7 +632,10 @@ async fn edit_commits_rejects_empty_and_noop_batches() {
 
     let empty = expect_err(
         server
-            .edit_commits(Parameters(EditCommitsReq { edits: vec![] }))
+            .edit_commits(Parameters(EditCommitsReq {
+                session: sel("main"),
+                edits: vec![],
+            }))
             .await,
     );
     assert!(
@@ -605,6 +648,7 @@ async fn edit_commits_rejects_empty_and_noop_batches() {
     let noop = expect_err(
         server
             .edit_commits(Parameters(EditCommitsReq {
+                session: sel("main"),
                 edits: vec![CommitEditDto {
                     commit: target,
                     message: None,
@@ -628,6 +672,7 @@ async fn replace_files_rewrites_contents_across_descendants() {
     let target = shas(&server).await[1].clone();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
             commit: target,
             files: vec![
                 FileContentDto {
@@ -667,6 +712,7 @@ async fn replace_files_requires_files() {
     let err = expect_err(
         server
             .replace_files(Parameters(ReplaceFilesReq {
+                session: sel("main"),
                 commit: sha,
                 files: vec![],
                 delete_paths: None,
@@ -695,6 +741,7 @@ async fn replace_in_file_rewrites_a_unique_match_across_descendants() {
     let target = shas(&server).await[1].clone();
     let result = server
         .replace_in_file(Parameters(ReplaceInFileReq {
+            session: sel("main"),
             commit: target,
             edits: vec![StrReplaceDto {
                 path: "a.txt".into(),
@@ -728,6 +775,7 @@ async fn replace_in_file_rejects_an_ambiguous_match() {
     let err = expect_err(
         server
             .replace_in_file(Parameters(ReplaceInFileReq {
+                session: sel("main"),
                 commit: target,
                 edits: vec![StrReplaceDto {
                     path: "a.txt".into(),
@@ -760,6 +808,7 @@ async fn replace_in_file_miss_hints_the_whitespace_difference() {
     let err = expect_err(
         server
             .replace_in_file(Parameters(ReplaceInFileReq {
+                session: sel("main"),
                 commit: target,
                 edits: vec![StrReplaceDto {
                     path: "a.rs".into(),
@@ -798,6 +847,7 @@ async fn replace_in_message_fixes_a_typo() {
     let target = shas(&server).await[1].clone();
     let result = server
         .replace_in_message(Parameters(ReplaceInMessageReq {
+            session: sel("main"),
             commit: target,
             old: "bulck".into(),
             new: "bulk".into(),
@@ -821,6 +871,7 @@ async fn replace_in_message_rejects_a_missing_match() {
     let err = expect_err(
         server
             .replace_in_message(Parameters(ReplaceInMessageReq {
+                session: sel("main"),
                 commit: target,
                 old: "nope".into(),
                 new: "x".into(),
@@ -852,6 +903,7 @@ async fn split_commit_peels_a_fixup_child_off_the_edited_commit() {
     let target = shas(&server).await[1].clone();
     let result = server
         .split_commit(Parameters(SplitCommitReq {
+            session: sel("main"),
             commit: target,
             files: vec![FileContentDto {
                 path: "a.txt".into(),
@@ -893,6 +945,7 @@ async fn reorder_moves_a_commit_under_a_new_parent() {
     let shas = shas(&server).await;
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
+            session: sel("main"),
             commit: shas[0].clone(),
             new_parent: shas[2].clone(),
             child: None,
@@ -922,6 +975,7 @@ async fn reorder_to_root_makes_a_commit_the_first() {
     let top = shas(&server).await[0].clone();
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
+            session: sel("main"),
             commit: top,
             new_parent: "root".into(),
             child: None,
@@ -948,6 +1002,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -971,6 +1026,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
+                session: sel("main"),
                 commit: merge.sha.clone(),
                 new_parent: base.sha.clone(),
                 child: None,
@@ -986,6 +1042,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
+                session: sel("main"),
                 commit: main1.sha.clone(),
                 new_parent: main1.sha.clone(),
                 child: None,
@@ -1001,6 +1058,7 @@ async fn reorder_rejects_noop_self_and_merge_moves() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
+                session: sel("main"),
                 commit: main1.sha.clone(),
                 new_parent: base.sha.clone(),
                 child: None,
@@ -1026,6 +1084,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1050,6 +1109,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     let err = expect_err(
         server
             .reorder_commit(Parameters(ReorderCommitReq {
+                session: sel("main"),
                 commit: top.sha.clone(),
                 new_parent: base.sha.clone(),
                 child: None,
@@ -1066,6 +1126,7 @@ async fn an_ambiguous_fork_reorder_needs_child_sha() {
     // Disambiguated: splice between base and main-1.
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
+            session: sel("main"),
             commit: top.sha.clone(),
             new_parent: base.sha.clone(),
             child: Some(main1.sha.clone()),
@@ -1102,6 +1163,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     let target = shas(&server).await[1].clone();
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: target.clone(),
             keep_changes: false,
         }))
@@ -1113,11 +1175,12 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     assert_eq!(git_log_subjects(dir.path()), ["third", "first"]);
 
     // It sits in the trash, counted by list_history.
-    let trash = server.list_trash().await.unwrap().0;
+    let trash = server.list_trash(Parameters(sel("main"))).await.unwrap().0;
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].sha, target);
     let listing = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1132,6 +1195,7 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     let first = shas(&server).await[1].clone();
     let result = server
         .restore_commit(Parameters(RestoreCommitReq {
+            session: sel("main"),
             commit: target,
             new_parent: first,
             child: None,
@@ -1142,7 +1206,13 @@ async fn drop_then_restore_round_trips_through_the_trash() {
     clean_head(&result);
 
     assert_eq!(git_log_subjects(dir.path()), ["third", "second", "first"]);
-    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert!(server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .is_empty());
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     git(dir.path(), &["fsck", "--no-progress"]);
 }
@@ -1164,6 +1234,7 @@ async fn drop_commit_keep_changes_uncommits_to_the_working_tree() {
     let tip = shas(&server).await[0].clone();
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: tip,
             keep_changes: true,
         }))
@@ -1181,7 +1252,13 @@ async fn drop_commit_keep_changes_uncommits_to_the_working_tree() {
     assert!(!wc.clean);
     assert_eq!(wc.entries.len(), 1);
     assert!(wc.entries[0].files.contains(&"a.txt".to_string()));
-    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert!(server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .is_empty());
 
     // git sees it as an unstaged modification (the index matches HEAD = second).
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "M a.txt");
@@ -1196,6 +1273,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1208,6 +1286,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let err = expect_err(
         server
             .drop_commit(Parameters(DropCommitReq {
+                session: sel("main"),
                 commit: merge.sha.clone(),
                 keep_changes: false,
             }))
@@ -1222,6 +1301,7 @@ async fn drop_refuses_merges_and_unknown_restores() {
     let err = expect_err(
         server
             .restore_commit(Parameters(RestoreCommitReq {
+                session: sel("main"),
                 commit: merge.sha.clone(),
                 new_parent: "root".into(),
                 child: None,
@@ -1256,6 +1336,7 @@ async fn squash(
 ) -> SaveResultDto {
     server
         .squash_commit(Parameters(SquashCommitReq {
+            session: sel("main"),
             source: source.into(),
             dest: dest.into(),
             mode: mode.map(str::to_string),
@@ -1339,6 +1420,7 @@ async fn squash_from_the_trash_restores_and_folds() {
     let listed = shas(&server).await;
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: listed[1].clone(),
             keep_changes: false,
         }))
@@ -1355,7 +1437,13 @@ async fn squash_from_the_trash_restores_and_folds() {
 
     assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
-    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert!(server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1366,6 +1454,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1384,6 +1473,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let err = expect_err(
         server
             .squash_commit(Parameters(SquashCommitReq {
+                session: sel("main"),
                 source: merge.sha.clone(),
                 dest: base.sha.clone(),
                 mode: None,
@@ -1405,6 +1495,7 @@ async fn squash_rejects_a_merge_source_and_bad_modes() {
     let err = expect_err(
         server
             .squash_commit(Parameters(SquashCommitReq {
+                session: sel("main"),
                 source: main1.sha.clone(),
                 dest: base.sha.clone(),
                 mode: Some("merge".into()),
@@ -1431,6 +1522,7 @@ async fn mutations_reject_a_stale_ref() {
     let stale = shas(&server).await[0].clone();
     server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: stale.clone(),
             message: "new".into(),
         }))
@@ -1441,6 +1533,7 @@ async fn mutations_reject_a_stale_ref() {
     let err = expect_err(
         server
             .edit_message(Parameters(EditMessageReq {
+                session: sel("main"),
                 commit: stale,
                 message: "again".into(),
             }))
@@ -1465,6 +1558,7 @@ async fn a_sha_prefix_addresses_a_commit() {
     let target = shas(&server).await[1].clone();
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: target[..8].to_string(),
             message: "first, by prefix".into(),
         }))
@@ -1487,6 +1581,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1501,6 +1596,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     // first rewrite churns the sha, the change id still addresses the commit.
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: change_id.clone(),
             message: "first, chained".into(),
         }))
@@ -1510,6 +1606,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
     clean_head(&result);
     let result = server
         .edit_identity(Parameters(EditIdentityReq {
+            session: sel("main"),
             commit: change_id.clone(),
             identity: IdentityFieldsDto {
                 author_name: Some("Chained Author".into()),
@@ -1523,6 +1620,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
 
     let listed = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -1548,6 +1646,7 @@ async fn a_too_short_ref_is_rejected() {
     let err = expect_err(
         server
             .edit_message(Parameters(EditMessageReq {
+                session: sel("main"),
                 commit: "abc".into(),
                 message: "x".into(),
             }))
@@ -1571,6 +1670,7 @@ async fn squash_prefers_a_history_match_over_the_trash() {
     let listed = shas(&server).await;
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: listed[1].clone(),
             keep_changes: false,
         }))
@@ -1578,12 +1678,21 @@ async fn squash_prefers_a_history_match_over_the_trash() {
         .unwrap()
         .0;
     clean_head(&dropped.result);
-    server.undo().await.unwrap();
+    server.undo(Parameters(sel("main"))).await.unwrap();
     assert_eq!(
         git_log_subjects(dir.path()),
         ["third", "follow-up", "target"]
     );
-    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+    assert_eq!(
+        server
+            .list_trash(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .commits
+            .len(),
+        1
+    );
 
     // The duplicated ref resolves to the history commit: a plain in-history
     // squash that leaves the stale trash entry alone.
@@ -1593,7 +1702,16 @@ async fn squash_prefers_a_history_match_over_the_trash() {
 
     assert_eq!(git_log_subjects(dir.path()), ["third", "target"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "one\ntwo");
-    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+    assert_eq!(
+        server
+            .list_trash(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .commits
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1612,6 +1730,7 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
     let target = shas(&server).await[1].clone();
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: target,
             keep_changes: false,
         }))
@@ -1622,6 +1741,7 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
 
     let shown = server
         .show_commit(Parameters(ShowCommitReq {
+            session: sel("main"),
             commit: dropped.dropped.change_id[..8].to_string(),
             include_contents: None,
         }))
@@ -1646,6 +1766,7 @@ async fn suggest_squash_targets_points_a_fixup_at_its_match() {
     let server = open_server(dir.path());
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![]),
@@ -1658,7 +1779,10 @@ async fn suggest_squash_targets_points_a_fixup_at_its_match() {
     let fixup = history.commits[0].change_id.clone();
 
     let resp = server
-        .suggest_squash_targets(Parameters(SuggestSquashReq { source: fixup }))
+        .suggest_squash_targets(Parameters(SuggestSquashReq {
+            session: sel("main"),
+            source: fixup,
+        }))
         .await
         .unwrap()
         .0;
@@ -1670,7 +1794,10 @@ async fn suggest_squash_targets_points_a_fixup_at_its_match() {
     // An unprefixed source has nothing to suggest.
     let plain = history.commits[1].change_id.clone();
     let resp = server
-        .suggest_squash_targets(Parameters(SuggestSquashReq { source: plain }))
+        .suggest_squash_targets(Parameters(SuggestSquashReq {
+            session: sel("main"),
+            source: plain,
+        }))
         .await
         .unwrap()
         .0;
@@ -1697,6 +1824,7 @@ async fn reorder_reports_the_moved_commit_with_its_new_parent_and_child() {
     let shas = shas(&server).await;
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
+            session: sel("main"),
             commit: shas[0].clone(),
             new_parent: shas[2].clone(),
             child: None,
@@ -1736,6 +1864,7 @@ async fn reorder_onto_a_merge_reports_the_merge_tip_and_its_two_parents() {
     // Splice "top" between "base" and "main-1" (the fork needs the child named).
     let result = server
         .reorder_commit(Parameters(ReorderCommitReq {
+            session: sel("main"),
             commit: top.clone(),
             new_parent: base.clone(),
             child: Some(main1.clone()),
@@ -1805,6 +1934,7 @@ async fn split_reports_the_edited_commit_and_its_new_fixup_child() {
     let target = shas(&server).await[1].clone();
     let result = server
         .split_commit(Parameters(SplitCommitReq {
+            session: sel("main"),
             commit: target,
             files: vec![FileContentDto {
                 path: "a.txt".into(),
@@ -1852,6 +1982,7 @@ async fn drop_reports_the_parent_now_carrying_the_dropped_commits_children() {
     let target = shas(&server).await[1].clone();
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: target,
             keep_changes: false,
         }))
@@ -1883,6 +2014,7 @@ async fn create_reports_the_new_commit_with_its_parent() {
     // Insert a new commit on top of HEAD ("second").
     let result = server
         .create_commit(Parameters(CreateCommitReq {
+            session: sel("main"),
             message: "added".into(),
             files: vec![FileContentDto {
                 path: "c.txt".into(),
@@ -1920,6 +2052,7 @@ async fn edit_message_stays_lean_and_omits_topology() {
     let target = shas(&server).await[0].clone();
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: target,
             message: "reworded".into(),
         }))

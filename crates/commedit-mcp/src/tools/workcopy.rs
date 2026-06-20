@@ -12,8 +12,8 @@ use rmcp::{tool, tool_router, ErrorData};
 use crate::convert::{commit_dto, file_change_dto, DetailFields};
 use crate::dto::{
     CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp,
-    PatchSelectionDto, SaveResultDto, SessionDiffResp, SquashWorkingCopyReq, SquashWorkingCopyResp,
-    WorkingCopyStatusResp,
+    PatchSelectionDto, SaveResultDto, SessionDiffResp, SessionSel, SquashWorkingCopyReq,
+    SquashWorkingCopyResp, WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -28,8 +28,11 @@ impl CommeditServer {
     #[tool(
         description = "Show the uncommitted changes (working copy). They are first-class: every rewrite carries them along automatically. The entry sha can be fed to show_commit for the full diff; it churns on every disk edit."
     )]
-    pub async fn working_copy_status(&self) -> Result<Yaml<WorkingCopyStatusResp>, ErrorData> {
-        self.with_session(|repo, _| working_copy_status_resp(repo))
+    pub async fn working_copy_status(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<WorkingCopyStatusResp>, ErrorData> {
+        self.with_session(req.session, |repo, _| working_copy_status_resp(repo))
             .await
             .map(Yaml)
     }
@@ -37,8 +40,11 @@ impl CommeditServer {
     #[tool(
         description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree)."
     )]
-    pub async fn session_diff(&self) -> Result<Yaml<SessionDiffResp>, ErrorData> {
-        self.with_session(|repo, _| {
+    pub async fn session_diff(
+        &self,
+        Parameters(req): Parameters<SessionSel>,
+    ) -> Result<Yaml<SessionDiffResp>, ErrorData> {
+        self.with_session(req.session, |repo, _| {
             let files = repo
                 .session_changes()
                 .map_err(internal)?
@@ -60,10 +66,11 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
         &self,
         Parameters(req): Parameters<SquashWorkingCopyReq>,
     ) -> Result<Yaml<SquashWorkingCopyResp>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             ensure_worktree_bound(repo)?;
             let SquashWorkingCopyReq {
+                session: _,
                 dest,
                 message,
                 paths,
@@ -125,7 +132,7 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
         &self,
         Parameters(req): Parameters<CommitWorkingCopyReq>,
     ) -> Result<Yaml<CommitWorkingCopyResp>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             ensure_worktree_bound(repo)?;
             // Track any named new files before checking for changes, so committing a
@@ -187,7 +194,7 @@ Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the i
         &self,
         Parameters(req): Parameters<DiscardWorkingCopyReq>,
     ) -> Result<Yaml<OkResp>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             ensure_worktree_bound(repo)?;
             if !req.confirm {

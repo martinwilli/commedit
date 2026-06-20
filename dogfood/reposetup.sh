@@ -521,7 +521,10 @@ git commit -q -m "Fix null deref in parser [BUG-123]"
 git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
-# solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
+# solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline
+# (Sonnet). The model is chosen by the teacher's Agent(...) launch, not here —
+# these are just the isolated worktrees each student works in. (An Opus plain-git
+# baseline 'gito' ran in run 4 and was retired — see dogfood/runs/4.md.)
 for t in 1 2 3 4 5 6 7 8 9 10; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"

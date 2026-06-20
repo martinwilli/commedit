@@ -7,13 +7,14 @@ use commedit_mcp::dto::{
     DiscardWorkingCopyReq, DropCommitReq, EditMessageReq, FileContentDto, JumpToOperationReq,
     ListHistoryReq, ReloadRepoReq, ReplaceFilesReq, RestoreCommitReq, SaveResultDto,
 };
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
+use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 async fn edit_tip_message(server: &commedit_mcp::server::CommeditServer, message: &str) {
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -24,6 +25,7 @@ async fn edit_tip_message(server: &commedit_mcp::server::CommeditServer, message
         .0;
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: history.commits[0].sha.clone(),
             message: message.into(),
         }))
@@ -45,7 +47,11 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
     edit_tip_message(&server, "second v2").await;
     edit_tip_message(&server, "second v3").await;
 
-    let ops = server.list_operations().await.unwrap().0;
+    let ops = server
+        .list_operations(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert_eq!(ops.ops.len(), 2);
     assert_eq!(ops.cursor, 2);
     assert!(ops.can_undo && !ops.can_redo);
@@ -56,7 +62,7 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
     );
 
     // Undo: back to v2; git follows.
-    let resp = server.undo().await.unwrap().0;
+    let resp = server.undo(Parameters(sel("main"))).await.unwrap().0;
     assert_eq!(resp.cursor, 1);
     assert_eq!(git_log_subjects(dir.path()), ["second v2", "first"]);
     assert_eq!(
@@ -65,13 +71,16 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
     );
 
     // Redo: forward to v3 again.
-    let resp = server.redo().await.unwrap().0;
+    let resp = server.redo(Parameters(sel("main"))).await.unwrap().0;
     assert_eq!(resp.cursor, 2);
     assert_eq!(git_log_subjects(dir.path()), ["second v3", "first"]);
 
     // Jump to the session-start floor: everything undone.
     let resp = server
-        .jump_to_operation(Parameters(JumpToOperationReq { index: 0 }))
+        .jump_to_operation(Parameters(JumpToOperationReq {
+            session: sel("main"),
+            index: 0,
+        }))
         .await
         .unwrap()
         .0;
@@ -80,7 +89,7 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 
     // Bounds are explicit errors.
-    let err = expect_err(server.undo().await);
+    let err = expect_err(server.undo(Parameters(sel("main"))).await);
     assert!(
         err.message.contains("session start"),
         "unexpected error: {}",
@@ -88,7 +97,10 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
     );
     let err = expect_err(
         server
-            .jump_to_operation(Parameters(JumpToOperationReq { index: 5 }))
+            .jump_to_operation(Parameters(JumpToOperationReq {
+                session: sel("main"),
+                index: 5,
+            }))
             .await,
     );
     assert!(
@@ -99,7 +111,7 @@ async fn undo_redo_and_jump_step_the_recorded_states() {
 
     // A fresh edit truncates the redo tail.
     edit_tip_message(&server, "second v4").await;
-    let err = expect_err(server.redo().await);
+    let err = expect_err(server.redo(Parameters(sel("main"))).await);
     assert!(
         err.message.contains("redo"),
         "unexpected error: {}",
@@ -116,7 +128,10 @@ async fn a_discard_is_recorded_but_its_content_is_gone() {
 
     std::fs::write(dir.path().join("a.txt"), "dirty\n").unwrap();
     server
-        .discard_working_copy(Parameters(DiscardWorkingCopyReq { confirm: true }))
+        .discard_working_copy(Parameters(DiscardWorkingCopyReq {
+            session: sel("main"),
+            confirm: true,
+        }))
         .await
         .unwrap();
     assert_eq!(
@@ -127,7 +142,7 @@ async fn a_discard_is_recorded_but_its_content_is_gone() {
     // The discard shows up as a recorded op, but undoing past it restores the
     // session-start state — which never contained the discarded edit. This is
     // the one unrecoverable action, as the tool description warns.
-    server.undo().await.unwrap();
+    server.undo(Parameters(sel("main"))).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "1\n"
@@ -149,6 +164,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -159,6 +175,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
         .0;
     let dropped = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: history.commits[1].sha.clone(),
             keep_changes: false,
         }))
@@ -168,13 +185,23 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
 
     // Undo the drop: the commit is back in history, but the trash entry
     // lingers (session trash is MCP state, not part of the jj op log).
-    server.undo().await.unwrap();
+    server.undo(Parameters(sel("main"))).await.unwrap();
     assert_eq!(git_log_subjects(dir.path()), ["third", "second", "first"]);
-    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+    assert_eq!(
+        server
+            .list_trash(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .commits
+            .len(),
+        1
+    );
 
     // Restoring the stale entry fails with a clean error; git is untouched.
     let bottom = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -189,6 +216,7 @@ async fn restoring_a_trash_entry_stale_after_undo_fails_cleanly() {
     let err = expect_err(
         server
             .restore_commit(Parameters(RestoreCommitReq {
+                session: sel("main"),
                 commit: dropped.dropped.sha.clone(),
                 new_parent: bottom,
                 child: None,
@@ -215,6 +243,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
     // Session state to be discarded: an op and a trash entry.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -225,12 +254,22 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
         .0;
     server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: history.commits[1].sha.clone(),
             keep_changes: false,
         }))
         .await
         .unwrap();
-    assert_eq!(server.list_trash().await.unwrap().0.commits.len(), 1);
+    assert_eq!(
+        server
+            .list_trash(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .commits
+            .len(),
+        1
+    );
 
     // An out-of-band commit the running session can't see.
     std::fs::write(dir.path().join("x.txt"), "external\n").unwrap();
@@ -239,6 +278,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
 
     let resp = server
         .reload_repo(Parameters(ReloadRepoReq {
+            session: sel("main"),
             path: None,
             branch: None,
         }))
@@ -253,6 +293,7 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
     // The fresh import sees the external commit; trash and ops are reset.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -263,7 +304,11 @@ async fn reload_repo_picks_up_external_commits_and_resets_the_session() {
         .0;
     assert_eq!(history.commits[0].subject, "external");
     assert_eq!(history.trash_count, 0);
-    let ops = server.list_operations().await.unwrap().0;
+    let ops = server
+        .list_operations(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(ops.ops.is_empty());
     assert_eq!(ops.cursor, 0);
 }
@@ -285,6 +330,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
     // A conflicting edit leaves a pending rewrite.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -296,6 +342,7 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
             commit: a.sha.clone(),
             files: vec![FileContentDto {
                 path: "f.txt".into(),
@@ -307,17 +354,32 @@ async fn reload_repo_drops_a_pending_rewrite_without_touching_git() {
         .unwrap()
         .0;
     assert!(matches!(result, SaveResultDto::Conflicts { .. }));
-    assert!(server.pending_status().await.unwrap().0.pending);
+    assert!(
+        server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
 
     // Reload while pending: allowed, the held rewrite is simply dropped.
     server
         .reload_repo(Parameters(ReloadRepoReq {
+            session: sel("main"),
             path: None,
             branch: None,
         }))
         .await
         .unwrap();
-    assert!(!server.pending_status().await.unwrap().0.pending);
+    assert!(
+        !server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
     assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head_before);
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");

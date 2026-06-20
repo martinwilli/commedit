@@ -12,11 +12,23 @@ use std::process::Command;
 use commedit_engine::graph::compute_graph;
 use commedit_engine::history::{CommitInfo, ReorderMove};
 use commedit_engine::repo::Repo;
+use commedit_mcp::dto::SessionSel;
 use commedit_mcp::server::CommeditServer;
 
-/// Open a server session over the repo at `dir`, the way `main` does.
+/// Open a server session over the repo at `dir`, the way `main` does. The launch
+/// session's id is the checked-out branch's short-name — `init_repo` uses `main`,
+/// so [`sel`]`("main")` addresses it.
 pub fn open_server(dir: &Path) -> CommeditServer {
     CommeditServer::new(Repo::open(dir).expect("opening the scratch repo"))
+}
+
+/// The session selector for id `id` — every session-operating tool now requires
+/// one. The launch session of [`open_server`] is `sel("main")`; of
+/// [`open_server_branch`] it is `sel(branch)`.
+pub fn sel(id: &str) -> SessionSel {
+    SessionSel {
+        session: id.to_string(),
+    }
 }
 
 /// Open a server session editing `branch` (which need not be checked out), the

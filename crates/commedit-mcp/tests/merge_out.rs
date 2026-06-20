@@ -6,7 +6,7 @@ mod common;
 
 use commedit_mcp::dto::{MergeOutReq, SaveResultDto};
 use commedit_mcp::server::CommeditServer;
-use common::{expect_err, git, init_merge_repo, init_repo, is_merge, open_server};
+use common::{expect_err, git, init_merge_repo, init_repo, is_merge, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -24,6 +24,7 @@ fn clean_head(result: &SaveResultDto) -> String {
 async fn merge_out(server: &CommeditServer, commit: &str) -> SaveResultDto {
     server
         .merge_out_commit(Parameters(MergeOutReq {
+            session: sel("main"),
             commit: commit.into(),
             child: None,
         }))
@@ -134,6 +135,7 @@ async fn merge_out_refuses_a_merge_and_the_root() {
     let err = expect_err(
         server
             .merge_out_commit(Parameters(MergeOutReq {
+                session: sel("main"),
                 commit: git(dir, &["rev-parse", "HEAD"]),
                 child: None,
             }))
@@ -146,6 +148,7 @@ async fn merge_out_refuses_a_merge_and_the_root() {
     let err = expect_err(
         server
             .merge_out_commit(Parameters(MergeOutReq {
+                session: sel("main"),
                 commit: root,
                 child: None,
             }))

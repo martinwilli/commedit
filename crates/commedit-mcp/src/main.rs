@@ -41,18 +41,20 @@ async fn main() -> Result<()> {
     tracing::info!(root = %repo.workspace_root().display(), "repository opened");
 
     let server = commedit_mcp::server::CommeditServer::new(repo);
-    // Grab the repo handle before `serve` consumes the server, so the index cache
-    // can be flushed at clean shutdown (the engine's `Drop` is the backstop).
-    let repo = server.repo_handle();
+    // Grab the registry handle before `serve` consumes the server, so every
+    // session's index cache can be flushed at clean shutdown (the engine's `Drop`
+    // is the backstop).
+    let sessions = server.sessions_handle();
     let service = server.serve(stdio()).await.context("starting MCP server")?;
     service.waiting().await.context("serving MCP")?;
 
-    // Persist the (now up-to-date) jj index back to the cache. Blocking file IO,
-    // so keep it off the async runtime.
+    // Persist each session's (now up-to-date) jj index back to the cache. Blocking
+    // file IO, so keep it off the async runtime.
     tokio::task::spawn_blocking(move || {
-        repo.lock()
+        sessions
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flush_index_cache();
+            .flush_all_caches();
     })
     .await
     .ok();

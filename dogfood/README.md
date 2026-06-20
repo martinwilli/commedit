@@ -218,19 +218,40 @@ for line in open(sys.argv[1]):
     if u:
         inp+=u.get("input_tokens",0);  out+=u.get("output_tokens",0)
         cc+=u.get("cache_creation_input_tokens",0); cr+=u.get("cache_read_input_tokens",0)
+# $/Mtok by component — students run on Sonnet 4.6: input 3.00, output 15.00,
+# 5-min cache WRITE 3.75 (1.25x input), cache READ 0.30 (0.1x input). Pricing each
+# component at its own rate is the whole point: it stops the operator's one-time
+# cache_create tax from being double-counted and surfaces git's cache_read volume.
+# (Teacher runs on Opus 4.8 — 5.00 / 25.00 / 6.25 / 0.50 — if you ever price it.)
+IN,OUT,CW,CR = 3.00, 15.00, 3.75, 0.30
+cost = (inp*IN + out*OUT + cc*CW + cr*CR) / 1e6
 print(f"in={inp} out={out} cache_create={cc} cache_read={cr} "
-      f"billable~={inp+out+cc} span={first} -> {last}")
+      f"billable~={inp+out+cc} cost=${cost:.4f} span={first} -> {last}")
 PY
 ```
 `<TEACHER_SESSION>` is the controlling session's UUID (the dir under
 `projects/-home-mwilli-repos-commedit/` that owns a `subagents/`). `cache_read` is cheap re-read
 (≈0.1×), so report components — don't lump it into one number.
 
+**Report `cost=$…` per student in every run's scorecard** (it's the one figure comparable across
+all three solvers — tokens-per-component aren't, since the mix differs). The snippet prices each
+component at its true rate, which is what makes the one-time/repetition split honest:
+- `cache_create` (≈1.25× input) is the operator's **one-time prompt-materialization tax** — paid
+  once per cold spawn, *independent of how much work the agent does*. The tournament is its
+  pessimistic case (every student is a fresh cold spawn re-paying it in full); a warm, reused
+  session hits `cache_read` (≈0.1×) instead, so real repeated use amortizes it. It still lands in
+  the $ estimate, so read a high operator `cost` as a **prompt floor, not effort**.
+- `cache_read` (≈0.1×) is cheap *per token* but its **volume balloons for plain-git**, which
+  re-reads its growing transcript on every one of its many calls. Pricing it properly (rather than
+  excluding it, as `billable~` does) is what makes the operator's efficiency edge come out *larger*
+  in dollars than `billable~` suggests — so always report `cost`, not just `billable~`.
+
 When done: `reload_repo(path=<this repo root>)` to rebind reads back to the checked-out branch.
 
 ### Grading rubric (1–5 each + overall)
-correctness (gate) · **efficiency — tokens first** (the only cross-student currency; wall-clock
-a noisy secondary; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
+correctness (gate) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
+capture* — the only currency comparable across all three solvers; tokens-by-component and wall-clock
+are noisier secondaries; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
 undercounts — `undo` prunes — read the **Tool Log** for true effort) · tool-fit (op/ctl: surgical
 vs whole-file, `change_id` addressing, `suggest_squash_targets`, oldest-first conflict, correct
 split partition; git: idiomatic *non-interactive* git — `--autosquash`, `--onto`, `rerere`) ·
@@ -241,7 +262,8 @@ clean, descendants rebased). Deltas per task: **operator↔control** (skill valu
 > **Token caveat.** The operator pays a **prompt tax** (large system prompt + on-demand skills) it
 > must earn back through fewer/cheaper turns. Report `cache_creation` vs `cache_read` separately so
 > that one-time tax stays visible and isn't double-counted (cache_read ≈0.1×; first-turn
-> cache_create ≈1.25× of fresh input). Optionally fold to a $ estimate via model pricing.
+> cache_create ≈1.25× of fresh input), **and the per-component `cost=$…`** (rates + recipe above) —
+> the dollar figure is the one number comparable across all three solvers.
 
 ### Reading the cost numbers (what `billable~` does and doesn't mean)
 Most of an MCP student's token cost is **not work** — it's a fixed **per-spawn
@@ -264,8 +286,9 @@ Two consequences when comparing students:
   + real in/out across many calls) and the operator's efficiency edge comes out *larger* in money
   than `billable~` shows.
 
-So always report `cache_create` vs `cache_read` **separately**, and fold to a $ estimate (model
-pricing) when you need one comparable number across students.
+So always report `cache_create` vs `cache_read` **separately**, and fold them into the per-student
+`cost=$…` (rates + recipe under *Metrics capture*) — that dollar figure is the headline efficiency
+number in each scorecard, the only one comparable across all three solvers.
 
 ---
 

@@ -7,21 +7,22 @@ the fastest way to catch a regression in *agent ergonomics* (which unit tests do
 
 The design is teacher↔student: a controlling agent (the "teacher") defines tasks and an
 **answer key**, hands each task to a **student** subagent, then verifies the result out-of-band
-and scores it. **Four** students run per task:
+and scores it. **Three** students run per task:
 - the shipped **`commedit-operator`** (Sonnet, all skills loaded);
 - a skill-less **`general-purpose`** **control** (Sonnet) that drives the `mcp__…__*` tools directly;
-- a **`general-purpose`** **plain-git** baseline (Sonnet) given *only* Bash/git — no MCP, no skills;
-- the **same plain-git** baseline on **Opus** (`gito`) — identical prompt, tools and worktree,
-  only the model differs.
+- a **`general-purpose`** **plain-git** baseline (Sonnet) given *only* Bash/git — no MCP, no skills.
 
-So each run yields three deltas: operator↔control (*does the operator prompt + skills help on top
-of the MCP?*), (operator|control)↔git (*does the MCP help at all over the tool everyone
-already has?* — the headline that justifies the project), and git↔git-opus (*how much of plain
-git's loss is the model vs the non-interactive tooling friction?* — a model A/B with the tool held
-constant). Each run also records **token cost and wall-clock per student** (§5) — the only effort
-metric comparable across all four.
+So each run yields two deltas: operator↔control (*does the operator prompt + skills help on top
+of the MCP?*) and (operator|control)↔git (*does the MCP help at all over the tool everyone
+already has?* — the headline that justifies the project). Each run also records **token cost and
+wall-clock per student** (§5) — the only effort metric comparable across all three.
 
-> Run history (Opus teacher; students on Sonnet, plus the one Opus plain-git baseline). Each run's
+> An **Opus** plain-git baseline (`gito`) ran a model-only A/B in [run 4](runs/4.md) and was then
+> **retired**: Opus barely moved the plain-git baseline (≈ equal correctness/score to the Sonnet
+> `git` student) at ~2.6× the cost — cost without signal. Plain git's losses are the non-interactive
+> tooling friction, not the model.
+
+> Run history (Opus teacher; students on Sonnet). Each run's
 > scorecard and findings live under [`runs/`](runs/), newest first.
 
 ---
@@ -55,11 +56,11 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 4. **commedit does NOT follow the shell cwd.** It only follows `reload_repo(path=…)`. A plain
    `git` command in the teacher (or a student) runs in whatever cwd the shell happens to hold —
    which bit both a student and the teacher during the first run. **Always use `git -C <abs-path>`.**
-5. **The plain-git students bypass the MCP server entirely.** Neither the Sonnet (`git`) nor the
-   Opus (`gito`) baseline ever calls `open_session`; both share no session state and work on their
-   own worktree purely via `git -C <wt>` (constraint #4 bites them hardest). All **four** students
-   can now run in parallel — op/ctl because each drives its **own** session, both git students
-   because they touch no session at all — so parallelism is no longer the git students' alone.
+5. **The plain-git student bypasses the MCP server entirely.** The Sonnet `git` baseline never calls
+   `open_session`; it shares no session state and works on its own worktree purely via
+   `git -C <wt>` (constraint #4 bites it hardest). All **three** students can now run in parallel —
+   op/ctl because each drives its **own** session, the git student because it touches no session at
+   all — so parallelism is no longer the git student's alone.
    ⚠️ The harness **forbids interactive git** (`rebase -i`, `add -i`), so they
    must do non-interactive surgery:
    `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash`, `rebase --onto`, scripted `--exec`,
@@ -281,7 +282,7 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
-For each task T (1→10), each solver S (operator, control, git, gito):
+For each task T (1→10), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for
@@ -291,19 +292,14 @@ For each task T (1→10), each solver S (operator, control, git, gito):
    (= the branch short-name) is the session selector for every later MCP call on this task. **git
    student:** skip this — it never touches the server.
 3. Launch the student(s) and **await fully**. Students for **different** tasks/sessions may run
-   **concurrently**: op/ctl on distinct sessions share no state, and both git students share nothing
-   (each on its own `stress/t<task>-git`/`-gito` worktree — so git and gito of the *same* task run in
-   parallel too).
+   **concurrently**: op/ctl on distinct sessions share no state, and the git student shares nothing
+   (it touches no session at all, working only on its own `stress/t<task>-git` worktree).
    (Two students on the **same** session must not overlap — but normally each task → its own session,
    so this is moot.)
    - operator: `Agent(subagent_type="commedit:commedit-operator", …)` (Sonnet)
    - control: `Agent(subagent_type="general-purpose", …)` (Sonnet) — do **not** spawn agents; drive the `mcp__plugin_commedit_commedit__*` tools directly.
    - git: `Agent(subagent_type="general-purpose", …)` (Sonnet) — give it **only** Bash/git; **forbid** MCP
      tools, commedit skills, and spawning agents; non-interactive git only (see §4 baseline).
-   - gito: **identical** to the git student but `Agent(subagent_type="general-purpose", model="opus", …)`
-     on the `stress/t<task>-gito` worktree — same prompt, same Bash/git-only tools, same non-interactive
-     constraint; **only the model differs**, so the git↔gito delta isolates the model. Price it at
-     **Opus** rates (see *Metrics capture*).
    - All prompts: give the intent (incl. conflict-resolution intent for T3 — otherwise a
      conflict-aware operator correctly stops and asks), and **require a `## Tool Log`** appended.
      **op/ctl prompts must state the session id** and instruct the student to pass `session=<id>` on
@@ -353,13 +349,12 @@ for line in open(sys.argv[1]):
     if u:
         inp+=u.get("input_tokens",0);  out+=u.get("output_tokens",0)
         cc+=u.get("cache_creation_input_tokens",0); cr+=u.get("cache_read_input_tokens",0)
-# $/Mtok by component. op/ctl/git run on Sonnet 4.6: input 3.00, output 15.00,
-# 5-min cache WRITE 3.75 (1.25x input), cache READ 0.30 (0.1x input). The gito
-# baseline (and the teacher) run on Opus 4.8: 5.00 / 25.00 / 6.25 / 0.50 — set
-# the four rates below to the Opus row when pricing gito. Pricing each component
-# at its own rate is the whole point: it stops the operator's one-time
-# cache_create tax from being double-counted and surfaces git's cache_read volume.
-IN,OUT,CW,CR = 3.00, 15.00, 3.75, 0.30        # Sonnet; for gito use 5.00, 25.00, 6.25, 0.50
+# $/Mtok by component. All three students run on Sonnet 4.6: input 3.00, output
+# 15.00, 5-min cache WRITE 3.75 (1.25x input), cache READ 0.30 (0.1x input).
+# Pricing each component at its own rate is the whole point: it stops the
+# operator's one-time cache_create tax from being double-counted and surfaces
+# git's cache_read volume.
+IN,OUT,CW,CR = 3.00, 15.00, 3.75, 0.30        # Sonnet
 cost = (inp*IN + out*OUT + cc*CW + cr*CR) / 1e6
 print(f"in={inp} out={out} cache_create={cc} cache_read={cr} "
       f"billable~={inp+out+cc} cost=${cost:.4f} span={first} -> {last}")
@@ -370,7 +365,7 @@ PY
 (≈0.1×), so report components — don't lump it into one number.
 
 **Report `cost=$…` per student in every run's scorecard** (it's the one figure comparable across
-all four solvers — tokens-per-component aren't, since the mix differs). The snippet prices each
+all three solvers — tokens-per-component aren't, since the mix differs). The snippet prices each
 component at its true rate, which is what makes the one-time/repetition split honest:
 - `cache_create` (≈1.25× input) is the operator's **one-time prompt-materialization tax** — paid
   once per cold spawn, *independent of how much work the agent does*. The tournament is its
@@ -388,22 +383,20 @@ checked-out branch).
 
 ### Grading rubric (1–5 each + overall)
 correctness (gate) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
-capture* — the only currency comparable across all four solvers; tokens-by-component and wall-clock
+capture* — the only currency comparable across all three solvers; tokens-by-component and wall-clock
 are noisier secondaries; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
 undercounts — `undo` prunes — read the **Tool Log** for true effort) · tool-fit (op/ctl: surgical
 vs whole-file, `change_id` addressing, `suggest_squash_targets`, oldest-first conflict, correct
 split partition; git: idiomatic *non-interactive* git — `--autosquash`, `--onto`, `rerere`) ·
 robustness/recovery · reporting (compact, accurate, flags decisions) · cleanliness (`fsck`/`status`
-clean, descendants rebased). Deltas per task: **operator↔control** (skill value),
-**(op|ctl)↔git** (MCP value — the headline), and **git↔gito** (model value on the baseline, tool
-held constant — note `gito` is priced at Opus rates, so compare it to `git` in `cost=$…`, never in
-raw tokens).
+clean, descendants rebased). Deltas per task: **operator↔control** (skill value) and
+**(op|ctl)↔git** (MCP value — the headline).
 
 > **Token caveat.** The operator pays a **prompt tax** (large system prompt + on-demand skills) it
 > must earn back through fewer/cheaper turns. Report `cache_creation` vs `cache_read` separately so
 > that one-time tax stays visible and isn't double-counted (cache_read ≈0.1×; first-turn
 > cache_create ≈1.25× of fresh input), **and the per-component `cost=$…`** (rates + recipe above) —
-> the dollar figure is the one number comparable across all four solvers.
+> the dollar figure is the one number comparable across all three solvers.
 
 ### Reading the cost numbers (what `billable~` does and doesn't mean)
 Most of an MCP student's token cost is **not work** — it's a fixed **per-spawn
@@ -428,7 +421,7 @@ Two consequences when comparing students:
 
 So always report `cache_create` vs `cache_read` **separately**, and fold them into the per-student
 `cost=$…` (rates + recipe under *Metrics capture*) — that dollar figure is the headline efficiency
-number in each scorecard, the only one comparable across all four solvers.
+number in each scorecard, the only one comparable across all three solvers.
 
 **Warming is organic; the lever is fewer turns, not a prefetch (run-4 finding).** Cross-spawn warming
 of the shared prompt prefix happens on its own — in a fan-out the *first* spawn of each cache prefix
@@ -463,10 +456,9 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
 - If tools were **added/renamed**: update the minimal paths in §4 and the rubric's tool-fit notes.
   Re-check whether the footguns recorded under [`runs/`](runs/) are fixed (does `split_commit` now
   warn on an empty child? does the interior-drop auto-resolve fire?).
-- Keep students on the **shipped** operator + a skill-less MCP control + a **git-only** baseline on
-  both Sonnet (`git`) and Opus (`gito`), so all three deltas stay comparable across runs. The
-  `reposetup.sh` provisioning loop already creates the `*-git` **and** `*-gito` worktrees; teardown
-  globs them (the `commedit-stress` / `stress/*` prefixes cover both).
+- Keep students on the **shipped** operator + a skill-less MCP control + a Sonnet **git-only**
+  baseline (`git`), so both deltas stay comparable across runs. The `reposetup.sh` provisioning loop
+  creates the `*-git` worktrees; teardown globs them (the `commedit-stress` / `stress/*` prefixes).
 - **Capture per-student metrics** every run (§5 step 5): tokens (components — esp. `cache_read`
   vs `cache_create`) + wall-clock from each `subagents/agent-*.jsonl`. Judge efficiency by token
   cost across MCP versions, not call counts.

@@ -430,6 +430,19 @@ So always report `cache_create` vs `cache_read` **separately**, and fold them in
 `cost=$…` (rates + recipe under *Metrics capture*) — that dollar figure is the headline efficiency
 number in each scorecard, the only one comparable across all four solvers.
 
+**Warming is organic; the lever is fewer turns, not a prefetch (run-4 finding).** Cross-spawn warming
+of the shared prompt prefix happens on its own — in a fan-out the *first* spawn of each cache prefix
+(keyed per agent-def × tool-set × model) pays the full `cache_create`, and every sibling within the
+~5-min TTL reads it back as cheap `cache_read` (run 4: first operator 85k `cache_create`, the nine
+siblings ~30k). So an explicit **warmup student buys little**: it only shifts that one cold spike to
+`cache_read` (~$0.2 for the operator class) and **cannot reduce `cache_read`**, which is the dominant
+component (~58% of operator cost) because every turn re-reads the whole always-on prefix. And it does
+nothing for the non-operator students, whose `cache_create` is intrinsic task work (the control's
+`ToolSearch` discovery; plain-git's long bash context), not a cold shared prefix. To actually cut cost,
+cut **turns**, **shrink the always-on prefix** (every turn's `cache_read` shrinks with it), or **reuse
+a warm session** across tasks — the per-task cold spawn here is the deliberate pessimistic case. See
+[run 4](runs/4.md) Headline 3.
+
 ---
 
 ## 6. Re-run checklist (as the MCP evolves)

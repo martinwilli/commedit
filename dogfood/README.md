@@ -61,7 +61,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~32-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~35-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -78,6 +78,7 @@ A ~32-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Merge branch 'search'` (bare subject) + `Make search case-insensitive` directly above it | merge needs a body; the follow-up belongs *in* the merge | T7 |
 | `Add experimental telemetry` (own file `src/telemetry.txt`) + `Add metrics endpoint` (own file `src/metrics.txt`), both buried | one to revert, one to drop-then-recover | T8 |
 | `Add report header`/`body`/`footer` (own file `src/report.txt`), a contiguous range by `jdoe <jane.doe@bigcorp.example>` dated 2000 | wrong author+committer identity and bogus dates across 3 commits | T9 |
+| `Add cache module` + `Bump cache capacity to 256` + `Bump cache capacity to 512` (own file `src/cache.txt`) | two same-line bumps that conflict when reordered | T10 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -115,6 +116,15 @@ Design notes that matter (learned the hard way):
   and built ancestors-first. The smell is metadata only — the tree is unchanged, so the batch must
   leave `git diff stress/base` empty. The `committer timestamp is pinned` (run-2 finding #1 in
   reverse): set the committer email explicitly and the batch must *not* re-stamp the timestamp.
+- T10 is the **conflict variant** that T3 doesn't reach: a *reorder* conflict (the `CleanTip`
+  resolution strategy) rather than a *drop* conflict (the `Drop` strategy), plus the `abort_rewrite`
+  path. The two cache bumps set the **same line** to **different values** (256, then 512), so
+  reordering the 512-bump below the 256-bump cannot auto-merge — it reliably **holds** (no spurious
+  auto-resolve to dodge), which is what makes the answer key deterministic. Verified with a
+  cherry-pick in the reordered order before wiring it up; the held conflict is fully abortable.
+  Deliberately *genuine* (not spurious) — constructing a reliably-spurious reorder is finicky (the
+  T1 drop's spurious auto-resolve famously *didn't* fire; see [run 1](runs/1.md) finding #2), so
+  whether a spurious reorder now auto-resolves stays a **calibration probe**, not a baked answer key.
 
 ---
 
@@ -155,6 +165,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T7** | Edit the `Merge branch 'search'` merge: reword it to add a body (subject kept, then a blank line + one or two sentences); and fold the follow-up `Make search case-insensitive` into the merge. | `edit_message(merge, body added)` + `squash_commit(source=case-insensitive, dest=merge, mode=fixup)` (2 mutations) | merge subject still `Merge branch 'search'`, now with a body; merge still has **2 parents**; no standalone `Make search case-insensitive` commit; its `src/search.txt` change present; `git diff stress/base` empty; descendants rebased; clean |
 | **T8** | The buried `Add experimental telemetry` shipped a privacy bug — **revert** it (inverse at the tip, keep the original). Separately, **drop** the buried `Add metrics endpoint`, then change your mind and **restore** it from the trash to the tip. | `revert_commit(telemetry)` + `drop_commit(metrics)` + `list_trash` (read) + `restore_commit(metrics, new_parent=tip)` (3 mutations + 1 read) | a revert commit removing `src/telemetry.txt` near the tip; original telemetry commit still present; `Add metrics endpoint` back in history (at the tip) with `src/metrics.txt` present; trash empty; `git diff stress/base` = only `src/telemetry.txt` deleted; descendants rebased; clean |
 | **T9** | The three `report` commits (`Add report header`/`body`/`footer`) were authored on a misconfigured machine: fix all three in one batch — set author+committer email to `jane.doe@example.com`, name `Jane Doe`, and re-date them to 2025-01-25/26/27 (keep their order). | `edit_commits([3 × {commit, identity: name+email+author_time+committer_time}])` (1 mutation) | all three carry author+committer `Jane Doe <jane.doe@example.com>` and the 2025 dates, in order; subjects unchanged; descendants rebased; `git diff stress/base` empty (metadata-only); clean |
+| **T10** | Reorder `Bump cache capacity to 512` to come *before* `Bump cache capacity to 256` — the same-line edits conflict and the rewrite holds. First **abort** to confirm the safety net (history/tree untouched), then redo it and **resolve** oldest-first so the final `capacity = 256`. | `reorder_commit(512-bump, new_parent=cache-module)` → `abort_rewrite`; then again → loop `read_conflict(oldest)`/`resolve_conflicts(oldest)` until `pending:false` (chain holds **two** conflicted commits) | after the abort: region identical to `stress/base`, `pending:false`; after the resolve: `512-bump` precedes `256-bump`, final tip `capacity = 256`, both commits present, `pending:false`; descendants rebased; clean |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -194,6 +205,15 @@ the ones below it). Because the change is metadata-only, the PASS gate is a tree
 `git diff stress/base` *plus* the exact author/committer/date fields — so it catches both a missed
 commit and a committer re-stamp.
 
+**T10 is the discriminator for the non-drop conflict + abort path.** T3 covers a *drop* conflict
+(the `Drop` rebuild-from-the-clean-prefix strategy); T10 covers a *reorder* conflict (the `CleanTip`
+peel-from-the-clean-tip strategy) — same oldest-first resolution loop, different internal path — and
+adds the one thing no other task does: `abort_rewrite`, the proof that a held conflict leaves git
+**completely frozen** (refs/HEAD/worktree untouched) until you either resolve or bail. The trap is
+that aborting is *not* an `undo` of a landed mutation — nothing landed; the rewrite was never
+exported. A conflict-aware student left to its own judgment will (correctly) stop and ask before
+resolving, so the prompt must carry the resolve-and-abort intent explicitly (as T3's does).
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -223,6 +243,11 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   --author=… --date=… --reset-author`-style fixes, or a `filter-branch`/`filter-repo --env-filter`
   keyed on the commit. `--reset-author` only fixes the author; the committer needs
   `GIT_COMMITTER_*` env on the amend. Fiddly across three commits; that's the point.
+- **T10** — reorder the two bumps via a scripted `GIT_SEQUENCE_EDITOR` `rebase <base>` (swap the two
+  `pick` lines) or `rebase --onto`; hit the same same-line conflict, hand-resolve to `capacity=256`,
+  `rebase --continue`. There is no "abort then redo" beat for git that maps to `abort_rewrite` — a
+  mid-rebase `rebase --abort` is the closest analogue (it also restores the pre-rebase state), so
+  grade whether the student demonstrates the bail-and-restore at all. `rerere` helps on the redo.
 - **T6** — no interactive `git add -p` (forbidden), so hand-craft partial patches: `git apply
   --cached <patch>` the `load`/`total` hunks → `commit --fixup=<storage sha>` → stash the rest →
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
@@ -233,8 +258,9 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds its
 multi-file conflict across both descendants, T2/T5 stay clean, T7's squash-into-merge keeps the
-two parents, T8's dropped commit lands in the trash where `restore_commit` can reach it, and T9's
-re-date batch stays tree-identical). For T6, run
+two parents, T8's dropped commit lands in the trash where `restore_commit` can reach it, T9's
+re-date batch stays tree-identical, and T10's reorder actually *holds* a conflict — and that
+`abort_rewrite` leaves the region identical to `stress/base`). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
 `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
@@ -243,7 +269,7 @@ the dirty WC, then confirm the fold rebases clean and the partition lands.
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→9), each solver S (operator, then control, then git):
+For each task T (1→10), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for

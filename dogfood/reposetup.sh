@@ -404,6 +404,35 @@ def footer(count):
     return "Total: " + str(count)
 EOF
 report_ci "Add report footer" "2000-03-03T08:00:00"
+
+# T10: a contiguous cache-capacity range on its OWN file for the conflict variant.
+# Two same-line bumps (256, then 512) that genuinely conflict when reordered
+# (different values on one line — no auto-merge possible, so the rewrite HOLDS).
+# T10 aborts the held reorder once (safety net), then resolves it oldest-first.
+# Reorder/squash conflicts exercise the CleanTip resolution strategy, the one T3's
+# drop never reaches. Explicit dates (don't consume the January DAY budget).
+cache_ci() { # $1 = message, $2 = ISO date (bypasses the DAY counter)
+  git add -A
+  GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
+  GIT_AUTHOR_NAME="Jane Doe"  GIT_AUTHOR_EMAIL="jane.doe@example.com" \
+  GIT_COMMITTER_NAME="Jane Doe" GIT_COMMITTER_EMAIL="jane.doe@example.com" \
+  git commit -q -m "$1"
+}
+cat > src/cache.txt <<'EOF'
+# cache
+capacity = 100
+EOF
+cache_ci "Add cache module" "2025-01-22T13:00:00"
+cat > src/cache.txt <<'EOF'
+# cache
+capacity = 256
+EOF
+cache_ci "Bump cache capacity to 256" "2025-01-23T13:00:00"
+cat > src/cache.txt <<'EOF'
+# cache
+capacity = 512
+EOF
+cache_ci "Bump cache capacity to 512" "2025-01-24T13:00:00"
 cat > src/main.txt   <<'EOF'
 # todo CLI
 from util import format_row, log
@@ -493,7 +522,7 @@ git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
-for t in 1 2 3 4 5 6 7 8 9; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7 8 9 10; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

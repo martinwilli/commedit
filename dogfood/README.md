@@ -7,9 +7,15 @@ the fastest way to catch a regression in *agent ergonomics* (which unit tests do
 
 The design is teacher↔student: a controlling agent (the "teacher") defines tasks and an
 **answer key**, hands each task to a **student** subagent, then verifies the result out-of-band
-and scores it. Two students run per task: the shipped **`commedit-operator`** (Sonnet, all
-skills loaded) and a skill-less **`general-purpose`** control — so each run also measures *how
-much the operator prompt + skills actually help*.
+and scores it. **Three** students run per task:
+- the shipped **`commedit-operator`** (Sonnet, all skills loaded);
+- a skill-less **`general-purpose`** **control** that drives the `mcp__…__*` tools directly;
+- a **`general-purpose`** **plain-git** baseline given *only* Bash/git — no MCP, no skills.
+
+So each run yields two deltas: operator↔control (*does the operator prompt + skills help on top
+of the MCP?*) and (operator|control)↔git (*does the MCP help at all over the tool everyone
+already has?* — the headline that justifies the project). Each run also records **token cost and
+wall-clock per student** (§5) — the only effort metric comparable across all three.
 
 > Run history (Opus teacher, Sonnet students). Each run's scorecard and findings live under
 > [`runs/`](runs/), newest first.
@@ -41,6 +47,15 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 4. **commedit does NOT follow the shell cwd.** It only follows `reload_repo(path=…)`. A plain
    `git` command in the teacher (or a student) runs in whatever cwd the shell happens to hold —
    which bit both a student and the teacher during the first run. **Always use `git -C <abs-path>`.**
+5. **The plain-git student bypasses the MCP server entirely.** It never calls `reload_repo`,
+   shares nothing with the `Arc<Mutex<Repo>>`, and works on its worktree purely via
+   `git -C <wt>` (constraint #4 bites it hardest). It is therefore the *one* student that could
+   run in parallel — but **keep it serial** for a clean grading slate. ⚠️ The harness **forbids
+   interactive git** (`rebase -i`, `add -i`), so it must do non-interactive surgery:
+   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash`, `rebase --onto`, scripted `--exec`,
+   `commit --amend`, hand-resolved conflicts (+ `rerere`). That mirrors commedit's own
+   non-interactive pitch, so the comparison is fair — and how hard this turns out to be is itself
+   a finding.
 
 ---
 
@@ -107,6 +122,21 @@ tree; a changed file you **omit stays in the retained commit** (the child gets n
 `util.txt`'s change to the child you must list it **reverted to its parent content** — listing
 `config.txt` (its own content) silently produces "retained keeps both, child empty."
 
+### Plain-git baseline (what the git student faces)
+The git student gets the *same* intents and PASS criteria — same topology, same file content —
+but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
+Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not adherence to this.
+- **T1** — `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` folds the `fixup!`;
+  reorder + drop need a scripted sequence editor (rewrite the todo list) or `rebase --onto`.
+- **T2** — at a `rebase` stop, `reset HEAD^` the kitchen-sink commit and re-commit in two parts
+  (config.txt, then util.txt). Still the discriminator — fiddly to split clean.
+- **T3** — drop the `timeout 60` commit via rebase; hit the *same* genuine conflict; hand-resolve
+  to `timeout = 120` and `rebase --continue`.
+- **T4** — mark the deep `athentication` commit `edit` (scripted sequence editor), then
+  `commit --amend --author="Jane Doe <…>" -m "Add authentication"` + edit `TOKEN_LEN`.
+- **T5** — `git cherry-pick` / `rebase --onto` to land it after `Add parser`, reword via amend;
+  leave `stress/hotfix` untouched.
+
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds a
@@ -116,29 +146,68 @@ conflict and T2/T5 stay clean). `git -C <cal> reset --hard stress/base && reload
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→5), each solver S (operator, then control):
+For each task T (1→5), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
-2. `reload_repo(path=<wt>)` — bind the server to this worktree (also resets the op-log → clean grading slate).
-3. Launch **one** student and **await it fully** (never two at once — shared server):
+2. **op/ctl only:** `reload_repo(path=<wt>)` — bind the server to this worktree (also resets the
+   op-log → clean grading slate). **git student:** skip this — it never touches the server.
+3. Launch **one** student and **await it fully** (never two at once — op/ctl share the server;
+   keep git serial too for a clean slate):
    - operator: `Agent(subagent_type="commedit:commedit-operator", …)`
    - control: `Agent(subagent_type="general-purpose", …)` — tell it the server is already bound, do **not** `reload_repo`, do **not** spawn agents, drive the `mcp__plugin_commedit_commedit__*` tools directly.
-   - Both prompts: give the intent (incl. conflict-resolution intent for T3 — otherwise a
+   - git: `Agent(subagent_type="general-purpose", …)` — give it **only** Bash/git; **forbid** MCP
+     tools, commedit skills, and spawning agents; non-interactive git only (see §4 baseline).
+   - All prompts: give the intent (incl. conflict-resolution intent for T3 — otherwise a
      conflict-aware operator correctly stops and asks), and **require a `## Tool Log`** appended.
-4. **Verify out-of-band** while still bound to `<wt>`: `list_operations`, then
-   `git -C <wt> log --graph / show / diff stress/base / fsck / status`; compare to the answer key.
-5. **Score** (rubric below). If correctness fails or there's a clear teachable miss, `SendMessage`
+4. **Verify out-of-band**: for op/ctl, while still bound to `<wt>`, `list_operations` then
+   `git -C <wt> log --graph / show / diff stress/base / fsck / status`; for the git student,
+   verify **purely from `git -C <wt>`** (`list_operations` is N/A — it never touched the server).
+   Compare to the answer key.
+5. **Capture metrics** (before the next `reload_repo` resets anything): record the student's
+   **tokens + wall-clock** from its transcript (recipe below).
+6. **Score** (rubric below). If correctness fails or there's a clear teachable miss, `SendMessage`
    the same student with targeted feedback and let it retry (cap: 1 round; 2 for T3). A held
    conflict left dangling is discarded by the next `reload_repo` (it's not pending-guarded).
+
+### Metrics capture (tokens + wall-clock, per student)
+Each subagent writes its own transcript; serial execution makes "newest file" unambiguous. Run
+this **right after** the student returns, naming the *teacher's* session dir:
+```bash
+SUB=~/.claude/projects/-home-mwilli-repos-commedit/<TEACHER_SESSION>/subagents
+F=$(ls -t "$SUB"/agent-*.jsonl | head -1)   # newest = the student just awaited (serial!)
+python3 - "$F" <<'PY'
+import sys, json
+inp=out=cc=cr=0; first=last=None
+for line in open(sys.argv[1]):
+    d=json.loads(line); t=d.get("timestamp"); u=d.get("message",{}).get("usage")
+    if t: first=first or t; last=t
+    if u:
+        inp+=u.get("input_tokens",0);  out+=u.get("output_tokens",0)
+        cc+=u.get("cache_creation_input_tokens",0); cr+=u.get("cache_read_input_tokens",0)
+print(f"in={inp} out={out} cache_create={cc} cache_read={cr} "
+      f"billable~={inp+out+cc} span={first} -> {last}")
+PY
+```
+`<TEACHER_SESSION>` is the controlling session's UUID (the dir under
+`projects/-home-mwilli-repos-commedit/` that owns a `subagents/`). `cache_read` is cheap re-read
+(≈0.1×), so report components — don't lump it into one number.
 
 When done: `reload_repo(path=<this repo root>)` to rebind reads back to the checked-out branch.
 
 ### Grading rubric (1–5 each + overall)
-correctness (gate) · efficiency (mutations vs minimal; thrash; retries — read the **Tool Log**,
-not just `list_operations`) · tool-fit (surgical vs whole-file; `change_id` addressing;
-`suggest_squash_targets`; oldest-first conflict; correct split partition) · robustness/recovery ·
-reporting (compact, accurate, flags decisions) · cleanliness (`fsck`/`status` clean, descendants
-rebased). Plus the **operator-vs-control delta** per task.
+correctness (gate) · **efficiency — tokens first** (the only cross-student currency; wall-clock
+a noisy secondary; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
+undercounts — `undo` prunes — read the **Tool Log** for true effort) · tool-fit (op/ctl: surgical
+vs whole-file, `change_id` addressing, `suggest_squash_targets`, oldest-first conflict, correct
+split partition; git: idiomatic *non-interactive* git — `--autosquash`, `--onto`, `rerere`) ·
+robustness/recovery · reporting (compact, accurate, flags decisions) · cleanliness (`fsck`/`status`
+clean, descendants rebased). Deltas per task: **operator↔control** (skill value) and
+**(op|ctl)↔git** (MCP value — the headline).
+
+> **Token caveat.** The operator pays a **prompt tax** (large system prompt + on-demand skills) it
+> must earn back through fewer/cheaper turns. Report `cache_creation` vs `cache_read` separately so
+> that one-time tax stays visible and isn't double-counted (cache_read ≈0.1×; first-turn
+> cache_create ≈1.25× of fresh input). Optionally fold to a $ estimate via model pricing.
 
 ---
 
@@ -160,7 +229,11 @@ rebased). Plus the **operator-vs-control delta** per task.
 - If tools were **added/renamed**: update the minimal paths in §4 and the rubric's tool-fit notes.
   Re-check whether the footguns recorded under [`runs/`](runs/) are fixed (does `split_commit` now
   warn on an empty child? does the interior-drop auto-resolve fire?).
-- Keep students on the **shipped** operator + a skill-less control so the operator-vs-control
-  delta stays comparable across runs.
+- Keep students on the **shipped** operator + a skill-less MCP control + a **git-only** baseline,
+  so all three deltas stay comparable across runs. The `reposetup.sh` provisioning loop already
+  creates the `*-git` worktrees; teardown globs them.
+- **Capture per-student metrics** every run (§5 step 5): tokens (components — esp. `cache_read`
+  vs `cache_create`) + wall-clock from each `subagents/agent-*.jsonl`. Judge efficiency by token
+  cost across MCP versions, not call counts.
 - 🔒 **Never** run a commedit *mutation* while the server is bound to anything but a `stress/*`
   worktree, and keep all test refs under `stress/*`. Use `git -C <abs>` everywhere.

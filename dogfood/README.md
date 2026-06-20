@@ -61,9 +61,9 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~26-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~27-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
-`stress/hotfix`. Each task targets a disjoint "smell" region so the six tasks never interfere:
+`stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
 | Region | Smell | Task |
 |---|---|---|
@@ -75,6 +75,7 @@ A ~26-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add athentication` (`temp@example.com`, `TOKEN_LEN = 8`) | typo subject + wrong author + bug, deep below tip | T4 |
 | `stress/hotfix`: `Fix null deref in parser [BUG-123]` (Alex Fixer) | off-branch fix to pull in | T5 |
 | `Add storage and stats helpers` (own files `src/store.txt` + `src/stats.txt`) | squash-up target for a dirty WC (no committed smell) | T6 |
+| `Merge branch 'search'` (bare subject) + `Make search case-insensitive` directly above it | merge needs a body; the follow-up belongs *in* the merge | T7 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -92,6 +93,13 @@ Design notes that matter (learned the hard way):
   helpers`, own files so a fold rebases clean). The "smell" is injected into the *working copy* at
   run time by [`t6-dirty.sh`](t6-dirty.sh) (§5 step 1), since T6 tests the working-copy → history
   path, the one axis no other task touches.
+- T7 is the **merge-editing** axis — the one thing every other task only *preserves*. The fixture
+  already had the `Merge branch 'search'` merge sitting idle; T7 finally edits it. `Make search
+  case-insensitive` is the merge's **direct child** and the only thing between it and the merge that
+  touches `src/search.txt`, so squashing it *into* the merge commutes cleanly (a merge is a valid
+  squash *destination*, never a source). The merge's bare `-m` subject (no body) is the second smell
+  — reword it to add one, per the repo's own merge convention. Verified the squash commutes and the
+  reword preserves the two parents before wiring it up.
 
 ---
 
@@ -111,7 +119,7 @@ for teardown.
 
 ---
 
-## 4. The six tasks (spec + answer key + minimal path)
+## 4. The tasks (spec + answer key + minimal path)
 
 Change ids are stable across rewrites; the first run's were:
 `f6b1ce85` Add parser · `1b6f85b9` fixup! · `a384cdf1` Add util helper · `8da4af94` Use format_row ·
@@ -129,6 +137,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T4** | On the deep `Add athentication` commit: fix subject typo, set author `Jane Doe`, fix `TOKEN_LEN 8→16`. | `edit_commits(msg+author)` + `replace_in_file` (2 mutations) | subject `Add authentication`; author correct; `TOKEN_LEN = 16`; descendants rebased; clean |
 | **T5** | Cherry-pick `stress/hotfix`'s fix to right after `Add parser`; reword to drop `[BUG-123]`. | `cherry_pick_commit(full sha, new_parent)` + `replace_in_message` (2 mutations) | fix after `Add parser`; author `Alex Fixer` preserved; no `[BUG-123]`; `stress/hotfix` untouched; clean |
 | **T6** | From the dirty WC ([`t6-dirty.sh`](t6-dirty.sh)): fold the `load`/`total` helpers into `Add storage and stats helpers`; then craft `Add backup command` (the `backup` fn + new `src/backup.txt`) and `Add average stat` (the `average` fn) as two new commits. | `show_commit(@)` → `squash_working_copy(dest, hunks=[store.txt#0, stats.txt#0])` → `commit_working_copy("Add backup command", paths=[store.txt, backup.txt], add_paths=[backup.txt])` → `commit_working_copy("Add average stat")` (1 read + 3 mutations) | `store.txt` `load`+`total` folded into the buried commit, descendants rebased; two new commits on top with the right partition (`backup`+`backup.txt`, then `average`); WC clean; `git diff stress/base` = all the dirt, distributed; clean |
+| **T7** | Edit the `Merge branch 'search'` merge: reword it to add a body (subject kept, then a blank line + one or two sentences); and fold the follow-up `Make search case-insensitive` into the merge. | `edit_message(merge, body added)` + `squash_commit(source=case-insensitive, dest=merge, mode=fixup)` (2 mutations) | merge subject still `Merge branch 'search'`, now with a body; merge still has **2 parents**; no standalone `Make search case-insensitive` commit; its `src/search.txt` change present; `git diff stress/base` empty; descendants rebased; clean |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -145,6 +154,15 @@ silently skips it unless it is named in **both** `add_paths` and `paths`. The pl
 feels both traps hardest — the harness forbids interactive `git add -p`, so it must hand-craft
 partial patches.
 
+**T7 is the discriminator for merge editing.** It's the only task that *changes* the merge rather
+than preserving it — and the one where plain git is most painful (rewording or squashing into a
+*buried* merge needs `rebase --rebase-merges` with a scripted sequence editor, which the harness's
+`GIT_EDITOR=true` actively breaks; see [run 2](runs/2.md) finding #3). The trap for the MCP students
+is the opposite of what you'd guess: a merge can be a squash *destination* but never a *source*
+(`squash_commit` refuses it), and the two rewrites of the same merge re-stamp its committer (run-2
+finding #1) — so don't grade committer identity here, and prefer reword-then-fixup so the dest
+message survives.
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -160,6 +178,11 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `commit --amend --author="Jane Doe <…>" -m "Add authentication"` + edit `TOKEN_LEN`.
 - **T5** — `git cherry-pick` / `rebase --onto` to land it after `Add parser`, reword via amend;
   leave `stress/hotfix` untouched.
+- **T7** — reword + squash-into a *buried merge* non-interactively: `rebase --rebase-merges <base>`
+  with a scripted `GIT_SEQUENCE_EDITOR` (mark the `merge -C` line for reword and the follow-up for
+  `fixup`/`squash`), supplying the new body via `-m`/`GIT_EDITOR` — fragile under the harness's
+  `GIT_EDITOR=true`. Alternative: reset to the merge's first parent, `git merge -s ours`/re-merge
+  with the new message + folded change, then `cherry-pick` the descendants. Fiddly; that's the point.
 - **T6** — no interactive `git add -p` (forbidden), so hand-craft partial patches: `git apply
   --cached <patch>` the `load`/`total` hunks → `commit --fixup=<storage sha>` → stash the rest →
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
@@ -169,7 +192,8 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds its
-multi-file conflict across both descendants and T2/T5 stay clean). For T6, run
+multi-file conflict across both descendants, T2/T5 stay clean, and T7's squash-into-merge keeps the
+two parents). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
 `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
@@ -178,7 +202,7 @@ the dirty WC, then confirm the fold rebases clean and the partition lands.
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→6), each solver S (operator, then control, then git):
+For each task T (1→7), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for

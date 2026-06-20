@@ -146,6 +146,18 @@ GIT_COMMITTER_NAME="Jane Doe" GIT_COMMITTER_EMAIL="jane.doe@example.com" \
 git merge -q --no-ff stress/search -m "Merge branch 'search'"
 DAY=$((DAY+1))
 
+# C8b T7: a stray follow-up to the just-merged search feature, sitting directly
+# above the merge so it folds in cleanly. T7 rewords the bare merge subject to add
+# a body (the repo's own merge convention) AND squashes this commit INTO the merge
+# (a merge may be a squash *destination*). Own edit to src/search.txt; nothing
+# between it and the merge touches that file, so the fold commutes.
+cat > src/search.txt <<'EOF'
+def search(rows, query):
+    q = query.lower()
+    return [r for r in rows if q in r.lower()]
+EOF
+ci "Make search case-insensitive"
+
 # C9 Add athentication (T4): wrong author, typo subject, TOKEN_LEN bug
 cat > src/auth.txt   <<'EOF'
 TOKEN_LEN = 8
@@ -419,7 +431,7 @@ git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
-for t in 1 2 3 4 5 6; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

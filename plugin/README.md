@@ -196,8 +196,10 @@ cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
 The still-running server keeps serving the *previous* build until you restart
 Claude Code, so relaunch to pick up the new one.
 
-**Quick loop — one session.** `--plugin-dir` reads `plugin/` in place, so
-rebuilding and relaunching picks up the new binary with no extra step:
+**Quick loop — one session (best for prompt / agent / skill tuning).**
+`--plugin-dir` reads `plugin/` in place — no marketplace, no snapshot, no
+`version` dance — so each relaunch picks up your current source, whether you
+rebuilt the binary or only edited an agent / skill / prompt `.md`:
 
 ```sh
 claude --plugin-dir plugin /path/to/your/repo
@@ -221,14 +223,28 @@ claude plugin marketplace add ~/commedit-marketplace
 claude plugin install commedit@commedit-local   # then restart Claude Code
 ```
 
-Installing **snapshots** the plugin into Claude Code's cache, so after each
-rebuild re-copy the binary and refresh the snapshot — then restart to apply:
+Installing **snapshots** the plugin into Claude Code's cache, so *any* edit —
+the server binary **or** an agent / skill / prompt `.md` — only takes effect
+once you re-snapshot **and restart**:
 
 ```sh
-cargo build --release -p commedit-mcp
+cargo build --release -p commedit-mcp   # only if you changed the server
 cp target/release/commedit-mcp plugin/bin/commedit-mcp-linux-x86_64
 claude plugin update commedit@commedit-local
 ```
 
-(If `update` won't refresh because `plugin.json`'s `version` is unchanged,
-`claude plugin uninstall commedit@commedit-local` and install again.)
+⚠️ `claude plugin update` keys off `plugin.json`'s `version`: when it's
+**unchanged** — the usual case mid-development — the update is a **silent
+no-op**. It reports success and copies *nothing*, so your edit stays invisible
+(an agent-only edit, with no binary rebuild, hits this every time). To force a
+fresh snapshot of the *same* version, **uninstall + install** (or bump
+`version`):
+
+```sh
+claude plugin uninstall commedit@commedit-local
+claude plugin install   commedit@commedit-local
+```
+
+A refreshed snapshot never reaches an **already-running** session — **restart**
+Claude Code to load it (or just use `--plugin-dir`, above, which skips the cache
+entirely).

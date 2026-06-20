@@ -28,7 +28,7 @@ Both binaries take `[PATH] [BRANCH]` (parsed by `commedit_engine::cli::parse_rep
 
 Run `cargo fmt` and `cargo clippy --workspace --all-targets` before committing, and keep clippy warning-free; each commit should build and pass tests on its own.
 
-The Claude Code plugin in `plugin/` bundles `commedit-mcp` as an MCP server. Follow *Developing locally* in [`plugin/README.md`](plugin/README.md) to build and install it for dogfooding.
+The Claude Code plugin in `plugin/` bundles `commedit-mcp` as an MCP server. Follow *Developing locally* in [`plugin/README.md`](plugin/README.md) to build and install it for dogfooding. [`dogfood/`](dogfood/README.md) defines a reproducible teacher↔student tournament that drives the real MCP server with subagents and scores correctness/efficiency — re-run it whenever the MCP surface, the operator agent, or the bundled skills change, to catch agent-ergonomics regressions unit tests don't cover.
 
 ## Architecture
 

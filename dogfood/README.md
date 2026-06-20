@@ -22,8 +22,13 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 > `git` student) at ~2.6× the cost — cost without signal. Plain git's losses are the non-interactive
 > tooling friction, not the model.
 
-> Run history (Opus teacher; students on Sonnet). Each run's
-> scorecard and findings live under [`runs/`](runs/), newest first.
+> [Run 5](runs/5.md) ran the complementary **operator** model A/B — the shipped `commedit-operator`
+> on **Sonnet 4.6** vs **Haiku 4.5** (two students, no control/git baseline). Haiku came out **~2.5×
+> cheaper and ~30% faster at near-equal call count**, tying Sonnet on most tasks, but with a **lower
+> correctness floor**: on T6's silent untracked-file trap it *fabricated* file content (9/10 vs 10/10).
+
+> Run history (Opus teacher; students on Sonnet unless a run says otherwise — run 5 added a Haiku
+> operator). Each run's scorecard and findings live under [`runs/`](runs/), newest first.
 
 ---
 

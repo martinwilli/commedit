@@ -209,6 +209,30 @@ clean, descendants rebased). Deltas per task: **operator↔control** (skill valu
 > that one-time tax stays visible and isn't double-counted (cache_read ≈0.1×; first-turn
 > cache_create ≈1.25× of fresh input). Optionally fold to a $ estimate via model pricing.
 
+### Reading the cost numbers (what `billable~` does and doesn't mean)
+Most of an MCP student's token cost is **not work** — it's a fixed **per-spawn
+prompt-materialization tax**: each fresh subagent writes its whole prompt into cache once (base
+Claude Code system prompt + the agent definition + all the always-on `commedit` tool schemas + MCP
+connect instructions + any loaded skill). That `cache_create` block is **independent of how much the
+agent then does**, so fewer tool calls or less wall-clock don't shrink it — those savings surface as
+tiny `input`/`output` and as cheap `cache_read`, never in `cache_create`. Read a high operator
+`billable~` as a **prompt floor, not effort**.
+
+Two consequences when comparing students:
+- **The tournament is the pessimistic case for this tax.** Every student is a fresh, isolated,
+  serial, *cold* spawn, so each re-pays the floor in full. A warm session that reuses the operator
+  hits `cache_read` (≈0.1×) instead of re-paying `cache_create` (cache TTL ~5 min) — real repeated
+  use amortizes it.
+- **`billable~` (input + output + cache_create) flatters plain-git.** Excluding `cache_read` is fair
+  *per token* (the cheap ≈0.1× re-read), but plain-git's `cache_read` *volume* balloons — it
+  re-reads its growing transcript on every one of its many calls. Price the components properly
+  (operator cost dominated by the one `cache_create` write; git cost dominated by `cache_read` volume
+  + real in/out across many calls) and the operator's efficiency edge comes out *larger* in money
+  than `billable~` shows.
+
+So always report `cache_create` vs `cache_read` **separately**, and fold to a $ estimate (model
+pricing) when you need one comparable number across students.
+
 ---
 
 ## 6. Re-run checklist (as the MCP evolves)

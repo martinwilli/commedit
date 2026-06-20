@@ -61,7 +61,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~25-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~26-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the six tasks never interfere:
 
@@ -71,7 +71,7 @@ A ~25-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add parser` + `fixup! Add parser` | a floating autosquash fixup | T1 |
 | `Use format_row` before `Add util helper format_row` | wrong logical order | T1 |
 | `Debug: add state dump helper` (own file `src/debug.txt`) | stray commit, **cleanly droppable** | T1 |
-| `Set timeout to 60` → `Set timeout to 120` (same line) | drop the first ⇒ **genuine conflict** | T3 |
+| `Raise server limits for load test` (timeout+backlog in server.txt, max_conn in `src/limits.txt`), re-touched by `Set timeout to 120` and `Bump backlog and max_conn` | drop it ⇒ **genuine conflict, 3 hunks over 2 files** | T3 |
 | `Add athentication` (`temp@example.com`, `TOKEN_LEN = 8`) | typo subject + wrong author + bug, deep below tip | T4 |
 | `stress/hotfix`: `Fix null deref in parser [BUG-123]` (Alex Fixer) | off-branch fix to pull in | T5 |
 | `Add storage and stats helpers` (own files `src/store.txt` + `src/stats.txt`) | squash-up target for a dirty WC (no committed smell) | T6 |
@@ -80,8 +80,12 @@ Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
   version edited `main.txt`, and dropping it **conflicted** with later `main.txt` edits — the
   spurious-drop auto-resolve did *not* trigger. (A finding in its own right; see [`runs/`](runs/).)
-- The T3 conflict is genuine because a later commit modifies a line an earlier commit set, and
-  dropping the earlier removes the anchor — confirmed it actually holds (not auto-resolved).
+- The T3 conflict is genuine and now **spans 3 hunks over 2 files**: the dropped commit set
+  `timeout`+`backlog` (server.txt) and `max_conn` (`src/limits.txt`), and two later commits
+  (`Set timeout to 120`, `Bump backlog and max_conn`) each re-touch those same lines — so dropping
+  the anchor conflicts in two descendant commits at once. Each is a true 3-way conflict (the values
+  genuinely differ), so it holds (not auto-resolved); resolution must land `timeout=120`,
+  `backlog=256`, `max_conn=1000`. Verified with a `git rebase --onto` drop before wiring it up.
 - The T5 hotfix touches `parse_all` while the T1 fixup touches `parse` (different lines) so the
   mid-history cherry-pick rebases cleanly past the fixup.
 - T6 has **no committed smell** — its region is a clean buried commit (`Add storage and stats
@@ -111,10 +115,11 @@ for teardown.
 
 Change ids are stable across rewrites; the first run's were:
 `f6b1ce85` Add parser · `1b6f85b9` fixup! · `a384cdf1` Add util helper · `8da4af94` Use format_row ·
-`79732184` kitchen-sink · `8c8db3bb` timeout 60 · `93e8b060` timeout 120 · `efd2cee6` athentication ·
-`ebd5b2c2` debug · hotfix sha `faa2ce30…` · `Add storage and stats helpers` (T6 fold target).
-**Re-derive them with `list_history` each run** — the storage/stats commit is new this version,
-so it had no run-1 change id.
+`79732184` kitchen-sink · `8c8db3bb` raise limits (T3 drop target) · `93e8b060` timeout 120 ·
+`efd2cee6` athentication · `ebd5b2c2` debug · hotfix sha `faa2ce30…` · plus `Bump backlog and
+max_conn` (T3) and `Add storage and stats helpers` (T6 fold target).
+**Re-derive them with `list_history` each run** — the `Bump backlog and max_conn` and
+storage/stats commits are new this version, so they had no run-1 change id.
 
 | # | Task (intent given to the student) | Minimal path | PASS criteria (verify with `git`) |
 |---|---|---|---|
@@ -148,8 +153,9 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   reorder + drop need a scripted sequence editor (rewrite the todo list) or `rebase --onto`.
 - **T2** — at a `rebase` stop, `reset HEAD^` the kitchen-sink commit and re-commit in two parts
   (config.txt, then util.txt). Still the discriminator — fiddly to split clean.
-- **T3** — drop the `timeout 60` commit via rebase; hit the *same* genuine conflict; hand-resolve
-  to `timeout = 120` and `rebase --continue`.
+- **T3** — drop the `Raise server limits for load test` commit via rebase; hit the *same* genuine
+  conflict, now in **two** descendant commits across server.txt + `src/limits.txt`; hand-resolve
+  each (`timeout=120`, `backlog=256`, `max_conn=1000`) and `rebase --continue` (rerere helps).
 - **T4** — mark the deep `athentication` commit `edit` (scripted sequence editor), then
   `commit --amend --author="Jane Doe <…>" -m "Add authentication"` + edit `TOKEN_LEN`.
 - **T5** — `git cherry-pick` / `rebase --onto` to land it after `Add parser`, reword via amend;
@@ -162,8 +168,9 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
-shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds a
-conflict and T2/T5 stay clean). For T6, run `./dogfood/t6-dirty.sh <cal>` after the reset to seed
+shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds its
+multi-file conflict across both descendants and T2/T5 stay clean). For T6, run
+`./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
 `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
 

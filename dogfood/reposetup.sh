@@ -55,6 +55,19 @@ cat > server.txt     <<'EOF'
 host = localhost
 timeout = 30
 workers = 4
+
+# logging
+loglevel = info
+format = plain
+buffer = 8192
+
+# limits
+backlog = 64
+EOF
+cat > src/limits.txt <<'EOF'
+max_conn = 100
+rate = 10
+burst = 20
 EOF
 ci "Initial commit"
 
@@ -142,13 +155,28 @@ def authenticate(user, token):
 EOF
 AN="temp" AE="temp@example.com" ci "Add athentication"
 
-# C10 Set timeout to 60 (T3 drop target)
+# C10 Raise server limits (T3 drop target) — touches timeout + backlog (server.txt)
+# and max_conn (src/limits.txt); 2 descendants below re-touch all three, so dropping
+# this conflicts across 3 hunks over 2 files.
 cat > server.txt     <<'EOF'
 host = localhost
 timeout = 60
 workers = 4
+
+# logging
+loglevel = info
+format = plain
+buffer = 8192
+
+# limits
+backlog = 128
 EOF
-ci "Set timeout to 60"
+cat > src/limits.txt <<'EOF'
+max_conn = 500
+rate = 10
+burst = 20
+EOF
+ci "Raise server limits for load test"
 
 # C11 changelog
 cat > CHANGELOG.md   <<'EOF'
@@ -213,13 +241,43 @@ def parse_all(lines):
 EOF
 ci "fixup! Add parser"
 
-# C14 Set timeout to 120 (T3 conflicting descendant)
+# C14 Set timeout to 120 (T3 conflicting descendant) — re-touches the timeout line
 cat > server.txt     <<'EOF'
 host = localhost
 timeout = 120
 workers = 4
+
+# logging
+loglevel = info
+format = plain
+buffer = 8192
+
+# limits
+backlog = 128
 EOF
 ci "Set timeout to 120"
+
+# C14b Bump backlog and max_conn (T3 conflicting descendant) — re-touches backlog
+# (server.txt) and max_conn (src/limits.txt), the other two lines C10 set.
+cat > server.txt     <<'EOF'
+host = localhost
+timeout = 120
+workers = 4
+
+# logging
+loglevel = info
+format = plain
+buffer = 8192
+
+# limits
+backlog = 256
+EOF
+cat > src/limits.txt <<'EOF'
+max_conn = 1000
+rate = 10
+burst = 20
+EOF
+ci "Bump backlog and max_conn"
 
 # C15 stray debug commit (T1 drop) — own file so the drop is CLEAN
 cat > src/debug.txt  <<'EOF'

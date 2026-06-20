@@ -305,7 +305,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Split a commit in two: the commit keeps the given file contents (the subset to retain, as in replace_files), and a new `fixup!` child commit receives the remainder, so both combined reproduce the original change. Descendants are untouched."
+        description = "Split a commit in two. `files` is the whole-file content this commit should KEEP for each path it changes (replace_files semantics, spliced onto the original tree); a new `fixup!` child commit gets the remainder, so the two combined reproduce the original change. KEY, and easy to get backwards: to move a file's change OUT to the child, list that file with its PARENT (pre-commit) content — a changed file you DON'T list stays in this commit. (Read the commit with show_commit include_contents first to get each file's parent content.) Passing the kept file at its current content changes nothing and is refused — it would leave the child empty. Descendants are untouched."
     )]
     pub async fn split_commit(
         &self,

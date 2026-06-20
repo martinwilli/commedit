@@ -57,8 +57,10 @@ edit in **one** atomic transaction with a single rebase, applied ancestors-first
 so a parent→child range re-dates correctly. Prefer it over looping the
 single-commit tools — it's atomic and won't re-stamp committers across the cascade.
 
-> Carving one commit into two (`split_commit`) is possible but error-prone — see
-> the `commit-as-you-go` skill for why committing eagerly beats splitting later.
+> Carving one commit into two (`split_commit`) has a precise contract — `files`
+> is the content to KEEP; to move a file's change out, pass it at its parent
+> content (a no-op split is refused). See the `commit-as-you-go` skill for the
+> details and why committing eagerly beats splitting later.
 
 ## When things go sideways
 

@@ -70,6 +70,56 @@ fn split_middle_commit_inserts_followup_and_preserves_descendants() {
 }
 
 #[test]
+fn split_that_changes_nothing_is_refused() {
+    // The footgun guard: `files` is the content to KEEP, spliced onto the original
+    // tree, and the inserted commit holds that original tree — so handing over a
+    // file at its *current* committed content (the classic mistake, instead of the
+    // file to move OUT reverted to its parent) splits out nothing. Refuse it
+    // rather than land an empty fixup child.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(
+        dir,
+        &[("f.txt", "v1\n", "first"), ("f.txt", "v2\n", "second")],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+    let target = commit_named(&repo, "second");
+
+    // "v2" is already the committed content, so this leaves the tree unchanged.
+    let err = repo
+        .split_commit(&target.id, &[("f.txt".to_string(), "v2\n".to_string())])
+        .expect_err("a no-op split must be refused");
+    assert!(
+        err.to_string().contains("move nothing into the new commit"),
+        "got: {err}"
+    );
+
+    // The failed split landed nothing: history and git are untouched.
+    assert_eq!(common::git_log_subjects(dir), vec!["second", "first"]);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn split_working_copy_that_changes_nothing_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    // One uncommitted change, then "split" it by handing over its current content
+    // — nothing peels off, so it must be refused (no empty entry, @ unchurned).
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    let err = repo
+        .split_working_copy(None, &[("a.txt".to_string(), "a\nAA\n".to_string())])
+        .expect_err("a no-op working-copy split must be refused");
+    assert!(
+        err.to_string().contains("move nothing into the new entry"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn split_working_copy_peels_a_file_into_a_second_entry_without_touching_git() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

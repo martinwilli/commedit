@@ -319,6 +319,16 @@ For each task T (1→10), each solver S (operator, control, git, gito):
    conflict left dangling in a session is discarded by reloading **that** session
    (`reload_repo(session=<id>)`; it's not pending-guarded).
 
+> ⚠️ **Ref-write race under full parallelism (run-4 finding).** Running all 40 students at once puts
+> ~40 git ref-writers (the plain-git rebases/commits **and** the MCP sessions' git-export bookkeeping)
+> on the **one shared `.git` common-dir** simultaneously. A concurrent `pack-refs`/`gc --auto` can then
+> silently drop a freshly-written loose ref, **reverting a student's correct result to an earlier value
+> after it finished** (run 4 lost 3 of 40 this way; 3 more self-recovered from reflog). The object store
+> is safe (append-only); only **ref updates** race. Before a fully-parallel run, prefer one of: a
+> separate clone/common-dir per student; `git config gc.auto 0` (+ `maintenance.auto false`) on the
+> repo; or capped concurrency. Either way, **verify out-of-band from `git` after the run settles** — the
+> revert can land post-completion, so student self-reports are not authoritative. See [run 4](runs/4.md).
+
 ### Between repeats of a task on the same worktree
 `git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**
 disturb other sessions running other tasks. A held conflict left in the session is discarded by the

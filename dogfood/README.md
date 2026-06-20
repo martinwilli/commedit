@@ -61,9 +61,9 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~25-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
-`stress/hotfix`. Each task targets a disjoint "smell" region so the five tasks never interfere:
+`stress/hotfix`. Each task targets a disjoint "smell" region so the six tasks never interfere:
 
 | Region | Smell | Task |
 |---|---|---|
@@ -74,6 +74,7 @@ A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Set timeout to 60` → `Set timeout to 120` (same line) | drop the first ⇒ **genuine conflict** | T3 |
 | `Add athentication` (`temp@example.com`, `TOKEN_LEN = 8`) | typo subject + wrong author + bug, deep below tip | T4 |
 | `stress/hotfix`: `Fix null deref in parser [BUG-123]` (Alex Fixer) | off-branch fix to pull in | T5 |
+| `Add storage and stats helpers` (own files `src/store.txt` + `src/stats.txt`) | squash-up target for a dirty WC (no committed smell) | T6 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -83,6 +84,10 @@ Design notes that matter (learned the hard way):
   dropping the earlier removes the anchor — confirmed it actually holds (not auto-resolved).
 - The T5 hotfix touches `parse_all` while the T1 fixup touches `parse` (different lines) so the
   mid-history cherry-pick rebases cleanly past the fixup.
+- T6 has **no committed smell** — its region is a clean buried commit (`Add storage and stats
+  helpers`, own files so a fold rebases clean). The "smell" is injected into the *working copy* at
+  run time by [`t6-dirty.sh`](t6-dirty.sh) (§5 step 1), since T6 tests the working-copy → history
+  path, the one axis no other task touches.
 
 ---
 
@@ -102,12 +107,14 @@ for teardown.
 
 ---
 
-## 4. The five tasks (spec + answer key + minimal path)
+## 4. The six tasks (spec + answer key + minimal path)
 
 Change ids are stable across rewrites; the first run's were:
 `f6b1ce85` Add parser · `1b6f85b9` fixup! · `a384cdf1` Add util helper · `8da4af94` Use format_row ·
 `79732184` kitchen-sink · `8c8db3bb` timeout 60 · `93e8b060` timeout 120 · `efd2cee6` athentication ·
-`ebd5b2c2` debug · hotfix sha `faa2ce30…`. **Re-derive them with `list_history` each run.**
+`ebd5b2c2` debug · hotfix sha `faa2ce30…` · `Add storage and stats helpers` (T6 fold target).
+**Re-derive them with `list_history` each run** — the storage/stats commit is new this version,
+so it had no run-1 change id.
 
 | # | Task (intent given to the student) | Minimal path | PASS criteria (verify with `git`) |
 |---|---|---|---|
@@ -116,11 +123,22 @@ Change ids are stable across rewrites; the first run's were:
 | **T3** | Drop `Raise server limits for load test`; resolve the resulting multi-file conflict so the final state is `timeout = 120`, `backlog = 256`, `max_conn = 1000`. | `drop` → loop `read_conflict(oldest)` → `resolve_conflicts(oldest)` until `pending:false` (chain may hold **two** conflicted commits across server.txt + `src/limits.txt`) | `timeout = 120`, `backlog = 256`, `max_conn = 1000`; the raise-limits commit gone; `pending:false`; clean |
 | **T4** | On the deep `Add athentication` commit: fix subject typo, set author `Jane Doe`, fix `TOKEN_LEN 8→16`. | `edit_commits(msg+author)` + `replace_in_file` (2 mutations) | subject `Add authentication`; author correct; `TOKEN_LEN = 16`; descendants rebased; clean |
 | **T5** | Cherry-pick `stress/hotfix`'s fix to right after `Add parser`; reword to drop `[BUG-123]`. | `cherry_pick_commit(full sha, new_parent)` + `replace_in_message` (2 mutations) | fix after `Add parser`; author `Alex Fixer` preserved; no `[BUG-123]`; `stress/hotfix` untouched; clean |
+| **T6** | From the dirty WC ([`t6-dirty.sh`](t6-dirty.sh)): fold the `load`/`total` helpers into `Add storage and stats helpers`; then craft `Add backup command` (the `backup` fn + new `src/backup.txt`) and `Add average stat` (the `average` fn) as two new commits. | `show_commit(@)` → `squash_working_copy(dest, hunks=[store.txt#0, stats.txt#0])` → `commit_working_copy("Add backup command", paths=[store.txt, backup.txt], add_paths=[backup.txt])` → `commit_working_copy("Add average stat")` (1 read + 3 mutations) | `store.txt` `load`+`total` folded into the buried commit, descendants rebased; two new commits on top with the right partition (`backup`+`backup.txt`, then `average`); WC clean; `git diff stress/base` = all the dirt, distributed; clean |
 
-**T2 is the discriminator.** `split_commit`'s `files` are spliced onto the *original* commit
-tree; a changed file you **omit stays in the retained commit** (the child gets nothing). To move
-`util.txt`'s change to the child you must list it **reverted to its parent content** — listing
-`config.txt` (its own content) silently produces "retained keeps both, child empty."
+**T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
+*original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
+nothing). To move `util.txt`'s change to the child you must list it **reverted to its parent
+content** — listing `config.txt` (its own content) silently produces "retained keeps both, child
+empty."
+
+**T6 is the discriminator for the working-copy → history path.** It is the one task starting from a
+*dirty* working copy, and the only one exercising partial hunk selection (`paths`/`hunks`/`patches`).
+Two traps: (a) `src/store.txt` and `src/stats.txt` each carry hunks bound for **different**
+destinations, so the fold must pick hunk indices (`git add -p` territory), not whole files — read
+them from `show_commit(@)` first; (b) `src/backup.txt` is **untracked**, so `commit_working_copy`
+silently skips it unless it is named in **both** `add_paths` and `paths`. The plain-git baseline
+feels both traps hardest — the harness forbids interactive `git add -p`, so it must hand-craft
+partial patches.
 
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
@@ -136,19 +154,28 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `commit --amend --author="Jane Doe <…>" -m "Add authentication"` + edit `TOKEN_LEN`.
 - **T5** — `git cherry-pick` / `rebase --onto` to land it after `Add parser`, reword via amend;
   leave `stress/hotfix` untouched.
+- **T6** — no interactive `git add -p` (forbidden), so hand-craft partial patches: `git apply
+  --cached <patch>` the `load`/`total` hunks → `commit --fixup=<storage sha>` → stash the rest →
+  `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
+  `backup` fn + `git add src/backup.txt` as one commit, then `average` as another. Fiddly; that's
+  the point.
 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds a
-conflict and T2/T5 stay clean). `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
+conflict and T2/T5 stay clean). For T6, run `./dogfood/t6-dirty.sh <cal>` after the reset to seed
+the dirty WC, then confirm the fold rebases clean and the partition lands.
+`git -C <cal> reset --hard stress/base && reload_repo` between tasks.
 
 ---
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→5), each solver S (operator, then control, then git):
+For each task T (1→6), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
+   **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for
+   every solver). The other tasks start from a clean tree; T6 starts dirty — that's its whole point.
 2. **op/ctl only:** `reload_repo(path=<wt>)` — bind the server to this worktree (also resets the
    op-log → clean grading slate). **git student:** skip this — it never touches the server.
 3. Launch **one** student and **await it fully** (never two at once — op/ctl share the server;

@@ -160,6 +160,36 @@ cat > CHANGELOG.md   <<'EOF'
 EOF
 ci "Update CHANGELOG"
 
+# C11b storage+stats helpers (T6 squash-up target) — own files, untouched
+# downstream, so a working-copy fold into this buried commit rebases clean.
+cat > src/store.txt  <<'EOF'
+# storage layer
+FORMAT = "csv"
+
+def save(rows, path):
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(r + "\n")
+
+def clear(path):
+    open(path, "w").close()
+EOF
+cat > src/stats.txt  <<'EOF'
+# stats helpers
+def count(rows):
+    return len(rows)
+
+def empty(rows):
+    return count(rows) == 0
+
+def first(rows):
+    return rows[0] if rows else None
+
+def last(rows):
+    return rows[-1] if rows else None
+EOF
+ci "Add storage and stats helpers"
+
 # C12 refactor config
 cat > src/config.txt <<'EOF'
 def load_config(path):
@@ -331,7 +361,7 @@ git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
-for t in 1 2 3 4 5; do for s in op ctl git; do
+for t in 1 2 3 4 5 6; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

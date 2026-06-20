@@ -61,7 +61,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~29-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~32-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -77,6 +77,7 @@ A ~29-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add storage and stats helpers` (own files `src/store.txt` + `src/stats.txt`) | squash-up target for a dirty WC (no committed smell) | T6 |
 | `Merge branch 'search'` (bare subject) + `Make search case-insensitive` directly above it | merge needs a body; the follow-up belongs *in* the merge | T7 |
 | `Add experimental telemetry` (own file `src/telemetry.txt`) + `Add metrics endpoint` (own file `src/metrics.txt`), both buried | one to revert, one to drop-then-recover | T8 |
+| `Add report header`/`body`/`footer` (own file `src/report.txt`), a contiguous range by `jdoe <jane.doe@bigcorp.example>` dated 2000 | wrong author+committer identity and bogus dates across 3 commits | T9 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -107,6 +108,13 @@ Design notes that matter (learned the hard way):
   at the tip, original kept) and the other test the `drop → list_trash → restore_commit` round-trip
   independently. The restore lands the commit at the **tip**, not its original buried slot, so a
   lazy `undo` of the drop won't satisfy it — the student must actually go through the trash.
+- T9 is the **bulk re-date / re-identify** axis — the headline `edit_commits` claim ("re-dating a
+  whole parent→child range stays correct"), which T4 only ever touched on a *single* commit. The
+  three `report` commits are a **contiguous range** with the wrong author+committer email and bogus
+  year-2000 dates, baked by an explicit-date helper (so they don't burn the January `DAY` budget)
+  and built ancestors-first. The smell is metadata only — the tree is unchanged, so the batch must
+  leave `git diff stress/base` empty. The `committer timestamp is pinned` (run-2 finding #1 in
+  reverse): set the committer email explicitly and the batch must *not* re-stamp the timestamp.
 
 ---
 
@@ -146,6 +154,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T6** | From the dirty WC ([`t6-dirty.sh`](t6-dirty.sh)): fold the `load`/`total` helpers into `Add storage and stats helpers`; then craft `Add backup command` (the `backup` fn + new `src/backup.txt`) and `Add average stat` (the `average` fn) as two new commits. | `show_commit(@)` → `squash_working_copy(dest, hunks=[store.txt#0, stats.txt#0])` → `commit_working_copy("Add backup command", paths=[store.txt, backup.txt], add_paths=[backup.txt])` → `commit_working_copy("Add average stat")` (1 read + 3 mutations) | `store.txt` `load`+`total` folded into the buried commit, descendants rebased; two new commits on top with the right partition (`backup`+`backup.txt`, then `average`); WC clean; `git diff stress/base` = all the dirt, distributed; clean |
 | **T7** | Edit the `Merge branch 'search'` merge: reword it to add a body (subject kept, then a blank line + one or two sentences); and fold the follow-up `Make search case-insensitive` into the merge. | `edit_message(merge, body added)` + `squash_commit(source=case-insensitive, dest=merge, mode=fixup)` (2 mutations) | merge subject still `Merge branch 'search'`, now with a body; merge still has **2 parents**; no standalone `Make search case-insensitive` commit; its `src/search.txt` change present; `git diff stress/base` empty; descendants rebased; clean |
 | **T8** | The buried `Add experimental telemetry` shipped a privacy bug — **revert** it (inverse at the tip, keep the original). Separately, **drop** the buried `Add metrics endpoint`, then change your mind and **restore** it from the trash to the tip. | `revert_commit(telemetry)` + `drop_commit(metrics)` + `list_trash` (read) + `restore_commit(metrics, new_parent=tip)` (3 mutations + 1 read) | a revert commit removing `src/telemetry.txt` near the tip; original telemetry commit still present; `Add metrics endpoint` back in history (at the tip) with `src/metrics.txt` present; trash empty; `git diff stress/base` = only `src/telemetry.txt` deleted; descendants rebased; clean |
+| **T9** | The three `report` commits (`Add report header`/`body`/`footer`) were authored on a misconfigured machine: fix all three in one batch — set author+committer email to `jane.doe@example.com`, name `Jane Doe`, and re-date them to 2025-01-25/26/27 (keep their order). | `edit_commits([3 × {commit, identity: name+email+author_time+committer_time}])` (1 mutation) | all three carry author+committer `Jane Doe <jane.doe@example.com>` and the 2025 dates, in order; subjects unchanged; descendants rebased; `git diff stress/base` empty (metadata-only); clean |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -178,6 +187,13 @@ reads `list_trash` and grafts it back at a chosen parent — landing it at the *
 slot) is what distinguishes a real restore from an `undo`. For plain git the recover half has no
 direct analogue — the reflog is the closest thing, which is itself the point of the comparison.
 
+**T9 is the discriminator for batch metadata edits.** One `edit_commits` call re-dates and
+re-identifies a whole 3-commit range atomically with a single rebase; the trap is doing it as three
+separate `edit_identity` calls (three rebases, and each rewrite risks re-stamping the committer of
+the ones below it). Because the change is metadata-only, the PASS gate is a tree-identical
+`git diff stress/base` *plus* the exact author/committer/date fields — so it catches both a missed
+commit and a committer re-stamp.
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -202,6 +218,11 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   has no git equivalent: drop the metrics commit with `rebase --onto <metrics>^ <metrics>`, then
   "restore" it by `cherry-pick`ing it back from the **reflog** (`git reflog`/`ORIG_HEAD`) to the
   tip — git has no trash, so finding the dropped commit *is* the task. Grade the reflog hunt.
+- **T9** — re-date+re-identify a buried range non-interactively: `rebase <base> --exec` can't vary
+  per-commit, so it's a scripted `rebase` stopping at each report commit for `commit --amend
+  --author=… --date=… --reset-author`-style fixes, or a `filter-branch`/`filter-repo --env-filter`
+  keyed on the commit. `--reset-author` only fixes the author; the committer needs
+  `GIT_COMMITTER_*` env on the amend. Fiddly across three commits; that's the point.
 - **T6** — no interactive `git add -p` (forbidden), so hand-craft partial patches: `git apply
   --cached <patch>` the `load`/`total` hunks → `commit --fixup=<storage sha>` → stash the rest →
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
@@ -212,8 +233,8 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds its
 multi-file conflict across both descendants, T2/T5 stay clean, T7's squash-into-merge keeps the
-two parents, and T8's dropped commit lands in the trash where `restore_commit` can reach it). For
-T6, run
+two parents, T8's dropped commit lands in the trash where `restore_commit` can reach it, and T9's
+re-date batch stays tree-identical). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
 `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
@@ -222,7 +243,7 @@ the dirty WC, then confirm the fold rebases clean and the partition lands.
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→8), each solver S (operator, then control, then git):
+For each task T (1→9), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for

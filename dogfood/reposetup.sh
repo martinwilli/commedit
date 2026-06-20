@@ -363,6 +363,47 @@ def incr(c):
     return c
 EOF
 ci "Add metrics endpoint"
+
+# T9: a contiguous 3-commit "report" range committed on a misconfigured machine —
+# wrong author+committer identity (jdoe <jane.doe@bigcorp.example>, Jane's work
+# laptop) and bogus year-2000 dates. T9 fixes the whole range in ONE edit_commits
+# batch (re-date + re-identify; committer timestamp pinned). Own file, explicit
+# dates so it does NOT consume the January DAY budget; built ancestors-first so the
+# batch stays a clean range.
+report_ci() { # $1 = message, $2 = ISO date (bypasses the DAY counter)
+  git add -A
+  GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" \
+  GIT_AUTHOR_NAME="jdoe"  GIT_AUTHOR_EMAIL="jane.doe@bigcorp.example" \
+  GIT_COMMITTER_NAME="jdoe" GIT_COMMITTER_EMAIL="jane.doe@bigcorp.example" \
+  git commit -q -m "$1"
+}
+cat > src/report.txt <<'EOF'
+# daily report
+def header(date):
+    return "Report for " + date
+EOF
+report_ci "Add report header" "2000-03-01T08:00:00"
+cat > src/report.txt <<'EOF'
+# daily report
+def header(date):
+    return "Report for " + date
+
+def body(rows):
+    return "\n".join(rows)
+EOF
+report_ci "Add report body" "2000-03-02T08:00:00"
+cat > src/report.txt <<'EOF'
+# daily report
+def header(date):
+    return "Report for " + date
+
+def body(rows):
+    return "\n".join(rows)
+
+def footer(count):
+    return "Total: " + str(count)
+EOF
+report_ci "Add report footer" "2000-03-03T08:00:00"
 cat > src/main.txt   <<'EOF'
 # todo CLI
 from util import format_row, log
@@ -452,7 +493,7 @@ git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
-for t in 1 2 3 4 5 6 7 8; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7 8 9; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

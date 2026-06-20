@@ -86,7 +86,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<EditMessageReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -106,7 +106,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<EditIdentityReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -140,7 +140,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<EditCommitsReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             if req.edits.is_empty() {
                 return Err(invalid("edits must not be empty"));
@@ -201,7 +201,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ReplaceFilesReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -225,7 +225,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ReplaceInFileReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             if req.edits.is_empty() {
                 return Err(invalid("edits must not be empty"));
@@ -271,7 +271,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ReplaceInMessageReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             if req.old.is_empty() {
                 return Err(invalid("`old` must not be empty"));
@@ -311,7 +311,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<SplitCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -334,7 +334,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<CreateCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
             let pre = change_id_set(&commits);
@@ -371,7 +371,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<RevertCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -406,7 +406,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<CherryPickCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (head, commits) = full_history(repo)?;
             let pre = change_id_set(&commits);
@@ -444,7 +444,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<DropCommitReq>,
     ) -> Result<Yaml<DropCommitResp>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -513,7 +513,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<ReorderCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;
@@ -542,7 +542,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<RestoreCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             ensure_not_pending(repo)?;
             let info = find_trashed(trash, &req.commit)?;
             let (_, commits) = full_history(repo)?;
@@ -571,7 +571,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<SquashCommitReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, trash| {
+        self.with_session(req.session.session.clone(), move |repo, trash| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let dest_entries = commits.iter().enumerate().map(|(i, c)| RefEntry::of(c, i));
@@ -639,7 +639,7 @@ impl CommeditServer {
         &self,
         Parameters(req): Parameters<MergeOutReq>,
     ) -> Result<Yaml<SaveResultDto>, ErrorData> {
-        self.with_session(move |repo, _| {
+        self.with_session(req.session.session.clone(), move |repo, _| {
             ensure_not_pending(repo)?;
             let (_, commits) = full_history(repo)?;
             let idx = find_commit(&commits, &req.commit)?;

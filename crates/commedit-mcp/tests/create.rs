@@ -10,7 +10,7 @@ use commedit_mcp::dto::{
     ResolveConflictsReq, RevertCommitReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
+use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -27,6 +27,7 @@ fn clean_head(result: &SaveResultDto) -> String {
 /// A `CreateCommitReq` with everything but the named fields defaulted.
 fn create(message: &str, files: &[(&str, &str)], new_parent: Option<&str>) -> CreateCommitReq {
     CreateCommitReq {
+        session: sel("main"),
         message: message.into(),
         files: files
             .iter()
@@ -45,6 +46,7 @@ fn create(message: &str, files: &[(&str, &str)], new_parent: Option<&str>) -> Cr
 /// A `CherryPickCommitReq` with everything but the named fields defaulted.
 fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
     CherryPickCommitReq {
+        session: sel("main"),
         commit: commit.into(),
         new_parent: new_parent.map(str::to_string),
         child: None,
@@ -55,6 +57,7 @@ fn pick(commit: &str, new_parent: Option<&str>) -> CherryPickCommitReq {
 async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp {
     server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -85,7 +88,14 @@ async fn create_commit_on_top_of_head_adds_a_new_tip() {
     assert_eq!(git(dir.path(), &["show", "HEAD:c.txt"]), "three");
     // The tree is clean — create_commit synthesizes content, it doesn't touch disk.
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
 }
 
 #[tokio::test]
@@ -202,7 +212,11 @@ async fn create_commit_preserves_uncommitted_changes() {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "one\nlocal\n"
     );
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!status.clean);
     assert_eq!(status.entries[0].files, vec!["a.txt".to_string()]);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "M a.txt");
@@ -215,6 +229,7 @@ async fn create_commit_with_an_explicit_author() {
     let server = open_server(dir.path());
 
     let req = CreateCommitReq {
+        session: sel("main"),
         message: "authored".into(),
         files: vec![FileContentDto {
             path: "c.txt".into(),
@@ -252,6 +267,7 @@ async fn create_commit_can_delete_relative_to_its_parent() {
     let server = open_server(dir.path());
 
     let req = CreateCommitReq {
+        session: sel("main"),
         message: "drop a".into(),
         files: vec![],
         delete_paths: Some(vec!["a.txt".into()]),
@@ -287,6 +303,7 @@ async fn revert_commit_inverts_a_commits_change() {
     let second = history(&server).await.commits[0].change_id.clone();
     let result = server
         .revert_commit(Parameters(RevertCommitReq {
+            session: sel("main"),
             commit: second,
             new_parent: None,
             child: None,
@@ -322,6 +339,7 @@ async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
     let add_x = history(&server).await.commits[1].change_id.clone();
     let result = server
         .revert_commit(Parameters(RevertCommitReq {
+            session: sel("main"),
             commit: add_x,
             new_parent: None,
             child: None,
@@ -339,6 +357,7 @@ async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
     let oldest = &commits[0];
     let result = server
         .resolve_conflicts(Parameters(ResolveConflictsReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             files: vec![ConflictFileEditDto {
                 path: oldest.files[0].path.clone(),
@@ -379,6 +398,7 @@ async fn revert_commit_refuses_a_merge() {
     let err = expect_err(
         server
             .revert_commit(Parameters(RevertCommitReq {
+                session: sel("main"),
                 commit: merge,
                 new_parent: None,
                 child: None,
@@ -408,6 +428,7 @@ async fn commit_working_copy_commits_the_dirt() {
     let err = expect_err(
         server
             .commit_working_copy(Parameters(CommitWorkingCopyReq {
+                session: sel("main"),
                 message: "nope".into(),
                 identity: IdentityFieldsDto::default(),
                 paths: None,
@@ -427,6 +448,7 @@ async fn commit_working_copy_commits_the_dirt() {
     std::fs::write(dir.path().join("a.txt"), "1\nlocal\n").unwrap();
     let result = server
         .commit_working_copy(Parameters(CommitWorkingCopyReq {
+            session: sel("main"),
             message: "local work".into(),
             identity: IdentityFieldsDto::default(),
             paths: None,
@@ -445,7 +467,14 @@ async fn commit_working_copy_commits_the_dirt() {
     );
     assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "1\nlocal");
     // The working tree ends up clean.
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -575,6 +604,7 @@ async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
     let oldest = &commits[0];
     let resp = server
         .read_conflict(Parameters(ReadConflictReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             path: Some(oldest.files[0].path.clone()),
             paths: None,
@@ -585,6 +615,7 @@ async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
     let file = &resp.files[0];
     let result = server
         .resolve_conflicts(Parameters(ResolveConflictsReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             files: vec![ConflictFileEditDto {
                 path: oldest.files[0].path.clone(),
@@ -620,6 +651,7 @@ async fn replace_files_can_delete_a_file() {
     let second = history(&server).await.commits[0].change_id.clone();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
             commit: second,
             files: vec![],
             delete_paths: Some(vec!["a.txt".into()]),

@@ -5,11 +5,16 @@ mod common;
 
 use commedit_mcp::dto::ShowGraphResp;
 use commedit_mcp::server::CommeditServer;
-use common::{init_merge_repo, init_repo, open_server};
+use common::{init_merge_repo, init_repo, open_server, sel};
+use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 async fn graph(server: &CommeditServer) -> ShowGraphResp {
-    server.show_graph().await.expect("show_graph call").0
+    server
+        .show_graph(Parameters(sel("main")))
+        .await
+        .expect("show_graph call")
+        .0
 }
 
 #[tokio::test]

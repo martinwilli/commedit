@@ -36,7 +36,7 @@ Three crates, split so the rewrite logic carries no GTK dependency and is unit-t
 
 - **`commedit-engine`** — all repository logic, built on `jj-lib` (jujutsu).
 - **`commedit-gtk`** — the UI (binary `commedit`). Depends on the engine.
-- **`commedit-mcp`** — MCP stdio server over the engine (binary `commedit-mcp`). A lib + thin bin so tool handlers are integration-tested directly (`tests/*.rs`). Tools live in `tools/{read,mutate,workcopy,conflict,ops}.rs`; session addressing/planning in `session.rs`; DTOs in `dto.rs`/`convert.rs` (no jj-lib types cross the boundary); results YAML-wrapped in `wrapper.rs`. The MCP surface is a superset of the GTK app.
+- **`commedit-mcp`** — MCP stdio server over the engine (binary `commedit-mcp`). A lib + thin bin so tool handlers are integration-tested directly (`tests/*.rs`). Tools live in `tools/{read,mutate,workcopy,conflict,ops}.rs`; the session registry, addressing and planning in `session.rs`; DTOs in `dto.rs`/`convert.rs` (no jj-lib types cross the boundary); results YAML-wrapped in `wrapper.rs`. The MCP surface is a superset of the GTK app.
 
 ### The jj-over-git "transparency" model
 
@@ -53,6 +53,14 @@ The core invariant: plain `git` always sees an ordinary, attached-HEAD repo. Key
 #### Cross-instance commit dragging
 
 Opening one repo in several windows (typically one branch each) lets you drag a commit from one onto another's history to cherry-pick it across branches. Windows are separate processes (`main.rs` uses `ApplicationFlags::NON_UNIQUE`), so the history drag carries a text payload (`commedit-gtk/src/dnd.rs`: pid + `Repo::object_store_key` + dragged commits by sha) GTK ferries across the boundary — an in-process drop reads the same string back and ignores it, working from the live `drag_*` cells. A drop whose payload pid differs from `std::process::id()` is foreign; if its `repo_key` matches ours (same shared ODB, so the commit is reachable) it's cherry-picked at the gap via `lookup_commit_in_store` → `plan_cherry_pick_candidates` → `cherry_pick_commit` (a *copy*, `DragAction::COPY`, source window untouched). Different `repo_key` ⇒ refused with a status note (separate object stores never meet). Both drop targets now read the source row index from `drag_from` (every source sets it), since history travels as text not an `i32`.
+
+### Multi-tenant MCP sessions (`commedit-mcp/src/session.rs`, `server.rs`)
+
+The MCP server is **multi-tenant**: one server hosts several independent editing sessions over the *one* repository it launched against, addressable per tool call. State is a `SessionRegistry` (`Arc<Mutex<…>>` on `CommeditServer`): a `root` (the launch worktree, for branch/worktree resolution) plus `slots: HashMap<id, Arc<SessionSlot>>`, where `SessionSlot { repo: Mutex<Repo>, trash: Mutex<TrashState> }`. The engine is already multi-tenant-safe (each `Repo` owns its `TempDir`/git-dir/settings; the shared ODB is append-only; distinct branches export to distinct refs; the index-cache `flock` degrades gracefully) — no engine locking changes.
+
+- **Three-tiered locking** (in `with_session`): the registry lock is held only to look up + `Arc::clone` the slot (short), the per-session repo mutex is held across the blocking jj work (single-writer-per-session, so different sessions run in parallel), git-level safety is the engine's. The one added rule: a (repo, branch) already live in a slot can't be opened twice (mirrors the engine's "branch checked out in another worktree" refusal). Never hold the registry lock while taking a repo lock (the deadlock-freedom invariant — `sessions_view` and `reload_repo` are written around it).
+- **Branch-keyed addressing.** The session id *is* the edited branch's short-name (`session_id_for`); a detached/unborn HEAD reserves the id `"HEAD"`. `open_session(branch)` looks up `worktree_for_branch` and anchors the `Repo` at that worktree (worktree-bound) or at `root` (off-worktree) — git's branch→worktree mapping decides, never the caller. `reload_repo(session, …)` retargets one slot and **re-keys** it when the branch changes (refusing a collision). `close_session` refuses the last slot (the registry is never empty).
+- **Required selector.** Every session-operating tool takes a required `session` via a flattened `SessionSel` DTO (the 9 argument-less tools use `Parameters<SessionSel>` directly); `list_sessions`/`open_session` need none. There is no implicit default. GTK (phase 2, not yet built) would reuse the same model with `Rc<RefCell<…>>` and an implicit focused-tab selector.
 
 ### Index cache (`index_cache.rs`)
 

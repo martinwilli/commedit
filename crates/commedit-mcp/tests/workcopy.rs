@@ -9,7 +9,7 @@ use commedit_mcp::dto::{
     IdentityFieldsDto, ListHistoryReq, PatchSelectionDto, SaveResultDto, ShowCommitReq,
     SquashWorkingCopyReq,
 };
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
+use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -22,6 +22,7 @@ fn commit_req(
     patches: Option<Vec<PatchSelectionDto>>,
 ) -> CommitWorkingCopyReq {
     CommitWorkingCopyReq {
+        session: sel("main"),
         message: message.into(),
         identity: IdentityFieldsDto::default(),
         paths,
@@ -41,11 +42,19 @@ async fn uncommitted_changes_survive_a_rewrite() {
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("a.txt"), "1\nlocal edit\n").unwrap();
-    assert!(!server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        !server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
 
     // Rewrite the bottom commit's message — the dirty file must ride along.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -56,6 +65,7 @@ async fn uncommitted_changes_survive_a_rewrite() {
         .0;
     let result = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
@@ -69,7 +79,11 @@ async fn uncommitted_changes_survive_a_rewrite() {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "1\nlocal edit\n"
     );
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!status.clean);
     assert_eq!(status.entries[0].files, vec!["a.txt".to_string()]);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "M a.txt");
@@ -87,6 +101,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     // A clean working copy has nothing to fold.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -99,6 +114,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     let err = expect_err(
         server
             .squash_working_copy(Parameters(SquashWorkingCopyReq {
+                session: sel("main"),
                 dest: first.sha.clone(),
                 message: None,
                 paths: None,
@@ -118,6 +134,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let result = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
             dest: first.sha,
             message: None,
             paths: None,
@@ -133,7 +150,14 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
     // The message is kept (fixup), the content landed, the tree is clean.
     assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nfolded");
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -147,7 +171,10 @@ async fn discard_working_copy_requires_confirmation() {
 
     let err = expect_err(
         server
-            .discard_working_copy(Parameters(DiscardWorkingCopyReq { confirm: false }))
+            .discard_working_copy(Parameters(DiscardWorkingCopyReq {
+                session: sel("main"),
+                confirm: false,
+            }))
             .await,
     );
     assert!(
@@ -161,7 +188,10 @@ async fn discard_working_copy_requires_confirmation() {
     );
 
     let resp = server
-        .discard_working_copy(Parameters(DiscardWorkingCopyReq { confirm: true }))
+        .discard_working_copy(Parameters(DiscardWorkingCopyReq {
+            session: sel("main"),
+            confirm: true,
+        }))
         .await
         .unwrap()
         .0;
@@ -172,10 +202,21 @@ async fn discard_working_copy_requires_confirmation() {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "1\n"
     );
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
     // The discard is on the session op-log (undo can bring the changes back).
-    let ops = server.list_operations().await.unwrap().0;
+    let ops = server
+        .list_operations(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert_eq!(ops.ops.len(), 1);
     assert!(
         ops.ops[0].label.contains("Drop uncommitted"),
@@ -194,12 +235,17 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
     let server = open_server(dir.path());
 
     std::fs::write(dir.path().join("untracked.txt"), "keep me\n").unwrap();
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(status.clean, "untracked files are not uncommitted changes");
 
     // A rewrite leaves the untracked file untouched on disk.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -210,6 +256,7 @@ async fn untracked_files_stay_out_of_the_working_copy_and_alive_on_disk() {
         .0;
     server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: history.commits[1].sha.clone(),
             message: "first, edited".into(),
         }))
@@ -233,6 +280,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
     std::fs::write(dir.path().join("a.txt"), "1\nfolded\n").unwrap();
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -243,6 +291,7 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
         .0;
     let result = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
             dest: history.commits[1].change_id[..8].to_string(),
             message: None,
             paths: None,
@@ -256,7 +305,14 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
     assert!(matches!(result.result, SaveResultDto::Clean { .. }));
 
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nfolded");
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
 }
 
 #[tokio::test]
@@ -290,7 +346,11 @@ async fn commit_working_copy_paths_tier_commits_only_listed_files() {
     assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "a\nedit-a");
 
     // The remainder is exactly the b.txt edit, still uncommitted.
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!status.clean);
     assert_eq!(status.entries[0].files, vec!["b.txt".to_string()]);
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "M b.txt");
@@ -314,10 +374,15 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
     std::fs::write(dir.path().join("f.txt"), &edited).unwrap();
 
     // show_commit on the working-copy entry reports the numbering to select from.
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     let wc_sha = status.entries[0].sha.clone();
     let shown = server
         .show_commit(Parameters(ShowCommitReq {
+            session: sel("main"),
             commit: wc_sha,
             include_contents: None,
         }))
@@ -362,7 +427,11 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
         committed.contains("\nl17\n"),
         "hunk 1 not committed: {committed}"
     );
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert_eq!(status.entries[0].files, vec!["f.txt".to_string()]);
 }
 
@@ -419,6 +488,7 @@ async fn squash_working_copy_partial_reports_the_remainder() {
     // "first" introduced a.txt — fold only a.txt into it; b.txt stays uncommitted.
     let first = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -432,6 +502,7 @@ async fn squash_working_copy_partial_reports_the_remainder() {
         .clone();
     let resp = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
             dest: first,
             message: None,
             paths: Some(vec!["a.txt".into()]),
@@ -481,7 +552,11 @@ async fn commit_working_copy_patches_tier_commits_a_sub_hunk() {
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
         "1\n2\nA\nB\n3\n"
     );
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert_eq!(status.entries[0].files, vec!["f.txt".to_string()]);
 }
 
@@ -627,7 +702,14 @@ async fn commit_working_copy_with_no_selection_commits_everything() {
 
     assert_eq!(git(dir.path(), &["show", "HEAD:a.txt"]), "a\nedit-a");
     assert_eq!(git(dir.path(), &["show", "HEAD:b.txt"]), "b\nedit-b");
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -646,6 +728,7 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
     std::fs::write(dir.path().join("b.txt"), "2\nB\n").unwrap();
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![]),
@@ -658,6 +741,7 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
 
     let result = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
             dest: first,
             message: Some("first (with a.txt)".into()),
             paths: Some(vec!["a.txt".into()]),
@@ -676,7 +760,11 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
         ["second", "first (with a.txt)"]
     );
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nA");
-    let status = server.working_copy_status().await.unwrap().0;
+    let status = server
+        .working_copy_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(!status.clean);
     assert_eq!(status.entries[0].files, vec!["b.txt".to_string()]);
 }
@@ -691,6 +779,7 @@ async fn list_history_can_include_working_copy_status() {
     // Without the flag, no working-copy block is attached.
     let plain = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![]),
@@ -704,6 +793,7 @@ async fn list_history_can_include_working_copy_status() {
     // With it, the uncommitted change rides along in one call.
     let with_wc = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: Some(vec![]),
@@ -745,7 +835,14 @@ async fn commit_working_copy_add_paths_includes_a_brand_new_file() {
 
     assert_eq!(git_log_subjects(dir.path()), ["add new", "first"]);
     assert_eq!(git(dir.path(), &["show", "HEAD:new.txt"]), "hello");
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }
 
@@ -782,6 +879,7 @@ async fn squash_working_copy_add_paths_folds_a_new_file_into_a_commit() {
     std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -792,6 +890,7 @@ async fn squash_working_copy_add_paths_folds_a_new_file_into_a_commit() {
         .0;
     let result = server
         .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
             dest: history.commits[1].change_id[..8].to_string(),
             message: None,
             paths: None,
@@ -807,6 +906,13 @@ async fn squash_working_copy_add_paths_folds_a_new_file_into_a_commit() {
     // The new file folded into "first" (HEAD~1) and the tree is clean again.
     assert_eq!(git(dir.path(), &["show", "HEAD~1:c.txt"]), "new");
     assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
-    assert!(server.working_copy_status().await.unwrap().0.clean);
+    assert!(
+        server
+            .working_copy_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .clean
+    );
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 }

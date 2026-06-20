@@ -222,6 +222,14 @@ from git until they resolve or abort, and every step undoable. Alongside the
 tools the plugin ships skills that teach the agent *when* to reach for these
 workflows and a `commedit-operator` subagent that drives them.
 
+One server hosts several **independent editing sessions** over the one repository
+it serves — one per branch — so an agent can edit several branches at once, and in
+parallel. Every tool names the session it acts on by id (the branch's short name);
+`list_sessions`, `open_session` and `close_session` manage them. A branch checked
+out in a worktree opens worktree-bound there (with a live working copy); a branch
+checked out nowhere opens off-worktree (only its ref moves). The launch branch is
+just the first session.
+
 The plugin is self-contained: each [GitHub release](../../releases) attaches
 `commedit-plugin.zip`, which bundles a prebuilt server for every supported
 target (Linux x86-64, Linux AArch64, macOS Apple Silicon) plus a launcher that

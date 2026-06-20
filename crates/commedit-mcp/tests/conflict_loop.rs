@@ -9,7 +9,7 @@ use commedit_mcp::dto::{
     ReadConflictReq, ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
-use common::{expect_err, git, git_log_subjects, init_repo, open_server};
+use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -30,6 +30,7 @@ fn conflicting_repo(dir: &std::path::Path) {
 async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -41,6 +42,7 @@ async fn conflicting_edit(server: &CommeditServer) -> SaveResultDto {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     server
         .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
             commit: a.sha.clone(),
             files: vec![FileContentDto {
                 path: "f.txt".into(),
@@ -72,7 +74,11 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
     assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
 
     // The pending state is also visible via pending_status.
-    let pending = server.pending_status().await.unwrap().0;
+    let pending = server
+        .pending_status(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(pending.pending);
     assert!(!pending.conflicts.is_empty());
     assert_ne!(pending.git_head_sha, pending.jj_head_sha);
@@ -82,6 +88,7 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
     let err = expect_err(
         server
             .edit_message(Parameters(EditMessageReq {
+                session: sel("main"),
                 commit: stale,
                 message: "x".into(),
             }))
@@ -103,6 +110,7 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
 
         let resp = server
             .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
                 commit: oldest.change_id.clone(),
                 path: Some(path.path.clone()),
                 paths: None,
@@ -123,6 +131,7 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
 
         result = server
             .resolve_conflicts(Parameters(ResolveConflictsReq {
+                session: sel("main"),
                 commit: oldest.change_id.clone(),
                 files: vec![ConflictFileEditDto {
                     path: path.path.clone(),
@@ -139,7 +148,14 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
     }
 
     // Clean: the rewrite (with resolutions) is exported to plain git.
-    assert!(!server.pending_status().await.unwrap().0.pending);
+    assert!(
+        !server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
     assert_eq!(git(dir.path(), &["show", "HEAD~1:f.txt"]), "1\nX\n3");
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
@@ -163,6 +179,7 @@ async fn read_conflict_validates_change_and_path() {
     let err = expect_err(
         server
             .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
                 commit: "00".into(),
                 path: Some("f.txt".into()),
                 paths: None,
@@ -183,6 +200,7 @@ async fn read_conflict_validates_change_and_path() {
     let err = expect_err(
         server
             .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
                 commit: commits[0].change_id.clone(),
                 path: Some("nope.txt".into()),
                 paths: None,
@@ -213,6 +231,7 @@ async fn read_conflict_reads_every_file_in_one_call() {
     // Rewrite "A"'s content for both files so "B"'s rebase conflicts on both.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -224,6 +243,7 @@ async fn read_conflict_reads_every_file_in_one_call() {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let result = server
         .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
             commit: a.sha.clone(),
             files: vec![
                 FileContentDto {
@@ -249,6 +269,7 @@ async fn read_conflict_reads_every_file_in_one_call() {
     // Omitting both `path` and `paths` reads every resolvable file at once.
     let resp = server
         .read_conflict(Parameters(ReadConflictReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             path: None,
             paths: None,
@@ -278,7 +299,7 @@ async fn abort_rewrite_restores_the_original_history() {
     let server = open_server(dir.path());
 
     // Abort without a pending rewrite is refused.
-    let err = expect_err(server.abort_rewrite().await);
+    let err = expect_err(server.abort_rewrite(Parameters(sel("main"))).await);
     assert!(
         err.message.contains("pending"),
         "unexpected error: {}",
@@ -288,10 +309,21 @@ async fn abort_rewrite_restores_the_original_history() {
     let result = conflicting_edit(&server).await;
     assert!(matches!(result, SaveResultDto::Conflicts { .. }));
 
-    let resp = server.abort_rewrite().await.unwrap().0;
+    let resp = server
+        .abort_rewrite(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0;
     assert!(resp.ok);
     assert_eq!(resp.head_sha.as_deref(), Some(head_before.as_str()));
-    assert!(!server.pending_status().await.unwrap().0.pending);
+    assert!(
+        !server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
 
     // Git never saw any of it; mutations work again.
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
@@ -299,6 +331,7 @@ async fn abort_rewrite_restores_the_original_history() {
     let tip = git(dir.path(), &["rev-parse", "HEAD"]);
     let clean = server
         .edit_message(Parameters(EditMessageReq {
+            session: sel("main"),
             commit: tip,
             message: "B, edited".into(),
         }))
@@ -318,6 +351,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
     // Dropping "A" leaves "B"'s same-line edit dangling: a true conflict.
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -329,6 +363,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: a.sha.clone(),
             keep_changes: false,
         }))
@@ -341,12 +376,19 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
     assert_eq!(resp.dropped.subject, "A");
 
     // While pending, the trash push is only staged — not visible yet.
-    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    assert!(server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .is_empty());
 
     // Resolving the conflict settles the drop; now the trash has it.
     let oldest = &commits[0];
     let resp = server
         .read_conflict(Parameters(ReadConflictReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             path: Some(oldest.files[0].path.clone()),
             paths: None,
@@ -357,6 +399,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
     let file = &resp.files[0];
     let result = server
         .resolve_conflicts(Parameters(ResolveConflictsReq {
+            session: sel("main"),
             commit: oldest.change_id.clone(),
             files: vec![ConflictFileEditDto {
                 path: oldest.files[0].path.clone(),
@@ -370,7 +413,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
         .0;
     assert!(matches!(result, SaveResultDto::Clean { .. }));
 
-    let trash = server.list_trash().await.unwrap().0;
+    let trash = server.list_trash(Parameters(sel("main"))).await.unwrap().0;
     assert_eq!(trash.commits.len(), 1);
     assert_eq!(trash.commits[0].subject, "A");
     assert_eq!(git_log_subjects(dir.path()), ["B", "base"]);
@@ -384,6 +427,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
 
     let history = server
         .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
             limit: None,
             offset: None,
             fields: None,
@@ -395,6 +439,7 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
     let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
     let resp = server
         .drop_commit(Parameters(DropCommitReq {
+            session: sel("main"),
             commit: a.sha.clone(),
             keep_changes: false,
         }))
@@ -403,8 +448,14 @@ async fn an_aborted_drop_leaves_the_trash_untouched() {
         .0;
     assert!(matches!(resp.result, SaveResultDto::Conflicts { .. }));
 
-    server.abort_rewrite().await.unwrap();
-    assert!(server.list_trash().await.unwrap().0.commits.is_empty());
+    server.abort_rewrite(Parameters(sel("main"))).await.unwrap();
+    assert!(server
+        .list_trash(Parameters(sel("main")))
+        .await
+        .unwrap()
+        .0
+        .commits
+        .is_empty());
     assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
 }
 
@@ -422,6 +473,7 @@ async fn conflicts_resolve_by_sha_or_prefix() {
         // Read by the commit's current sha, resolve by a change-id prefix.
         let resp = server
             .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
                 commit: oldest.sha.clone(),
                 path: Some(oldest.files[0].path.clone()),
                 paths: None,
@@ -432,6 +484,7 @@ async fn conflicts_resolve_by_sha_or_prefix() {
         let file = &resp.files[0];
         result = server
             .resolve_conflicts(Parameters(ResolveConflictsReq {
+                session: sel("main"),
                 commit: oldest.change_id[..8].to_string(),
                 files: vec![ConflictFileEditDto {
                     path: oldest.files[0].path.clone(),
@@ -447,6 +500,13 @@ async fn conflicts_resolve_by_sha_or_prefix() {
         assert!(steps < 10, "resolution should converge");
     }
 
-    assert!(!server.pending_status().await.unwrap().0.pending);
+    assert!(
+        !server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
 }

@@ -61,7 +61,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~27-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~29-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -76,6 +76,7 @@ A ~27-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `stress/hotfix`: `Fix null deref in parser [BUG-123]` (Alex Fixer) | off-branch fix to pull in | T5 |
 | `Add storage and stats helpers` (own files `src/store.txt` + `src/stats.txt`) | squash-up target for a dirty WC (no committed smell) | T6 |
 | `Merge branch 'search'` (bare subject) + `Make search case-insensitive` directly above it | merge needs a body; the follow-up belongs *in* the merge | T7 |
+| `Add experimental telemetry` (own file `src/telemetry.txt`) + `Add metrics endpoint` (own file `src/metrics.txt`), both buried | one to revert, one to drop-then-recover | T8 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -100,6 +101,12 @@ Design notes that matter (learned the hard way):
   squash *destination*, never a source). The merge's bare `-m` subject (no body) is the second smell
   — reword it to add one, per the repo's own merge convention. Verified the squash commutes and the
   reword preserves the two parents before wiring it up.
+- T8 is the **revert + recover** axis (the whole `review-and-recover` skill, which had zero task
+  coverage). Both commits live in **their own files** so the revert, the drop, and the restore are
+  all clean rebases. Splitting the work over two files lets one half test `revert_commit` (inverse
+  at the tip, original kept) and the other test the `drop → list_trash → restore_commit` round-trip
+  independently. The restore lands the commit at the **tip**, not its original buried slot, so a
+  lazy `undo` of the drop won't satisfy it — the student must actually go through the trash.
 
 ---
 
@@ -138,6 +145,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T5** | Cherry-pick `stress/hotfix`'s fix to right after `Add parser`; reword to drop `[BUG-123]`. | `cherry_pick_commit(full sha, new_parent)` + `replace_in_message` (2 mutations) | fix after `Add parser`; author `Alex Fixer` preserved; no `[BUG-123]`; `stress/hotfix` untouched; clean |
 | **T6** | From the dirty WC ([`t6-dirty.sh`](t6-dirty.sh)): fold the `load`/`total` helpers into `Add storage and stats helpers`; then craft `Add backup command` (the `backup` fn + new `src/backup.txt`) and `Add average stat` (the `average` fn) as two new commits. | `show_commit(@)` → `squash_working_copy(dest, hunks=[store.txt#0, stats.txt#0])` → `commit_working_copy("Add backup command", paths=[store.txt, backup.txt], add_paths=[backup.txt])` → `commit_working_copy("Add average stat")` (1 read + 3 mutations) | `store.txt` `load`+`total` folded into the buried commit, descendants rebased; two new commits on top with the right partition (`backup`+`backup.txt`, then `average`); WC clean; `git diff stress/base` = all the dirt, distributed; clean |
 | **T7** | Edit the `Merge branch 'search'` merge: reword it to add a body (subject kept, then a blank line + one or two sentences); and fold the follow-up `Make search case-insensitive` into the merge. | `edit_message(merge, body added)` + `squash_commit(source=case-insensitive, dest=merge, mode=fixup)` (2 mutations) | merge subject still `Merge branch 'search'`, now with a body; merge still has **2 parents**; no standalone `Make search case-insensitive` commit; its `src/search.txt` change present; `git diff stress/base` empty; descendants rebased; clean |
+| **T8** | The buried `Add experimental telemetry` shipped a privacy bug — **revert** it (inverse at the tip, keep the original). Separately, **drop** the buried `Add metrics endpoint`, then change your mind and **restore** it from the trash to the tip. | `revert_commit(telemetry)` + `drop_commit(metrics)` + `list_trash` (read) + `restore_commit(metrics, new_parent=tip)` (3 mutations + 1 read) | a revert commit removing `src/telemetry.txt` near the tip; original telemetry commit still present; `Add metrics endpoint` back in history (at the tip) with `src/metrics.txt` present; trash empty; `git diff stress/base` = only `src/telemetry.txt` deleted; descendants rebased; clean |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -163,6 +171,13 @@ is the opposite of what you'd guess: a merge can be a squash *destination* but n
 finding #1) — so don't grade committer identity here, and prefer reword-then-fixup so the dest
 message survives.
 
+**T8 is the discriminator for the recover/safety-net axis.** It is the only task whose *correct*
+path runs a commit through the **trash** and back, and the only one using `revert_commit`. The trap
+is the `drop → restore` round-trip: dropping defaults to the trash (restorable), so `restore_commit`
+reads `list_trash` and grafts it back at a chosen parent — landing it at the **tip** (not its old
+slot) is what distinguishes a real restore from an `undo`. For plain git the recover half has no
+direct analogue — the reflog is the closest thing, which is itself the point of the comparison.
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -183,6 +198,10 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `fixup`/`squash`), supplying the new body via `-m`/`GIT_EDITOR` — fragile under the harness's
   `GIT_EDITOR=true`. Alternative: reset to the merge's first parent, `git merge -s ours`/re-merge
   with the new message + folded change, then `cherry-pick` the descendants. Fiddly; that's the point.
+- **T8** — `git revert --no-edit <telemetry>` lands the inverse at the tip cleanly. The recover half
+  has no git equivalent: drop the metrics commit with `rebase --onto <metrics>^ <metrics>`, then
+  "restore" it by `cherry-pick`ing it back from the **reflog** (`git reflog`/`ORIG_HEAD`) to the
+  tip — git has no trash, so finding the dropped commit *is* the task. Grade the reflog hunt.
 - **T6** — no interactive `git add -p` (forbidden), so hand-craft partial patches: `git apply
   --cached <patch>` the `load`/`total` hunks → `commit --fixup=<storage sha>` → stash the rest →
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
@@ -192,8 +211,9 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
 shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actually holds its
-multi-file conflict across both descendants, T2/T5 stay clean, and T7's squash-into-merge keeps the
-two parents). For T6, run
+multi-file conflict across both descendants, T2/T5 stay clean, T7's squash-into-merge keeps the
+two parents, and T8's dropped commit lands in the trash where `restore_commit` can reach it). For
+T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands.
 `git -C <cal> reset --hard stress/base && reload_repo` between tasks.
@@ -202,7 +222,7 @@ the dirty WC, then confirm the fold rebases clean and the partition lands.
 
 ## 5. Execution protocol (strictly serial)
 
-For each task T (1→7), each solver S (operator, then control, then git):
+For each task T (1→8), each solver S (operator, then control, then git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for

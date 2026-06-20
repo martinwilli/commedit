@@ -342,6 +342,27 @@ def test_parse():
     assert parse("a,b") == "a"
 EOF
 ci "Add tests for parser"
+
+# T8: two buried own-file commits for the revert + recover task (own files, so a
+# revert / drop / restore is a clean rebase). telemetry is the revert target
+# (inverse at the tip; the original stays in history for the record); metrics is
+# the drop -> trash -> restore_commit round-trip (recover a dropped commit).
+cat > src/telemetry.txt <<'EOF'
+ENABLED = True
+
+def emit(event):
+    print("telemetry:", event)
+EOF
+ci "Add experimental telemetry"
+cat > src/metrics.txt <<'EOF'
+def counter(name):
+    return {"name": name, "value": 0}
+
+def incr(c):
+    c["value"] += 1
+    return c
+EOF
+ci "Add metrics endpoint"
 cat > src/main.txt   <<'EOF'
 # todo CLI
 from util import format_row, log
@@ -431,7 +452,7 @@ git checkout -q stress/base
 
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline (§5).
-for t in 1 2 3 4 5 6 7; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7 8; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

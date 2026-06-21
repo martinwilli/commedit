@@ -448,3 +448,127 @@ fn narrowing_to_one_branch_still_works() {
     );
     g(&["fsck", "--no-progress"]);
 }
+
+/// Phase 2: `set_editable_branches` widens then narrows the set *in place* while
+/// preserving the session undo op-log — a dropdown toggle must not reset undo/trash
+/// the way a full reopen would. After an edit, widening (tick `feature`) and
+/// narrowing back (untick it) leave the recorded op intact, so the edit still
+/// undoes; widening also makes the new branch's commit editable, and narrowing
+/// freezes it again.
+#[test]
+fn widen_then_narrow_preserves_the_undo_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    // Open just the launch branch (the GTK default: opened branch only).
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into()],
+    )
+    .expect("open singleton");
+    assert_eq!(repo.editable_branches(), vec!["main".to_string()]);
+
+    // Land an edit on main, so there is a recorded op to step back to.
+    let head = repo.head_commit_id().expect("head");
+    let c = commedit_engine::history::history(&repo.repo, &head).expect("history")[0]
+        .id
+        .clone();
+    repo.rewrite_message(&c, "C (edited)").expect("rewrite");
+    assert_eq!(repo.session_ops().len(), 1, "one recorded op");
+    assert!(repo.can_undo());
+    let main_after_edit = g(&["rev-parse", "main"]);
+
+    // Widen: tick `feature`. The op-log is untouched, and feature joins the set.
+    repo.set_editable_branches(&["main".into(), "feature".into()])
+        .expect("widen");
+    assert_eq!(
+        repo.editable_branches(),
+        vec!["main".to_string(), "feature".to_string()]
+    );
+    assert_eq!(
+        repo.session_ops().len(),
+        1,
+        "widening did not reset the op-log"
+    );
+    assert_eq!(g(&["rev-parse", "main"]), main_after_edit, "main unmoved");
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature unmoved"
+    );
+
+    // feature's commit F is now editable: rewriting it moves feature's ref.
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    repo.rewrite_message(&f, "F (edited)").expect("rewrite F");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F (edited)", "B", "A"],
+        "feature is editable while ticked"
+    );
+    assert_eq!(repo.session_ops().len(), 2, "second op recorded");
+
+    // Narrow back to just main: feature leaves the set and is frozen on its
+    // (rewritten) tip — further edits to main never touch it.
+    let feature_frozen = g(&["rev-parse", "feature"]);
+    repo.set_editable_branches(&["main".into()])
+        .expect("narrow");
+    assert_eq!(repo.editable_branches(), vec!["main".to_string()]);
+    assert_eq!(
+        repo.session_ops().len(),
+        2,
+        "narrowing did not reset the op-log"
+    );
+
+    // The op-log survived both toggles: undo still steps the recorded edits back.
+    repo.undo().expect("undo F");
+    repo.undo().expect("undo C");
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["C", "B", "A"],
+        "undo walked back the recorded edits across the toggles"
+    );
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_frozen,
+        "feature, out of the set, stayed frozen on its tip"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Phase 2: the last-branch rule at the engine boundary — `set_editable_branches`
+/// refuses to empty the set, mirroring the MCP's "the last session can't be closed".
+#[test]
+fn the_editable_set_cannot_be_emptied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let err = repo.set_editable_branches(&[]).unwrap_err().to_string();
+    assert!(
+        err.contains("cannot be emptied"),
+        "refusal mentions the last-branch rule: {err}"
+    );
+    // The set is unchanged after the refusal.
+    assert_eq!(
+        repo.editable_branches(),
+        vec!["main".to_string(), "feature".to_string()]
+    );
+}

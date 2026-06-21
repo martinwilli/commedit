@@ -83,10 +83,19 @@ pub fn init_shared_git_dir(
     // multi-bookmark import can see each branch's tip through the shared objects.
     for branch in extra_branches {
         if let Some(tip) = ref_commit(workspace_root, branch) {
-            git_in_dir(git_dir, &["update-ref", branch, &tip])?;
+            seed_session_ref(git_dir, branch, &tip)?;
         }
     }
     Ok(())
+}
+
+/// Point a single branch's ref (`full`, a full ref name) at `tip` in the session
+/// git dir, without touching HEAD — so jj's multi-bookmark import can see that
+/// branch's tip through the shared objects. Used at open ([`init_shared_git_dir`])
+/// and when widening the editable set in place
+/// ([`crate::repo::Repo::set_editable_branches`]).
+pub fn seed_session_ref(git_dir: &Path, full: &str, tip: &str) -> Result<()> {
+    git_in_dir(git_dir, &["update-ref", full, tip])
 }
 
 /// Point the session git dir's edited-branch ref (and HEAD) at that branch's

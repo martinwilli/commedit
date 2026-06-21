@@ -146,6 +146,11 @@ impl EditableSet {
             .into_iter()
             .chain(self.extra.iter().map(String::as_str))
     }
+
+    /// Whether `full` (a full ref name) is in the set.
+    fn contains(&self, full: &str) -> bool {
+        self.refs().any(|r| r == full)
+    }
 }
 
 /// An editable branch that is checked out in a *separate* git worktree, mapped
@@ -169,13 +174,20 @@ pub(crate) struct WorktreeView {
 }
 
 /// A local branch the multi-branch DAG view can fold in: its short-name, current
-/// tip, and whether it is the branch this session edits. Produced by
+/// tip, whether it is the session's primary (launch/opened) branch, and whether it
+/// is currently in the editable set (imported as a real bookmark). Produced by
 /// [`Repo::local_branches`].
 #[derive(Debug, Clone)]
 pub struct BranchHead {
     pub name: String,
     pub head: CommitId,
+    /// The session's primary (launch/opened) branch — the one whose working copy is
+    /// tracked and whose name labels the UI.
     pub is_current: bool,
+    /// Whether this branch is in the editable set right now: ticked in the dropdown,
+    /// imported as a real jj bookmark, and a drop target. The primary is always
+    /// editable; extras toggle via [`Repo::set_editable_branches`].
+    pub is_editable: bool,
 }
 
 impl Repo {
@@ -984,9 +996,9 @@ impl Repo {
 
     /// The user's local branches, read fresh from git — the candidates for the
     /// multi-branch DAG dropdown. Each entry pairs the branch short-name with its
-    /// current tip and a flag marking the one this session edits (the primary,
-    /// always shown but not foldable into itself). Branches whose tip is not a
-    /// readable commit are skipped.
+    /// current tip, a flag marking the primary (the launch/opened branch), and a
+    /// flag marking whether it is currently in the editable set (ticked / imported).
+    /// Branches whose tip is not a readable commit are skipped.
     pub fn local_branches(&self) -> Vec<BranchHead> {
         let current = self.current_bookmark();
         let current_name = current.as_ref().map(|c| c.as_str());
@@ -997,10 +1009,23 @@ impl Repo {
                 let head = CommitId::try_from_hex(&sha)?;
                 Some(BranchHead {
                     is_current: current_name == Some(name),
+                    is_editable: self.edited.contains(&refname),
                     name: name.to_string(),
                     head,
                 })
             })
+            .collect()
+    }
+
+    /// The editable set as branch short-names (the `refs/heads/` prefix stripped) —
+    /// the branches imported as real bookmarks and rewritable right now. The primary
+    /// (if any) comes first. A GTK frontend reads this back to seed the multi-head
+    /// history walk from the set's real bookmark tips and to reflect the dropdown's
+    /// ticked state. A singleton (the classic/MCP open) returns just one name.
+    pub fn editable_branches(&self) -> Vec<String> {
+        self.edited
+            .refs()
+            .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
             .collect()
     }
 
@@ -1221,6 +1246,111 @@ impl Repo {
         )?;
         self.import_git()?;
         Ok(true)
+    }
+
+    /// Change the editable set *in place* — widen it (a branch ticked in the GTK
+    /// dropdown) or narrow it (unticked) — **without** the full reopen
+    /// [`Self::open_multi`] would do, so the session's undo op-log and trash survive
+    /// a toggle. `branches` is the complete desired set as short-names or full refs;
+    /// it is diffed against the current set, only the difference is applied, and the
+    /// order is honoured (the first entry becomes the primary). A no-op when the set
+    /// is unchanged.
+    ///
+    /// **Widening** seeds each newly-added branch's ref into the session git dir and
+    /// re-runs [`Self::import_git`] (a *recorded* jj operation — the same path
+    /// [`Self::sync_to_git_head`] uses — so the undo floor and trash are untouched),
+    /// then registers its worktree if it lives in one. **Narrowing** drops the
+    /// branch from the set (and deregisters its worktree): it then falls *outside*
+    /// the set, so the export bridge stops mirroring it and the protect-backstop
+    /// (`protect_unrelated_heads`, exempting only the set) freezes it on its current
+    /// commit — the intended "unticked ⇒ frozen/forked" behavior, with no fragile jj
+    /// bookmark de-import. The branch's git ref already holds its real tip (every
+    /// clean save bridged it out), so leaving the stale in-view bookmark behind is
+    /// harmless: it is never bridged again.
+    ///
+    /// Refused if `branches` is empty (the **last-branch rule**, mirroring the MCP's
+    /// "the last session can't be closed"), if a named branch does not exist, or
+    /// while a conflicted rewrite is pending (the held rewrite assumes a fixed set).
+    pub fn set_editable_branches(&mut self, branches: &[String]) -> Result<()> {
+        if self.is_pending() {
+            anyhow::bail!(
+                "a conflicted rewrite is being resolved; finish or abort it before \
+                 changing the editable branch set"
+            );
+        }
+        let root = self.workspace.workspace_root().to_path_buf();
+        // Resolve to full refs (verifying existence), dedup, preserve order.
+        let mut desired: Vec<String> = Vec::new();
+        for name in branches {
+            let full = crate::transparency::resolve_local_branch(&root, name)?;
+            if !desired.contains(&full) {
+                desired.push(full);
+            }
+        }
+        if desired.is_empty() {
+            anyhow::bail!(
+                "the editable set cannot be emptied — at least one branch must stay \
+                 editable"
+            );
+        }
+        let current: Vec<String> = self.edited.refs().map(str::to_string).collect();
+        if desired == current {
+            return Ok(()); // already exactly this set (same order)
+        }
+
+        // Branches leaving the set: drop their registered worktree (if any). They
+        // fall out of the exempt set, so the protect-backstop freezes them and the
+        // bridge stops mirroring them — no jj de-import needed.
+        let removed: Vec<String> = current
+            .iter()
+            .filter(|c| !desired.contains(c))
+            .cloned()
+            .collect();
+        self.extra_worktrees
+            .retain(|w| !removed.contains(&w.branch));
+
+        // Re-key the set to the desired order (first = primary). Done before the
+        // import so the import filter and the worktree mapping see the new set.
+        let mut it = desired.iter().cloned();
+        let primary = it.next();
+        let extra: Vec<String> = it.collect();
+        self.edited = EditableSet { primary, extra };
+
+        // Branches joining the set: seed each ref into the session git dir so jj's
+        // import can see its tip, then re-import the whole set as one recorded op.
+        let added: Vec<String> = desired
+            .iter()
+            .filter(|d| !current.contains(d))
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            let git_dir = self._workdir.path().join("git");
+            for full in &added {
+                if let Some(tip) = crate::transparency::ref_commit(&root, full) {
+                    crate::transparency::seed_session_ref(&git_dir, full, &tip)?;
+                }
+            }
+            self.import_git()?;
+            // Register a git worktree for any added branch checked out in one other
+            // than the launch worktree, so a rewrite re-materializes it (mirrors the
+            // mapping `open_multi` does at open).
+            let launch_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let worktree_map = crate::transparency::worktrees(&root)?;
+            for full in &added {
+                let Some(path) = worktree_map
+                    .iter()
+                    .find(|(_, b)| b.as_deref() == Some(full.as_str()))
+                    .map(|(path, _)| path.clone())
+                else {
+                    continue; // no worktree: a pure ref-move
+                };
+                if std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()) == launch_root {
+                    continue; // the launch worktree is handled by the working-copy path
+                }
+                self.register_worktree(full, &path)?;
+            }
+        }
+        Ok(())
     }
 }
 

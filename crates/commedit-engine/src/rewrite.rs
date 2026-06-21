@@ -16,9 +16,9 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    parse_timestamp, plan_drop, plan_insert_candidates, plan_reorder_candidates,
-    plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
-    ReorderSetCandidate,
+    parse_timestamp, plan_drop, plan_insert_candidates, plan_insert_candidates_multi,
+    plan_reorder_candidates, plan_reorder_candidates_multi, plan_reorder_set_candidates,
+    plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderSetCandidate,
 };
 use crate::repo::Repo;
 
@@ -297,6 +297,32 @@ impl Repo {
         plan_reorder_candidates(commits, &head, layout, &self.root_commit_id(), from, to)
     }
 
+    /// All destination lines for dragging the commit at display index `from` to
+    /// the insertion gap `to` across the **multi-branch DAG** — the cross-branch
+    /// *move* planner. Unlike [`Self::plan_reorder_candidates`], the reachable
+    /// subgraph spans every editable branch's tip ([`Self::editable_heads`]), so a
+    /// line on a sibling branch's lane is a valid destination; the primary stays
+    /// the branch tip, and the moved commit reparents onto the chosen lane (its
+    /// bookmark rides the rebase). The apply is [`Self::reorder_commit`] /
+    /// [`Self::reorder_commits`] with the chosen candidate's parents/children.
+    /// See [`crate::history::plan_reorder_candidates_multi`].
+    pub fn plan_reorder_candidates_multi(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        from: usize,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        plan_reorder_candidates_multi(
+            commits,
+            &self.editable_heads(),
+            layout,
+            &self.root_commit_id(),
+            from,
+            to,
+        )
+    }
+
     /// All destination lines for dragging the *set* `set` of commits to the
     /// insertion gap `to` as a group — one candidate per ancestry line crossing
     /// the gap that is bounded by commits outside the set. Empty for a no-op /
@@ -349,6 +375,30 @@ impl Repo {
             return Vec::new();
         };
         plan_insert_candidates(commits, &head, layout, &self.root_commit_id(), target, to)
+    }
+
+    /// All destination lines for cherry-picking `target` into the **multi-branch
+    /// DAG** at insertion gap `to` — the cross-branch *copy* planner. Like
+    /// [`Self::plan_cherry_pick_candidates`] but the reachable subgraph spans every
+    /// editable branch's tip ([`Self::editable_heads`]), so a sibling branch's lane
+    /// is a valid graft point. The apply is [`Self::cherry_pick_commit`] with the
+    /// chosen candidate's parents/children; the source commit is left intact. See
+    /// [`crate::history::plan_insert_candidates_multi`].
+    pub fn plan_cherry_pick_candidates_multi(
+        &self,
+        commits: &[CommitInfo],
+        layout: &GraphLayout,
+        target: &CommitId,
+        to: usize,
+    ) -> Vec<ReorderCandidate> {
+        plan_insert_candidates_multi(
+            commits,
+            &self.editable_heads(),
+            layout,
+            &self.root_commit_id(),
+            target,
+            to,
+        )
     }
 
     /// The id of the commit at display `index` if it can be dropped to the trash,

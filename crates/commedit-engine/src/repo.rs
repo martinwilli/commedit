@@ -1029,6 +1029,33 @@ impl Repo {
             .collect()
     }
 
+    /// The editable set as commit ids — every editable branch's current tip, the
+    /// primary's first. This is the multi-head reachability set the cross-branch
+    /// drag planners ([`Self::plan_reorder_candidates_multi`] et al.) walk to
+    /// recognise a sibling branch's lane as a valid splice/squash destination. The
+    /// primary's tip is [`Self::head_commit_id`] (git HEAD or the ref tip); each
+    /// extra branch's tip is read fresh from its git ref. A singleton set returns
+    /// just the primary head — the classic single-branch path. Empty only on a
+    /// detached HEAD with no branch (no primary tip).
+    pub fn editable_heads(&self) -> Vec<CommitId> {
+        let mut heads = Vec::new();
+        if let Some(primary) = self.head_commit_id() {
+            heads.push(primary);
+        }
+        let root = self.workspace.workspace_root();
+        for full in self.edited.extra.iter() {
+            let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+            if let Some(id) = crate::transparency::ref_commit(root, short)
+                .and_then(|h| CommitId::try_from_hex(&h))
+            {
+                if !heads.contains(&id) {
+                    heads.push(id);
+                }
+            }
+        }
+        heads
+    }
+
     /// History walk over the **union** of several branch tips' ancestries — the
     /// multi-branch DAG view. `heads` is the edited branch's tip plus the extra
     /// branches the user folded in (resolve their tips via [`Self::local_branches`]

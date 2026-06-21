@@ -365,8 +365,23 @@ pub struct ReorderSetCandidate {
 /// them all; rows not in the set (foreign branches/tags, should the view ever
 /// interleave them) are off-limits to structural edits.
 pub(crate) fn branch_commits(commits: &[CommitInfo], head: &CommitId) -> HashSet<CommitId> {
+    branch_commits_multi(commits, std::slice::from_ref(head))
+}
+
+/// The commits reachable from the **union** of `heads` within the displayed list
+/// — the editable subgraph of the multi-branch DAG. A singleton `heads` is
+/// exactly [`branch_commits`]; the wider set lets the splice/squash planners
+/// recognise sibling-branch lanes (a commit only reachable from another editable
+/// branch's tip) as valid splice destinations and squash sources/targets, which
+/// is what makes a cross-branch drag work. The GTK frontend passes every editable
+/// branch's tip; the classic/MCP single-branch path passes just the one head and
+/// is byte-identical.
+pub(crate) fn branch_commits_multi(
+    commits: &[CommitInfo],
+    heads: &[CommitId],
+) -> HashSet<CommitId> {
     let mut reachable = HashSet::new();
-    let mut stack = vec![head.clone()];
+    let mut stack: Vec<CommitId> = heads.to_vec();
     while let Some(id) = stack.pop() {
         if !reachable.insert(id.clone()) {
             continue;
@@ -380,6 +395,12 @@ pub(crate) fn branch_commits(commits: &[CommitInfo], head: &CommitId) -> HashSet
 
 /// The static graph context the splice planners share: the displayed commits,
 /// the branch head, the lane layout, and the virtual root commit.
+///
+/// `head` is the *primary* branch tip — it anchors the gap-0 splice and the
+/// `new_tip` the bookmark lands on, so a cross-branch move leaves the primary
+/// where it is and lets the rebased sibling bookmark ride along. The reachable
+/// subgraph (which lanes are valid destinations) is passed separately, so it can
+/// span every editable head, not just `head`'s own ancestry.
 #[derive(Clone, Copy)]
 struct SpliceCtx<'a> {
     commits: &'a [CommitInfo],
@@ -487,12 +508,32 @@ pub fn plan_reorder_candidates(
     from: usize,
     to: usize,
 ) -> Vec<ReorderCandidate> {
+    plan_reorder_candidates_multi(commits, std::slice::from_ref(head), layout, root, from, to)
+}
+
+/// [`plan_reorder_candidates`] over a multi-branch DAG: `heads` is every editable
+/// branch's tip, `heads[0]` the primary (which anchors `new_tip` so a cross-branch
+/// move leaves the primary bookmark in place and the sibling rides the rebase).
+/// The reachable subgraph spans the union of `heads`, so a destination line on a
+/// sibling branch's lane — a commit reachable only from another editable tip — is
+/// a valid splice target. A singleton `heads` is exactly [`plan_reorder_candidates`].
+pub fn plan_reorder_candidates_multi(
+    commits: &[CommitInfo],
+    heads: &[CommitId],
+    layout: &GraphLayout,
+    root: &CommitId,
+    from: usize,
+    to: usize,
+) -> Vec<ReorderCandidate> {
     let n = commits.len();
+    let Some(head) = heads.first() else {
+        return Vec::new();
+    };
     if from >= n || to > n || layout.boundaries.len() != n {
         return Vec::new();
     }
     let dragged = &commits[from];
-    let branch = branch_commits(commits, head);
+    let branch = branch_commits_multi(commits, heads);
     // A merge stays fixed — there is no single line to splice it into — and a
     // row off the editable subgraph is refused.
     if dragged.parents.len() != 1 || !branch.contains(&dragged.id) {
@@ -652,14 +693,40 @@ pub fn plan_insert_candidates(
     target: &CommitId,
     to: usize,
 ) -> Vec<ReorderCandidate> {
+    plan_insert_candidates_multi(
+        commits,
+        std::slice::from_ref(head),
+        layout,
+        root,
+        target,
+        to,
+    )
+}
+
+/// [`plan_insert_candidates`] over a multi-branch DAG: `heads` is every editable
+/// branch's tip (`heads[0]` the primary). The reachable subgraph spans the union
+/// of `heads`, so a sibling branch's lane is a valid destination — this is what
+/// lets a cross-branch *copy* (cherry-pick) graft onto another branch in the
+/// unified view. A singleton `heads` is exactly [`plan_insert_candidates`].
+pub fn plan_insert_candidates_multi(
+    commits: &[CommitInfo],
+    heads: &[CommitId],
+    layout: &GraphLayout,
+    root: &CommitId,
+    target: &CommitId,
+    to: usize,
+) -> Vec<ReorderCandidate> {
     let n = commits.len();
+    let Some(head) = heads.first() else {
+        return Vec::new();
+    };
     if n == 0 || to > n || layout.boundaries.len() != n {
         return Vec::new();
     }
     if commits.iter().any(|c| c.id == *target) {
         return Vec::new();
     }
-    let branch = branch_commits(commits, head);
+    let branch = branch_commits_multi(commits, heads);
     let ctx = SpliceCtx {
         commits,
         head,
@@ -703,8 +770,9 @@ pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Optio
 mod tests {
     use super::{
         format_timestamp, is_linear_history, parse_timestamp, plan_drop, plan_insert_candidates,
-        plan_reorder_candidates, plan_reorder_set_candidates, plan_restore_candidates, CommitInfo,
-        ReorderCandidate, ReorderMove, ReorderSetCandidate, ReorderSetMove,
+        plan_insert_candidates_multi, plan_reorder_candidates, plan_reorder_candidates_multi,
+        plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
+        ReorderMove, ReorderSetCandidate, ReorderSetMove,
     };
     use crate::graph::compute_graph;
     use jj_lib::backend::{ChangeId, CommitId};
@@ -1106,6 +1174,70 @@ mod tests {
         assert_eq!(
             plan_insert_candidates(&h, &cid(3), &g, &cid(0), &cid(2), 2),
             vec![]
+        );
+    }
+
+    /// Two divergent branches folded into one DAG: branch A is `3 <- 1` (tip 3),
+    /// branch B is `5 <- 4 <- 1` (tip 5), forking at the shared ancestor 1.
+    /// Newest-first display order `[5, 4, 3, 1]`; the graph puts B's chain on
+    /// lane 0 and A's tip on lane 1.
+    fn two_branch_dag() -> Vec<CommitInfo> {
+        vec![ci(5, 4), ci(4, 1), ci(3, 1), ci(1, 0)]
+    }
+
+    #[test]
+    fn a_cross_branch_move_needs_the_other_head_in_the_set() {
+        // Drag A's tip (3, row 2) into the gap below B's tip (gap 1): the line
+        // there descends on lane 0 to B's parent 4, carrying child 5.
+        let h = two_branch_dag();
+        let g = compute_graph(&h, &cid(0));
+        // Single-head A: B's commits aren't reachable, so the destination line is
+        // off-branch and yields no candidate.
+        assert_eq!(
+            plan_reorder_candidates(&h, &cid(3), &g, &cid(0), 2, 1),
+            vec![]
+        );
+        // Both branch tips in the set: the cross-branch line is now valid. 3 is
+        // A's tip, so moving it away leaves A on its parent (new_tip 1); it splices
+        // onto B between 5 and 4.
+        assert_eq!(
+            plan_reorder_candidates_multi(&h, &[cid(3), cid(5)], &g, &cid(0), 2, 1),
+            vec![ReorderCandidate {
+                mv: mv(3, &[4], &[5], 1),
+                lane: 0
+            }]
+        );
+        // A singleton head is exactly the single-head planner.
+        assert_eq!(
+            plan_reorder_candidates_multi(&h, &[cid(3)], &g, &cid(0), 2, 1),
+            plan_reorder_candidates(&h, &cid(3), &g, &cid(0), 2, 1)
+        );
+    }
+
+    #[test]
+    fn a_cross_branch_copy_needs_the_other_head_in_the_set() {
+        // Cherry-pick a foreign commit (9) onto B's lane at gap 1 (between 5 and
+        // 4). The insert planner uses the primary head (3) as new_tip, ignored by
+        // the cherry-pick apply.
+        let h = two_branch_dag();
+        let g = compute_graph(&h, &cid(0));
+        // Single-head A: B's lane is off-branch, no graft point.
+        assert_eq!(
+            plan_insert_candidates(&h, &cid(3), &g, &cid(0), &cid(9), 1),
+            vec![]
+        );
+        // Both heads in the set: B's lane is a valid graft point.
+        assert_eq!(
+            plan_insert_candidates_multi(&h, &[cid(3), cid(5)], &g, &cid(0), &cid(9), 1),
+            vec![ReorderCandidate {
+                mv: mv(9, &[4], &[5], 3),
+                lane: 0
+            }]
+        );
+        // A singleton head is exactly the single-head planner.
+        assert_eq!(
+            plan_insert_candidates_multi(&h, &[cid(3)], &g, &cid(0), &cid(9), 1),
+            plan_insert_candidates(&h, &cid(3), &g, &cid(0), &cid(9), 1)
         );
     }
 

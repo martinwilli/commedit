@@ -239,6 +239,152 @@ fn editing_a_shared_ancestor_moves_both_branches() {
     g(&["fsck", "--no-progress"]);
 }
 
+/// Open `main` + `feature` as one editable DAG and return the opened repo plus
+/// the two branch tips (`[main_head, feature_head]`) the cross-branch planners
+/// take. The `setup` layout is `main: A-B-C` (checked out), `feature: A-B-F`.
+fn open_two_branch_dag(dir: &std::path::Path) -> (Repo, [jj_lib::backend::CommitId; 2]) {
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    (repo, [head, feature_head])
+}
+
+/// Cross-branch **squash** (Phase 3 GTK center-drop): folding a commit on one
+/// branch onto a commit on another lands across the boundary — the source is
+/// consumed (its branch loses it), the destination's branch keeps its own tip
+/// with the merged change. Drives the engine path the GTK squash arm uses
+/// (`plan_squash_multi` → `squash_into`).
+#[test]
+fn a_cross_branch_squash_lands_and_consumes_the_source() {
+    use commedit_engine::squash::SquashMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+
+    let (mut repo, heads) = open_two_branch_dag(dir);
+    // Fold F (feature-only) into C (main-only): different branches, shared
+    // ancestor B. The single-head planner refuses it; the multi-head one allows it.
+    let (union, _) = repo.history_multi(&heads, 0, usize::MAX).unwrap();
+    let f_idx = union.iter().position(|c| c.subject == "F").unwrap();
+    let c_idx = union.iter().position(|c| c.subject == "C").unwrap();
+    assert!(
+        repo.plan_squash(&union, f_idx, c_idx).is_none(),
+        "single-head planner refuses the cross-branch squash"
+    );
+    let (src, dest) = repo
+        .plan_squash_multi(&union, f_idx, c_idx)
+        .expect("cross-branch squash planned");
+    repo.squash_into(&src, &dest, SquashMode::Fixup, None)
+        .expect("cross-branch squash");
+
+    // main's C now carries f.txt; feature lost F (its tip is B again).
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"],
+        "main keeps its own tip C (Fixup keeps the message)"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["B", "A"],
+        "feature lost F — the squash consumed the source"
+    );
+    assert_eq!(
+        g(&["show", "main:f.txt"]),
+        "f",
+        "F's change folded into main's C"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Cross-branch **copy** (Phase 3 GTK Copy): cherry-picking a commit from one
+/// branch onto another grows a re-applied copy and leaves the source branch
+/// intact. Drives the engine path the GTK Copy popover uses
+/// (`plan_cherry_pick_candidates_multi` → `cherry_pick_commit`).
+#[test]
+fn a_cross_branch_copy_leaves_the_source_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    let (mut repo, heads) = open_two_branch_dag(dir);
+    let f = find_commit(&repo, &heads, "F");
+    let main_head = heads[0].clone();
+    // Cherry-pick F on top of main's tip C: a copy, source untouched.
+    repo.cherry_pick_commit(&f, vec![main_head], vec![], None)
+        .expect("cross-branch cherry-pick");
+
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["F", "C", "B", "A"],
+        "main grew a re-applied copy of F on top of C"
+    );
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature is untouched — Copy leaves the source where it is"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Cross-branch **move** (Phase 3 GTK Move): reparenting a commit from one branch
+/// onto another lifts it out of its old slot and reparents it onto the
+/// destination lane. The jj/git-correct semantics: the commit's *own* bookmark
+/// rides the rebase to the new location (a reparent doesn't transfer ownership),
+/// while the primary bookmark — the explicit `new_tip` anchor — stays put. Drives
+/// the engine path the GTK Move popover uses (`reorder_commit` with cross-lane
+/// parents). Contrast [`a_cross_branch_copy_leaves_the_source_intact`]: Move
+/// consumes the source slot, Copy leaves the original where it was.
+#[test]
+fn a_cross_branch_move_reparents_and_consumes_the_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let main_before = g(&["rev-parse", "main"]);
+
+    let (mut repo, heads) = open_two_branch_dag(dir);
+    let f = find_commit(&repo, &heads, "F");
+    let main_head = heads[0].clone();
+    // Move F (feature's tip, parented on the shared ancestor B) onto main's tip C.
+    // F is lifted off B and reparented onto C; feature — the bookmark that owns F
+    // — follows it there, so feature becomes F-C-B-A. main (the primary, pinned at
+    // new_tip) is unchanged. F's old slot on B is gone: the source is consumed.
+    repo.reorder_commit(&f, vec![main_head.clone()], vec![], &main_head)
+        .expect("cross-branch move");
+
+    // feature is now F-C-B-A: F was lifted off its old parent B (the source slot
+    // is consumed) and reparented onto main's C, its bookmark riding along.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "C", "B", "A"],
+        "F's bookmark (feature) rode the reparent onto main's C"
+    );
+    assert_eq!(
+        g(&["rev-parse", "feature~1"]),
+        main_before,
+        "F's new parent is main's tip C (it left its old parent B)"
+    );
+    assert_eq!(
+        g(&["rev-parse", "main"]),
+        main_before,
+        "main (the primary anchor) is left in place"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
 /// A 1-element editable set (`open_multi` with one branch) is byte-identical to
 /// the classic `open_branch`: only that branch's ref moves, no sibling is
 /// disturbed. Guards the singleton-equivalence the MCP relies on.

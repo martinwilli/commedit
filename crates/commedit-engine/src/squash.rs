@@ -16,7 +16,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
 
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
-use crate::history::{branch_commits, CommitInfo};
+use crate::history::{branch_commits, branch_commits_multi, CommitInfo};
 use crate::repo::Repo;
 use crate::workcopy::PartialSelection;
 
@@ -168,11 +168,27 @@ pub fn plan_squash(
     from: usize,
     onto: usize,
 ) -> Option<(CommitId, CommitId)> {
+    plan_squash_multi(commits, std::slice::from_ref(head), from, onto)
+}
+
+/// [`plan_squash`] over a multi-branch DAG: `heads` is every editable branch's
+/// tip. The reachable subgraph spans their union, so the source and destination
+/// may sit on different branches' lanes — jj's `squash_commits` folds the change
+/// across branch lines and the destination's bookmark (whichever editable branch
+/// the target lies on) rides the rebase. A singleton `heads` is exactly
+/// [`plan_squash`]; the squash always consumes the source, so there is no
+/// copy/move choice to make.
+pub fn plan_squash_multi(
+    commits: &[CommitInfo],
+    heads: &[CommitId],
+    from: usize,
+    onto: usize,
+) -> Option<(CommitId, CommitId)> {
     if from == onto {
         return None;
     }
     let (src, dest) = (commits.get(from)?, commits.get(onto)?);
-    let branch = branch_commits(commits, head);
+    let branch = branch_commits_multi(commits, heads);
     if src.parents.len() != 1 || !branch.contains(&src.id) || !branch.contains(&dest.id) {
         return None;
     }
@@ -265,6 +281,22 @@ impl Repo {
     ) -> Option<(CommitId, CommitId)> {
         let head = self.head_commit_id()?;
         plan_squash(commits, &head, from, onto)
+    }
+
+    /// Plan a drag-squash of the commit at display row `from` onto the commit at
+    /// row `onto` across the **multi-branch DAG** — the cross-branch squash. Like
+    /// [`Self::plan_squash`] but the reachable subgraph spans every editable
+    /// branch's tip ([`Self::editable_heads`]), so source and destination may sit
+    /// on different branches' lanes; the apply is [`Self::squash_into`] (or
+    /// [`Self::squash_into_many`]), which always consumes the source — so there is
+    /// no copy/move choice. See [`plan_squash_multi`].
+    pub fn plan_squash_multi(
+        &self,
+        commits: &[CommitInfo],
+        from: usize,
+        onto: usize,
+    ) -> Option<(CommitId, CommitId)> {
+        plan_squash_multi(commits, &self.editable_heads(), from, onto)
     }
 
     /// Plan a drag-squash of a *trashed* commit `restored` onto the commit at
@@ -670,9 +702,9 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_squash_message, parse_squash_mode, plan_squash, plan_squash_restore,
-        squash_recommendations, squash_recommendations_for, squash_target_subject,
-        SquashHighlights, SquashMode,
+        compose_squash_message, parse_squash_mode, plan_squash, plan_squash_multi,
+        plan_squash_restore, squash_recommendations, squash_recommendations_for,
+        squash_target_subject, SquashHighlights, SquashMode,
     };
     use crate::history::CommitInfo;
     use jj_lib::backend::{ChangeId, CommitId};
@@ -807,6 +839,44 @@ mod tests {
         assert_eq!(plan_squash(&h, &cid(4), 1, 0), Some((cid(3), cid(4))));
         // …but a merge is not a source: its own change is its resolution.
         assert_eq!(plan_squash(&h, &cid(4), 0, 1), None);
+    }
+
+    /// Two divergent branches in one unified DAG: branch A is `3 <- 1 <- root`
+    /// (tip 3), branch B is `5 <- 4 <- 1 <- root` (tip 5); they fork at the shared
+    /// ancestor 1. The display order interleaves them newest-first.
+    fn two_branch_dag() -> Vec<CommitInfo> {
+        vec![
+            ci(5, 4, "b-2"),
+            ci(4, 1, "b-1"),
+            ci(3, 1, "a-1"),
+            ci(1, 0, "base"),
+        ]
+    }
+
+    #[test]
+    fn cross_branch_squash_needs_the_other_head_in_the_set() {
+        let h = two_branch_dag();
+        // Row 0 ("b-2") is on branch B; row 2 ("a-1") is on branch A. With only
+        // A's tip (3) in the set, B's commits aren't reachable, so the single-head
+        // planner refuses the squash in either direction.
+        assert_eq!(plan_squash(&h, &cid(3), 0, 2), None);
+        assert_eq!(plan_squash(&h, &cid(3), 2, 0), None);
+        // Folding both branch tips into the reachable set makes the cross-branch
+        // squash valid — jj rebases the change across the fork, the destination's
+        // own bookmark rides along.
+        assert_eq!(
+            plan_squash_multi(&h, &[cid(3), cid(5)], 0, 2),
+            Some((cid(5), cid(3)))
+        );
+        assert_eq!(
+            plan_squash_multi(&h, &[cid(3), cid(5)], 2, 0),
+            Some((cid(3), cid(5)))
+        );
+        // A singleton head is exactly the single-head planner (byte-identical path).
+        assert_eq!(
+            plan_squash_multi(&h, &[cid(3)], 0, 2),
+            plan_squash(&h, &cid(3), 0, 2)
+        );
     }
 
     #[test]

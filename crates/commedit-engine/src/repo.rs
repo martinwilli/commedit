@@ -104,6 +104,16 @@ impl Drop for Repo {
 /// relative spot, and `git_target` still resolves. See [`Repo::load_detached`].
 const RELATIVE_GIT_DIR: &str = "../../git";
 
+/// A local branch the multi-branch DAG view can fold in: its short-name, current
+/// tip, and whether it is the branch this session edits. Produced by
+/// [`Repo::local_branches`].
+#[derive(Debug, Clone)]
+pub struct BranchHead {
+    pub name: String,
+    pub head: CommitId,
+    pub is_current: bool,
+}
+
 impl Repo {
     /// Open the repository at `workspace_root`: spin up a fresh, throwaway jj
     /// workspace whose metadata lives in a temp dir (see [`Self::init_detached`]),
@@ -778,6 +788,44 @@ impl Repo {
             }
         }
         refs
+    }
+
+    /// The user's local branches, read fresh from git — the candidates for the
+    /// multi-branch DAG dropdown. Each entry pairs the branch short-name with its
+    /// current tip and a flag marking the one this session edits (the primary,
+    /// always shown but not foldable into itself). Branches whose tip is not a
+    /// readable commit are skipped.
+    pub fn local_branches(&self) -> Vec<BranchHead> {
+        let current = self.current_bookmark();
+        let current_name = current.as_ref().map(|c| c.as_str());
+        crate::transparency::local_head_oids(self.workspace.workspace_root())
+            .into_iter()
+            .filter_map(|(refname, sha)| {
+                let name = refname.strip_prefix("refs/heads/").unwrap_or(&refname);
+                let head = CommitId::try_from_hex(&sha)?;
+                Some(BranchHead {
+                    is_current: current_name == Some(name),
+                    name: name.to_string(),
+                    head,
+                })
+            })
+            .collect()
+    }
+
+    /// History walk over the **union** of several branch tips' ancestries — the
+    /// multi-branch DAG view. `heads` is the edited branch's tip plus the extra
+    /// branches the user folded in (resolve their tips via [`Self::local_branches`]
+    /// or [`Self::lookup_commit_in_store`]). Read-only: the extra heads are made
+    /// index-visible in a transient transaction that is rolled back, never
+    /// touching git, the op-log, or the edited branch (see
+    /// [`crate::history::history_limited_multi`]).
+    pub fn history_multi(
+        &self,
+        heads: &[CommitId],
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<crate::history::CommitInfo>, bool)> {
+        crate::history::history_limited_multi(&self.repo, heads, offset, limit)
     }
 
     /// The branch tip jj just exported into its session-local git dir, read from

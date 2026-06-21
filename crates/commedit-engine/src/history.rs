@@ -4,6 +4,7 @@
 //! not shown.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
@@ -114,9 +115,58 @@ pub fn history_limited(
     offset: usize,
     limit: usize,
 ) -> Result<(Vec<CommitInfo>, bool)> {
+    collect_ancestors(repo, std::slice::from_ref(head), offset, limit)
+}
+
+/// Like [`history_limited`], but walks the **union** of several heads' ancestries
+/// — the multi-branch DAG view, where the user folds additional local branches
+/// into the current one. The returned list is newest-first across the union
+/// (children before parents), ready for [`crate::graph::compute_graph`] to lay
+/// out fork/merge lanes.
+///
+/// commedit imports only the checked-out branch into jj's view (see
+/// `Repo::import_git`), so the extra heads are *not* in jj's index and a bare
+/// `commits(heads).ancestors()` evaluation fails ("not found in index"). We make
+/// them resolvable by adding each as an anonymous head in a **transient
+/// transaction we never commit** — visible to the index for this one walk, then
+/// rolled back. Because no bookmark is created and nothing is committed, the
+/// extra heads stay invisible to jj's export, never enter the op-log, and never
+/// become rebase_descendants targets for a later mutation of the edited branch
+/// (the `sibling_branch` invariant is preserved). This read does not mutate the
+/// repo; the edited branch stays the only writable anchor.
+pub fn history_limited_multi(
+    repo: &Arc<ReadonlyRepo>,
+    heads: &[CommitId],
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<CommitInfo>, bool)> {
+    let mut tx = repo.start_transaction();
+    for head in heads {
+        let commit = repo
+            .store()
+            .get_commit(head)
+            .context("loading an extra branch head")?;
+        pollster::block_on(tx.repo_mut().add_head(&commit))
+            .context("making an extra branch head visible")?;
+    }
+    collect_ancestors(tx.repo(), heads, offset, limit)
+    // `tx` is dropped here without commit — the added heads are rolled back.
+}
+
+/// Shared core: collect [`CommitInfo`]s for the ancestors of `heads`, newest
+/// first, skipping `offset` and stopping after `limit` (with a "more remain"
+/// flag). Evaluated against any [`Repo`] view — the persistent [`ReadonlyRepo`]
+/// for a single imported head, or a transient [`jj_lib::repo::MutableRepo`] with
+/// extra heads added for the multi-branch walk.
+fn collect_ancestors(
+    repo: &dyn Repo,
+    heads: &[CommitId],
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<CommitInfo>, bool)> {
     let symbol_resolver =
         SymbolResolver::new(repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
-    let expression = RevsetExpression::commits(vec![head.clone()])
+    let expression = RevsetExpression::commits(heads.to_vec())
         .ancestors()
         .resolve_user_expression(repo, &symbol_resolver)
         .context("resolving history revset")?;

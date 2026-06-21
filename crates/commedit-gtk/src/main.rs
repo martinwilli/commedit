@@ -52,6 +52,7 @@ use crate::conflict::*;
 mod diff_cues;
 mod dnd;
 mod dragdrop;
+mod lanebranch;
 mod linenums;
 mod msglint;
 mod search;

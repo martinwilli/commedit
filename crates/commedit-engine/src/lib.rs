@@ -21,3 +21,10 @@ pub mod tabwidth;
 pub mod transparency;
 pub mod tree;
 pub mod workcopy;
+
+/// jj-lib's commit/change identities, re-exported so GTK/MCP consumers can name
+/// the types carried by [`history::CommitInfo`], [`history::ReorderMove`] et al.
+/// without taking a direct `jj-lib` dependency (the crate's whole point is to be
+/// the only thing that does). `ChangeId` is used mainly by the GTK pure-logic
+/// unit tests that build scratch [`history::CommitInfo`]s.
+pub use jj_lib::backend::{ChangeId, CommitId};

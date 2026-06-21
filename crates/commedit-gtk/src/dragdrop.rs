@@ -12,17 +12,52 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use commedit_engine::conflict::SaveOutcome;
-use commedit_engine::history::{ReorderMove, ReorderSetMove};
+use commedit_engine::history::{CommitInfo, ReorderMove, ReorderSetMove};
+use commedit_engine::repo::Repo;
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
+use commedit_engine::CommitId;
 use gtk::prelude::*;
 use gtk::{
-    gdk, glib, Box as GtkBox, Button, DragSource, DropTarget, ListBox, ListBoxRow, Orientation,
-    Popover,
+    gdk, glib, Box as GtkBox, Button, DragSource, DropTarget, Label, ListBox, ListBoxRow,
+    Orientation, Popover,
 };
 
 use crate::dnd::{DraggedCommit, DraggedCommits};
+use crate::lanebranch::{BranchTip, LaneBranches};
 use crate::rows::{lane_color, populate_trash};
 use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, PostDrag, Widgets};
+
+/// Build the lane→branch map for the currently displayed `commits` from the
+/// repo's editable set: each editable branch paired with its current tip (via
+/// `local_branches()`), fed to [`LaneBranches::compute`]. Reads the repo fresh, so
+/// it reflects the branch moves a clean save exported. A singleton editable set
+/// yields a map in which no drop is ever cross-branch (see
+/// [`LaneBranches::is_cross_branch`]), preserving today's single-branch behaviour.
+fn lane_branches(repo: &Repo, commits: &[CommitInfo]) -> LaneBranches {
+    let editable: std::collections::HashSet<String> =
+        repo.editable_branches().into_iter().collect();
+    let tips: Vec<BranchTip> = repo
+        .local_branches()
+        .into_iter()
+        .filter(|b| editable.contains(&b.name))
+        .map(|b| BranchTip {
+            name: b.name,
+            tip: b.head,
+        })
+        .collect();
+    LaneBranches::compute(commits, &tips)
+}
+
+/// The commits that identify a reorder/insert candidate's destination *line* —
+/// the ones it re-parents (`new_children`), falling back to its `new_parents` for
+/// a top/childless splice. [`LaneBranches`] reads the branch identity off these.
+fn line_commits(mv: &ReorderMove) -> &[CommitId] {
+    if mv.new_children.is_empty() {
+        &mv.new_parents
+    } else {
+        &mv.new_children
+    }
+}
 
 /// Install the drag-and-drop controllers on the history, trash and working-copy
 /// lists. See the module docs.
@@ -185,9 +220,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 )
                                 .is_empty()
                         } else {
+                            // Across the whole editable DAG, so a gap that only a
+                            // cross-branch line crosses still opens.
                             !repo
                                 .borrow()
-                                .plan_reorder_candidates(&commits, &graph.borrow(), from, new_gap)
+                                .plan_reorder_candidates_multi(
+                                    &commits,
+                                    &graph.borrow(),
+                                    from,
+                                    new_gap,
+                                )
                                 .is_empty()
                         }
                     }
@@ -262,15 +304,19 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 DragOrigin::History => {
                     let set = drag_set.borrow();
                     let commits = commits.borrow();
+                    // Validate across the whole editable DAG (`_multi`), so a
+                    // squash onto another branch's commit lights up too.
                     if set.len() > 1 {
                         // Every selected commit must fold onto the target, and the
                         // target must not be one of them.
                         !set.contains(&ci)
-                            && set
-                                .iter()
-                                .all(|&i| repo.borrow().plan_squash(&commits, i, ci).is_some())
+                            && set.iter().all(|&i| {
+                                repo.borrow().plan_squash_multi(&commits, i, ci).is_some()
+                            })
                     } else {
-                        repo.borrow().plan_squash(&commits, from, ci).is_some()
+                        repo.borrow()
+                            .plan_squash_multi(&commits, from, ci)
+                            .is_some()
                     }
                 }
                 DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
@@ -656,7 +702,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         show_status("That commit isn't in this repository's object store");
                         return;
                     };
-                    let cands = repo.borrow().plan_cherry_pick_candidates(
+                    // The whole editable DAG is a graft target (a foreign commit
+                    // can land on any visible lane), so plan across all editable
+                    // heads, and label each candidate line with the branch it
+                    // carries.
+                    let cands = repo.borrow().plan_cherry_pick_candidates_multi(
                         &commits.borrow(),
                         &graph.borrow(),
                         &target,
@@ -695,13 +745,19 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // still be releasing, and grabbing into that wedges all
                         // input. In-process drops show this from `drag-end` (grab
                         // already gone) and keep autohide.
-                        _ => show_lane_popover(
-                            &list,
-                            to,
-                            cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
-                            &apply,
-                            false,
-                        ),
+                        _ => {
+                            let lb = lane_branches(&repo.borrow(), &commits.borrow());
+                            show_lane_popover(
+                                &list,
+                                to,
+                                cands
+                                    .into_iter()
+                                    .map(|c| (c.lane, lb.label_for(line_commits(&c.mv)), c.mv))
+                                    .collect(),
+                                &apply,
+                                false,
+                            )
+                        }
                     }
                 });
                 return true;
@@ -850,10 +906,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         };
                         match &cands[..] {
                             [single] => apply(&single.mv),
+                            // A group move stays within the branch (its in-branch
+                            // lanes), so the lane picker is the colour swatch alone.
                             _ => show_lane_popover(
                                 &list,
                                 to,
-                                cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
+                                cands.into_iter().map(|c| (c.lane, None, c.mv)).collect(),
                                 &apply,
                                 true,
                             ),
@@ -862,9 +920,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     true
                 }
                 DragOrigin::History if onto.is_some() => {
-                    // Dropped ONTO a commit: squash the dragged commit into it. A
-                    // prefixed commit acts immediately; an unprefixed one opens a
-                    // popover to pick the mode.
+                    // Dropped ONTO a commit: squash the dragged commit into it,
+                    // anywhere in the DAG — onto another branch's commit too (a
+                    // squash always consumes the source, so there is no Copy/Move
+                    // choice). A prefixed commit acts immediately; an unprefixed
+                    // one opens a popover to pick the mode.
                     let onto = onto.unwrap();
                     let repo = repo.clone();
                     let commits = commits.clone();
@@ -876,7 +936,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         let plan =
                             repo.borrow()
-                                .plan_squash(&commits.borrow(), from as usize, onto);
+                                .plan_squash_multi(&commits.borrow(), from as usize, onto);
                         let Some((source, dest)) = plan else {
                             return;
                         };
@@ -931,9 +991,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
-                        // One candidate per ancestry line crossing the gap; a
-                        // no-op, merge or off-branch drop yields none.
-                        let cands = repo.borrow().plan_reorder_candidates(
+                        // One candidate per ancestry line crossing the gap, across
+                        // *every* editable branch's lanes (so a line on another
+                        // branch is a real destination); a no-op, merge or fully
+                        // off-branch drop yields none.
+                        let cands = repo.borrow().plan_reorder_candidates_multi(
                             &commits.borrow(),
                             &graph.borrow(),
                             from as usize,
@@ -942,9 +1004,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         if cands.is_empty() {
                             return;
                         }
+                        let source = commits.borrow()[from as usize].id.clone();
+                        let lb = Rc::new(lane_branches(&repo.borrow(), &commits.borrow()));
 
-                        // Run the chosen splice and report the outcome.
-                        let apply: Rc<dyn Fn(&ReorderMove)> = {
+                        // Run a Move (reparent — consume the source) and report.
+                        let apply_move: Rc<dyn Fn(&ReorderMove)> = {
                             let repo = repo.clone();
                             let refresh = refresh.clone();
                             let show_status = show_status.clone();
@@ -965,15 +1029,85 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 }
                             })
                         };
+                        // Run a Copy (cherry-pick — leave the source intact) and report.
+                        let apply_copy: Rc<dyn Fn(&ReorderMove)> = {
+                            let repo = repo.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            Rc::new(move |mv: &ReorderMove| {
+                                let outcome = repo.borrow_mut().cherry_pick_commit(
+                                    &mv.target,
+                                    mv.new_parents.clone(),
+                                    mv.new_children.clone(),
+                                    None,
+                                );
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => refresh(),
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        enter_conflict_mode(commits)
+                                    }
+                                    Err(err) => show_status(&format!("Copy failed: {err}")),
+                                }
+                            })
+                        };
+
+                        // Splice the chosen line: an in-branch line moves straight
+                        // away (no popover, exactly as before); a line on another
+                        // branch first asks Copy vs Move (the source rides along on
+                        // Move, stays put on Copy).
+                        let apply: Rc<dyn Fn(&ReorderMove)> = {
+                            let apply_move = apply_move.clone();
+                            let apply_copy = apply_copy.clone();
+                            let list = list.clone();
+                            let source = source.clone();
+                            let lb = lb.clone();
+                            Rc::new(move |mv: &ReorderMove| {
+                                let line = line_commits(mv);
+                                if !lb.line_is_cross_branch(&source, line) {
+                                    apply_move(mv);
+                                    return;
+                                }
+                                // Anchor the chooser at the row bordering the gap:
+                                // the row at `to`, else the last row for a bottom
+                                // gap. If none is alive, fall back to a plain Move.
+                                let Some(target_row) = popover_anchor_row(&list, to) else {
+                                    apply_move(mv);
+                                    return;
+                                };
+                                let dest = lb.label_for(line);
+                                let on_move: Rc<dyn Fn()> = {
+                                    let apply_move = apply_move.clone();
+                                    let mv = mv.clone();
+                                    Rc::new(move || apply_move(&mv))
+                                };
+                                let on_copy: Rc<dyn Fn()> = {
+                                    let apply_copy = apply_copy.clone();
+                                    let mv = mv.clone();
+                                    Rc::new(move || apply_copy(&mv))
+                                };
+                                show_copy_move_popover(
+                                    &target_row,
+                                    dest.as_deref(),
+                                    &on_move,
+                                    &on_copy,
+                                );
+                            })
+                        };
 
                         match &cands[..] {
-                            // A single crossing line: splice right in.
+                            // A single crossing line: splice it (Copy/Move if it
+                            // crosses a branch, straight Move otherwise).
                             [single] => apply(&single.mv),
-                            // Several lines cross the gap: ask which one.
+                            // Several lines cross the gap: ask which one (labelled
+                            // by branch), then splice the picked line via `apply`.
                             _ => show_lane_popover(
                                 &list,
                                 to,
-                                cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
+                                cands
+                                    .into_iter()
+                                    .map(|c| (c.lane, lb.label_for(line_commits(&c.mv)), c.mv))
+                                    .collect(),
                                 &apply,
                                 true,
                             ),
@@ -1163,10 +1297,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
 
                         match &cands[..] {
                             [single] => apply(&single.mv),
+                            // Restore grafts within the (primary) branch's lanes,
+                            // so the picker is the colour swatch alone.
                             _ => show_lane_popover(
                                 &list,
                                 to,
-                                cands.into_iter().map(|c| (c.lane, c.mv)).collect(),
+                                cands.into_iter().map(|c| (c.lane, None, c.mv)).collect(),
                                 &apply,
                                 true,
                             ),
@@ -1683,15 +1819,98 @@ fn show_squash_popover(target_row: &ListBoxRow, apply: &Rc<dyn Fn(SquashMode)>) 
     popover.popup();
 }
 
+/// A small popover anchored at `target_row` letting the user choose how a drag
+/// that **crosses a branch boundary** lands: **Move** (reparent — consume the
+/// source) or **Copy** (cherry-pick — leave the source intact), or Cancel. The
+/// UX family of [`show_squash_popover`]; shown only when the destination lane
+/// belongs to a different branch than the source (an in-branch reorder never asks
+/// — it just moves, exactly as before). `dest_branch` names the branch being
+/// dropped onto, for the button tooltips. Shown from the post-drag idle, where the
+/// row is alive and GTK's drag bookkeeping is torn down.
+fn show_copy_move_popover(
+    target_row: &ListBoxRow,
+    dest_branch: Option<&str>,
+    on_move: &Rc<dyn Fn()>,
+    on_copy: &Rc<dyn Fn()>,
+) {
+    let popover = Popover::new();
+    let vbox = GtkBox::new(Orientation::Vertical, 0);
+    let onto = dest_branch
+        .map(|b| format!(" onto {b}"))
+        .unwrap_or_default();
+    let button = |label: &str, tip: &str| {
+        let b = Button::with_label(label);
+        b.add_css_class("flat");
+        b.set_tooltip_text(Some(tip));
+        b.set_halign(gtk::Align::Fill);
+        vbox.append(&b);
+        b
+    };
+    let move_btn = button(
+        "Move",
+        &format!(
+            "Reparent this commit{onto} — its descendants rebase, and it leaves its old branch."
+        ),
+    );
+    let copy_btn = button(
+        "Copy",
+        &format!(
+            "Cherry-pick this commit{onto} — a re-applied copy; the original stays where it is."
+        ),
+    );
+    vbox.append(&gtk::Separator::new(Orientation::Horizontal));
+    let cancel_btn = button("Cancel", "Don't move or copy — leave history unchanged.");
+
+    popover.set_child(Some(&vbox));
+    // Parent to the list, not the (possibly selected) row, so the button labels
+    // get the normal theme colours — same reasoning as `show_squash_popover`.
+    if let Some(parent) = target_row.parent() {
+        popover.set_parent(&parent);
+        popover.set_pointing_to(Some(&target_row.allocation()));
+    } else {
+        popover.set_parent(target_row);
+    }
+    popover.set_autohide(true);
+
+    let wire = |btn: &Button, action: Option<Rc<dyn Fn()>>| {
+        let popover = popover.clone();
+        btn.connect_clicked(move |_| {
+            if let Some(action) = action.as_ref() {
+                action();
+            }
+            popover.popdown();
+        });
+    };
+    wire(&move_btn, Some(on_move.clone()));
+    wire(&copy_btn, Some(on_copy.clone()));
+    wire(&cancel_btn, None);
+
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+/// The list row to anchor a gap-borne popover at: the (visible) row just below
+/// the gap `to`, or — for the bottom gap — the last visible row above it. `None`
+/// when neither is alive. Surplus rows `populate_rows` hid (never unparented)
+/// have stale allocations, so they are skipped. Used by the Copy/Move chooser
+/// (the lane picker inlines the same rule, pointing at the 1px gap edge instead).
+fn popover_anchor_row(list: &ListBox, to: usize) -> Option<ListBoxRow> {
+    let row_at = |i: usize| list.row_at_index(i as i32).filter(|r| r.is_visible());
+    row_at(to).or_else(|| to.checked_sub(1).and_then(row_at))
+}
+
 /// Width/height of one lane swatch in the pick-a-line popover.
 const SWATCH_W: i32 = 16;
 const SWATCH_H: i32 = 28;
 
 /// A popover at the drop gap letting the user pick which ancestry line to
 /// splice the dragged commit(s) into, when several cross it: one flat button per
-/// candidate `(lane, payload)` (lane order, matching the graph's columns
-/// left-to-right), each drawing just a vertical line in its lane's color — no
-/// text. A click runs `apply` with that candidate's `payload`; a click outside
+/// candidate `(lane, label, payload)` (lane order, matching the graph's columns
+/// left-to-right). Each button draws a vertical line in its lane's colour and,
+/// when `label` is set (the branch(es) the line carries — see [`LaneBranches`]),
+/// shows that branch name under it, so picking a *cross-branch* destination is a
+/// named choice rather than a bare colour guess (the multi-branch usability win).
+/// A click runs `apply` with that candidate's `payload`; a click outside
 /// dismisses. Generic over the payload so both a single-commit [`ReorderMove`]
 /// and a group [`ReorderSetMove`] reuse it. Shown from the post-drag idle like
 /// [`show_squash_popover`]: the gesture is fully torn down and no rewrite has
@@ -1700,13 +1919,13 @@ const SWATCH_H: i32 = 28;
 fn show_lane_popover<T: 'static>(
     list: &ListBox,
     gap: usize,
-    candidates: Vec<(usize, T)>,
+    candidates: Vec<(usize, Option<String>, T)>,
     apply: &Rc<dyn Fn(&T)>,
     autohide: bool,
 ) {
     let popover = Popover::new();
     let hbox = GtkBox::new(Orientation::Horizontal, 0);
-    for (lane, payload) in candidates {
+    for (lane, label, payload) in candidates {
         let swatch = gtk::DrawingArea::new();
         swatch.set_content_width(SWATCH_W);
         swatch.set_content_height(SWATCH_H);
@@ -1718,15 +1937,36 @@ fn show_lane_popover<T: 'static>(
             cr.line_to(w as f64 / 2.0, h as f64 - 2.0);
             let _ = cr.stroke();
         });
+        // Swatch on top; the branch label (if any) below it, so a labelled lane
+        // reads as "this colour = this branch".
+        let cell = GtkBox::new(Orientation::Vertical, 2);
+        cell.set_halign(gtk::Align::Center);
+        cell.append(&swatch);
+        if let Some(text) = label {
+            let lbl = Label::new(Some(&text));
+            lbl.add_css_class("caption");
+            cell.append(&lbl);
+        }
         let btn = Button::new();
-        btn.set_child(Some(&swatch));
+        btn.set_child(Some(&cell));
         btn.add_css_class("flat");
         hbox.append(&btn);
         let apply = apply.clone();
         let popover = popover.clone();
+        // `T` isn't `Clone`, but the idle closure below must own the payload, so
+        // hold it behind an `Rc`.
+        let payload = Rc::new(payload);
         btn.connect_clicked(move |_| {
-            apply(&payload);
+            // Tear THIS popover down first so it releases its seat grab, then run
+            // the action at idle. The action may itself open another grabbing
+            // popover (the cross-branch Copy/Move chooser); mapping a grabbing
+            // popup while this one still held the grab trips GTK's "grabbing popup
+            // with a non-top most parent" refusal — the grab handoff aborts, no
+            // popover ends up owning the seat, and all input wedges.
             popover.popdown();
+            let apply = apply.clone();
+            let payload = payload.clone();
+            glib::idle_add_local_once(move || apply(payload.as_ref()));
         });
     }
     popover.set_child(Some(&hbox));

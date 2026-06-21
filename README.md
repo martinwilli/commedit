@@ -71,12 +71,34 @@ an interactive-rebase session.
   highlighted in purple — a content-derived "this is where it belongs", stronger
   than the subject match.
 
+- **Edit several branches as one DAG** — the header branch dropdown is a *set* of
+  editable branches, not just a view filter. It starts at the branch you opened;
+  tick another and it folds into one unified history graph as a real, rewritable
+  lane (untick to drop it again — the last one stays). Every commit shown is then
+  editable, on any branch, and editing a commit several branches share moves all of
+  them (their bookmarks follow, their descendants rebase) — git-correct, the way a
+  shared-ancestor amend should behave. Each branch's worktree, if it has one, is
+  kept in sync.
+
+- **Drag commits across branches** — with more than one branch in the DAG, drag a
+  commit from one lane onto another's. Crossing a branch boundary pops a small
+  **Copy / Move** chooser (the same family as the squash picker): **Move**
+  reparents the commit onto the other branch (it leaves its old one, descendants
+  rebase); **Copy** cherry-picks it (a re-applied copy, the original stays put).
+  Drag a commit *onto* another branch's commit to **squash** it in across the
+  boundary — a squash always consumes the source, so it just folds in. A
+  same-branch reorder or squash is unchanged (no chooser). When several lanes cross
+  the drop gap, the pick-a-line popover now labels each by branch name, so choosing
+  the destination branch is a named choice rather than a colour guess.
+
 - **Drag a commit between windows** — open the same repo in two windows (say one
   per branch) and drag a commit from one onto a gap in the other's history to
   **cherry-pick** it in. It's a copy: the source window keeps its commit, the
   target grows a re-applied one (descendants rebase, conflicts held back as
   usual). Both windows must be on the *same* repository — they share an object
-  store; dragging between two different repos is refused.
+  store; dragging between two different repos is refused. (In-window, the unified
+  DAG above does the same copy *and* offers a move; the two-window drag remains the
+  way to copy a commit you don't want to fold a whole branch in to see.)
 
 - **Revert a commit in place** — hover a commit's row in the history list and a
   revert button appears at its right edge (aligned down the list); clicking it
@@ -250,21 +272,29 @@ is kept entirely out of your repository: it operates on a throwaway directory th
 shares only your repo's object database and is discarded when you close the app,
 so comm(ed)it never leaves a `.jj` directory or stray `refs/jj/*` behind, and
 never disturbs a repo you already manage with jj.
-It rewrites only the branch you have checked out; your other local branches and
+By default it rewrites only the branch you opened; your other local branches and
 tags stay exactly where they are (they simply diverge, as they would after a
-`git commit --amend`). The code is split into a headless `commedit-engine` crate
-(all repository logic, unit-tested against scratch repos) and a `commedit-gtk`
-crate (the UI), so the rewrite logic carries no GTK dependency.
+`git commit --amend`). The header branch dropdown is an *editable set*: tick more
+branches and they are imported as real bookmarks into one unified DAG, so a rewrite
+that touches a commit several of them share moves every one (its bookmark rides the
+rebase, its descendants follow) and a commit can be dragged or squashed from one
+branch's lane onto another's. A branch you only see as an ancestor *pill* (a git
+decoration, not a ticked entry) is left frozen, exactly as today. The code is split
+into a headless `commedit-engine` crate (all repository logic, unit-tested against
+scratch repos) and a `commedit-gtk` crate (the UI), so the rewrite logic carries no
+GTK dependency.
 
 You can also edit a branch you have **not** checked out: pass its name —
 `commedit /path/to/repo <branch>`, or just `commedit <branch>` from inside the
 repo (a lone argument is a path if it's an existing directory, otherwise a
 branch). comm(ed)it then moves only that branch's ref and leaves `HEAD`, the
 index and the working tree completely untouched. Every history edit works as
-usual, but there is no working copy (a branch you haven't checked out has no
-uncommitted changes), so the working-copy features are unavailable. Editing a
-branch that is checked out in *another* worktree is refused — rewriting it would
-desync that worktree; open comm(ed)it in that worktree instead.
+usual, but there is no working copy for the launch view (a branch you haven't
+checked out has no uncommitted changes), so its working-copy features are
+unavailable. A branch in the editable set that *is* checked out in another worktree
+is kept in sync: a rewrite that moves it re-materializes that worktree's files and
+index (its own uncommitted changes ride along), so editing it no longer desyncs the
+other checkout.
 
 Opening several windows on one repository — typically one per branch — lets you
 drag a commit from one onto another to cherry-pick it across branches. The

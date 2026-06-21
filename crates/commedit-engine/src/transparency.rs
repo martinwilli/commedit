@@ -56,6 +56,7 @@ pub fn init_shared_git_dir(
     git_dir: &Path,
     workspace_root: &Path,
     seed_branch: Option<&str>,
+    extra_branches: &[String],
 ) -> Result<()> {
     let objects = git_objects_dir(workspace_root)?;
     // A known-valid bare layout (HEAD, config, refs/, …) for gix to open.
@@ -77,7 +78,15 @@ pub fn init_shared_git_dir(
     symlink_dir(&objects, &local_objects)?;
     // Seed the edited branch / detached HEAD and its tip (resolvable now via the
     // shared objects) so jj imports that history.
-    seed_session_head(git_dir, workspace_root, seed_branch)
+    seed_session_head(git_dir, workspace_root, seed_branch)?;
+    // Seed any additional editable branches' refs (no HEAD change) so jj's
+    // multi-bookmark import can see each branch's tip through the shared objects.
+    for branch in extra_branches {
+        if let Some(tip) = ref_commit(workspace_root, branch) {
+            git_in_dir(git_dir, &["update-ref", branch, &tip])?;
+        }
+    }
+    Ok(())
 }
 
 /// Point the session git dir's edited-branch ref (and HEAD) at that branch's
@@ -307,27 +316,28 @@ pub fn ref_decorations(workspace_root: &Path) -> BTreeMap<String, Vec<RefDecorat
     map
 }
 
-/// Force every local branch *except* `current` (a full ref name like
-/// `refs/heads/main`) back to the commit it pointed at in `before`, undoing any
-/// move jj's ref export made to a branch other than the one being edited. This
-/// is a git-level safety net behind the jj-bookmark confinement: whatever path
-/// nudges an unrelated branch — a backup sharing the rewritten tip, a tracked
-/// bookmark, a future jj quirk — it is reverted here before the user sees it.
+/// Force every local branch *outside* the editable set `exempt` (full ref names
+/// like `refs/heads/main`) back to the commit it pointed at in `before`, undoing
+/// any move jj's ref export made to a branch the session does not legitimately
+/// edit. This is a git-level safety net behind the jj-bookmark confinement:
+/// whatever path nudges an unrelated branch — a backup sharing the rewritten tip,
+/// a tracked bookmark, a future jj quirk — it is reverted here before the user
+/// sees it.
 ///
 /// Returns the branches it had to restore (empty in the common case), so callers
 /// can surface that a leak occurred. A branch that vanished is recreated; one
-/// that merely moved is reset. No-op when `current` is `None` (detached HEAD),
-/// matching the rest of the transparency layer.
+/// that merely moved is reset. An empty `exempt` (detached HEAD, no editable
+/// branch) protects every branch, matching the rest of the transparency layer.
 pub fn restore_unrelated_heads(
     workspace_root: &Path,
-    current: Option<&str>,
+    exempt: &[&str],
     before: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let after = local_head_oids(workspace_root);
     let mut restored = Vec::new();
     let mut updates = String::new();
     for (name, oid) in before {
-        if Some(name.as_str()) == current {
+        if exempt.contains(&name.as_str()) {
             continue;
         }
         if after.get(name).map(String::as_str) != Some(oid.as_str()) {

@@ -94,7 +94,7 @@ fn restores_an_unrelated_branch_but_leaves_the_current_one() {
     g(&["update-ref", "refs/heads/backup", "main~1"]);
     g(&["update-ref", "refs/heads/main", "main~2"]);
 
-    let restored = restore_unrelated_heads(dir, Some("refs/heads/main"), &before);
+    let restored = restore_unrelated_heads(dir, &["refs/heads/main"], &before);
 
     // Only the unrelated branch is reverted; the current branch keeps its move.
     assert_eq!(restored, vec!["refs/heads/backup".to_string()]);
@@ -117,7 +117,7 @@ fn recreates_a_branch_that_was_deleted() {
     let tip = g(&["rev-parse", "backup"]);
 
     g(&["branch", "-D", "backup"]);
-    let restored = restore_unrelated_heads(dir, Some("refs/heads/main"), &before);
+    let restored = restore_unrelated_heads(dir, &["refs/heads/main"], &before);
 
     assert_eq!(restored, vec!["refs/heads/backup".to_string()]);
     assert_eq!(g(&["rev-parse", "backup"]), tip, "deleted branch recreated");
@@ -132,7 +132,7 @@ fn no_op_when_nothing_moved() {
     g(&["branch", "backup"]);
     let before = local_head_oids(dir);
 
-    let restored = restore_unrelated_heads(dir, Some("refs/heads/main"), &before);
+    let restored = restore_unrelated_heads(dir, &["refs/heads/main"], &before);
     assert!(restored.is_empty(), "untouched branches need no restoring");
 }
 

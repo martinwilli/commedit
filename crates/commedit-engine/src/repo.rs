@@ -39,14 +39,18 @@ pub struct Repo {
     /// colocated layout stays invisible to plain git. `None` if HEAD was already
     /// detached.
     git_head_branch: Option<String>,
-    /// The branch (full ref name) whose history this session edits. Equals
-    /// [`Self::git_head_branch`] in the normal worktree-bound session; differs in
-    /// *off-worktree* mode, where the user opened a branch they have **not**
-    /// checked out. Off-worktree the session moves only this ref and never touches
-    /// HEAD, the index or the worktree (a branch you haven't checked out has no
-    /// working copy). `None` only on a detached HEAD with no branch selected. See
-    /// [`Self::is_worktree_bound`].
-    target_branch: Option<String>,
+    /// The **editable set**: the branches whose history this session may rewrite,
+    /// imported as real jj bookmarks. A rewrite of any commit rebases descendants
+    /// across the whole imported DAG and re-exports every bookmark that moved.
+    ///
+    /// The set's *primary* ([`EditableSet::primary`]) is the launch/opened branch;
+    /// it equals [`Self::git_head_branch`] in the normal worktree-bound session and
+    /// differs in *off-worktree* mode (the user opened a branch they have **not**
+    /// checked out). A **1-element set** (primary only, no extras) reproduces the
+    /// classic single-branch behavior byte-for-byte — this is what `commedit-mcp`
+    /// and the classic GTK/CLI opens pass. The primary is `None` only on a detached
+    /// HEAD with no branch selected. See [`Self::is_worktree_bound`].
+    edited: EditableSet,
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
@@ -103,6 +107,37 @@ impl Drop for Repo {
 /// session's `state_dir`, that session re-creates a fresh `git/` at the same
 /// relative spot, and `git_target` still resolves. See [`Repo::load_detached`].
 const RELATIVE_GIT_DIR: &str = "../../git";
+
+/// The set of branches a session may rewrite — the "editable set". Stored as full
+/// ref names (`refs/heads/…`). The [`Self::primary`] is the launch/opened branch
+/// (the one the UI labels, HEAD re-attaches to, and the working copy tracks in
+/// phase 1a); [`Self::extra`] are the additional branches folded into the editable
+/// DAG. A set with no extras is a **singleton** and behaves exactly like the old
+/// single-`target_branch` session.
+///
+/// Membership decides ancestor ride-along: an in-set bookmark follows a rewrite of
+/// a commit it points at (its ref moves, descendants rebase); an out-of-set branch
+/// is held in place by the protect-backstop. The primary is `None` only on a
+/// detached HEAD with no branch argument, in which case the set is empty.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EditableSet {
+    /// The launch/opened branch (full ref name), or `None` on a detached HEAD.
+    primary: Option<String>,
+    /// Additional editable branches (full ref names), excluding the primary and
+    /// never duplicating it.
+    extra: Vec<String>,
+}
+
+impl EditableSet {
+    /// Every editable branch as a full ref name: the primary (if any) first, then
+    /// the extras.
+    fn refs(&self) -> impl Iterator<Item = &str> {
+        self.primary
+            .as_deref()
+            .into_iter()
+            .chain(self.extra.iter().map(String::as_str))
+    }
+}
 
 /// A local branch the multi-branch DAG view can fold in: its short-name, current
 /// tip, and whether it is the branch this session edits. Produced by
@@ -169,6 +204,27 @@ impl Repo {
         cache: crate::index_cache::IndexCache,
         branch: Option<&str>,
     ) -> Result<Self> {
+        let branches: Vec<String> = branch.map(str::to_string).into_iter().collect();
+        Self::open_multi(workspace_root, cache, &branches)
+    }
+
+    /// Like [`Self::open_branch`], but edits a *set* of branches (the "editable
+    /// set"): all of them are imported as real jj bookmarks, so rewriting any
+    /// commit rebases descendants across the whole imported DAG and re-exports
+    /// every bookmark that moved. The **first** entry is the primary (the launch
+    /// branch the working copy tracks in phase 1a); an empty slice opens the
+    /// checked-out branch (the classic worktree-bound open). A 1-element slice is
+    /// byte-identical to [`Self::open_branch`] with that branch.
+    ///
+    /// Each branch is resolved to a full ref and verified to exist; an off-worktree
+    /// branch (one not checked out here) live in *another* worktree is refused, as
+    /// moving its ref would orphan that checkout (phase 1b lifts this for branches
+    /// we can re-materialize).
+    pub fn open_multi(
+        workspace_root: &Path,
+        cache: crate::index_cache::IndexCache,
+        branches: &[String],
+    ) -> Result<Self> {
         // Resolve a path inside the repo to the repository root that encloses it
         // (walking up to `.git`); bails if there is no git repo above it.
         let workspace_root = find_git_root(workspace_root)?;
@@ -177,31 +233,40 @@ impl Repo {
         // Record the checked-out branch before jj touches HEAD, so we can
         // re-attach to it afterwards.
         let git_head_branch = crate::transparency::head_branch(workspace_root);
-        // The branch this session edits: the explicitly requested one (resolved to
-        // a full ref, verified to exist), else the checked-out branch.
-        let target_branch = match branch {
-            Some(name) => Some(crate::transparency::resolve_local_branch(
-                workspace_root,
-                name,
-            )?),
-            None => git_head_branch.clone(),
-        };
-        // Off-worktree (editing a branch that isn't checked out here): refuse if it
-        // is live in another worktree — moving its ref would orphan that checkout.
-        if target_branch != git_head_branch {
-            if let Some(target) = target_branch.as_deref() {
-                if let Some(other) =
-                    crate::transparency::worktree_for_branch(workspace_root, target)?
-                {
-                    let short = target.strip_prefix("refs/heads/").unwrap_or(target);
-                    anyhow::bail!(
-                        "branch '{short}' is checked out in worktree {}; editing its \
-                         history there would corrupt that worktree. Open commedit in \
-                         that worktree (without a branch argument), or detach its HEAD \
-                         first.",
-                        other.display()
-                    );
+        // The editable set. The primary is the first requested branch (resolved to
+        // a full ref, verified to exist), else the checked-out branch; the extras
+        // are the remaining requested branches, deduplicated and excluding the
+        // primary.
+        let edited = {
+            let mut resolved: Vec<String> = Vec::new();
+            for name in branches {
+                let full = crate::transparency::resolve_local_branch(workspace_root, name)?;
+                if !resolved.contains(&full) {
+                    resolved.push(full);
                 }
+            }
+            let mut it = resolved.into_iter();
+            let primary = it.next().or_else(|| git_head_branch.clone());
+            EditableSet {
+                primary,
+                extra: it.collect(),
+            }
+        };
+        // Refuse editing a branch live in *another* worktree (off-worktree): moving
+        // its ref would orphan that checkout.
+        for full in edited.refs() {
+            if Some(full) == git_head_branch.as_deref() {
+                continue; // the launch worktree's own branch is always safe
+            }
+            if let Some(other) = crate::transparency::worktree_for_branch(workspace_root, full)? {
+                let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+                anyhow::bail!(
+                    "branch '{short}' is checked out in worktree {}; editing its \
+                     history there would corrupt that worktree. Open commedit in \
+                     that worktree (without a branch argument), or detach its HEAD \
+                     first.",
+                    other.display()
+                );
             }
         }
 
@@ -228,12 +293,7 @@ impl Repo {
             Some(handle) if handle.valid => {
                 let workdir = new_workdir()?;
                 let primed = handle.prime(workdir.path()).and_then(|()| {
-                    Self::load_detached(
-                        &settings,
-                        workspace_root,
-                        workdir.path(),
-                        target_branch.as_deref(),
-                    )
+                    Self::load_detached(&settings, workspace_root, workdir.path(), &edited)
                 });
                 match primed {
                     Ok((workspace, repo)) => (workdir, workspace, repo),
@@ -245,7 +305,7 @@ impl Repo {
                             &settings,
                             workspace_root,
                             workdir.path(),
-                            target_branch.as_deref(),
+                            &edited,
                         )?;
                         (workdir, workspace, repo)
                     }
@@ -253,12 +313,8 @@ impl Repo {
             }
             _ => {
                 let workdir = new_workdir()?;
-                let (workspace, repo) = Self::init_detached(
-                    &settings,
-                    workspace_root,
-                    workdir.path(),
-                    target_branch.as_deref(),
-                )?;
+                let (workspace, repo) =
+                    Self::init_detached(&settings, workspace_root, workdir.path(), &edited)?;
                 (workdir, workspace, repo)
             }
         };
@@ -268,7 +324,7 @@ impl Repo {
             repo,
             settings,
             git_head_branch,
-            target_branch,
+            edited,
             pending: None,
             session_op: None,
             session_head: None,
@@ -340,7 +396,7 @@ impl Repo {
         settings: &UserSettings,
         workspace_root: &Path,
         state_dir: &Path,
-        seed_branch: Option<&str>,
+        edited: &EditableSet,
     ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
         let repo_dir = state_dir.join("repo");
         std::fs::create_dir(&repo_dir).context("creating jj repo dir")?;
@@ -350,8 +406,13 @@ impl Repo {
         // The git dir jj writes into: session-local, with an object store shared
         // with the user's repo but private refs.
         let git_dir = state_dir.join("git");
-        crate::transparency::init_shared_git_dir(&git_dir, workspace_root, seed_branch)
-            .context("setting up the session git dir")?;
+        crate::transparency::init_shared_git_dir(
+            &git_dir,
+            workspace_root,
+            edited.primary.as_deref(),
+            &edited.extra,
+        )
+        .context("setting up the session git dir")?;
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|
          -> Result<Box<dyn Backend>, BackendInitError> {
@@ -437,7 +498,7 @@ impl Repo {
         settings: &UserSettings,
         workspace_root: &Path,
         state_dir: &Path,
-        seed_branch: Option<&str>,
+        edited: &EditableSet,
     ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
         use jj_lib::repo::{RepoLoader, StoreFactories};
 
@@ -448,8 +509,13 @@ impl Repo {
         // Fresh session-local git dir; the primed `repo/store/git_target` is the
         // relative `RELATIVE_GIT_DIR`, so it resolves to this newly-created dir.
         let git_dir = state_dir.join("git");
-        crate::transparency::init_shared_git_dir(&git_dir, workspace_root, seed_branch)
-            .context("setting up the session git dir")?;
+        crate::transparency::init_shared_git_dir(
+            &git_dir,
+            workspace_root,
+            edited.primary.as_deref(),
+            &edited.extra,
+        )
+        .context("setting up the session git dir")?;
 
         let loader =
             RepoLoader::init_from_file_system(settings, &repo_dir, &StoreFactories::default())
@@ -495,7 +561,8 @@ impl Repo {
     /// This is the bookmark imported, rewritten and exported — the checked-out
     /// branch in the normal session, a different branch when editing off-worktree.
     pub(crate) fn current_bookmark(&self) -> Option<RefNameBuf> {
-        self.target_branch
+        self.edited
+            .primary
             .as_ref()
             .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).into())
     }
@@ -507,13 +574,14 @@ impl Repo {
     /// frozen, and there is consequently no working copy. A detached-HEAD session
     /// with no branch argument is worktree-bound (`None == None`).
     pub fn is_worktree_bound(&self) -> bool {
-        self.target_branch == self.git_head_branch
+        self.edited.primary == self.git_head_branch
     }
 
     /// The edited branch's short name (its `refs/heads/` prefix stripped), or
     /// `None` on a detached HEAD with no branch selected. For UI/MCP labelling.
     pub fn target_branch_name(&self) -> Option<&str> {
-        self.target_branch
+        self.edited
+            .primary
             .as_deref()
             .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
     }
@@ -544,7 +612,8 @@ impl Repo {
         if self.is_worktree_bound() {
             self.head_commit()
         } else {
-            self.target_branch
+            self.edited
+                .primary
                 .as_deref()
                 .and_then(|b| crate::transparency::ref_commit(self.workspace.workspace_root(), b))
         }
@@ -709,18 +778,19 @@ impl Repo {
     /// Logs to stderr when it intervenes, so any remaining leak is visible
     /// rather than silently corrupting an unrelated (e.g. backup) branch.
     pub(crate) fn protect_unrelated_heads(&self, before: &BTreeMap<String, String>) {
-        // Exempt the *edited* branch (the one this session legitimately moves) and
-        // protect every other local branch — including the checked-out one when
-        // editing off-worktree.
+        // Exempt every branch in the *editable set* (the ones this session
+        // legitimately moves) and protect every other local branch — including the
+        // checked-out one when its branch is not in the set (off-worktree).
+        let exempt: Vec<&str> = self.edited.refs().collect();
         let restored = crate::transparency::restore_unrelated_heads(
             self.workspace.workspace_root(),
-            self.target_branch.as_deref(),
+            &exempt,
             before,
         );
         if !restored.is_empty() {
             eprintln!(
                 "commedit: reverted unintended move of branch(es) {}; \
-                 only the edited branch is rewritten",
+                 only the editable branches are rewritten",
                 restored.join(", ")
             );
         }
@@ -841,36 +911,71 @@ impl Repo {
         self.repo.view().git_head().as_normal().map(|id| id.hex())
     }
 
-    /// Mirror the branch tip jj exported into its throwaway git dir back into the
-    /// user's real repository — the single git ref move commedit performs itself
-    /// now that jj's objects land in the shared ODB but its refs stay session-
-    /// local (see [`Self::init_detached`]). Runs in the export tail *before*
-    /// materializing the working tree, so the user's HEAD resolves to the new tip
-    /// by the time the index is reset.
+    /// The tip jj exported for the bookmark `short` (a branch short-name) into its
+    /// session-local git dir, read from jj's own view — `None` if that bookmark is
+    /// absent or conflicted. The per-branch counterpart of [`Self::exported_tip`],
+    /// used by [`Self::bridge_branches_to_git`] to mirror each moved editable
+    /// bookmark back to the user repo.
+    fn exported_bookmark_tip(&self, short: &str) -> Option<String> {
+        let name: RefNameBuf = short.into();
+        self.repo
+            .view()
+            .get_local_bookmark(&name)
+            .as_normal()
+            .map(|id| id.hex())
+    }
+
+    /// Mirror every editable bookmark jj moved in its throwaway git dir back into
+    /// the user's real repository — the git ref moves commedit performs itself now
+    /// that jj's objects land in the shared ODB but its refs stay session-local
+    /// (see [`Self::init_detached`]). Runs in the export tail *before* materializing
+    /// the working tree, so the user's HEAD resolves to the new tip by the time the
+    /// index is reset.
     ///
-    /// Compare-and-swaps against `old_head` so a racing commedit instance is
-    /// detected, not clobbered; a mismatch (or any other failure) is logged and
-    /// tolerated, reconciled on the next open — the same posture jj's own ref
-    /// export takes (see [`crate::transparency::export_to_git`]).
-    pub(crate) fn bridge_branch_to_git(&self, old_head: Option<&str>) {
-        let Some(new_tip) = self.exported_tip() else {
-            return;
-        };
+    /// Each editable branch whose exported tip *differs* from its pre-rewrite oid in
+    /// `before` ([`Self::snapshot_heads`]) is moved, compare-and-swapped against that
+    /// per-branch old oid so a racing commedit instance is detected, not clobbered.
+    /// A bookmark whose tip is unchanged is skipped entirely (so editing one branch
+    /// never touches another's ref). On a detached HEAD (no primary branch) the
+    /// rewritten tip is mirrored onto `HEAD --no-deref`, CAS'd against `old_head`.
+    /// A mismatch (or any other failure) is logged and tolerated, reconciled on the
+    /// next open — the same posture jj's own ref export takes.
+    pub(crate) fn bridge_branches_to_git(
+        &self,
+        old_head: Option<&str>,
+        before: &BTreeMap<String, String>,
+    ) {
         let root = self.workspace.workspace_root();
-        // Move the *edited* branch's ref. Off-worktree this is a branch other than
-        // the checked-out one, moved by name (never `HEAD`); worktree-bound it is
-        // the checked-out branch, or `HEAD --no-deref` on a detached HEAD.
-        let (ref_name, no_deref) = match self.target_branch.as_deref() {
-            Some(branch) => (branch, false),
-            None => ("HEAD", true),
-        };
-        if let Err(e) =
-            crate::transparency::update_user_ref(root, ref_name, &new_tip, old_head, no_deref)
-        {
-            eprintln!(
-                "commedit: could not move {ref_name} to the rewritten tip {new_tip} ({e}); \
-                 git will reconcile on the next open"
-            );
+        // Detached HEAD: no editable branch ref, mirror the rewritten tip onto HEAD.
+        if self.edited.primary.is_none() {
+            if let Some(new_tip) = self.exported_tip() {
+                if let Err(e) =
+                    crate::transparency::update_user_ref(root, "HEAD", &new_tip, old_head, true)
+                {
+                    eprintln!(
+                        "commedit: could not move HEAD to the rewritten tip {new_tip} ({e}); \
+                         git will reconcile on the next open"
+                    );
+                }
+            }
+            return;
+        }
+        // Mirror each editable branch whose jj-exported tip moved vs `before`.
+        for full in self.edited.refs() {
+            let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+            let Some(new_tip) = self.exported_bookmark_tip(short) else {
+                continue; // absent or conflicted bookmark: nothing to mirror
+            };
+            let old = before.get(full).map(String::as_str);
+            if old == Some(new_tip.as_str()) {
+                continue; // unchanged: leave this branch's ref untouched
+            }
+            if let Err(e) = crate::transparency::update_user_ref(root, full, &new_tip, old, false) {
+                eprintln!(
+                    "commedit: could not move {full} to the rewritten tip {new_tip} ({e}); \
+                     git will reconcile on the next open"
+                );
+            }
         }
     }
 
@@ -911,7 +1016,11 @@ impl Repo {
     /// `record_synthetic_predecessors: false` keeps imported commits free of
     /// jj-only predecessor metadata.
     fn import_git(&mut self) -> Result<()> {
-        let current = self.current_bookmark();
+        let edited_short: Vec<String> = self
+            .edited
+            .refs()
+            .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
+            .collect();
         let mut tx = self.repo.start_transaction();
         pollster::block_on(git::import_head(tx.repo_mut())).context("importing git HEAD")?;
         let options = GitImportOptions {
@@ -919,19 +1028,20 @@ impl Repo {
             record_synthetic_predecessors: false,
             remote_auto_track_bookmarks: HashMap::new(),
         };
+        // Import the local bookmark for every branch in the editable set (a
+        // singleton set reproduces the classic single-branch import); remote-
+        // tracking refs and tags are excluded.
         let git_ref_filter = |kind: GitRefKind, symbol: RemoteRefSymbol<'_>| {
-            current.as_ref().is_some_and(|name| {
-                kind == GitRefKind::Bookmark
-                    && symbol.remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO
-                    && symbol.name == *name
-            })
+            kind == GitRefKind::Bookmark
+                && symbol.remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                && edited_short.iter().any(|n| n == symbol.name.as_str())
         };
         pollster::block_on(git::import_some_refs(
             tx.repo_mut(),
             &options,
             git_ref_filter,
         ))
-        .context("importing the checked-out branch")?;
+        .context("importing the editable branches")?;
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing after import")?;
         self.repo =
             pollster::block_on(tx.commit("import git refs")).context("committing import")?;
@@ -985,7 +1095,7 @@ impl Repo {
         crate::transparency::seed_session_head(
             &git_dir,
             self.workspace.workspace_root(),
-            self.target_branch.as_deref(),
+            self.edited.primary.as_deref(),
         )?;
         self.import_git()?;
         Ok(true)

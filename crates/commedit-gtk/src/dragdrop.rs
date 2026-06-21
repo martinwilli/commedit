@@ -391,6 +391,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
             let idx = row.index() as usize;
+            // Every commit in the unified DAG is editable, so every row is a drag
+            // source (cross-branch transplant routing lands in phase 3).
             // If the grabbed row is part of a standing multi-selection, drag the
             // whole set as a group; otherwise it's an ordinary single-commit drag.
             // Indices are in commit space (no placeholder is inserted yet) and stay

@@ -1235,9 +1235,19 @@ impl Repo {
         if self.is_worktree_bound() {
             // Write the rebased working-copy commit @' back to disk (preserving the
             // user's uncommitted changes through the rewrite), in place of the old
-            // git read-tree sync.
+            // git read-tree sync. Unconditional when worktree-bound: the launch `@`
+            // can move even when the launch branch's tip does not (e.g. `revert_all`
+            // resets the working copy), so a tip-only gate here would skip a needed
+            // re-materialization.
             self.materialize_after_rewrite(old_head)?;
         }
+        // Re-materialize every *extra* worktree whose branch tip actually moved (its
+        // bridged git ref differs from the pre-rewrite `before` map). A worktree
+        // whose branch was untouched is left frozen, and a selected branch with no
+        // worktree is a pure ref-move (none registered). Unlike the launch worktree,
+        // an extra worktree's `@` only moves when its branch tip does, so a tip
+        // comparison is both correct and sufficient here.
+        self.materialize_moved_worktrees(heads)?;
         Ok(())
     }
 }

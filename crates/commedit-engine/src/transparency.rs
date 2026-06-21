@@ -543,6 +543,26 @@ fn git_line(workspace_root: &Path, args: &[&str]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// Resolve a git-relative path (e.g. `info/exclude`) to its absolute location for
+/// the worktree at `workspace_root`, the way `git rev-parse --git-path` does —
+/// honouring a linked worktree's separate gitdir vs. its common dir. `None` if git
+/// can't be run or the path can't be resolved.
+pub fn git_path(workspace_root: &Path, rel: &str) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", "--git-path", rel])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(workspace_root.join(raw))
+}
+
 /// Read a single git config value (e.g. `user.name`) as git itself would see it
 /// — honouring the system, global, and repo-local config hierarchy. `None` if
 /// the key is unset or git can't be run. Whitespace-only values count as unset.
@@ -592,11 +612,13 @@ pub fn resolve_local_branch(workspace_root: &Path, name: &str) -> Result<String>
     Ok(full)
 }
 
-/// The worktree that currently has `branch` (a full ref like `refs/heads/feature`)
-/// checked out, if any — parsed from `git worktree list --porcelain`. commedit
-/// refuses to rewrite a branch that is live in another worktree: moving its ref
-/// would leave that worktree's HEAD/index pointing at an orphaned commit.
-pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+/// Every git worktree of this repository, paired with the full ref name of the
+/// branch it has checked out (`None` for a detached-HEAD worktree) — parsed from
+/// `git worktree list --porcelain`. The main worktree is included. commedit maps
+/// each editable branch's worktree onto a jj workspace so a rewrite that moves
+/// that branch re-materializes *its* working copy (see
+/// [`crate::repo::Repo::open_multi`]).
+pub fn worktrees(workspace_root: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
     let out = Command::new("git")
         .current_dir(workspace_root)
         .args(["worktree", "list", "--porcelain"])
@@ -609,17 +631,36 @@ pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option
         );
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut result: Vec<(PathBuf, Option<String>)> = Vec::new();
     let mut current: Option<PathBuf> = None;
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
+            // A blank line separates worktree records; the `worktree` line opens
+            // a new one. Push the previous (branchless or detached) record first.
+            if let Some(prev) = current.take() {
+                result.push((prev, None));
+            }
             current = Some(PathBuf::from(path));
         } else if let Some(b) = line.strip_prefix("branch ") {
-            if b == branch {
-                return Ok(current);
+            if let Some(path) = current.take() {
+                result.push((path, Some(b.to_string())));
             }
         }
     }
-    Ok(None)
+    if let Some(path) = current.take() {
+        result.push((path, None));
+    }
+    Ok(result)
+}
+
+/// The worktree that currently has `branch` (a full ref like `refs/heads/feature`)
+/// checked out, if any. A thin filter over [`worktrees`]; commedit uses it to map
+/// each editable branch onto its worktree (registering a jj workspace there) and,
+/// when no such mapping is possible, to refuse the open.
+pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(worktrees(workspace_root)?
+        .into_iter()
+        .find_map(|(path, b)| (b.as_deref() == Some(branch)).then_some(path)))
 }
 
 /// The full ref name (e.g. `refs/heads/main`) HEAD symbolically points at, or

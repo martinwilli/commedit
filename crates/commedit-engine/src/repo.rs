@@ -17,7 +17,7 @@ use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
-use jj_lib::ref_name::{RefNameBuf, RemoteRefSymbol, WorkspaceName};
+use jj_lib::ref_name::{RefNameBuf, RemoteRefSymbol, WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _};
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
@@ -51,6 +51,15 @@ pub struct Repo {
     /// and the classic GTK/CLI opens pass. The primary is `None` only on a detached
     /// HEAD with no branch selected. See [`Self::is_worktree_bound`].
     edited: EditableSet,
+    /// The *extra* worktrees: every editable branch other than the launch one
+    /// that is checked out in a git worktree, mapped onto its own jj workspace so
+    /// a rewrite that moves that branch re-materializes *its* working copy and
+    /// resets *its* index (full per-worktree symmetry — see [`WorktreeView`] and
+    /// [`Repo::open_multi`]). The launch worktree is `self.workspace` (the jj
+    /// `DEFAULT` workspace), never listed here; an editable branch with no
+    /// worktree (`open_multi` couldn't map one) is a pure ref-move and absent too.
+    /// Empty in the classic singleton/MCP path.
+    pub(crate) extra_worktrees: Vec<WorktreeView>,
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
@@ -137,6 +146,26 @@ impl EditableSet {
             .into_iter()
             .chain(self.extra.iter().map(String::as_str))
     }
+}
+
+/// An editable branch that is checked out in a *separate* git worktree, mapped
+/// onto its own jj workspace so commedit can keep that worktree in sync. Each
+/// holds the jj [`Workspace`] anchored at the worktree's root (with its own
+/// working-copy state and `@`), the full ref of the branch checked out there, and
+/// the jj workspace name keying its `@` in the view. The launch worktree is *not*
+/// one of these — it is the `Repo`'s primary [`Repo::workspace`] (the `DEFAULT`
+/// jj workspace).
+pub(crate) struct WorktreeView {
+    /// The jj workspace anchored at the worktree's on-disk root, with its own
+    /// working-copy state dir. Snapshotted before each mutation and re-checked-out
+    /// after a rewrite that moves [`Self::branch`].
+    pub(crate) workspace: Workspace,
+    /// The full ref (`refs/heads/…`) of the branch checked out in this worktree —
+    /// one of the editable set, never the launch branch.
+    pub(crate) branch: String,
+    /// The jj workspace name keying this worktree's `@` in the repo view
+    /// (`get_wc_commit_id(name)`). Derived from [`Self::branch`]'s short name.
+    pub(crate) name: WorkspaceNameBuf,
 }
 
 /// A local branch the multi-branch DAG view can fold in: its short-name, current
@@ -252,23 +281,30 @@ impl Repo {
                 extra: it.collect(),
             }
         };
-        // Refuse editing a branch live in *another* worktree (off-worktree): moving
-        // its ref would orphan that checkout.
-        for full in edited.refs() {
-            if Some(full) == git_head_branch.as_deref() {
-                continue; // the launch worktree's own branch is always safe
-            }
-            if let Some(other) = crate::transparency::worktree_for_branch(workspace_root, full)? {
-                let short = full.strip_prefix("refs/heads/").unwrap_or(full);
-                anyhow::bail!(
-                    "branch '{short}' is checked out in worktree {}; editing its \
-                     history there would corrupt that worktree. Open commedit in \
-                     that worktree (without a branch argument), or detach its HEAD \
-                     first.",
-                    other.display()
-                );
-            }
-        }
+        // Map every editable branch onto the git worktree it is checked out in (if
+        // any) that is *not* the launch worktree. Phase 1b registers a jj workspace
+        // per such worktree so a rewrite that moves the branch re-materializes
+        // *its* working copy and resets *its* index — so a branch live in another
+        // worktree is now editable (it was refused before per-worktree sync
+        // existed). The launch worktree's own branch (worktree-bound) is handled by
+        // the working-copy path, not here; a branch with no worktree stays a pure
+        // ref-move (no entry). Keyed on the worktree *path*, not the branch name, so
+        // even the primary branch — when it lives in a worktree other than the
+        // launch one (off-worktree open) — is kept in sync.
+        let launch_root = std::fs::canonicalize(workspace_root).unwrap_or(workspace_root.into());
+        let worktree_map = crate::transparency::worktrees(workspace_root)?;
+        let extra_targets: Vec<(String, PathBuf)> = edited
+            .refs()
+            .filter_map(|full| {
+                worktree_map
+                    .iter()
+                    .find(|(_, b)| b.as_deref() == Some(full))
+                    .map(|(path, _)| (full.to_string(), path.clone()))
+            })
+            .filter(|(_, path)| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != launch_root
+            })
+            .collect();
 
         // Acquire the cache slot (a shared lock held for the session) and run
         // opportunistic eviction while the base is resolved.
@@ -325,6 +361,7 @@ impl Repo {
             settings,
             git_head_branch,
             edited,
+            extra_worktrees: Vec::new(),
             pending: None,
             session_op: None,
             session_head: None,
@@ -349,6 +386,13 @@ impl Repo {
             // Record any uncommitted changes into @ so they show in the history and
             // ride through rewrites from the start.
             this.snapshot_working_copy()?;
+        }
+        // Register each extra editable branch's worktree as its own jj workspace,
+        // anchoring an `@` on the branch tip and snapshotting that worktree's disk
+        // — so its uncommitted changes ride through a later rewrite exactly like the
+        // launch worktree's. Done after import so the branch tip is in jj's view.
+        for (branch, path) in extra_targets {
+            this.register_worktree(&branch, &path)?;
         }
         // Remember the fully-initialized session-start state (after the working
         // copy snapshot, so it includes the original uncommitted changes) so
@@ -545,6 +589,84 @@ impl Repo {
         )
         .context("assembling the jj workspace")?;
         Ok((workspace, repo))
+    }
+
+    /// Register an editable branch's git worktree as a *second* jj workspace, so
+    /// commedit keeps that worktree in sync the same way it keeps the launch one.
+    /// `branch` (full ref) is checked out at `worktree_root` on disk; the branch is
+    /// already imported into jj's view (`open_multi` registers after `import_git`).
+    ///
+    /// It mints a fresh jj workspace name (from the branch short-name) and a
+    /// per-worktree working-copy state dir under this session's temp workdir, anchors
+    /// a fresh `@` on the branch's imported tip in the repo view (mirroring the launch
+    /// worktree's open-time reattach), then snapshots that worktree's disk into its
+    /// `@` so its uncommitted changes are tracked from the start. The new
+    /// [`WorktreeView`] is recorded in [`Self::extra_worktrees`]; a [`Self::workspace`]
+    /// remains the launch worktree's `DEFAULT` workspace, untouched.
+    fn register_worktree(&mut self, branch: &str, worktree_root: &Path) -> Result<()> {
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        // The jj workspace name keys this worktree's `@` in the view. Branch short-
+        // names are unique among local branches, so this never collides with another
+        // worktree's name (nor with the `DEFAULT` launch workspace).
+        let name: WorkspaceNameBuf = short.into();
+        // A private working-copy state dir for this worktree, alongside the launch
+        // worktree's `working_copy/` under the session temp workdir.
+        let wc_state = self._workdir.path().join(format!("working_copy-{short}"));
+        std::fs::create_dir_all(&wc_state)
+            .with_context(|| format!("creating working-copy state dir for worktree '{short}'"))?;
+
+        let working_copy = LocalWorkingCopyFactory {}
+            .init_working_copy(
+                self.repo.store().clone(),
+                worktree_root.to_path_buf(),
+                wc_state,
+                self.repo.op_id().clone(),
+                name.clone(),
+                &self.settings,
+            )
+            .with_context(|| format!("initializing the working copy for worktree '{short}'"))?;
+        let workspace = Workspace::new(
+            worktree_root,
+            self.workspace.repo_path().to_path_buf(),
+            working_copy,
+            self.repo.loader().clone(),
+        )
+        .with_context(|| format!("assembling the jj workspace for worktree '{short}'"))?;
+
+        let mut view = WorktreeView {
+            workspace,
+            branch: branch.to_string(),
+            name: name.clone(),
+        };
+        // Anchor a fresh `@` on the branch's imported tip, so the following snapshot
+        // records only that worktree's uncommitted delta (not its whole history).
+        // The bookmark is keyed by the branch short-name (a ref name), distinct from
+        // the workspace name (which keys the `@` in the view).
+        let bookmark: RefNameBuf = short.into();
+        if let Some(tip) = self
+            .repo
+            .view()
+            .get_local_bookmark(&bookmark)
+            .as_normal()
+            .cloned()
+        {
+            let commit = self
+                .repo
+                .store()
+                .get_commit(&tip)
+                .context("loading the worktree branch tip")?;
+            let mut tx = self.repo.start_transaction();
+            pollster::block_on(tx.repo_mut().check_out(name, &commit))
+                .context("anchoring the worktree working copy on its branch tip")?;
+            pollster::block_on(tx.repo_mut().rebase_descendants())
+                .context("rebasing after attach")?;
+            self.repo = pollster::block_on(tx.commit("commedit: attach worktree working copy"))
+                .context("committing the worktree attach")?;
+        }
+        // Snapshot the worktree's disk into its `@` (uncommitted changes ride along).
+        self.snapshot_extra_worktree(&mut view)?;
+        self.extra_worktrees.push(view);
+        Ok(())
     }
 
     /// Re-attach git HEAD to the originally checked-out branch, undoing jj's

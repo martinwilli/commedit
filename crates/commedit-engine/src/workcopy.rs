@@ -125,7 +125,12 @@ impl Repo {
     /// like `git add`, so only this first snapshot needs to name it; a path that is
     /// already tracked or absent on disk is a harmless no-op.
     pub fn snapshot_working_copy_tracking(&mut self, add_paths: &[String]) -> Result<()> {
-        // Off-worktree there is no working copy to snapshot: the on-disk tree
+        // First snapshot every *extra* worktree (independent of the launch branch's
+        // worktree state — an off-worktree session can still have editable branches
+        // that *are* checked out elsewhere), so each worktree's uncommitted changes
+        // ride through the rewrite this snapshot precedes.
+        self.snapshot_extra_worktrees()?;
+        // Off-worktree there is no launch working copy to snapshot: the on-disk tree
         // belongs to a different (checked-out) branch and must not be folded into
         // the edited branch's `@`. A silent no-op keeps the callers that snapshot
         // defensively (open, session_changes, every mutation) working unchanged.
@@ -218,7 +223,18 @@ impl Repo {
     /// tree from (a repo with no commits). That fallback is safe: it only risks
     /// over-tracking, never dropping a committed file.
     fn tracked_paths_matcher(&self, extra: &[RepoPathBuf]) -> Result<Box<dyn Matcher>> {
-        let Some(wc_id) = self.working_copy_commit_id() else {
+        self.tracked_paths_matcher_for(self.working_copy_commit_id(), extra)
+    }
+
+    /// [`Self::tracked_paths_matcher`] for an explicit working-copy commit `@`
+    /// (rather than the launch workspace's), so an extra worktree's snapshot tracks
+    /// exactly the files its own branch tip holds.
+    fn tracked_paths_matcher_for(
+        &self,
+        wc_id: Option<CommitId>,
+        extra: &[RepoPathBuf],
+    ) -> Result<Box<dyn Matcher>> {
+        let Some(wc_id) = wc_id else {
             return Ok(Box::new(EverythingMatcher));
         };
         let wc = self
@@ -238,6 +254,131 @@ impl Repo {
         let mut paths: Vec<RepoPathBuf> = base.tree().entries().map(|(path, _)| path).collect();
         paths.extend(extra.iter().cloned());
         Ok(Box::new(FilesMatcher::new(paths)))
+    }
+
+    /// Snapshot every extra worktree (see [`Self::snapshot_extra_worktree`]) before
+    /// a mutation. The worktree list is temporarily moved out so each snapshot can
+    /// borrow `&mut self` and the view together; it is always restored (including on
+    /// error). A no-op in the classic singleton path (no extra worktrees).
+    pub(crate) fn snapshot_extra_worktrees(&mut self) -> Result<()> {
+        if self.extra_worktrees.is_empty() {
+            return Ok(());
+        }
+        let mut views = std::mem::take(&mut self.extra_worktrees);
+        let result = views
+            .iter_mut()
+            .try_for_each(|view| self.snapshot_extra_worktree(view));
+        self.extra_worktrees = views;
+        result
+    }
+
+    /// Snapshot one *extra* worktree's on-disk tree into its own `@` (keyed by the
+    /// view's per-worktree workspace name), so its uncommitted changes are recorded
+    /// and ride through a later `rebase_descendants` exactly like the launch
+    /// worktree's. The per-worktree analogue of [`Self::snapshot_working_copy`],
+    /// minus the launch-only HEAD catch-up / `@`-chain reconciliation: an extra
+    /// worktree has a single `@` directly on its branch tip (anchored at
+    /// registration), and its branch is moved only by commedit, never by an
+    /// out-of-band `git commit`. A no-op when its disk matches the last snapshot.
+    pub(crate) fn snapshot_extra_worktree(
+        &mut self,
+        view: &mut crate::repo::WorktreeView,
+    ) -> Result<()> {
+        let name = view.name.clone();
+        let wc_id = self.repo.view().get_wc_commit_id(&name).cloned();
+        let tracked = self.tracked_paths_matcher_for(wc_id.clone(), &[])?;
+        let base_ignores = self.base_ignores_at(view.workspace.workspace_root())?;
+        let options = SnapshotOptions {
+            base_ignores,
+            progress: None,
+            start_tracking_matcher: tracked.as_ref(),
+            force_tracking_matcher: tracked.as_ref(),
+            max_new_file_size: u64::MAX,
+        };
+
+        let mut locked_ws = block_on(view.workspace.start_working_copy_mutation())
+            .context("locking the worktree working copy")?;
+        let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
+            .context("snapshotting the worktree working copy")?;
+
+        if let Some(wc_id) = wc_id {
+            let wc = self
+                .repo
+                .store()
+                .get_commit(&wc_id)
+                .context("loading the worktree working-copy commit")?;
+            if wc.tree().tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
+                let mut tx = self.repo.start_transaction();
+                block_on(tx.repo_mut().rewrite_commit(&wc).set_tree(new_tree).write())
+                    .context("recording the worktree working-copy snapshot")?;
+                block_on(tx.repo_mut().rebase_descendants())
+                    .context("rebasing after worktree snapshot")?;
+                self.repo = block_on(tx.commit("commedit: snapshot worktree working copy"))
+                    .context("committing the worktree working-copy snapshot")?;
+            }
+        }
+        let op_id = self.repo.operation().id().clone();
+        block_on(locked_ws.finish(op_id)).context("saving worktree working-copy state")?;
+        Ok(())
+    }
+
+    /// Re-materialize every extra worktree whose branch tip moved across the
+    /// rewrite — its bridged git ref now differs from its pre-rewrite oid in
+    /// `before` ([`Repo::snapshot_heads`]). A worktree whose branch was untouched is
+    /// left frozen on disk. Runs in the export tail *after* the editable bookmarks
+    /// have been bridged to git, so each worktree's ref already holds its new tip.
+    /// A no-op in the classic singleton path (no extra worktrees).
+    pub(crate) fn materialize_moved_worktrees(
+        &mut self,
+        before: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        if self.extra_worktrees.is_empty() {
+            return Ok(());
+        }
+        let mut views = std::mem::take(&mut self.extra_worktrees);
+        let result = views.iter_mut().try_for_each(|view| {
+            let root = view.workspace.workspace_root();
+            let new_tip = crate::transparency::ref_commit(root, &view.branch);
+            let old_tip = before.get(&view.branch).map(String::as_str);
+            if new_tip.as_deref() == old_tip {
+                return Ok(()); // this worktree's branch was untouched: leave it frozen
+            }
+            self.materialize_extra_worktree(view)
+        });
+        self.extra_worktrees = views;
+        result
+    }
+
+    /// Materialize one extra worktree's rebased `@'` back to its own on-disk root
+    /// and reset *its* git index to its branch tip, so that worktree's `git status`
+    /// reflects the rewrite while preserving its uncommitted changes. The
+    /// per-worktree analogue of [`Self::materialize_after_rewrite`]; called only for
+    /// a worktree whose branch tip actually moved (see [`crate::conflict`]'s export
+    /// tail). The index-only-content backup is launch-worktree-specific and skipped
+    /// here.
+    pub(crate) fn materialize_extra_worktree(
+        &mut self,
+        view: &mut crate::repo::WorktreeView,
+    ) -> Result<()> {
+        let name = view.name.clone();
+        let Some(wc_id) = self.repo.view().get_wc_commit_id(&name).cloned() else {
+            return Ok(());
+        };
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&wc_id)
+            .context("loading the worktree commit to check out")?;
+        let op_id = self.repo.operation().id().clone();
+        block_on(view.workspace.check_out(op_id, None, &commit))
+            .context("checking out the worktree working copy")?;
+        // Reset that worktree's index to its branch's new tip, so its `git status`
+        // shows the preserved uncommitted changes against the rewritten history.
+        let root = view.workspace.workspace_root();
+        if let Some(new_tip) = crate::transparency::ref_commit(root, &view.branch) {
+            crate::transparency::reset_index_to(root, &new_tip)?;
+        }
+        Ok(())
     }
 
     /// Write `target`'s tree to the working directory (and update jj's
@@ -1102,17 +1243,22 @@ impl Repo {
         Ok(())
     }
 
-    /// The base gitignore for snapshotting: the repo-local `.git/info/exclude`
-    /// (in-tree `.gitignore`s are chained automatically as jj descends).
+    /// The base gitignore for snapshotting the launch worktree: its
+    /// `.git/info/exclude` (in-tree `.gitignore`s are chained automatically as jj
+    /// descends).
     fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>> {
-        let exclude = self
-            .workspace
-            .workspace_root()
-            .join(".git")
-            .join("info")
-            .join("exclude");
+        self.base_ignores_at(self.workspace.workspace_root())
+    }
+
+    /// [`Self::base_ignores`] for an arbitrary worktree `root`. A *linked* worktree's
+    /// `.git` is a file, not a directory, so its `info/exclude` is resolved via git
+    /// (`rev-parse --git-path`) rather than the literal `.git/info/exclude` path;
+    /// the launch worktree resolves to the same place.
+    fn base_ignores_at(&self, root: &std::path::Path) -> Result<Arc<GitIgnoreFile>> {
+        let exclude = crate::transparency::git_path(root, "info/exclude")
+            .unwrap_or_else(|| root.join(".git").join("info").join("exclude"));
         GitIgnoreFile::empty()
             .chain_with_file(RepoPath::root(), exclude)
-            .context("reading .git/info/exclude")
+            .context("reading info/exclude")
     }
 }

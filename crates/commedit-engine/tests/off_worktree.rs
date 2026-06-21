@@ -1,8 +1,9 @@
 //! End-to-end: editing the history of a branch that is *not* checked out in the
 //! worktree. The session moves only that branch's ref; HEAD, the index and the
 //! on-disk worktree stay frozen, and there is no working copy (working-copy
-//! operations are refused). Opening a branch that is live in another worktree —
-//! or one that doesn't exist — is refused up front.
+//! operations are refused). A branch that is live in *another* worktree is now
+//! editable — commedit maps that worktree onto a jj workspace and keeps it in
+//! sync (Phase 1b) — while a branch that doesn't exist is still refused up front.
 
 mod common;
 
@@ -215,25 +216,56 @@ fn session_changes_and_undo_track_the_off_worktree_branch() {
 }
 
 #[test]
-fn opening_a_branch_checked_out_in_another_worktree_is_refused() {
+fn editing_a_branch_live_in_another_worktree_syncs_that_worktree() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     init_two_branch_repo(dir);
 
-    // Check `feature` out in a linked worktree, then try to edit its history from
-    // the main checkout — rewriting it would orphan that worktree.
+    // Check `feature` out in a linked worktree, then edit its history from the main
+    // checkout. Phase 1b maps that worktree onto a jj workspace, so the rewrite is
+    // now allowed and keeps the linked worktree in sync (it was refused before).
     let wt_parent = tempfile::tempdir().unwrap();
     let wt = wt_parent.path().join("wt");
     common::git(dir, &["worktree", "add", wt.to_str().unwrap(), "feature"]);
+    let main_before = rev(dir, "main");
+    let head_before = rev(dir, "HEAD");
 
-    let err = match Repo::open_branch(dir, IndexCache::Disabled, Some("feature")) {
-        Ok(_) => panic!("editing a branch live in another worktree must be refused"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("checked out in worktree"),
-        "refusal explains the conflict: {err}"
+    let mut repo =
+        Repo::open_branch(dir, IndexCache::Disabled, Some("feature")).expect("open feature");
+
+    // Rewrite D's file content; feature's ref moves and the linked worktree is
+    // re-materialized onto the new tip.
+    let d = commit_id(&repo, "D");
+    repo.rewrite_file(&d, "d.txt", "d rewritten\n")
+        .expect("rewrite D");
+
+    assert_eq!(subjects(dir, "feature"), vec!["D", "C", "B", "A"]);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("d.txt")).unwrap(),
+        "d rewritten\n",
+        "the linked worktree's file follows the rewrite"
     );
+    // The linked worktree's index matches its new tip → a clean status there.
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "",
+        "the linked worktree's index was reset to the rewritten tip"
+    );
+    // The launch worktree (main) is untouched: ref, HEAD and a clean tree.
+    assert_eq!(rev(dir, "main"), main_before, "main ref unmoved");
+    assert_eq!(rev(dir, "HEAD"), head_before, "launch HEAD frozen");
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+
+    // Undo: feature's tip moves back, so the linked worktree re-materializes onto
+    // the original content (its tip-moved gate fires in reverse, too).
+    repo.undo().expect("undo");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("d.txt")).unwrap(),
+        "d\n",
+        "undo restored the linked worktree's file"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
 }
 
 #[test]

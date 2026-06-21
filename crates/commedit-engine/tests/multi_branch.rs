@@ -276,3 +276,175 @@ fn a_singleton_set_behaves_like_classic_single_branch() {
     );
     g(&["fsck", "--no-progress"]);
 }
+
+/// Add a linked worktree on `feature` (the `setup` layout: `main: A-B-C` checked
+/// out in `dir`, `feature: A-B-F`) at a path *outside* `dir` (git refuses nesting),
+/// returning the linked worktree's canonical path. The `parent` TempDir must
+/// outlive the worktree. Phase 1b maps it onto its own jj workspace.
+fn add_feature_worktree(dir: &std::path::Path, parent: &tempfile::TempDir) -> std::path::PathBuf {
+    let wt = parent.path().join("wt");
+    common::git(dir, &["worktree", "add", wt.to_str().unwrap(), "feature"]);
+    std::fs::canonicalize(&wt).unwrap()
+}
+
+/// Phase 1b: a rewrite touching the *second* worktree's branch updates **that**
+/// worktree's files and index, while the launch worktree stays clean — and the
+/// reverse holds for an edit on the launch branch.
+#[test]
+fn a_rewrite_materializes_only_the_touched_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    let head_before = g(&["rev-parse", "HEAD"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Rewrite F's content (lives only on feature, checked out in the linked wt).
+    let f = find_commit(&repo, &heads, "F");
+    repo.rewrite_file(&f, "f.txt", "f rewritten\n")
+        .expect("rewrite F");
+
+    // The linked worktree followed the rewrite; its index is clean against the tip.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f rewritten\n",
+        "the feature worktree's file follows the rewrite"
+    );
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "",
+        "the feature worktree's index was reset to the rewritten tip"
+    );
+    // The launch worktree (main) is untouched: HEAD frozen, tree clean, f.txt absent.
+    assert_eq!(g(&["rev-parse", "HEAD"]), head_before, "launch HEAD frozen");
+    assert_eq!(g(&["status", "--porcelain"]), "", "launch worktree clean");
+    assert!(!dir.join("f.txt").exists(), "f.txt is not on main");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Phase 1b: uncommitted changes in *each* worktree survive a rewrite — every
+/// worktree's `@` is snapshotted before the mutation and re-materialized after, so
+/// neither the launch worktree's nor the linked worktree's edits are clobbered.
+#[test]
+fn uncommitted_changes_in_each_worktree_survive_a_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    // Dirty both worktrees on a tracked file before opening.
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "a dirty on feature\n").unwrap();
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Rewrite the shared ancestor B: both branches rebase, both worktrees move.
+    let b = find_commit(&repo, &heads, "B");
+    repo.rewrite_message(&b, "B (edited)").expect("rewrite B");
+
+    // Each worktree's uncommitted edit to a.txt is preserved across the rewrite.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "a dirty on main\n",
+        "main's uncommitted change survived"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a dirty on feature\n",
+        "the feature worktree's uncommitted change survived"
+    );
+    // Both branches carry the rewritten ancestor.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B (edited)", "A"]
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B (edited)", "A"]
+    );
+    // Both worktrees still report exactly the one dirty file (index synced to tip).
+    // (The `common::git` helper trims, so the porcelain " M a.txt" loses its lead.)
+    assert_eq!(g(&["status", "--porcelain"]), "M a.txt");
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M a.txt");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Phase 1b: narrowing the editable set back to a single branch (no extra
+/// worktree) still works and is byte-identical to the classic single-branch open —
+/// the registration machinery cleanly degrades to nothing.
+#[test]
+fn narrowing_to_one_branch_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    let feature_before = g(&["rev-parse", "feature"]);
+    let wt_status_before = common::git(&wt, &["status", "--porcelain"]);
+
+    // Open just `main` even though `feature` has a worktree: feature is not in the
+    // editable set, so no extra worktree is registered and it stays frozen.
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into()],
+    )
+    .expect("open singleton");
+
+    let head = repo.head_commit_id().expect("head");
+    let c = commedit_engine::history::history(&repo.repo, &head).expect("history")[0]
+        .id
+        .clone();
+    repo.rewrite_message(&c, "C (edited)").expect("rewrite");
+
+    assert_eq!(
+        common::git_log_subjects(dir),
+        vec!["C (edited)", "B", "A"],
+        "main carries the edit"
+    );
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature (not in the set) is left where it was"
+    );
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        wt_status_before,
+        "the feature worktree is untouched"
+    );
+    g(&["fsck", "--no-progress"]);
+}

@@ -230,6 +230,18 @@ that aborting is *not* an `undo` of a landed mutation — nothing landed; the re
 exported. A conflict-aware student left to its own judgment will (correctly) stop and ask before
 resolving, so the prompt must carry the resolve-and-abort intent explicitly (as T3's does).
 
+### Automated correctness gate (`./dogfood/verify.sh`)
+The PASS column above is codified as a deterministic, **git-only** oracle:
+`./dogfood/verify.sh <t1..t10> <worktree-path>` asserts each task's end state (subjects, file
+contents, topology, tree-vs-`stress/base`, clean tree) and exits `0`=PASS / `1`=FAIL, ending with a
+`PASS: t<n>` / `FAIL: t<n>` line. It addresses commits by their stable fixture **subject** and by
+**content**, never by sha/change_id (both churn), so it survives a rebuild and grades any solving
+path identically — MCP *or* plain git (validated: the same script passes the operator solutions and
+the mechanically-different plain-git ones). Because it touches no MCP session it is also the
+**post-settle re-check** for the ref-write race (§5): a silently-reverted result fails the oracle even
+when the student self-reported success. It grades the **end state only** — transient beats (T10's
+`abort_rewrite`, the resolution loop itself) are still read from the Tool Log.
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -278,7 +290,10 @@ two parents, T8's dropped commit lands in the trash where `restore_commit` can r
 re-date batch stays tree-identical, and T10's reorder actually *holds* a conflict — and that
 `abort_rewrite` leaves the region identical to `stress/base`). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
-the dirty WC, then confirm the fold rebases clean and the partition lands.
+the dirty WC, then confirm the fold rebases clean and the partition lands. After solving each task,
+run `./dogfood/verify.sh <task> <cal>` and confirm it exits 0 — calibration is also where the oracle
+is validated to agree with your hand-checked answer key (and where you'd fix it if a tool change
+moved the minimal path).
 Open the calibration session once with `open_session(branch=stress/cal)` (worktree-bound at
 `<cal>`); between tasks `git -C <cal> reset --hard stress/base && reload_repo(session=<cal id>)`
 (scoped — does not disturb other sessions).
@@ -309,10 +324,11 @@ For each task T (1→10), each solver S (operator, control, git):
      conflict-aware operator correctly stops and asks), and **require a `## Tool Log`** appended.
      **op/ctl prompts must state the session id** and instruct the student to pass `session=<id>` on
      **every** MCP tool call (the server's own MCP instructions document the required selector).
-4. **Verify out-of-band**: for op/ctl, `list_operations(session=<id>)` then
-   `git -C <wt> log --graph / show / diff stress/base / fsck / status`; for the git student,
-   verify **purely from `git -C <wt>`** (`list_operations` is N/A — it never touched the server).
-   Compare to the answer key.
+4. **Verify out-of-band**: run the oracle — `./dogfood/verify.sh <task> <wt>` — as the correctness
+   **gate** (exit 0 = PASS); it is pure `git -C <wt>`, so it grades op/ctl and the git student
+   identically. Then eyeball the soft axes: for op/ctl `list_operations(session=<id>)` plus
+   `git -C <wt> log --graph / show`; for the git student its Tool Log. (`list_operations` is N/A for
+   the git student — it never touched the server.)
 5. **Capture metrics** (before the next `reload_repo(session=<id>)` resets that session's op-log):
    record the student's **tokens + wall-clock** from its transcript (recipe below).
 6. **Score** (rubric below). If correctness fails or there's a clear teachable miss, `SendMessage`
@@ -327,8 +343,9 @@ For each task T (1→10), each solver S (operator, control, git):
 > after it finished** (run 4 lost 3 of 40 this way; 3 more self-recovered from reflog). The object store
 > is safe (append-only); only **ref updates** race. Before a fully-parallel run, prefer one of: a
 > separate clone/common-dir per student; `git config gc.auto 0` (+ `maintenance.auto false`) on the
-> repo; or capped concurrency. Either way, **verify out-of-band from `git` after the run settles** — the
-> revert can land post-completion, so student self-reports are not authoritative. See [run 4](runs/4.md).
+> repo; or capped concurrency. Either way, **re-run the oracle (`./dogfood/verify.sh`) after the run
+> settles** — it is exactly this out-of-band `git` re-check, and the revert can land post-completion,
+> so student self-reports are not authoritative. See [run 4](runs/4.md).
 
 ### Between repeats of a task on the same worktree
 `git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**
@@ -387,7 +404,7 @@ When done: `close_session(session=<id>)` each per-task session (the registry ref
 checked-out branch).
 
 ### Grading rubric (1–5 each + overall)
-correctness (gate) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
+correctness (gate — `./dogfood/verify.sh <task> <wt>` must exit 0) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
 capture* — the only currency comparable across all three solvers; tokens-by-component and wall-clock
 are noisier secondaries; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
 undercounts — `undo` prunes — read the **Tool Log** for true effort) · tool-fit (op/ctl: surgical
@@ -458,6 +475,10 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
 - Rebuild the fixture (`./dogfood/reposetup.sh`), re-derive change ids with `list_history` (they
   differ per build), re-run calibration (§4) — **don't trust last run's answer keys blindly**; a
   tool change may alter call counts or which path is "minimal."
+- **The oracle (`./dogfood/verify.sh`) keys on fixture SUBJECTS + file content, not shas**, so it
+  survives a rebuild untouched — but if you rename a fixture commit subject or move a smell to a new
+  file, update the matching assertion in `verify.sh`. Run it as the correctness gate for every
+  student, and **re-run it after a parallel run settles** to catch a ref-race revert (§5).
 - If tools were **added/renamed**: update the minimal paths in §4 and the rubric's tool-fit notes.
   Re-check whether the footguns recorded under [`runs/`](runs/) are fixed (does `split_commit` now
   warn on an empty child? does the interior-drop auto-resolve fire?).

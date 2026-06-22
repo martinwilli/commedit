@@ -13,7 +13,7 @@
 //! This module owns that state machine. The mutation methods in [`crate::rewrite`]
 //! / [`crate::tree`] all funnel their tail through [`Repo::finish_mutation`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
@@ -193,6 +193,31 @@ pub(crate) enum SpuriousResolve {
     /// that lingers in the store) so its original change can be re-applied even
     /// though it is absent from the pre-restore history.
     Restore { commit: CommitId },
+}
+
+/// One editable branch's spurious-conflict rebuild, computed read-only by
+/// [`Repo::plan_spurious_head`] and applied in the shared transaction by
+/// [`Repo::try_auto_resolve_spurious`]. `chain` is the branch's current
+/// (conflicted) commit chain oldest-first; `[lo, n]` (with `n` the tip index) is
+/// the conflicted range to rewrite with explicit trees; `trees[i]` holds the
+/// reconstructed clean tree for each `i` in that range.
+struct ChainRebuild {
+    chain: Vec<Commit>,
+    lo: usize,
+    n: usize,
+    trees: Vec<Option<MergedTree>>,
+}
+
+/// Outcome of planning one editable branch's spurious rebuild.
+enum HeadPlan {
+    /// The branch's chain is conflict-free — nothing to rebuild here, skip it.
+    Clean,
+    /// The branch can't be safely auto-resolved (a true conflict at the tip, a
+    /// non-linear range, a missing original, a structural change): abandon the
+    /// whole attempt and hand every conflict to manual resolution.
+    Bail,
+    /// The branch's conflicted range was reconstructed clean.
+    Rebuild(ChainRebuild),
 }
 
 /// The held-back state of a rewrite whose chain is conflicted, carried across
@@ -955,63 +980,274 @@ impl Repo {
 
     /// Try to rebuild a held-back rewrite whose conflicts are merely *spurious* —
     /// adjacent-but-independent edits that jj's symmetric 3-way merge can't place,
-    /// even though the combined result is well-defined. Two reconstruction modes,
-    /// by [`SpuriousResolve`] strategy:
+    /// even though the combined result is well-defined. Generalized over the whole
+    /// editable set: it reconstructs **every** conflicted editable branch's chain
+    /// (each anchored on *its own* pre-rewrite tip) and re-parents **every**
+    /// worktree's `@` — the launch one and each extra worktree's — carrying that
+    /// worktree's *own* uncommitted delta, never another's. Two reconstruction
+    /// modes per branch, by [`SpuriousResolve`] strategy:
     /// - [`SpuriousResolve::CleanTip`] (reorder/squash): the net change set is
-    ///   preserved, so the post-mutation tip is conflict-free and *is* the result.
-    ///   Anchored on that clean tip, each conflicted commit's tree is rebuilt
-    ///   top-down by *peeling* the commit above it off (replaying its introduced
-    ///   change in reverse, see [`crate::replay`]). A conflicted tip means a *true*
-    ///   conflict and bails.
+    ///   preserved, so each conflicted branch's post-mutation tip is conflict-free
+    ///   and *is* the result. Anchored on that clean tip, each conflicted commit's
+    ///   tree is rebuilt top-down by *peeling* the commit above it off (replaying
+    ///   its introduced change in reverse, see [`crate::replay`]). A conflicted tip
+    ///   means a *true* conflict and bails.
     /// - [`SpuriousResolve::Drop`] / [`SpuriousResolve::Restore`]: the change set
-    ///   itself changed (a commit was removed / re-inserted), so the post-mutation
+    ///   itself changed (a commit was removed / re-inserted), so a post-mutation
     ///   tip may be conflicted and can't anchor anything. Instead each conflicted
     ///   commit's tree is rebuilt bottom-up from the clean prefix by *applying* its
-    ///   own original change forward onto the rebuilt parent — which, unlike peeling
-    ///   from a computed tip, also keeps the chain order of adjacent insertions.
+    ///   own original change forward onto the rebuilt parent.
     ///
-    /// In both modes the rebuilt range — and the working copy `@`, carrying its
-    /// uncommitted delta — are written with explicit trees so jj never re-merges.
-    /// Returns `Ok(true)` once it rebuilt the chain clean (the caller re-settles to
-    /// export), `Ok(false)` when it bailed — a real conflict, a non-text/structural
-    /// change, a split working-copy chain, or anything it can't prove safe —
-    /// leaving jj at the post-mutation state for manual resolution.
+    /// Every branch is planned read-only first ([`Self::plan_spurious_head`]), then
+    /// the chains and `@`s are rewritten in *one* transaction with explicit trees
+    /// so jj never re-merges. A singleton editable set with one launch `@`
+    /// reproduces the old single-head behaviour exactly. Returns `Ok(true)` once it
+    /// rebuilt the conflicted chains clean (the caller re-settles to export),
+    /// `Ok(false)` when it bailed — a real conflict, a non-text/structural change,
+    /// a split launch `@`, two heads sharing a rewritten commit, or anything it
+    /// can't prove safe — leaving jj at the post-mutation state for manual
+    /// resolution.
     fn try_auto_resolve_spurious(&mut self, strategy: SpuriousResolve) -> Result<bool> {
         let (pre_op, old_head_hex) = match self.pending.as_ref() {
             Some(p) => (p.pre_op.clone(), p.old_head.clone()),
             None => return Ok(false),
         };
-        let Some(old_head_hex) = old_head_hex else {
-            return Ok(false); // detached HEAD: no original branch tip to anchor on
-        };
-        let Some(orig_head) = CommitId::try_from_hex(old_head_hex) else {
-            return Ok(false);
-        };
-        let store = self.repo.store().clone();
-
-        // CleanTip peels down from the clean post-mutation tip; Drop/Restore rebuild
-        // forward from the clean prefix (the tip may be conflicted).
+        // CleanTip peels down from each clean tip; Drop/Restore rebuild forward from
+        // the clean prefix (a tip may be conflicted).
         let forward = match &strategy {
             SpuriousResolve::Off => return Ok(false),
             SpuriousResolve::CleanTip => false,
             SpuriousResolve::Drop | SpuriousResolve::Restore { .. } => true,
         };
-
-        let Some(head) = self.current_head_in_jj() else {
+        let Some(old_head_hex) = old_head_hex else {
+            return Ok(false); // detached HEAD: no primary tip to anchor on
+        };
+        let Some(orig_primary) = CommitId::try_from_hex(old_head_hex) else {
             return Ok(false);
         };
+        let store = self.repo.store().clone();
+        let pre_view = block_on(pre_op.view()).context("reading the pre-rewrite view")?;
+
+        // Each editable branch's pre-rewrite tip — the anchor its `@` delta replays
+        // from. The primary's is the authoritative `old_head`; the extras' come from
+        // the pending pre-rewrite heads map (git was frozen, so it still holds the
+        // pre-rewrite oids).
+        let mut pre_tips: HashMap<String, CommitId> = HashMap::new();
+        if let Some(primary) = self.target_branch_name() {
+            pre_tips.insert(primary.to_string(), orig_primary);
+        }
+        // Only *editable* branches are imported into this session's index, so a
+        // non-editable branch in the (all-branches) pending heads map must be
+        // skipped — walking its history below would fail "not found in index".
+        let editable: HashSet<String> = self.editable_branches().into_iter().collect();
+        if let Some(p) = self.pending.as_ref() {
+            for (full, hex) in &p.heads {
+                let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+                if !editable.contains(short) {
+                    continue;
+                }
+                if let Some(id) = CommitId::try_from_hex(hex) {
+                    pre_tips.entry(short.to_string()).or_insert(id);
+                }
+            }
+        }
+
+        // The original introduced change of every editable branch's pre-rewrite
+        // commit, by change id (a shared ancestor appears once). Drives both the
+        // peel and the forward rebuild. Restore additionally seeds the restored
+        // (orphan) commit, absent from the post-drop histories.
+        let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
+        for orig_tip in pre_tips.values() {
+            for info in crate::history::history(&self.repo, orig_tip)? {
+                if originals.contains_key(&info.change_id) {
+                    continue;
+                }
+                let c = store
+                    .get_commit(&info.id)
+                    .context("loading an original commit")?;
+                let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
+                    .context("reading an original parent tree")?;
+                originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
+            }
+        }
+        if let SpuriousResolve::Restore { commit } = &strategy {
+            let c = store
+                .get_commit(commit)
+                .context("loading the restored commit")?;
+            let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
+                .context("reading the restored commit's parent tree")?;
+            originals.insert(c.change_id().clone(), (parent_tree, c.tree()));
+        }
+
+        // Plan every editable head's rebuild read-only. Bail the whole attempt on
+        // any non-spurious / non-linear / structural case, or if two heads share a
+        // rewritten commit (only manual resolution handles that safely). Each plan
+        // carries its branch's worktree `@` (if dirty), re-parented onto the new
+        // tip from *that* worktree's own pre-rewrite `@`.
+        #[allow(clippy::type_complexity)]
+        let mut plans: Vec<(String, ChainRebuild, Option<(Commit, MergedTree)>)> = Vec::new();
+        let mut seen: HashSet<CommitId> = HashSet::new();
+        for branch in self.editable_branches() {
+            let name: jj_lib::ref_name::RefNameBuf = branch.as_str().into();
+            let Some(head) = self
+                .repo
+                .view()
+                .get_local_bookmark(&name)
+                .as_normal()
+                .cloned()
+            else {
+                continue;
+            };
+            let chain = match self.plan_spurious_head(&store, &head, forward, &originals)? {
+                HeadPlan::Clean => continue,
+                HeadPlan::Bail => return Ok(false),
+                HeadPlan::Rebuild(c) => c,
+            };
+            // A commit rewritten by two heads can't be rebuilt twice — bail.
+            for c in &chain.chain[chain.lo..=chain.n] {
+                if !seen.insert(c.id().clone()) {
+                    return Ok(false);
+                }
+            }
+            // This branch's worktree `@`: the launch worktree for the primary (when
+            // bound), else the extra worktree checked out on this branch.
+            let is_launch = Some(branch.as_str()) == self.target_branch_name();
+            let wc_name = if is_launch {
+                self.is_worktree_bound()
+                    .then(|| self.workspace.workspace_name().to_owned())
+            } else {
+                self.find_worktree(&branch).map(|v| v.name.clone())
+            };
+            // A split launch `@` chain isn't reconstructed (matches the old guard);
+            // extra worktrees always have a single `@`.
+            if is_launch && self.is_worktree_bound() && self.working_copy_chain_ids().len() > 1 {
+                return Ok(false);
+            }
+            let wc = if let Some(wc_name) = &wc_name {
+                match self.repo.view().get_wc_commit_id(wc_name).cloned() {
+                    Some(wc_id) => {
+                        let wc = store
+                            .get_commit(&wc_id)
+                            .context("loading the working copy")?;
+                        let new_tip_tree = chain.trees[chain.n].clone().expect("tip tree computed");
+                        let orig_wc_tree = match pre_view.get_wc_commit_id(wc_name) {
+                            Some(id) => Some(
+                                store
+                                    .get_commit(id)
+                                    .context("loading the original working copy")?
+                                    .tree(),
+                            ),
+                            None => None,
+                        };
+                        // Carry the worktree's uncommitted delta onto the new tip.
+                        // CleanTip leaves the tip unchanged, so `@`'s pre-mutation
+                        // tree re-parents directly; drop/restore move it, so replay
+                        // the delta (this branch's orig tip → its orig `@`) forward.
+                        // A clean `@` has an empty delta, so it stays empty.
+                        let wc_tree = match &orig_wc_tree {
+                            None => new_tip_tree,
+                            Some(w) if !forward => w.clone(),
+                            Some(w) => {
+                                let Some(orig_tip) = pre_tips.get(&branch) else {
+                                    return Ok(false);
+                                };
+                                let orig_tip_tree = store
+                                    .get_commit(orig_tip)
+                                    .context("loading the original tip")?
+                                    .tree();
+                                match self.transform_tree(
+                                    &store,
+                                    &orig_tip_tree,
+                                    w,
+                                    new_tip_tree,
+                                    Dir::Forward,
+                                )? {
+                                    Some(t) => t,
+                                    None => return Ok(false),
+                                }
+                            }
+                        };
+                        Some((wc, wc_tree))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            plans.push((branch, chain, wc));
+        }
+        if plans.is_empty() {
+            return Ok(false); // no conflicted chain to rebuild (e.g. an `@`-only conflict)
+        }
+
+        // Apply every plan in one transaction: rewrite each conflicted range with
+        // explicit trees/parents, re-parent each worktree `@`, re-point each
+        // bookmark. The ranges are disjoint, so the single `rebase_descendants` only
+        // settles jj's bookkeeping — nothing actually rebases.
+        let mut tx = self.repo.start_transaction();
+        for (branch, chain, wc) in &plans {
+            let mut parent_id = chain.chain[chain.lo - 1].id().clone();
+            let mut new_tip = parent_id.clone();
+            for i in chain.lo..=chain.n {
+                let tree = chain.trees[i]
+                    .clone()
+                    .expect("tree computed for the conflicted range");
+                let new_commit = block_on(
+                    tx.repo_mut()
+                        .rewrite_commit(&chain.chain[i])
+                        .set_parents(vec![parent_id.clone()])
+                        .set_tree(tree)
+                        .write(),
+                )
+                .context("rewriting a reconstructed commit")?;
+                parent_id = new_commit.id().clone();
+                new_tip = new_commit.id().clone();
+            }
+            if let Some((wc_commit, wc_tree)) = wc {
+                block_on(
+                    tx.repo_mut()
+                        .rewrite_commit(wc_commit)
+                        .set_parents(vec![new_tip.clone()])
+                        .set_tree(wc_tree.clone())
+                        .write(),
+                )
+                .context("re-parenting the working copy")?;
+            }
+            self.set_branch_bookmark(tx.repo_mut(), branch, new_tip);
+        }
+        // Update jj's bookkeeping (notably the working-copy pointers) for the
+        // explicit rewrites; every commit is already rewritten with the right
+        // parents, so nothing is actually rebased.
+        block_on(tx.repo_mut().rebase_descendants()).context("settling the rebuilt chain")?;
+        self.repo = block_on(tx.commit("commedit: auto-resolve spurious conflict"))
+            .context("committing the rebuilt chain")?;
+        Ok(true)
+    }
+
+    /// Plan one editable branch's spurious rebuild (read-only): walk `head`'s chain,
+    /// find the conflicted range `[lo, n]`, and reconstruct a clean tree for each
+    /// commit in it. [`HeadPlan::Clean`] when the chain has no conflict (skip it),
+    /// [`HeadPlan::Bail`] when it can't be proven spurious (abandon the whole
+    /// attempt). This is the per-branch core the old single-head resolver ran on the
+    /// primary alone.
+    fn plan_spurious_head(
+        &self,
+        store: &std::sync::Arc<jj_lib::store::Store>,
+        head: &CommitId,
+        forward: bool,
+        originals: &HashMap<ChangeId, (MergedTree, MergedTree)>,
+    ) -> Result<HeadPlan> {
         let tip = store
-            .get_commit(&head)
+            .get_commit(head)
             .context("loading the rewritten tip")?;
         // CleanTip *requires* a clean tip (a conflicted one is a true conflict);
         // drop/restore tolerate it and never read it back.
         if !forward && tip.has_conflict() {
-            return Ok(false);
+            return Ok(HeadPlan::Bail);
         }
-
-        let chain_infos = crate::history::history(&self.repo, &head)?;
+        let chain_infos = crate::history::history(&self.repo, head)?;
         if chain_infos.is_empty() {
-            return Ok(false);
+            return Ok(HeadPlan::Clean);
         }
         let mut chain = Vec::with_capacity(chain_infos.len());
         for info in chain_infos.iter().rev() {
@@ -1023,66 +1259,20 @@ impl Repo {
         }
         let n = chain.len() - 1; // tip index (oldest-first)
         let Some(lo) = chain.iter().position(|c| c.has_conflict()) else {
-            return Ok(false); // nothing conflicted on the branch — not our case
+            return Ok(HeadPlan::Clean); // nothing conflicted on this branch
         };
         if lo == 0 {
-            return Ok(false); // the root is conflicted: not a plain rewrite
+            return Ok(HeadPlan::Bail); // the root is conflicted: not a plain rewrite
         }
-        // The rebuild below rewrites `[lo, n]` as a single-parent chain anchored
-        // on `chain[lo - 1]` — `history()`'s topological order reversed is only a
-        // parent chain when that range is linear. A merge or an interleaved
-        // sibling branch in the range would be silently linearized, so hand those
-        // to the manual flow. (`chain[lo - 1]` itself may be a merge: it is only
-        // read as a tree anchor, never re-parented.)
+        // The rebuild rewrites `[lo, n]` as a single-parent chain anchored on
+        // `chain[lo - 1]`; `history()`'s reversed order is only a parent chain when
+        // that range is linear. A merge or interleaved sibling would be silently
+        // linearized, so hand those to manual resolution.
         for i in lo..=n {
             if chain[i].parent_ids() != std::slice::from_ref(chain[i - 1].id()) {
-                return Ok(false);
+                return Ok(HeadPlan::Bail);
             }
         }
-
-        // Only a simple single-`@` working copy is handled; a split chain falls
-        // back. Uncommitted changes are *preserved*, not a reason to bail: their
-        // delta re-applies onto the new tip.
-        if self.working_copy_chain_ids().len() > 1 {
-            return Ok(false);
-        }
-        let pre_view = block_on(pre_op.view()).context("reading the pre-rewrite view")?;
-        let orig_wc_tree = match pre_view.get_wc_commit_id(self.workspace.workspace_name()) {
-            Some(id) => Some(
-                store
-                    .get_commit(id)
-                    .context("loading the original working copy")?
-                    .tree(),
-            ),
-            None => None,
-        };
-
-        // The original introduced change of each commit, by change id: (parent
-        // tree, own tree). Drives both the peel (off the tip) and the forward
-        // rebuild (onto the parent).
-        let orig_infos = crate::history::history(&self.repo, &orig_head)?;
-        let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
-        for info in &orig_infos {
-            let c = store
-                .get_commit(&info.id)
-                .context("loading an original commit")?;
-            let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                .context("reading an original parent tree")?;
-            originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
-        }
-        // Restore: `orig_head` is the *post-drop* tip, which lacks the restored
-        // commit; yet its rewrite is on the post-restore chain and may fall in the
-        // rebuilt range, so seed its original change too.
-        if let SpuriousResolve::Restore { commit } = &strategy {
-            let c = store
-                .get_commit(commit)
-                .context("loading the restored commit")?;
-            let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                .context("reading the restored commit's parent tree")?;
-            originals.insert(c.change_id().clone(), (parent_tree, c.tree()));
-        }
-
-        // Reconstruct the conflicted range `[lo, n]`.
         let mut trees: Vec<Option<MergedTree>> = vec![None; chain.len()];
         if forward {
             // Bottom-up: apply each commit's own original change forward onto its
@@ -1092,13 +1282,12 @@ impl Repo {
             }
             for i in lo..=n {
                 let below = trees[i - 1].clone().expect("tree below computed");
-                let change_id = chain[i].change_id();
-                let Some((parent_tree, own_tree)) = originals.get(change_id) else {
-                    return Ok(false);
+                let Some((parent_tree, own_tree)) = originals.get(chain[i].change_id()) else {
+                    return Ok(HeadPlan::Bail);
                 };
-                match self.transform_tree(&store, parent_tree, own_tree, below, Dir::Forward)? {
+                match self.transform_tree(store, parent_tree, own_tree, below, Dir::Forward)? {
                     Some(tree) => trees[i] = Some(tree),
-                    None => return Ok(false), // a real overlap or a structural change
+                    None => return Ok(HeadPlan::Bail), // a real overlap or structural change
                 }
             }
         } else {
@@ -1106,78 +1295,21 @@ impl Repo {
             trees[n] = Some(tip.tree());
             for i in (lo..n).rev() {
                 let above = trees[i + 1].clone().expect("upper tree computed");
-                let change_id = chain[i + 1].change_id();
-                let Some((parent_tree, own_tree)) = originals.get(change_id) else {
-                    return Ok(false);
+                let Some((parent_tree, own_tree)) = originals.get(chain[i + 1].change_id()) else {
+                    return Ok(HeadPlan::Bail);
                 };
-                match self.transform_tree(&store, parent_tree, own_tree, above, Dir::Peel)? {
+                match self.transform_tree(store, parent_tree, own_tree, above, Dir::Peel)? {
                     Some(tree) => trees[i] = Some(tree),
-                    None => return Ok(false),
+                    None => return Ok(HeadPlan::Bail),
                 }
             }
         }
-
-        // Rewrite the conflicted range with explicit trees and parents so jj never
-        // re-merges, then re-parent the working copy `@` onto the new tip.
-        let mut tx = self.repo.start_transaction();
-        let mut parent_id = chain[lo - 1].id().clone();
-        let mut new_tip = head.clone();
-        for i in lo..=n {
-            let tree = trees[i]
-                .clone()
-                .expect("tree computed for the conflicted range");
-            let new_commit = block_on(
-                tx.repo_mut()
-                    .rewrite_commit(&chain[i])
-                    .set_parents(vec![parent_id.clone()])
-                    .set_tree(tree)
-                    .write(),
-            )
-            .context("rewriting a reconstructed commit")?;
-            parent_id = new_commit.id().clone();
-            new_tip = new_commit.id().clone();
-        }
-        if let Some(wc_id) = self.working_copy_commit_id() {
-            let wc = store
-                .get_commit(&wc_id)
-                .context("loading the working copy")?;
-            let new_tip_tree = trees[n].clone().expect("tip tree computed");
-            // Carry the working copy's uncommitted delta onto the new tip. For
-            // CleanTip the tip is unchanged, so `@`'s pre-mutation tree re-parents
-            // directly (an empty `@` stays empty); for drop/restore the tip moved,
-            // so replay the delta (original tip → original `@`) forward onto it — a
-            // clean `@` has an empty delta, so it still stays empty.
-            let wc_tree = match &orig_wc_tree {
-                None => new_tip_tree,
-                Some(w) if !forward => w.clone(),
-                Some(w) => {
-                    let orig_tip = store
-                        .get_commit(&orig_head)
-                        .context("loading the original tip")?
-                        .tree();
-                    match self.transform_tree(&store, &orig_tip, w, new_tip_tree, Dir::Forward)? {
-                        Some(t) => t,
-                        None => return Ok(false),
-                    }
-                }
-            };
-            block_on(
-                tx.repo_mut()
-                    .rewrite_commit(&wc)
-                    .set_parents(vec![new_tip.clone()])
-                    .set_tree(wc_tree)
-                    .write(),
-            )
-            .context("re-parenting the working copy")?;
-        }
-        self.set_head_bookmark(tx.repo_mut(), new_tip.clone());
-        // Update jj's bookkeeping (notably the working-copy pointer) for the
-        // explicit rewrites; every commit is already rewritten with the right
-        // parents, so nothing is actually rebased.
-        block_on(tx.repo_mut().rebase_descendants()).context("settling the rebuilt chain")?;
-        self.repo = block_on(tx.commit("commedit: auto-resolve spurious conflict"))
-            .context("committing the rebuilt chain")?;
-        Ok(true)
+        Ok(HeadPlan::Rebuild(ChainRebuild {
+            chain,
+            lo,
+            n,
+            trees,
+        }))
     }
 
     /// Replay one commit's introduced change (`parent_tree` → `own_tree`) onto the

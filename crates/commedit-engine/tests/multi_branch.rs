@@ -908,3 +908,129 @@ fn a_conflict_on_a_sibling_tip_defers_the_whole_export() {
     );
     g(&["fsck", "--no-progress"]);
 }
+
+/// Multi-head spurious auto-resolve (the data-loss-critical path): a *spurious*
+/// drop on a **sibling** branch checked out in another worktree auto-resolves
+/// cleanly, and that worktree's own dirty `@` rides onto the rebuilt tip —
+/// reconstructed from *its* pre-rewrite `@`, not the launch worktree's.
+#[test]
+fn spurious_drop_on_a_sibling_worktree_auto_resolves_and_preserves_its_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // base(f=foo) on main; `feature` branches there with the spurious shape
+    // +bar / +baz (dropping `bar` leaves the well-defined foo/baz). main then adds
+    // an unrelated commit so the two branches diverge above `base`.
+    common::init_repo(dir, &[("f.txt", "foo\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "foo\nbar\n").unwrap();
+    g(&["commit", "-aqm", "C1-bar"]);
+    std::fs::write(dir.join("f.txt"), "foo\nbar\nbaz\n").unwrap();
+    g(&["commit", "-aqm", "C2-baz"]);
+    g(&["checkout", "-q", "main"]);
+    std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+    g(&["add", "m.txt"]);
+    g(&["commit", "-qm", "M"]);
+
+    // Check feature out in a second worktree and dirty its @ (append `local`).
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    std::fs::write(wt.join("f.txt"), "foo\nbar\nbaz\nlocal\n").unwrap();
+
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Drop C1-bar on feature — a sibling-only spurious drop.
+    let c1bar = find_commit(&repo, &heads, "C1-bar");
+    let outcome = repo.abandon_commit(&c1bar).expect("drop C1-bar on feature");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "a spurious sibling drop must auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing left pending");
+    // feature: `bar` dropped, `baz` kept; tip is the well-defined foo/baz.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["C2-baz", "base"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "foo\nbaz");
+    // The sibling worktree's uncommitted delta (+local) rode onto the rebuilt tip —
+    // replayed from feature's own pre-rewrite @, not main's launch @.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "foo\nbaz\nlocal\n",
+        "the sibling worktree's uncommitted change survived the auto-resolve"
+    );
+    // main is untouched and the launch worktree stays clean and transparent.
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    assert_eq!(g(&["status", "--porcelain"]), "", "launch worktree clean");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// A *genuine* conflict on a sibling drop must still fall back to manual: the
+/// per-head auto-resolve bails (it can't prove the result well-defined), so the
+/// whole rewrite defers with git frozen — no half-applied sibling rewrite.
+#[test]
+fn a_genuine_conflict_on_a_sibling_drop_falls_back_to_manual() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // feature rewrites the SAME single line each commit, so dropping C1 leaves C2's
+    // edit un-applicable onto the base — a genuine conflict.
+    common::init_repo(dir, &[("f.txt", "one\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+    g(&["commit", "-aqm", "C1"]);
+    std::fs::write(dir.join("f.txt"), "three\n").unwrap();
+    g(&["commit", "-aqm", "C2"]);
+    g(&["checkout", "-q", "main"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let c1 = find_commit(&repo, &[head, feature_head], "C1");
+    let outcome = repo.abandon_commit(&c1).expect("drop C1 on feature");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a genuine sibling conflict must defer, got {outcome:?}"
+    );
+    assert!(repo.is_pending(), "held pending for manual resolution");
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature ref frozen — no half-applied rewrite"
+    );
+    g(&["fsck", "--no-progress"]);
+}

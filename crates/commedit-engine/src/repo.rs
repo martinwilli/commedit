@@ -720,6 +720,17 @@ impl Repo {
             .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
     }
 
+    /// The extra worktree whose checked-out branch is `branch` (short-name), if
+    /// any — the lookup that routes a working-copy mutation or a spurious-`@`
+    /// rebuild to the right [`WorktreeView`]. The launch worktree is *not* among
+    /// these (it is `self.workspace`); a branch with no separate worktree (a pure
+    /// ref-move, or the off-worktree primary) returns `None`.
+    pub(crate) fn find_worktree(&self, branch: &str) -> Option<&WorktreeView> {
+        self.extra_worktrees
+            .iter()
+            .find(|v| v.branch.strip_prefix("refs/heads/").unwrap_or(&v.branch) == branch)
+    }
+
     /// Refuse a working-copy operation when editing off-worktree: a branch you
     /// have not checked out has no working copy, so committing/squashing/splitting
     /// /discarding uncommitted changes is meaningless. `op` names the action for
@@ -798,6 +809,20 @@ impl Repo {
         if let Some(name) = self.current_bookmark() {
             mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
         }
+    }
+
+    /// Point an arbitrary local bookmark (`branch` short-name) at `target` inside
+    /// `mut_repo` — the multi-head generalization of [`Self::set_head_bookmark`],
+    /// used by the spurious-conflict rebuild to re-point every rebuilt editable
+    /// branch, not just the primary.
+    pub(crate) fn set_branch_bookmark(
+        &self,
+        mut_repo: &mut MutableRepo,
+        branch: &str,
+        target: CommitId,
+    ) {
+        let name: RefNameBuf = branch.into();
+        mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
     }
 
     /// The git commit HEAD currently points at — capture this before a rewrite

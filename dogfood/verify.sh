@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deterministic correctness oracle for the dogfood tournament.
 #
-#   ./dogfood/verify.sh <t1..t10> <worktree-path>
+#   ./dogfood/verify.sh <t1..t11> <worktree-path>
 #
 # Codifies each task's PASS criteria from README §4 as git-observable assertions,
 # so the correctness GATE no longer rides on teacher attention and is byte-comparable
@@ -26,8 +26,8 @@
 set -u
 
 BASE="${BASE:-stress/base}"
-TASK="${1:?usage: verify.sh <t1..t10> <worktree-path>}"
-WT="${2:?usage: verify.sh <t1..t10> <worktree-path>}"
+TASK="${1:?usage: verify.sh <t1..t11> <worktree-path>}"
+WT="${2:?usage: verify.sh <t1..t11> <worktree-path>}"
 
 g()  { git -C "$WT" "$@"; }
 fail=0
@@ -224,10 +224,32 @@ t10() {
   echo "  note: the abort beat (safety net) is transient — grade it from the Tool Log, not git."
 }
 
+t11() {
+  # Cross-branch move. WT is the TRUNK worktree (HEAD = stress/t11-<solver>); the
+  # feature sibling ref is derived from it (stress/t11s-<solver>) — refs are global,
+  # so the off-worktree sibling is graded by ref without a checkout of its own.
+  local cur sib
+  cur=$(g symbolic-ref --quiet --short HEAD 2>/dev/null)
+  sib="${cur/t11-/t11s-}"
+  [ -n "$cur" ] && [ "$sib" != "$cur" ] && ok "trunk=$cur, sibling=$sib" || { bad "cannot derive sibling from HEAD ('$cur')"; return; }
+  # trunk gained the misplaced commit + its file, but NOT the feature-only work
+  has_subject 'Add version string' && ok "trunk now has 'Add version string'" || bad "trunk missing 'Add version string'"
+  in_tree src/version.txt && ok "trunk has src/version.txt" || bad "trunk missing src/version.txt"
+  in_tree src/flag.txt && bad "trunk wrongly has feature-only src/flag.txt (moved too much)" || ok "trunk free of feature-only src/flag.txt"
+  # sibling: misplaced commit moved OUT, legit feature work kept (rebased)
+  if g rev-parse --verify -q "$sib" >/dev/null; then
+    g log --format='%s' "$sib" | grep -qxF 'Add version string' && bad "feature still has 'Add version string' (not moved out)" || ok "feature no longer has 'Add version string'"
+    g cat-file -e "$sib:src/version.txt" 2>/dev/null && bad "feature still has src/version.txt" || ok "feature free of src/version.txt"
+    g log --format='%s' "$sib" | grep -qxF 'Add experimental flag' && ok "feature keeps legit 'Add experimental flag'" || bad "feature lost 'Add experimental flag' (over-dropped)"
+    g cat-file -e "$sib:src/flag.txt" 2>/dev/null && ok "feature keeps src/flag.txt" || bad "feature lost src/flag.txt"
+  else bad "sibling branch $sib not found"; fi
+  check_clean
+}
+
 echo "== verify ${TASK} @ ${WT} (base=${BASE}) =="
 case "${TASK,,}" in
   t1) t1;; t2) t2;; t3) t3;; t4) t4;; t5) t5;;
-  t6) t6;; t7) t7;; t8) t8;; t9) t9;; t10) t10;;
-  *) echo "unknown task: ${TASK} (want t1..t10)" >&2; exit 2;;
+  t6) t6;; t7) t7;; t8) t8;; t9) t9;; t10) t10;; t11) t11;;
+  *) echo "unknown task: ${TASK} (want t1..t11)" >&2; exit 2;;
 esac
 if [ "$fail" -eq 0 ]; then echo "PASS: ${TASK}"; exit 0; else echo "FAIL: ${TASK}"; exit 1; fi

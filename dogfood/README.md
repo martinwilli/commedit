@@ -77,7 +77,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~35-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -95,6 +95,7 @@ A ~35-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add experimental telemetry` (own file `src/telemetry.txt`) + `Add metrics endpoint` (own file `src/metrics.txt`), both buried | one to revert, one to drop-then-recover | T8 |
 | `Add report header`/`body`/`footer` (own file `src/report.txt`), a contiguous range by `jdoe <jane.doe@bigcorp.example>` dated 2000 | wrong author+committer identity and bogus dates across 3 commits | T9 |
 | `Add cache module` + `Bump cache capacity to 256` + `Bump cache capacity to 512` (own file `src/cache.txt`) | two same-line bumps that conflict when reordered | T10 |
+| `stress/feature`: `Add version string` (own file `src/version.txt`) under `Add experimental flag` (own file `src/flag.txt`) | a commit on the **wrong branch** — belongs on the trunk | T11 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -141,6 +142,17 @@ Design notes that matter (learned the hard way):
   Deliberately *genuine* (not spurious) — constructing a reliably-spurious reorder is finicky (the
   T1 drop's spurious auto-resolve famously *didn't* fire; see [run 1](runs/1.md) finding #2), so
   whether a spurious reorder now auto-resolves stays a **calibration probe**, not a baked answer key.
+- T11 is the **multi-tenant / cross-branch** axis — the MCP's headline architecture, which no other
+  task touches. Every other task hands the student a single pre-opened, worktree-bound session; T11
+  forces it to **drive sessions itself** and operate **two at once**. `stress/feature` carries `Add
+  version string` (own file `src/version.txt`), committed there by mistake but belonging on the trunk,
+  sitting **below** a legit `Add experimental flag` (own file `src/flag.txt`) so dropping the misplaced
+  one rebases the legit one. Both own-file ⇒ the move (cherry-pick onto trunk + drop from feature) and
+  the rebase are **clean + deterministic** — T11's difficulty is session management and **off-worktree
+  editing**, not a conflict. The feature sibling is checked out **nowhere** for op/ctl, so `open_session`
+  opens it **off-worktree** (anchored at the launch root, ref-move only) — the engine path no other task
+  exercises. Plain git can't edit a branch without a worktree, so `git` gets one; that asymmetry is the
+  finding.
 
 ---
 
@@ -182,6 +194,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T8** | The buried `Add experimental telemetry` shipped a privacy bug — **revert** it (inverse at the tip, keep the original). Separately, **drop** the buried `Add metrics endpoint`, then change your mind and **restore** it from the trash to the tip. | `revert_commit(telemetry)` + `drop_commit(metrics)` + `list_trash` (read) + `restore_commit(metrics, new_parent=tip)` (3 mutations + 1 read) | a revert commit removing `src/telemetry.txt` near the tip; original telemetry commit still present; `Add metrics endpoint` back in history (at the tip) with `src/metrics.txt` present; trash empty; `git diff stress/base` = only `src/telemetry.txt` deleted; descendants rebased; clean |
 | **T9** | The three `report` commits (`Add report header`/`body`/`footer`) were authored on a misconfigured machine: fix all three in one batch — set author+committer email to `jane.doe@example.com`, name `Jane Doe`, and re-date them to 2025-01-25/26/27 (keep their order). | `edit_commits([3 × {commit, identity: name+email+author_time+committer_time}])` (1 mutation) | all three carry author+committer `Jane Doe <jane.doe@example.com>` and the 2025 dates, in order; subjects unchanged; descendants rebased; `git diff stress/base` empty (metadata-only); clean |
 | **T10** | Reorder `Bump cache capacity to 512` to come *before* `Bump cache capacity to 256` — the same-line edits conflict and the rewrite holds. First **abort** to confirm the safety net (history/tree untouched), then redo it and **resolve** oldest-first so the final `capacity = 256`. | `reorder_commit(512-bump, new_parent=cache-module)` → `abort_rewrite`; then again → loop `read_conflict(oldest)`/`resolve_conflicts(oldest)` until `pending:false` (chain holds **two** conflicted commits) | after the abort: region identical to `stress/base`, `pending:false`; after the resolve: `512-bump` precedes `256-bump`, final tip `capacity = 256`, both commits present, `pending:false`; descendants rebased; clean |
+| **T11** | `Add version string` was committed on the feature branch `stress/t11s-<solver>` but belongs on the trunk `stress/t11-<solver>`. Move it: land it on the trunk and remove it from the feature branch, keeping the feature's own `Add experimental flag` intact. | open the trunk session (given) + `open_session(stress/t11s-…)` (opens **off-worktree**) → `cherry_pick_commit(full sha, new_parent=trunk tip)` on the **trunk** session + `drop_commit` on the **feature** session (1 open + 2 mutations across **two** sessions) | trunk has `Add version string` + `src/version.txt` (and *not* `src/flag.txt`); feature no longer has it (no `src/version.txt`) but keeps `Add experimental flag` + `src/flag.txt`, rebased; both clean — `./dogfood/verify.sh t11 <trunk-wt>` exits 0 |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -230,9 +243,27 @@ that aborting is *not* an `undo` of a landed mutation — nothing landed; the re
 exported. A conflict-aware student left to its own judgment will (correctly) stop and ask before
 resolving, so the prompt must carry the resolve-and-abort intent explicitly (as T3's does).
 
+**T11 is the discriminator for the multi-tenant surface.** It is the only task where the student
+**opens a session itself** (`open_session`) rather than being handed one, the only one that operates
+**two sessions in one task**, and the only one that edits an **off-worktree** branch (the feature
+sibling is checked out nowhere for op/ctl, so the drop is a pure ref-move + rebase, no working copy).
+The trap is addressing: every MCP call carries a required `session`, and the move spans two of them —
+cherry-pick on the *trunk* session, drop on the *feature* session — so a student that loses track of
+which id goes where mutates the wrong branch. There is no single "move across branches" MCP tool (that
+is the GTK drag); the student must compose copy-then-drop, and the PASS gate fails a partial job
+(copied but not dropped, or vice versa). For plain git there are no sessions — it just needs both
+branches as worktrees and a `cherry-pick` + `rebase --onto`; the second worktree it needs (vs
+commedit's off-worktree session) is the comparison.
+
+**Session-hygiene probe (calibration, not a scored task).** While calibrating T11, also confirm the
+refusal ergonomics the model leans on: `open_session` on a branch **already open** is refused (a branch
+is editable by at most one session), as is a **non-existent** branch, and `close_session` on the **last**
+remaining session. These are judgment checks (does the agent read the refusal and recover, or flail?) —
+so, like T10's spurious-reorder probe, they stay a probe, not a baked answer key.
+
 ### Automated correctness gate (`./dogfood/verify.sh`)
 The PASS column above is codified as a deterministic, **git-only** oracle:
-`./dogfood/verify.sh <t1..t10> <worktree-path>` asserts each task's end state (subjects, file
+`./dogfood/verify.sh <t1..t11> <worktree-path>` asserts each task's end state (subjects, file
 contents, topology, tree-vs-`stress/base`, clean tree) and exits `0`=PASS / `1`=FAIL, ending with a
 `PASS: t<n>` / `FAIL: t<n>` line. It addresses commits by their stable fixture **subject** and by
 **content**, never by sha/change_id (both churn), so it survives a rebuild and grades any solving
@@ -281,6 +312,11 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
   `backup` fn + `git add src/backup.txt` as one commit, then `average` as another. Fiddly; that's
   the point.
+- **T11** — no sessions for git: it gets **both** branches as worktrees, `git cherry-pick`s the
+  `Add version string` commit onto the trunk, then drops it from the feature branch with
+  `git rebase --onto stress/base <version-sha>` (replays `Add experimental flag` onto the fork point).
+  Both halves are clean (own files). The off-worktree convenience commedit has — editing the feature
+  branch with no checkout — has no git analogue; the extra worktree git needs is the friction to grade.
 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
@@ -302,7 +338,7 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
-For each task T (1→10), each solver S (operator, control, git):
+For each task T (1→11), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for
@@ -311,6 +347,10 @@ For each task T (1→10), each solver S (operator, control, git):
    checked out at `.worktrees/<task>`, so the session opens **worktree-bound** there. The returned id
    (= the branch short-name) is the session selector for every later MCP call on this task. **git
    student:** skip this — it never touches the server.
+   **T11 (cross-branch):** the teacher opens only the **trunk** session (`stress/t11-<solver>`); the
+   *student* must `open_session(stress/t11s-<solver>)` itself — that sibling is checked out nowhere, so
+   it opens **off-worktree** — and pass the right `session` on each call (cherry-pick on the trunk, drop
+   on the feature). The **git** student instead gets **both** worktree paths (`…-t11-git`, `…-t11s-git`).
 3. Launch the student(s) and **await fully**. Students for **different** tasks/sessions may run
    **concurrently**: op/ctl on distinct sessions share no state, and the git student shares nothing
    (it touches no session at all, working only on its own `stress/t<task>-git` worktree).
@@ -350,7 +390,9 @@ For each task T (1→10), each solver S (operator, control, git):
 ### Between repeats of a task on the same worktree
 `git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**
 disturb other sessions running other tasks. A held conflict left in the session is discarded by the
-same reload.
+same reload. **T11:** also reset the sibling — `git -C <repo> branch -f stress/t11s-<solver> stress/feature`
+(op/ctl, no worktree) or `git -C <sibwt> reset --hard stress/feature` (git) — and `reload_repo` the
+sibling session if it was opened.
 
 ### Metrics capture (tokens + wall-clock, per student)
 Each subagent writes its own transcript. ⚠️ **Under parallel execution the "newest file" shortcut is

@@ -394,6 +394,33 @@ same reload. **T11:** also reset the sibling — `git -C <repo> branch -f stress
 (op/ctl, no worktree) or `git -C <sibwt> reset --hard stress/feature` (git) — and `reload_repo` the
 sibling session if it was opened.
 
+### Repeats for variance (k per cell)
+**N=1 per (task × solver) can't tell a skill gap from a dice roll.** Run 5 saw Sonnet *lose* T1 to
+Haiku because it grabbed the wrong `change_id` *once*; runs 4–5 saw the ref-race silently revert a
+*correct* result post-completion on a handful of cells. With one sample you can't separate
+"consistently better" from "one bad roll," yet the scorecards keep ranking cells 4.97 vs 4.75. Repeat
+each cell **k** times and report the spread, so a rank-order claim rests on signal, not noise.
+
+- **No fixture change, no extra concurrency.** Run a cell's k repeats **serially on its own worktree**,
+  using the *Between repeats* reset+reload recipe above between them; **different cells still run in
+  parallel.** Peak concurrent ref-writers — and thus the ref-race exposure (§5 box) — is unchanged; only
+  each cell's wall-clock grows ~k×. Each repeat is an independent cold spawn with its own transcript,
+  identified by its Agent id (not by recency — see *Metrics capture*).
+- **How big is k.** `k=1` for a quick **regression** run (is a tool still correct? cheapest). `k=3` is
+  the **variance floor** — enough to expose a flaky cell and a wide score spread. `k=5` when two cells
+  you mean to rank sit close. The runs that draw *comparative* conclusions (the operator↔control delta,
+  the model A/Bs of runs 4–5) are exactly the ones that should use `k≥3`; a smoke run can stay at 1.
+- **Aggregate per cell, don't average blindly.**
+  - **correctness** = the **`verify.sh` pass-fraction** `k_pass/k`. The gate is deterministic per end
+    state (§4), so a cell that lands `2/3` is *flaky* — a finding in itself, usually a ref-race revert:
+    re-run the oracle after settle and record both numbers.
+  - **soft scores** (1–5) → **median [min–max]**; a wide spread means the cell is not safe to rank.
+  - **cost / wall-clock / calls** → **median [range]** (one outlier — a recovery loop, a stale-read
+    detour — shouldn't set the headline).
+- **The scorecard cell becomes** e.g. `5.0 [5.0–5.0] · 3/3` (robust) or `4.3 [3.5–5.0] · 2/3` (flaky +
+  spread). Carry the per-component `cost=$…` as a median with its range. **Two cells whose score
+  spreads overlap are a tie, not a delta** — don't read a 0.2 rank gap across overlapping ranges.
+
 ### Metrics capture (tokens + wall-clock, per student)
 Each subagent writes its own transcript. ⚠️ **Under parallel execution the "newest file" shortcut is
 ambiguous** — several students write transcripts at once, so identify each student's transcript by
@@ -454,7 +481,8 @@ vs whole-file, `change_id` addressing, `suggest_squash_targets`, oldest-first co
 split partition; git: idiomatic *non-interactive* git — `--autosquash`, `--onto`, `rerere`) ·
 robustness/recovery · reporting (compact, accurate, flags decisions) · cleanliness (`fsck`/`status`
 clean, descendants rebased). Deltas per task: **operator↔control** (skill value) and
-**(op|ctl)↔git** (MCP value — the headline).
+**(op|ctl)↔git** (MCP value — the headline). Report each cell **aggregated over its k repeats** (see
+*Repeats for variance*); a delta whose two cells' score spreads overlap is noise, not a finding.
 
 > **Token caveat.** The operator pays a **prompt tax** (large system prompt + on-demand skills) it
 > must earn back through fewer/cheaper turns. Report `cache_creation` vs `cache_read` separately so
@@ -530,6 +558,9 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
 - **Capture per-student metrics** every run (§5 step 5): tokens (components — esp. `cache_read`
   vs `cache_create`) + wall-clock from each `subagents/agent-*.jsonl`. Judge efficiency by token
   cost across MCP versions, not call counts.
+- **Pick k for the run's purpose** (§5 *Repeats for variance*): a smoke/regression run stays at `k=1`;
+  a run that draws a **comparative** conclusion (a model A/B, an operator↔control claim) uses `k≥3` per
+  cell and reports median + spread, so the headline delta isn't one dice roll.
 - 🔒 **Never** run a commedit *mutation* on a session other than a `stress/*` one (don't open or
   mutate the launch session's real branch), and keep all test refs under `stress/*`. Use
   `git -C <abs>` everywhere.

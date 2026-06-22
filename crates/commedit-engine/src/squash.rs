@@ -18,7 +18,7 @@ use jj_lib::rewrite::{squash_commits, CommitWithSelection};
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
 use crate::history::{branch_commits, branch_commits_multi, CommitInfo};
 use crate::repo::Repo;
-use crate::workcopy::PartialSelection;
+use crate::workcopy::{PartialSelection, WcTarget};
 
 /// Which `--autosquash`-style merge to perform when one commit is dropped onto
 /// another. Derived from the source commit's subject prefix, or chosen in the
@@ -408,12 +408,27 @@ impl Repo {
         dest: &CommitId,
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
-        self.require_worktree("fold the working copy into a commit")?;
+        self.squash_working_copy_into_at(WcTarget::Launch, change_hex, dest, message)
+    }
+
+    /// Like [`Self::squash_working_copy_into`] but folds `target`'s worktree `@`
+    /// into `dest` (a commit on that worktree's branch) — folds a sibling
+    /// worktree's uncommitted changes into one of its own commits from the unified
+    /// DAG. `squash_into`'s shared `finish_mutation` tail exports the moved branch
+    /// and re-materializes that worktree.
+    pub fn squash_working_copy_into_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "fold the working copy into a commit")?;
         // Snapshot before resolving so the resolved id survives squash_into's own
         // (now no-op) snapshot — otherwise a churned leaf id would go stale.
-        self.snapshot_working_copy()?;
+        self.snapshot_wc(&target)?;
         let source = self
-            .resolve_working_copy_change(change_hex)
+            .resolve_wc(&target, change_hex)
             .context("no working-copy entry to fold")?;
         self.squash_into(&source, dest, SquashMode::Fixup, message)
     }

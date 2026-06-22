@@ -1034,3 +1034,151 @@ fn a_genuine_conflict_on_a_sibling_drop_falls_back_to_manual() {
     );
     g(&["fsck", "--no-progress"]);
 }
+
+/// Open `main` + `feature` (feature in a second worktree, dirty) and return the
+/// opened repo plus the worktree path. Shared by the sibling working-copy
+/// mutation tests below.
+fn open_with_dirty_feature_worktree(
+    dir: &std::path::Path,
+    wt_parent: &tempfile::TempDir,
+    f_contents: &str,
+) -> (Repo, std::path::PathBuf) {
+    setup(dir);
+    let wt = add_feature_worktree(dir, wt_parent);
+    std::fs::write(wt.join("f.txt"), f_contents).unwrap();
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    (repo, wt)
+}
+
+/// A `@`-only edit to a *sibling* worktree's working copy rewrites that
+/// worktree's file on disk, leaves its branch tip put, and never touches main.
+#[test]
+fn editing_a_sibling_worktrees_uncommitted_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f edited on disk\n");
+
+    let target = repo
+        .wc_target_for_branch("feature")
+        .expect("feature has a worktree");
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f set by edit\n"))
+        .expect("edit the sibling @");
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f set by edit\n",
+        "the sibling worktree's file reflects the edit"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+    // The @-only edit leaves feature's tip and main untouched.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Discarding a sibling worktree's uncommitted changes resets *its* `@` to its
+/// tip (jj recreates the per-worktree `@`) and re-materializes that worktree.
+#[test]
+fn discarding_a_sibling_worktrees_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.drop_working_copy_at(target, None)
+        .expect("discard the sibling @");
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\n",
+        "the sibling worktree reverts to its tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Folding a sibling worktree's uncommitted changes into one of its commits
+/// rewrites that commit, re-materializes the worktree onto the rewritten tip, and
+/// leaves main alone.
+#[test]
+fn folding_a_sibling_worktrees_uncommitted_changes_into_its_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nmore\n");
+
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .squash_working_copy_into_at(target, None, &f, None)
+        .expect("fold the sibling @ into F");
+
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n",
+        "the worktree sits clean on the rewritten tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"],
+        "F amended in place"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Committing a sibling worktree's uncommitted changes crystallizes a new commit
+/// on *that* branch's tip, leaves its worktree clean, and never moves main.
+#[test]
+fn committing_a_sibling_worktrees_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nnew\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_at(target, "feature WIP", None)
+        .expect("commit the sibling @");
+
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature WIP", "F", "B", "A"],
+        "a new commit on feature's tip"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nnew");
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "",
+        "the worktree is clean after committing its @"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

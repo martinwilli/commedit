@@ -813,65 +813,102 @@ impl Repo {
             .cloned()
     }
 
-    /// Walk the rewritten range of `head` (oldest first) collecting the commits
-    /// whose trees are conflicted, with their conflicted paths. Only rewritten
-    /// commits can be conflicted, so this scans [`Self::rewritten_history`] rather
-    /// than the whole — possibly huge — ancestry.
-    fn collect_conflicts(&self, head: Option<&CommitId>) -> Result<Vec<ConflictedCommit>> {
-        let Some(head) = head else {
-            return Ok(Vec::new());
-        };
-        let infos = self.rewritten_history(head)?;
-        let store = self.repo.store();
-        let mut out = Vec::new();
-        for info in infos.iter().rev() {
-            let commit = store.get_commit(&info.id).context("loading commit")?;
-            if !commit.has_conflict() {
-                continue;
+    /// Each editable branch's tip as jj currently sees it (its local bookmark),
+    /// primary first and deduped — the *post-rewrite* tips, read before the
+    /// deferred git export, so a sibling branch's freshly-rewritten (possibly
+    /// conflicted) chain is visible even while its git ref is still frozen. Empty
+    /// on a detached HEAD with no bookmark. The multi-head analogue of
+    /// [`Self::current_head_in_jj`], used by [`Self::collect_conflicts`].
+    fn editable_heads_in_jj(&self) -> Vec<CommitId> {
+        let view = self.repo.view();
+        let mut heads = Vec::new();
+        for short in self.editable_branches() {
+            let name: jj_lib::ref_name::RefNameBuf = short.as_str().into();
+            if let Some(id) = view.get_local_bookmark(&name).as_normal() {
+                if !heads.contains(id) {
+                    heads.push(id.clone());
+                }
             }
-            let tree = commit.tree();
-            let mut files = Vec::new();
-            for (path, value) in tree.conflicts() {
-                let value = value.context("reading conflict entry")?;
-                files.push(ConflictedPath {
-                    path,
-                    resolvable: value.to_file_merge().is_some(),
-                });
-            }
-            out.push(ConflictedCommit {
-                change_id: info.change_id.clone(),
-                commit_id: info.id.clone(),
-                subject: info.subject.clone(),
-                files,
+        }
+        heads
+    }
+
+    /// Build a [`ConflictedCommit`] for the commit at `id` when its tree is
+    /// conflicted (else `None`), labelled `subject`. Shared by the per-branch
+    /// chain walk and the working-copy `@` checks in [`Self::collect_conflicts`].
+    fn conflicted_commit_at(
+        &self,
+        id: &CommitId,
+        subject: &str,
+    ) -> Result<Option<ConflictedCommit>> {
+        let commit = self.repo.store().get_commit(id).context("loading commit")?;
+        if !commit.has_conflict() {
+            return Ok(None);
+        }
+        let tree = commit.tree();
+        let mut files = Vec::new();
+        for (path, value) in tree.conflicts() {
+            let value = value.context("reading conflict entry")?;
+            files.push(ConflictedPath {
+                path,
+                resolvable: value.to_file_merge().is_some(),
             });
         }
-        // The working-copy chain (@ and any split-off entries) is a *descendant*
-        // of the tip, so the ancestor walk above never sees it. Append each
-        // conflicted entry, oldest first (the chain is newest-first), so an
-        // overlap between the user's uncommitted changes and the rewrite defers
-        // the export and is resolved in the diff pane like any other commit.
-        for wc_id in self.working_copy_chain_ids().into_iter().rev() {
-            let commit = store
-                .get_commit(&wc_id)
-                .context("loading a working-copy chain commit")?;
-            if !commit.has_conflict() {
+        Ok(Some(ConflictedCommit {
+            change_id: commit.change_id().clone(),
+            commit_id: id.clone(),
+            subject: subject.to_string(),
+            files,
+        }))
+    }
+
+    /// Walk **every** editable branch's rewritten range (oldest first) plus
+    /// **every** worktree's working copy, collecting the commits whose trees are
+    /// conflicted. Only rewritten commits can be conflicted, so each branch scans
+    /// [`Self::rewritten_history`] rather than its whole — possibly huge —
+    /// ancestry; a shared ancestor rewritten on several branches is reported once
+    /// (`seen`). The working copies — the launch `@` chain and every *extra*
+    /// worktree's single `@` (see [`crate::repo::WorktreeView`]) — are descendants
+    /// of their tips, so the ancestor walks never reach them; they are appended,
+    /// oldest first, so an overlap between any worktree's uncommitted changes and
+    /// the rewrite defers the export and is resolved in the diff pane like any
+    /// other commit. This is the multi-branch generalization of the old
+    /// primary-chain-plus-launch-`@` scan: a singleton editable set with no extra
+    /// worktrees reproduces it exactly. Empty on a detached HEAD with no bookmark
+    /// (nothing to scope the walk to), matching the previous behaviour.
+    fn collect_conflicts(&self) -> Result<Vec<ConflictedCommit>> {
+        let heads = self.editable_heads_in_jj();
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for head in &heads {
+            for info in self.rewritten_history(head)?.iter().rev() {
+                if !seen.insert(info.id.clone()) {
+                    continue;
+                }
+                if let Some(cc) = self.conflicted_commit_at(&info.id, &info.subject)? {
+                    out.push(cc);
+                }
+            }
+        }
+        // The launch `@` chain (newest-first → reverse to oldest-first), then each
+        // extra worktree's single `@`.
+        let mut wc_ids: Vec<CommitId> = self.working_copy_chain_ids();
+        wc_ids.reverse();
+        for view in &self.extra_worktrees {
+            if let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
+                wc_ids.push(id);
+            }
+        }
+        for wc_id in wc_ids {
+            if !seen.insert(wc_id.clone()) {
                 continue;
             }
-            let tree = commit.tree();
-            let mut files = Vec::new();
-            for (path, value) in tree.conflicts() {
-                let value = value.context("reading conflict entry")?;
-                files.push(ConflictedPath {
-                    path,
-                    resolvable: value.to_file_merge().is_some(),
-                });
+            if let Some(cc) = self.conflicted_commit_at(&wc_id, "Uncommitted changes")? {
+                out.push(cc);
             }
-            out.push(ConflictedCommit {
-                change_id: commit.change_id().clone(),
-                commit_id: wc_id,
-                subject: "Uncommitted changes".to_string(),
-                files,
-            });
         }
         Ok(out)
     }
@@ -879,8 +916,7 @@ impl Repo {
     /// After committing a rewrite/resolution, decide whether the chain is clean
     /// (export and clear pending) or still conflicted (refresh pending).
     fn settle(&mut self) -> Result<SaveOutcome> {
-        let head = self.current_head_in_jj();
-        let conflicts = self.collect_conflicts(head.as_ref())?;
+        let conflicts = self.collect_conflicts()?;
         if conflicts.is_empty() {
             let p = self
                 .pending

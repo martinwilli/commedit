@@ -7,6 +7,7 @@
 
 mod common;
 
+use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::repo::Repo;
 
 /// Build `main: A-B-C` (checked out) with `feature` branching off `B` and adding
@@ -835,4 +836,75 @@ fn worktree_uncommitted_is_empty_when_clean() {
         repo.worktree_uncommitted().is_empty(),
         "no uncommitted changes anywhere"
     );
+}
+
+/// Multi-head conflict *detection*: a rewrite of a *shared* ancestor that
+/// conflicts only on a **sibling** branch's tip — the primary stays clean — must
+/// still defer (git frozen) rather than silently exporting the conflicted
+/// sibling. Before detection went multi-head it scanned only the primary chain
+/// plus the launch `@`, so this exact case exported a conflicted commit to git.
+#[test]
+fn a_conflict_on_a_sibling_tip_defers_the_whole_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // main: A(x.txt) - B(adds m.txt) - C(adds c.txt). `feature` branches at B and
+    // edits x.txt's middle line.
+    common::init_repo(
+        dir,
+        &[
+            ("x.txt", "a\nb\nc\n", "A"),
+            ("m.txt", "m\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
+    );
+    g(&["checkout", "-q", "-b", "feature", "HEAD~1"]); // at B
+    std::fs::write(dir.join("x.txt"), "a\nF\nc\n").unwrap();
+    g(&["add", "x.txt"]);
+    g(&["commit", "-q", "-m", "F"]);
+    g(&["checkout", "-q", "main"]);
+
+    let main_before = g(&["rev-parse", "main"]);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Rewrite the shared ancestor B's x.txt middle line: main's C (touches only
+    // c.txt) rebases clean, but feature's F (also edited that line) conflicts —
+    // on the *sibling* tip, not the primary's.
+    let b = find_commit(&repo, &heads, "B");
+    let outcome = repo
+        .rewrite_file(&b, "x.txt", "a\nB\nc\n")
+        .expect("rewrite shared ancestor B");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a conflict on the sibling tip must defer, not export dirty"
+    );
+    assert!(
+        repo.is_pending(),
+        "the rewrite is held back pending resolution"
+    );
+    // git stays frozen: neither branch's ref moved while the chain is conflicted.
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main ref frozen");
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature ref frozen"
+    );
+    g(&["fsck", "--no-progress"]);
 }

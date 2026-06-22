@@ -122,7 +122,11 @@ the untouched content can't drift and the call stays small. Make `old` long \
 enough to match exactly once; an ambiguous or missing match is rejected — a \
 miss reports the closest text with any whitespace/indentation difference named, \
 so correct `old` from that rather than re-guessing tabs from a rendered diff. \
-edit_message / replace_files remain for wholesale rewrites.
+Match against the RAW stored text, not YAML-rendered output: a `|` block scalar \
+(how messages and file bodies print) adds leading indentation that is NOT part \
+of the string, so a line copied straight from the response carries phantom \
+spaces that make `old` miss. edit_message / replace_files remain for wholesale \
+rewrites.
 
 Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
 held back IN FULL — git history, HEAD and the working tree stay untouched \

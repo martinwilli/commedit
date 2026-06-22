@@ -59,8 +59,14 @@ jobs:
           sudo apt-get install -y libgtk-4-dev libgtksourceview-5-dev libspelling-1-dev
 
       # --- macOS: GTK from Homebrew, Rust from rustup ---------------------
+      # The runner image pre-taps third-party repos (aws/tap, azure/bicep) we
+      # never use. Opt into Homebrew's upcoming tap-trust default so it simply
+      # ignores untrusted taps instead of printing the transition warning;
+      # official taps are always trusted, so our formulae install unaffected.
       - name: Install GTK (macOS)
         if: runner.os == 'macOS'
+        env:
+          HOMEBREW_REQUIRE_TAP_TRUST: 1
         run: brew install gtk4 gtksourceview5 libspelling pkg-config
 
       - name: Install Rust

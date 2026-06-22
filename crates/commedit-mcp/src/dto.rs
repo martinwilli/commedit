@@ -7,16 +7,30 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// `skip_serializing_if` for a bool whose documented default is `false`: the
+/// field is omitted when false, so an absent field reads as false. Keeps the
+/// common case (a non-merge commit, a text file, a clean entry…) off the wire.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// `skip_serializing_if` for a count whose documented default is `0`.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 // ---------------------------------------------------------------------------
 // Shared response shapes
 
 /// One commit of the current branch's history.
 ///
-/// The identifying header — sha, change_id, subject, is_merge, refs — is always
-/// present. The verbose [`CommitDetailDto`] fields (message body, identity,
-/// parents) are flattened in alongside; each appears only when `list_history`'s
-/// `fields` selects it (all of them by default, none for a header-only
-/// overview). `show_commit` and `list_trash` always include them all.
+/// The core header — sha, change_id, subject — is always present; `is_merge`
+/// and `refs` ride alongside but are omitted at their default (a non-merge, an
+/// undecorated commit), so a plain commit reduces to those three keys plus the
+/// selected detail. The verbose [`CommitDetailDto`] fields (message body,
+/// identity, parents) are flattened in alongside; each appears only when
+/// `list_history`'s `fields` selects it (all of them by default, none for a
+/// header-only overview). `show_commit` and `list_trash` always include them all.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CommitDto {
     /// Full commit id. Every mutation rewrites ids — address commits by their
@@ -29,8 +43,12 @@ pub struct CommitDto {
     pub subject: String,
     /// Merge commits cannot be reordered, dropped, split, reverted,
     /// cherry-picked or used as a squash source (squashing *into* one is fine).
+    /// Omitted when false (the default) — present and true only on a merge.
+    #[serde(skip_serializing_if = "is_false")]
     pub is_merge: bool,
-    /// Local branches and tags pointing at this commit.
+    /// Local branches and tags pointing at this commit. Omitted when empty (the
+    /// default) — present only on a decorated commit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refs: Vec<RefDto>,
     /// The verbose fields, each present only when selected (see `CommitField`).
     #[serde(flatten)]
@@ -87,7 +105,9 @@ pub struct RefDto {
     pub name: String,
     /// `branch` or `tag`.
     pub kind: String,
-    /// True for the checked-out branch (the one being edited).
+    /// True for the checked-out branch (the one being edited). Omitted when
+    /// false (the default).
+    #[serde(skip_serializing_if = "is_false")]
     pub current: bool,
 }
 
@@ -98,9 +118,13 @@ pub struct FileChangeDto {
     pub path: String,
     /// `added`, `modified` or `removed`.
     pub kind: String,
-    /// Non-UTF-8 content on either side; no diff or text is provided.
+    /// Non-UTF-8 content on either side; no diff or text is provided. Omitted
+    /// when false (the default).
+    #[serde(skip_serializing_if = "is_false")]
     pub is_binary: bool,
     /// Merge-commit path whose parents disagree: shown as-is, not editable.
+    /// Omitted when false (the default).
+    #[serde(skip_serializing_if = "is_false")]
     pub conflicted_base: bool,
     /// Unified diff of the change (absent for binary files).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,7 +167,9 @@ pub struct WorkingCopyEntryDto {
     /// The changed files' paths.
     pub files: Vec<String>,
     /// True when a rewrite clashed with these uncommitted changes and the
-    /// entry is conflicted (resolve or abort via the conflict tools).
+    /// entry is conflicted (resolve or abort via the conflict tools). Omitted
+    /// when false (the default).
+    #[serde(skip_serializing_if = "is_false")]
     pub has_conflict: bool,
 }
 
@@ -304,11 +330,17 @@ pub struct ListHistoryResp {
     pub commits: Vec<CommitDto>,
     /// True when the limit cut the walk short — more commits remain below.
     pub has_more: bool,
-    /// The offset this page started at (0 unless paged).
+    /// The offset this page started at. Omitted when 0 (the default, an
+    /// unpaged listing starting at HEAD).
+    #[serde(skip_serializing_if = "is_zero")]
     pub offset: usize,
-    /// Offset to pass next to continue paging, or null at the end of history.
+    /// Offset to pass next to continue paging. Omitted at the end of history
+    /// (paging done); its absence mirrors `has_more: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
-    /// Number of dropped commits currently in the session trash.
+    /// Number of dropped commits currently in the session trash. Omitted when 0
+    /// (the default, an empty trash).
+    #[serde(skip_serializing_if = "is_zero")]
     pub trash_count: usize,
     /// The uncommitted-changes status, present only when the request set
     /// `working_copy: true` (else null) — the same payload as working_copy_status.
@@ -1109,6 +1141,53 @@ pub struct CloseSessionResp {
 mod tests {
     use super::*;
 
+    fn empty_detail() -> CommitDetailDto {
+        CommitDetailDto {
+            description: None,
+            author_name: None,
+            author_email: None,
+            author_time: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            parent_shas: None,
+        }
+    }
+
+    #[test]
+    fn default_header_flags_are_omitted_from_a_listed_commit() {
+        // A plain non-merge, undecorated commit reduces to sha/change_id/subject
+        // (plus selected detail) — is_merge: false and refs: [] never reach the
+        // wire, since their absence is documented to mean exactly that.
+        let plain = CommitDto {
+            sha: "abc123".into(),
+            change_id: "zzzz".into(),
+            subject: "ordinary".into(),
+            is_merge: false,
+            refs: Vec::new(),
+            detail: empty_detail(),
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.get("is_merge").is_none(), "is_merge omitted when false");
+        assert!(v.get("refs").is_none(), "refs omitted when empty");
+
+        // A merge with a current branch decoration carries both — and the ref's
+        // `current` flag, which is likewise only present when true.
+        let decorated = CommitDto {
+            is_merge: true,
+            refs: vec![RefDto {
+                name: "main".into(),
+                kind: "branch".into(),
+                current: true,
+            }],
+            ..plain
+        };
+        let v = serde_json::to_value(&decorated).unwrap();
+        assert_eq!(v["is_merge"], true);
+        assert_eq!(v["refs"][0]["name"], "main");
+        assert_eq!(v["refs"][0]["current"], true);
+    }
+
     #[test]
     fn drop_commit_resp_flattens_status_to_the_top_level() {
         // drop_commit must report its outcome like every other mutation —
@@ -1125,16 +1204,7 @@ mod tests {
                 subject: "dropped one".into(),
                 is_merge: false,
                 refs: Vec::new(),
-                detail: CommitDetailDto {
-                    description: None,
-                    author_name: None,
-                    author_email: None,
-                    author_time: None,
-                    committer_name: None,
-                    committer_email: None,
-                    committer_time: None,
-                    parent_shas: None,
-                },
+                detail: empty_detail(),
             },
             working_copy: None,
         };

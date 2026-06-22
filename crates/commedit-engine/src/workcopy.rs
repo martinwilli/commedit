@@ -1059,6 +1059,30 @@ impl Repo {
         vec![leaf]
     }
 
+    /// Build a [`WorkingCopyEntry`] for one working-copy commit `@`: its
+    /// git-tracked changed files, labelled "Uncommitted changes". `None` when the
+    /// `@` changes nothing (an empty leaf — e.g. the fresh `@` jj recreates after
+    /// the whole pile is folded into a commit — is never shown). Shared by the
+    /// launch chain ([`Self::working_copy_chain`]) and the per-worktree reader
+    /// ([`Self::worktree_uncommitted`]).
+    fn wc_entry_for(&self, id: &CommitId) -> Option<WorkingCopyEntry> {
+        let commit = self.repo.store().get_commit(id).ok()?;
+        let file_names: Vec<String> = crate::diff::commit_changes(&self.repo, id)
+            .map(|c| c.into_iter().map(|f| f.path).collect())
+            .unwrap_or_default();
+        if file_names.is_empty() {
+            return None;
+        }
+        let mut info = crate::history::CommitInfo::from_commit(&commit);
+        info.subject = "Uncommitted changes".to_string();
+        Some(WorkingCopyEntry {
+            info,
+            changed_files: file_names.len(),
+            file_names,
+            has_conflict: commit.has_conflict(),
+        })
+    }
+
     /// The uncommitted-changes entries to show as read-only rows above the
     /// history, newest first (the leaf `@` first). One per commit in the
     /// working-copy chain that actually changes files — an empty leaf (e.g. the
@@ -1067,25 +1091,41 @@ impl Repo {
     /// [`crate::history::history`] so the reorder/drop/squash index arithmetic is
     /// unaffected.
     pub fn working_copy_chain(&self) -> Vec<WorkingCopyEntry> {
+        self.working_copy_chain_ids()
+            .iter()
+            .filter_map(|id| self.wc_entry_for(id))
+            .collect()
+    }
+
+    /// Uncommitted changes per editable worktree, for the unified multi-branch
+    /// DAG. Each tuple is `(branch short-name, entries)` newest-first: the launch
+    /// worktree (when its branch is checked out here) contributes its full `@`
+    /// chain under the primary branch's name; every *extra* editable worktree (see
+    /// [`crate::repo::WorktreeView`]) contributes its single dirty `@` under its
+    /// own branch's name. A clean worktree, a branch with no worktree (a pure
+    /// ref-move), and the off-worktree primary all contribute nothing — an empty
+    /// `entries` list is never emitted. The launch `@` chain is read exactly as
+    /// [`Self::working_copy_chain`]; the extra worktrees' `@`s are read from their
+    /// per-worktree workspace, mirroring [`Self::snapshot_extra_worktree`].
+    pub fn worktree_uncommitted(&self) -> Vec<(String, Vec<WorkingCopyEntry>)> {
         let mut out = Vec::new();
-        for id in self.working_copy_chain_ids() {
-            let Ok(commit) = self.repo.store().get_commit(&id) else {
+        if self.is_worktree_bound() {
+            let chain = self.working_copy_chain();
+            if !chain.is_empty() {
+                out.push((self.target_branch_name().unwrap_or("").to_string(), chain));
+            }
+        }
+        for view in &self.extra_worktrees {
+            let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() else {
                 continue;
             };
-            let file_names: Vec<String> = crate::diff::commit_changes(&self.repo, &id)
-                .map(|c| c.into_iter().map(|f| f.path).collect())
-                .unwrap_or_default();
-            if file_names.is_empty() {
-                continue;
+            if let Some(entry) = self.wc_entry_for(&id) {
+                let short = view
+                    .branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&view.branch);
+                out.push((short.to_string(), vec![entry]));
             }
-            let mut info = crate::history::CommitInfo::from_commit(&commit);
-            info.subject = "Uncommitted changes".to_string();
-            out.push(WorkingCopyEntry {
-                info,
-                changed_files: file_names.len(),
-                file_names,
-                has_conflict: commit.has_conflict(),
-            });
         }
         out
     }

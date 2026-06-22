@@ -718,3 +718,121 @@ fn the_editable_set_cannot_be_emptied() {
         vec!["main".to_string(), "feature".to_string()]
     );
 }
+
+/// `worktree_uncommitted` surfaces the launch worktree's `@` chain *and* every
+/// extra worktree's dirty `@`, each keyed by its branch's short-name, launch
+/// first. Dirtying happens before open so the open-time snapshot captures both
+/// worktrees (`snapshot_working_copy` snapshots the extras first).
+#[test]
+fn worktree_uncommitted_lists_the_launch_and_each_dirty_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "a dirty on feature\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let wc = repo.worktree_uncommitted();
+    assert_eq!(
+        wc.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(),
+        vec!["main", "feature"],
+        "the launch worktree comes first, then each extra worktree"
+    );
+    for (branch, entries) in &wc {
+        assert_eq!(entries.len(), 1, "{branch}: a single dirty @");
+        assert_eq!(
+            entries[0].file_names,
+            vec!["a.txt".to_string()],
+            "{branch}: the one dirtied tracked file"
+        );
+        assert_eq!(entries[0].changed_files, 1, "{branch}: one changed file");
+        assert!(!entries[0].has_conflict, "{branch}: a clean snapshot");
+    }
+}
+
+/// A clean extra worktree contributes nothing — only the dirty launch worktree
+/// is listed.
+#[test]
+fn worktree_uncommitted_skips_a_clean_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent); // feature checked out, left clean
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert_eq!(
+        repo.worktree_uncommitted()
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main"],
+        "the clean feature worktree is absent"
+    );
+}
+
+/// An editable branch with no worktree (a pure ref-move) has no `@`, so it
+/// contributes nothing even while it is in the editable set.
+#[test]
+fn worktree_uncommitted_ignores_a_worktreeless_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir); // `feature` exists as a ref only — never checked out anywhere
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert_eq!(
+        repo.worktree_uncommitted()
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main"],
+        "feature has no worktree, so no uncommitted @"
+    );
+}
+
+/// A clean tree across every worktree yields no entries at all.
+#[test]
+fn worktree_uncommitted_is_empty_when_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert!(
+        repo.worktree_uncommitted().is_empty(),
+        "no uncommitted changes anywhere"
+    );
+}

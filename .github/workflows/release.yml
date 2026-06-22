@@ -13,6 +13,13 @@
 #
 # Push a tag like `v0.1.0` to cut a GitHub Release; or run manually via the
 # Actions tab to just produce downloadable build artifacts.
+#
+# The build/plugin jobs only upload workflow artifacts; a final `release` job
+# gathers them and publishes the release in one shot. It does so the way
+# GitHub's *immutable releases* require: create a DRAFT, attach every asset to
+# it, then flip it to published. A published immutable release is locked, so
+# the old approach (each matrix job appending its own asset to an
+# already-published release) cannot work — only the draft is still writable.
 name: release
 
 on:
@@ -86,13 +93,6 @@ jobs:
           name: ${{ matrix.mcp_asset }}
           path: ${{ matrix.mcp_asset }}
 
-      - name: Attach app to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ matrix.asset }}
-          fail_on_unmatched_files: true
-
   # Bundle the per-target MCP binaries into a single Claude Code plugin zip.
   plugin:
     name: package plugin
@@ -137,9 +137,44 @@ jobs:
           name: commedit-plugin.zip
           path: commedit-plugin.zip
 
-      - name: Attach plugin to release
-        if: startsWith(github.ref, 'refs/tags/')
+  # Publish the release once, with every asset, via GitHub's immutable-release
+  # flow: a draft is the only writable state, so we attach all assets to a
+  # draft and then flip it to published (which locks it). Only on a tag.
+  release:
+    name: publish release
+    needs: [build, plugin]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      # Pull every uploaded artifact flat into dist/. The bare MCP binaries
+      # land here too but are filtered out below — only tarballs + the plugin
+      # zip get attached, matching what the release carried before.
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release with all assets
+        id: draft
         uses: softprops/action-gh-release@v3
         with:
-          files: commedit-plugin.zip
+          draft: true
+          files: |
+            dist/*.tar.gz
+            dist/commedit-plugin.zip
           fail_on_unmatched_files: true
+
+      # Flipping draft -> published is the point the release becomes immutable,
+      # with all assets already in place. This job has no checkout, so
+      # `gh release edit` would shell out to git to discover the repo and die
+      # with "not a git repository"; patch the release by its id (from the step
+      # above) via `gh api`, whose fully-qualified path needs neither a git
+      # checkout nor a tag lookup.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH \
+            "/repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
+            -F draft=false

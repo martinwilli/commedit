@@ -27,10 +27,11 @@ use commedit_engine::workcopy::WorkingCopyEntry;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, DropDown, Entry,
-    EventControllerKey, EventControllerScroll, EventControllerScrollFlags, Grid, HeaderBar, Label,
-    ListBox, ListBoxRow, Orientation, Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow,
-    SearchEntry, Shortcut, ShortcutController, ShortcutTrigger, Stack, StringList, ToggleButton,
+    gdk, Application, ApplicationWindow, Box as GtkBox, Button, CallbackAction, CheckButton,
+    DropDown, Entry, EventControllerKey, EventControllerScroll, EventControllerScrollFlags, Grid,
+    HeaderBar, Label, ListBox, ListBoxRow, MenuButton, Orientation, Paned, PolicyType, Popover,
+    PropagationPhase, ScrolledWindow, SearchEntry, Shortcut, ShortcutController, ShortcutTrigger,
+    Stack, StringList, ToggleButton,
 };
 use sourceview5::prelude::ViewExt;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -51,6 +52,7 @@ use crate::conflict::*;
 mod diff_cues;
 mod dnd;
 mod dragdrop;
+mod lanebranch;
 mod linenums;
 mod msglint;
 mod search;
@@ -776,7 +778,35 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     search_entry.set_tooltip_text(Some(
         "Search commit subjects (Ctrl+F) — Enter jumps to the next match",
     ));
+    // A branch dropdown between Reload and Search: it controls the *editable set* —
+    // tick a local branch to fold it into the unified DAG as a real, editable lane,
+    // untick it to freeze it again. Defaults to just the opened branch; the last
+    // editable branch can't be unticked. The checkbox list is (re)populated each
+    // time the popover opens and wired to `set_editable_branches` + `refresh`
+    // further below, once they exist.
+    let branch_menu = MenuButton::new();
+    branch_menu.set_icon_name("view-list-symbolic");
+    branch_menu.set_tooltip_text(Some(
+        "Choose which branches are editable — tick to add a branch to the unified DAG",
+    ));
+    let branch_list = ListBox::new();
+    branch_list.set_selection_mode(gtk::SelectionMode::None);
+    // Wrap the list in a scrolled window: a repo can have dozens of branches, and
+    // a GTK4 popover does not scroll its own child, so a bare list grows taller
+    // than the monitor and the compositor silently fails to place the popover (it
+    // never appears). Cap the height and let it scroll; propagate the natural
+    // width so the popover is still only as wide as the longest branch name.
+    let branch_scroll = ScrolledWindow::new();
+    branch_scroll.set_child(Some(&branch_list));
+    branch_scroll.set_policy(PolicyType::Never, PolicyType::Automatic);
+    branch_scroll.set_propagate_natural_width(true);
+    branch_scroll.set_propagate_natural_height(true);
+    branch_scroll.set_max_content_height(400);
+    let branch_popover = Popover::new();
+    branch_popover.set_child(Some(&branch_scroll));
+    branch_menu.set_popover(Some(&branch_popover));
     header.pack_start(&reload_button);
+    header.pack_start(&branch_menu);
     header.pack_start(&search_entry);
     // pack_end fills right-to-left, so packing the history button first leaves
     // "Compare" to its left: [ Compare ][ ↺ ].
@@ -2425,9 +2455,30 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         Rc::new(move || {
             let (loaded, has_more) = {
                 let r = repo.borrow();
+                let limit = history_limit.get();
                 match r.head_commit_id() {
                     Some(head) => {
-                        history_limited(&r.repo, &head, 0, history_limit.get()).unwrap_or_default()
+                        // The editable set is the source of truth (the dropdown toggles
+                        // it via `set_editable_branches`). Seed the history walk from
+                        // every editable branch's real bookmark tip; a singleton set
+                        // walks just that branch's chain, a wider set unions them into
+                        // one DAG. Every commit shown is now editable — no view-only
+                        // gating.
+                        let editable = r.editable_branches();
+                        if editable.len() <= 1 {
+                            history_limited(&r.repo, &head, 0, limit).unwrap_or_default()
+                        } else {
+                            let branches = r.local_branches();
+                            let mut heads = vec![head.clone()];
+                            for name in &editable {
+                                if let Some(b) = branches.iter().find(|b| &b.name == name) {
+                                    if b.head != head {
+                                        heads.push(b.head.clone());
+                                    }
+                                }
+                            }
+                            r.history_multi(&heads, 0, limit).unwrap_or_default()
+                        }
                     }
                     None => (Vec::new(), false),
                 }
@@ -3082,12 +3133,111 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         }
     });
 
-    // "Reload" (top-left header button): re-open the repository from disk so
-    // edits made outside commedit (a `git commit`, branch switch, …) show up —
-    // a fresh session in place, same as restarting the app. Session state
-    // (edit history, trash, a pending conflict, the split working-copy chain)
-    // is dropped, exactly as a restart would; `Repo::open` re-snapshots the
-    // working copy and collapses the chain to git's single-pile view.
+    // The branch dropdown *is* the editable-branch set. Ticking a branch widens the
+    // live `Repo`'s editable set (it joins the unified DAG as a real, rewritable
+    // lane); unticking narrows it (its ref freezes again). Both go through the
+    // engine's in-place `set_editable_branches`, so the session's undo history and
+    // trash survive a toggle — unlike a full reopen. The set defaults to just the
+    // opened branch; there is no pinned branch, only a last-branch rule (the final
+    // editable branch can't be unticked). The list is (re)populated every time the
+    // popover opens (branches move/appear out of band); it is a small transient
+    // list, not the segfault-sensitive history list, so rebuilding its rows is safe.
+    // The last-branch rule, applied live: disable the sole ticked branch's
+    // checkbox (so the set can never be emptied) and re-enable it as soon as a
+    // second branch is ticked. Run after (re)building the list and after every
+    // toggle, so the greyed-out state tracks the set without reopening the
+    // popover. It only flips `sensitive`/tooltip on the existing checkboxes — no
+    // row is added or removed — so it is safe to call from inside a checkbox's
+    // own `toggled` handler (unlike a rebuild, which would unparent that row
+    // mid-signal).
+    let apply_last_branch_rule: Rc<dyn Fn()> = {
+        let branch_list = branch_list.clone();
+        Rc::new(move || {
+            let mut checks: Vec<CheckButton> = Vec::new();
+            let mut child = branch_list.first_child();
+            while let Some(w) = child {
+                child = w.next_sibling();
+                if let Ok(cb) = w.downcast::<CheckButton>() {
+                    checks.push(cb);
+                }
+            }
+            let only_one = checks.iter().filter(|c| c.is_active()).count() == 1;
+            for cb in &checks {
+                let last = only_one && cb.is_active();
+                cb.set_sensitive(!last);
+                cb.set_tooltip_text(last.then_some("The last editable branch — keep at least one"));
+            }
+        })
+    };
+
+    branch_menu.connect_active_notify({
+        let repo = repo.clone();
+        let refresh = refresh.clone();
+        let branch_list = branch_list.clone();
+        let show_status = show_status.clone();
+        let apply_last_branch_rule = apply_last_branch_rule.clone();
+        move |mb| {
+            if !mb.is_active() {
+                return;
+            }
+            while let Some(child) = branch_list.first_child() {
+                branch_list.remove(&child);
+            }
+            for b in repo.borrow().local_branches() {
+                let check = CheckButton::with_label(&b.name);
+                check.set_active(b.is_editable);
+                // Connect *after* set_active, so seeding the initial state doesn't
+                // fire a spurious toggle.
+                check.connect_toggled({
+                    let name = b.name.clone();
+                    let repo = repo.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let apply_last_branch_rule = apply_last_branch_rule.clone();
+                    move |c| {
+                        // Compute the desired set from the live editable set ± this
+                        // branch, preserving order (existing first, newcomers appended).
+                        let mut desired = repo.borrow().editable_branches();
+                        if c.is_active() {
+                            if !desired.contains(&name) {
+                                desired.push(name.clone());
+                            }
+                        } else {
+                            desired.retain(|n| n != &name);
+                        }
+                        if desired.is_empty() {
+                            // Last-branch rule backstop: revert the tick, do nothing.
+                            c.set_active(true);
+                            show_status("Keep at least one branch editable");
+                            return;
+                        }
+                        // Bind in a `let` so the `borrow_mut()` temporary is released at
+                        // the `;` — `refresh()` re-borrows `repo`, and a temporary held in
+                        // a `match` scrutinee would still be alive in the arm, panicking
+                        // with "already mutably borrowed".
+                        let outcome = repo.borrow_mut().set_editable_branches(&desired);
+                        match outcome {
+                            Ok(()) => {
+                                refresh();
+                                // Re-evaluate which checkbox is the now-sole ticked
+                                // branch so the greyed-out state stays in sync.
+                                apply_last_branch_rule();
+                            }
+                            Err(err) => {
+                                // Revert the checkbox to match the unchanged set.
+                                c.set_active(!c.is_active());
+                                show_status(&format!("Could not change the branch set: {err}"));
+                            }
+                        }
+                    }
+                });
+                branch_list.append(&check);
+            }
+            // Seed the greyed-out state for the freshly built list.
+            apply_last_branch_rule();
+        }
+    });
+
     reload_button.connect_clicked({
         let repo = repo.clone();
         let repo_path = repo_path.clone();

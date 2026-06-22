@@ -1214,15 +1214,20 @@ impl Repo {
         let mut tx = self.repo.start_transaction();
         crate::transparency::export_to_git(tx.repo_mut())?;
         self.repo = block_on(tx.commit("commedit: export to git")).context("committing export")?;
-        // jj exported the moved bookmark into its throwaway git dir, not the
-        // user's repo; mirror that one branch tip into the real repository. Must
-        // precede materialize_after_rewrite, which resets the index to the user's
-        // HEAD (now the new tip).
-        self.bridge_branch_to_git(old_head.as_deref());
-        // Off-worktree the user's HEAD, index and worktree belong to a different
-        // branch and must stay frozen: only the edited branch's ref moves (above).
-        // Skip re-attaching HEAD and materializing the working copy — there is no
-        // working copy on a branch that isn't checked out.
+        // jj exported the moved bookmarks into its throwaway git dir, not the user's
+        // repo; mirror every editable bookmark whose tip changed into the real
+        // repository. Must precede materialize_after_rewrite, which resets the index
+        // to the user's HEAD (now the new tip).
+        self.bridge_branches_to_git(old_head.as_deref(), heads);
+        // The launch worktree's HEAD/index/worktree participate only when this
+        // session is worktree-bound — i.e. its primary branch is the checked-out
+        // one. Off-worktree (the primary isn't checked out here) there is no working
+        // copy: HEAD/index/worktree stay frozen, only the editable refs move.
+        //
+        // When worktree-bound and editing a *sibling* editable branch (multi-branch
+        // set), the launch branch's tip is unchanged, so re-attaching HEAD and
+        // re-checking-out the launch `@` are no-ops on disk: `@` and HEAD are where
+        // they were. (Phase 1b generalizes this to per-worktree materialization.)
         if self.is_worktree_bound() {
             self.reattach_head()?;
         }
@@ -1230,9 +1235,19 @@ impl Repo {
         if self.is_worktree_bound() {
             // Write the rebased working-copy commit @' back to disk (preserving the
             // user's uncommitted changes through the rewrite), in place of the old
-            // git read-tree sync.
+            // git read-tree sync. Unconditional when worktree-bound: the launch `@`
+            // can move even when the launch branch's tip does not (e.g. `revert_all`
+            // resets the working copy), so a tip-only gate here would skip a needed
+            // re-materialization.
             self.materialize_after_rewrite(old_head)?;
         }
+        // Re-materialize every *extra* worktree whose branch tip actually moved (its
+        // bridged git ref differs from the pre-rewrite `before` map). A worktree
+        // whose branch was untouched is left frozen, and a selected branch with no
+        // worktree is a pure ref-move (none registered). Unlike the launch worktree,
+        // an extra worktree's `@` only moves when its branch tip does, so a tip
+        // comparison is both correct and sufficient here.
+        self.materialize_moved_worktrees(heads)?;
         Ok(())
     }
 }

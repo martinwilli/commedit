@@ -56,6 +56,7 @@ pub fn init_shared_git_dir(
     git_dir: &Path,
     workspace_root: &Path,
     seed_branch: Option<&str>,
+    extra_branches: &[String],
 ) -> Result<()> {
     let objects = git_objects_dir(workspace_root)?;
     // A known-valid bare layout (HEAD, config, refs/, …) for gix to open.
@@ -77,7 +78,24 @@ pub fn init_shared_git_dir(
     symlink_dir(&objects, &local_objects)?;
     // Seed the edited branch / detached HEAD and its tip (resolvable now via the
     // shared objects) so jj imports that history.
-    seed_session_head(git_dir, workspace_root, seed_branch)
+    seed_session_head(git_dir, workspace_root, seed_branch)?;
+    // Seed any additional editable branches' refs (no HEAD change) so jj's
+    // multi-bookmark import can see each branch's tip through the shared objects.
+    for branch in extra_branches {
+        if let Some(tip) = ref_commit(workspace_root, branch) {
+            seed_session_ref(git_dir, branch, &tip)?;
+        }
+    }
+    Ok(())
+}
+
+/// Point a single branch's ref (`full`, a full ref name) at `tip` in the session
+/// git dir, without touching HEAD — so jj's multi-bookmark import can see that
+/// branch's tip through the shared objects. Used at open ([`init_shared_git_dir`])
+/// and when widening the editable set in place
+/// ([`crate::repo::Repo::set_editable_branches`]).
+pub fn seed_session_ref(git_dir: &Path, full: &str, tip: &str) -> Result<()> {
+    git_in_dir(git_dir, &["update-ref", full, tip])
 }
 
 /// Point the session git dir's edited-branch ref (and HEAD) at that branch's
@@ -307,27 +325,28 @@ pub fn ref_decorations(workspace_root: &Path) -> BTreeMap<String, Vec<RefDecorat
     map
 }
 
-/// Force every local branch *except* `current` (a full ref name like
-/// `refs/heads/main`) back to the commit it pointed at in `before`, undoing any
-/// move jj's ref export made to a branch other than the one being edited. This
-/// is a git-level safety net behind the jj-bookmark confinement: whatever path
-/// nudges an unrelated branch — a backup sharing the rewritten tip, a tracked
-/// bookmark, a future jj quirk — it is reverted here before the user sees it.
+/// Force every local branch *outside* the editable set `exempt` (full ref names
+/// like `refs/heads/main`) back to the commit it pointed at in `before`, undoing
+/// any move jj's ref export made to a branch the session does not legitimately
+/// edit. This is a git-level safety net behind the jj-bookmark confinement:
+/// whatever path nudges an unrelated branch — a backup sharing the rewritten tip,
+/// a tracked bookmark, a future jj quirk — it is reverted here before the user
+/// sees it.
 ///
 /// Returns the branches it had to restore (empty in the common case), so callers
 /// can surface that a leak occurred. A branch that vanished is recreated; one
-/// that merely moved is reset. No-op when `current` is `None` (detached HEAD),
-/// matching the rest of the transparency layer.
+/// that merely moved is reset. An empty `exempt` (detached HEAD, no editable
+/// branch) protects every branch, matching the rest of the transparency layer.
 pub fn restore_unrelated_heads(
     workspace_root: &Path,
-    current: Option<&str>,
+    exempt: &[&str],
     before: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let after = local_head_oids(workspace_root);
     let mut restored = Vec::new();
     let mut updates = String::new();
     for (name, oid) in before {
-        if Some(name.as_str()) == current {
+        if exempt.contains(&name.as_str()) {
             continue;
         }
         if after.get(name).map(String::as_str) != Some(oid.as_str()) {
@@ -533,6 +552,26 @@ fn git_line(workspace_root: &Path, args: &[&str]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// Resolve a git-relative path (e.g. `info/exclude`) to its absolute location for
+/// the worktree at `workspace_root`, the way `git rev-parse --git-path` does —
+/// honouring a linked worktree's separate gitdir vs. its common dir. `None` if git
+/// can't be run or the path can't be resolved.
+pub fn git_path(workspace_root: &Path, rel: &str) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", "--git-path", rel])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(workspace_root.join(raw))
+}
+
 /// Read a single git config value (e.g. `user.name`) as git itself would see it
 /// — honouring the system, global, and repo-local config hierarchy. `None` if
 /// the key is unset or git can't be run. Whitespace-only values count as unset.
@@ -582,11 +621,13 @@ pub fn resolve_local_branch(workspace_root: &Path, name: &str) -> Result<String>
     Ok(full)
 }
 
-/// The worktree that currently has `branch` (a full ref like `refs/heads/feature`)
-/// checked out, if any — parsed from `git worktree list --porcelain`. commedit
-/// refuses to rewrite a branch that is live in another worktree: moving its ref
-/// would leave that worktree's HEAD/index pointing at an orphaned commit.
-pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+/// Every git worktree of this repository, paired with the full ref name of the
+/// branch it has checked out (`None` for a detached-HEAD worktree) — parsed from
+/// `git worktree list --porcelain`. The main worktree is included. commedit maps
+/// each editable branch's worktree onto a jj workspace so a rewrite that moves
+/// that branch re-materializes *its* working copy (see
+/// [`crate::repo::Repo::open_multi`]).
+pub fn worktrees(workspace_root: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
     let out = Command::new("git")
         .current_dir(workspace_root)
         .args(["worktree", "list", "--porcelain"])
@@ -599,17 +640,36 @@ pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option
         );
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut result: Vec<(PathBuf, Option<String>)> = Vec::new();
     let mut current: Option<PathBuf> = None;
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
+            // A blank line separates worktree records; the `worktree` line opens
+            // a new one. Push the previous (branchless or detached) record first.
+            if let Some(prev) = current.take() {
+                result.push((prev, None));
+            }
             current = Some(PathBuf::from(path));
         } else if let Some(b) = line.strip_prefix("branch ") {
-            if b == branch {
-                return Ok(current);
+            if let Some(path) = current.take() {
+                result.push((path, Some(b.to_string())));
             }
         }
     }
-    Ok(None)
+    if let Some(path) = current.take() {
+        result.push((path, None));
+    }
+    Ok(result)
+}
+
+/// The worktree that currently has `branch` (a full ref like `refs/heads/feature`)
+/// checked out, if any. A thin filter over [`worktrees`]; commedit uses it to map
+/// each editable branch onto its worktree (registering a jj workspace there) and,
+/// when no such mapping is possible, to refuse the open.
+pub fn worktree_for_branch(workspace_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(worktrees(workspace_root)?
+        .into_iter()
+        .find_map(|(path, b)| (b.as_deref() == Some(branch)).then_some(path)))
 }
 
 /// The full ref name (e.g. `refs/heads/main`) HEAD symbolically points at, or

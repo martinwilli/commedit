@@ -116,7 +116,13 @@ pub fn init_repo(dir: &Path, commits: &[(&str, &str, &str)]) {
 
 /// Subjects on `main`, newest first.
 pub fn git_log_subjects(dir: &Path) -> Vec<String> {
-    git(dir, &["log", "--format=%s", "main"])
+    git_log_subjects_of(dir, "main")
+}
+
+/// Like [`git_log_subjects`], but for an arbitrary `revspec` (e.g. another
+/// branch) — used by the multi-branch tests to assert per-branch ref movement.
+pub fn git_log_subjects_of(dir: &Path, revspec: &str) -> Vec<String> {
+    git(dir, &["log", "--format=%s", revspec])
         .lines()
         .map(str::to_string)
         .collect()

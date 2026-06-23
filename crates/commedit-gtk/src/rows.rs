@@ -15,7 +15,10 @@ use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 
 use crate::msglint::{self, RepoStyle};
-use crate::state::{LintFixCallback, MergeOutCallback, RestoreToWorktreeCallback, RevertCallback};
+use crate::state::{
+    row_commit_index, DisplayRow, LintFixCallback, MergeOutCallback, RestoreToWorktreeCallback,
+    RevertCallback, SharedHollow,
+};
 
 /// The history list's ancestry-graph layout, shared between `build_ui`'s refresh
 /// (which recomputes it) and every row's drawing area (which reads its own row).
@@ -54,22 +57,26 @@ fn graph_width(layout: &GraphLayout) -> i32 {
 }
 
 /// Build the per-row ancestry drawing area. The draw func captures the shared
-/// layout plus this row's **creation index** and reads `rows[index]` at draw
-/// time — valid because `populate_rows` always shows `commits[i]` in the i-th
-/// appended row and never unparents (so a row keeps its index for life); a
-/// hidden surplus row indexes past the layout and draws nothing.
+/// **draw** layout (over the interleaved display list) plus this row's
+/// **creation index** (a *display* index) and reads `rows[index]` at draw time —
+/// valid because the populate functions always show display row *i* in the i-th
+/// appended row and never unparent (so a row keeps its index for life); a hidden
+/// surplus row indexes past the layout and draws nothing. `hollow[index]` (read
+/// at draw time, same discipline) draws a ring instead of a filled disc — a
+/// worktree's uncommitted `@` node.
 ///
 /// Each row draws edge-to-edge: incoming edges from the top edge to the vertical
 /// center, the node at the center, outgoing edges down to the bottom edge — so
 /// adjacent rows' lines connect without any cross-row drawing state. Colors
 /// follow `compute_graph`'s contract (above-edges by `from` lane, below-edges by
 /// `to` lane) to keep a line's color continuous across rows.
-fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
+fn graph_area(graph: &SharedGraph, hollow: &SharedHollow, index: usize) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(graph_width(&graph.borrow()));
     // Purely decorative: keep GTK's pointer/drop picking on the row itself.
     area.set_can_target(false);
     let graph = graph.clone();
+    let hollow = hollow.clone();
     area.set_draw_func(move |_, cr, _w, h| {
         let layout = graph.borrow();
         let Some(row) = layout.rows.get(index) else {
@@ -117,7 +124,14 @@ fn graph_area(graph: &SharedGraph, index: usize) -> gtk::DrawingArea {
         } else {
             set_color(row.node_lane);
         }
-        let _ = cr.fill();
+        // A working-copy `@` node is drawn as a hollow ring (uncommitted, not yet
+        // a real commit); every real commit is a filled disc.
+        if hollow.borrow().get(index).copied().unwrap_or(false) {
+            cr.set_line_width(EDGE_W);
+            let _ = cr.stroke();
+        } else {
+            let _ = cr.fill();
+        }
     });
     area
 }
@@ -503,7 +517,7 @@ fn commit_row_box(
     commit: &CommitInfo,
     conflicted: bool,
     refs: &[RefDecoration],
-    graph: Option<(&SharedGraph, usize)>,
+    graph: Option<(&SharedGraph, &SharedHollow, usize)>,
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
@@ -573,12 +587,12 @@ fn commit_row_box(
         content.add_css_class("no-merge-out");
     }
     let outer = GtkBox::new(Orientation::Horizontal, 0);
-    if let Some((graph, index)) = graph {
+    if let Some((graph, hollow, index)) = graph {
         // The lane column supplies the leading whitespace; the graph lines must
         // reach the row edges, so the content box drops its leading margin.
         row_box.set_margin_start(4);
         row_box.set_hexpand(true);
-        outer.append(&graph_area(graph, index));
+        outer.append(&graph_area(graph, hollow, index));
     }
     outer.append(&content);
     outer
@@ -640,7 +654,7 @@ fn set_row_commit(
     commit: &CommitInfo,
     conflicted: bool,
     refs: &[RefDecoration],
-    graph: Option<(&SharedGraph, usize)>,
+    graph: Option<(&SharedGraph, &SharedHollow, usize)>,
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
@@ -723,7 +737,7 @@ fn set_row_commit(
             }
             set_pills(&pills, refs);
             badge.set_visible(conflicted);
-            if let (Some(area), Some((graph, _))) = (&area, graph) {
+            if let (Some(area), Some((graph, _, _))) = (&area, graph) {
                 // The shared layout was just recomputed: re-fit the lane column
                 // and repaint this row's slice of it.
                 area.set_content_width(graph_width(&graph.borrow()));
@@ -765,7 +779,7 @@ fn populate_rows(
     selectable: bool,
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
-    graph: Option<&SharedGraph>,
+    graph: Option<(&SharedGraph, &SharedHollow)>,
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_restore: Option<&RestoreToWorktreeCallback>,
@@ -787,7 +801,7 @@ fn populate_rows(
             commit,
             conflicts.contains(&commit.change_id_hex()),
             refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
-            graph.map(|g| (g, i)),
+            graph.map(|(g, h)| (g, h, i)),
             on_revert,
             on_merge_out,
             on_restore,
@@ -803,44 +817,164 @@ fn populate_rows(
     }
 }
 
-/// Show the history commits in `list` (newest first), reusing rows. See
-/// [`populate_rows`]. `refs` (commit hex → branch/tag names, from
-/// `Repo::commit_refs`) supplies the pill decorations after each subject;
-/// `graph` (from `compute_graph` over the same commits) the ancestry lines.
+/// CSS class tagging a row currently built as a working-copy `@` node, so the
+/// populate loop can tell whether an existing row's child needs a layout swap
+/// (commit ↔ `@`). [`set_row_wc`] adds it; [`populate_history`] strips it when a
+/// row flips back to a commit.
+const WC_ROW_CLASS: &str = "wc-node-row";
+
+/// The summary line shown in a working-copy `@` row, e.g.
+/// "✏ Uncommitted changes — main.rs, lib.rs (+3 more)" (or "⚠ … conflicts in …").
+fn wc_row_text(entry: &WorkingCopyEntry) -> String {
+    let files = summarize_files(&entry.file_names);
+    if entry.has_conflict {
+        format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {files}")
+    } else {
+        format!("\u{270E} Uncommitted changes \u{2014} {files}")
+    }
+}
+
+/// Build a working-copy `@` row's child: the ancestry drawing area (drawing a
+/// hollow node on the entry's lane) leading a single summary label — the lane
+/// analogue of the old standalone working-copy list row.
+fn wc_row_box(
+    entry: &WorkingCopyEntry,
+    graph: &SharedGraph,
+    hollow: &SharedHollow,
+    index: usize,
+) -> GtkBox {
+    let outer = GtkBox::new(Orientation::Horizontal, 0);
+    outer.append(&graph_area(graph, hollow, index));
+    let label = Label::builder()
+        .label(wc_row_text(entry))
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(4)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .hexpand(true)
+        .build();
+    outer.append(&label);
+    outer
+}
+
+/// Update a row to show working-copy entry `entry` as a lane node at display
+/// `index`. Reuses the existing `@`-row child in place (just refits the lane
+/// column and refreshes the label); rebuilds it whole when the row was a commit
+/// row (or empty) — `set_child` swaps the child without unparenting the row, so
+/// the drag-safety discipline of [`populate_rows`] holds.
+fn set_row_wc(
+    row: &ListBoxRow,
+    entry: &WorkingCopyEntry,
+    graph: &SharedGraph,
+    hollow: &SharedHollow,
+    index: usize,
+) {
+    let reused = row.has_css_class(WC_ROW_CLASS);
+    let outer = row.child().and_downcast::<GtkBox>();
+    let area = outer
+        .as_ref()
+        .and_then(|b| b.first_child())
+        .and_downcast::<gtk::DrawingArea>();
+    let label = area
+        .as_ref()
+        .and_then(|a| a.next_sibling())
+        .and_downcast::<Label>();
+    match (reused, area, label) {
+        (true, Some(area), Some(label)) => {
+            area.set_content_width(graph_width(&graph.borrow()));
+            area.queue_draw();
+            label.set_text(&wc_row_text(entry));
+        }
+        _ => {
+            row.set_child(Some(&wc_row_box(entry, graph, hollow, index)));
+            row.add_css_class(WC_ROW_CLASS);
+        }
+    }
+}
+
+/// Show the unified history in `list` (newest first), reusing rows. Each
+/// [`DisplayRow`] is either a real commit (rendered as today, ancestry node
+/// filled) or a worktree's uncommitted `@` (a hollow lane node + summary label).
+/// `draw_graph`/`hollow` (over the same `display`) feed the row drawing areas;
+/// `commits` backs the `Commit` rows; `refs`/`conflicts`/`style` and the row
+/// callbacks apply to commit rows only. See [`populate_rows`] for the
+/// hide-never-unparent discipline this shares.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn populate_list(
+pub(crate) fn populate_history(
     list: &ListBox,
+    display: &[DisplayRow],
     commits: &[CommitInfo],
+    draw_graph: &SharedGraph,
+    hollow: &SharedHollow,
     conflicts: &HashSet<String>,
     refs: &BTreeMap<String, Vec<RefDecoration>>,
-    graph: &SharedGraph,
     on_revert: Option<&RevertCallback>,
     on_merge_out: Option<&MergeOutCallback>,
     on_lint: Option<&LintFixCallback>,
     style: Option<&RepoStyle>,
 ) {
-    populate_rows(
-        list,
-        commits,
-        true,
-        conflicts,
-        refs,
-        Some(graph),
-        on_revert,
-        on_merge_out,
-        None,
-        on_lint,
-        style,
-    );
+    for (i, drow) in display.iter().enumerate() {
+        let row = list.row_at_index(i as i32).unwrap_or_else(|| {
+            let row = ListBoxRow::new();
+            row.set_selectable(true);
+            row.set_activatable(true);
+            list.append(&row);
+            row
+        });
+        row.set_visible(true);
+        match drow {
+            DisplayRow::Commit(ci) => {
+                let Some(commit) = commits.get(*ci) else {
+                    continue;
+                };
+                // This row now holds a commit: drop the `@` marker so a later flip
+                // back to `@` rebuilds the child rather than reusing a commit one.
+                // (`set_row_commit` itself detects a stale `@`-shaped child by the
+                // structural downcast and rebuilds, so reuse stays correct either way.)
+                row.remove_css_class(WC_ROW_CLASS);
+                set_row_commit(
+                    &row,
+                    commit,
+                    conflicts.contains(&commit.change_id_hex()),
+                    refs.get(&commit.id_hex()).map_or(&[], Vec::as_slice),
+                    Some((draw_graph, hollow, i)),
+                    on_revert,
+                    on_merge_out,
+                    None,
+                    on_lint,
+                    style,
+                );
+            }
+            DisplayRow::Wc { entry, .. } => set_row_wc(&row, entry, draw_graph, hollow, i),
+        }
+    }
+    // Hide surplus rows rather than removing them (see `populate_rows`).
+    let mut i = display.len() as i32;
+    while let Some(extra) = list.row_at_index(i) {
+        extra.set_visible(false);
+        i += 1;
+    }
 }
 
 /// Add the `op-affected` highlight to every history row whose commit's change id
 /// is in `affected` — used while hovering an "Edit history" dropdown entry, to
 /// show which commit(s) that operation touched before committing to a jump.
-pub(crate) fn highlight_affected(list: &ListBox, commits: &[CommitInfo], affected: &[String]) {
+/// `commit_rows` (commit index → display-row index) places each highlight on the
+/// right list row now that `@` nodes shift commit rows down.
+pub(crate) fn highlight_affected(
+    list: &ListBox,
+    commit_rows: &[usize],
+    commits: &[CommitInfo],
+    affected: &[String],
+) {
     for (i, commit) in commits.iter().enumerate() {
         if affected.iter().any(|c| *c == commit.change_id_hex()) {
-            if let Some(row) = list.row_at_index(i as i32) {
+            if let Some(row) = commit_rows
+                .get(i)
+                .and_then(|&di| list.row_at_index(di as i32))
+            {
                 row.add_css_class("op-affected");
             }
         }
@@ -866,13 +1000,18 @@ pub(crate) fn clear_highlight(list: &ListBox) {
 /// [`highlight_affected`] / [`clear_highlight`].
 pub(crate) fn apply_search_highlight(
     list: &ListBox,
+    display: &[DisplayRow],
     commits: &[CommitInfo],
     query: &str,
 ) -> Vec<usize> {
     let mut matches = Vec::new();
-    for (i, commit) in commits.iter().enumerate() {
+    for i in 0..display.len() {
         let Some(row) = list.row_at_index(i as i32) else {
             break;
+        };
+        // Only commit rows carry a searchable subject; `@` nodes are skipped.
+        let Some(commit) = row_commit_index(display, i).and_then(|ci| commits.get(ci)) else {
+            continue;
         };
         let Some(label) = row_subject_label(&row) else {
             continue;
@@ -959,41 +1098,4 @@ fn summarize_files(names: &[String]) -> String {
         summary.push_str(&format!(" (+{more} more)"));
     }
     summary
-}
-
-/// Fill the working-copy list with one summary row per uncommitted entry (newest
-/// first, the leaf `@` first), reusing rows and hiding the surplus — the same
-/// drag-safe pattern as [`populate_rows`]. Each row is a single label, e.g.
-/// "✏ Uncommitted changes — main.rs, lib.rs (+3 more)" (or "⚠ … conflicts in …").
-pub(crate) fn populate_wc(list: &ListBox, entries: &[WorkingCopyEntry]) {
-    for (i, entry) in entries.iter().enumerate() {
-        let row = list.row_at_index(i as i32).unwrap_or_else(|| {
-            let label = Label::new(None);
-            label.set_halign(gtk::Align::Start);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_margin_start(8);
-            label.set_margin_end(8);
-            label.set_margin_top(4);
-            label.set_margin_bottom(4);
-            let row = ListBoxRow::new();
-            row.set_child(Some(&label));
-            list.append(&row);
-            row
-        });
-        row.set_visible(true);
-        let files = summarize_files(&entry.file_names);
-        let text = if entry.has_conflict {
-            format!("\u{26A0} Uncommitted changes \u{2014} conflicts in {files}")
-        } else {
-            format!("\u{270E} Uncommitted changes \u{2014} {files}")
-        };
-        if let Some(label) = row.child().and_downcast::<Label>() {
-            label.set_text(&text);
-        }
-    }
-    let mut i = entries.len() as i32;
-    while let Some(extra) = list.row_at_index(i) {
-        extra.set_visible(false);
-        i += 1;
-    }
 }

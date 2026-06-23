@@ -126,13 +126,17 @@ an interactive-rebase session.
   abort and leave history exactly as it was.
 
 - **Uncommitted changes are first-class** — whatever you've edited or added on
-  disk but not committed appears as its own row above the history, with the same
-  editable diff. With the message left empty, **Save** writes your diff edits
-  back to the working tree; type a commit message and **Save** instead commits
-  the changes on top of `HEAD` (author/committer default to your git identity
-  unless you set them). Fold it into an existing commit, **Split** off a piece,
-  or drop it onto the trash to discard it — and until you commit it, it rides
-  through every rewrite untouched, still uncommitted when you're done.
+  disk but not committed appears as a **hollow node on its branch's lane** in the
+  history, with the same editable diff. With the message left empty, **Save**
+  writes your diff edits back to the working tree; type a commit message and
+  **Save** instead commits the changes on top of that branch's tip
+  (author/committer default to your git identity unless you set them). Fold it
+  into an existing commit, **Split** off a piece, or drop it onto the trash to
+  discard it — and until you commit it, it rides through every rewrite untouched,
+  still uncommitted when you're done. Every branch you're editing that is checked
+  out in a worktree shows its own hollow node, so you can tidy several worktrees'
+  uncommitted work from one window (Split and partial-commit apply only to the
+  checked-out launch worktree's node).
 
 - **Review before you're done** — the toolbar's **Review** toggle flips the
   window into a read-only, full-window diff of every content change you've made
@@ -292,9 +296,15 @@ index and the working tree completely untouched. Every history edit works as
 usual, but there is no working copy for the launch view (a branch you haven't
 checked out has no uncommitted changes), so its working-copy features are
 unavailable. A branch in the editable set that *is* checked out in another worktree
-is kept in sync: a rewrite that moves it re-materializes that worktree's files and
-index (its own uncommitted changes ride along), so editing it no longer desyncs the
-other checkout.
+is kept in sync: its uncommitted changes appear as their own hollow node on its
+lane — which you can fold into a commit, discard, edit, or commit, exactly like
+the checked-out worktree's — and a rewrite that moves the branch re-materializes
+that worktree's files and index (its own uncommitted changes ride along), so
+editing it no longer desyncs the other checkout. A plain `git commit` you make in
+that worktree out of band is absorbed onto its branch on the next operation,
+rather than reappearing as a phantom uncommitted change. (Split and partial-commit
+stay launch-only: a sibling worktree carries a single working-copy commit with no
+split chain.)
 
 Opening several windows on one repository — typically one per branch — lets you
 drag a commit from one onto another to cherry-pick it across branches. The
@@ -321,7 +331,10 @@ That transparency is what keeps conflicts out of your history. While a rewrite i
 conflicted, comm(ed)it moves no git ref, `HEAD` or working-tree file: the
 conflicted commit objects sit unreachable in the object store and plain `git`
 keeps seeing your original history, until the chain resolves clean (then it
-exports in one step) or you abort (then nothing happened). *Spurious* conflicts
+exports in one step) or you abort (then nothing happened). A conflict that lands
+on a *sibling* branch or a sibling worktree's uncommitted changes — not just the
+launch branch's — is resolved in the diff pane the same way, since detection and
+resolution both span every editable branch and every worktree. *Spurious* conflicts
 — adjacent but independent edits that an ordinary 3-way merge can't place even
 though the combined result is unambiguous — are reconstructed and resolved
 automatically before any of that, so you only ever face conflicts that genuinely
@@ -334,9 +347,12 @@ working-copy commit and rebases them forward like any other descendant. The one
 thing the jj model can't see is content that lives *only* in the git index — a
 file you `git add`ed and then changed or removed on disk — so before each rewrite
 resets the index, comm(ed)it pins the whole index to a
-`refs/commedit/backup/index-*` ref. These are silent, transient safety nets: only
-the most recent one is kept (older ones are pruned automatically on the next
-rewrite), and you almost never need them. If you do, recover with
+`refs/commedit/backup/index-*` ref. The same protection applies to every worktree
+it re-materializes: a sibling worktree's index is backed up before its reset too,
+under a per-worktree-keyed ref so the recovery points don't evict one another.
+These are silent, transient safety nets: only the most recent one per worktree is
+kept (older ones are pruned automatically on the next rewrite), and you almost
+never need them. If you do, recover with
 `git read-tree <ref>` (restage) or `git checkout <ref> -- .` (write to disk);
 `git for-each-ref refs/commedit/backup/` lists any that exist.
 

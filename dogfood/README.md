@@ -29,6 +29,11 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 
 > Run history (Opus teacher; students on Sonnet unless a run says otherwise — run 5 added a Haiku
 > operator). Each run's scorecard and findings live under [`runs/`](runs/), newest first.
+>
+> [Run 7](runs/7.md) was the **k=2 ref-race fix verification**: 66 students at full 33-way concurrency,
+> twice, **with the `gc.auto 0` mitigation removed** — **zero** silent reverts (vs run 6's 4/33 *with* the
+> mitigation). The "ref-write race" was re-diagnosed (commit `c6f56ca`) as a cross-session
+> `protect_unrelated_heads` clobber, not a git `pack-refs`/`gc` race, and the fix retires the mitigation.
 
 ---
 
@@ -376,16 +381,22 @@ For each task T (1→11), each solver S (operator, control, git):
    conflict left dangling in a session is discarded by reloading **that** session
    (`reload_repo(session=<id>)`; it's not pending-guarded).
 
-> ⚠️ **Ref-write race under full parallelism (run-4 finding).** Running all 40 students at once puts
-> ~40 git ref-writers (the plain-git rebases/commits **and** the MCP sessions' git-export bookkeeping)
-> on the **one shared `.git` common-dir** simultaneously. A concurrent `pack-refs`/`gc --auto` can then
-> silently drop a freshly-written loose ref, **reverting a student's correct result to an earlier value
-> after it finished** (run 4 lost 3 of 40 this way; 3 more self-recovered from reflog). The object store
-> is safe (append-only); only **ref updates** race. Before a fully-parallel run, prefer one of: a
-> separate clone/common-dir per student; `git config gc.auto 0` (+ `maintenance.auto false`) on the
-> repo; or capped concurrency. Either way, **re-run the oracle (`./dogfood/verify.sh`) after the run
-> settles** — it is exactly this out-of-band `git` re-check, and the revert can land post-completion,
-> so student self-reports are not authoritative. See [run 4](runs/4.md).
+> ✅ **The "ref-write race" was fixed in `c6f56ca` (verified in [run 7](runs/7.md)).** Runs 4–6 saw a
+> student's correct result silently **revert to an earlier value after it finished** under full
+> parallelism (run 4 lost 3/40, run 6 lost 4/33) and blamed a git `pack-refs`/`gc --auto` race on the
+> shared common-dir. The real cause: `protect_unrelated_heads` was force-restoring **another session's**
+> branch (one this session never imported) back to *this* session's stale snapshot — a cross-session
+> clobber. Scoping the backstop to jj-tracked refs (`view().git_refs()`) fixed it. Run 7 ran 66 students
+> at peak 33-way concurrency, twice, **with the old `gc.auto 0` + `maintenance.auto false` mitigation
+> removed**, and saw **zero** reverts — so that mitigation is **no longer needed**; keep it rolled back.
+> `tests/refrace_repro.rs` is the unit guard.
+> Still mandatory regardless: **re-run the oracle (`./dogfood/verify.sh`) after the run settles** — an
+> out-of-band `git` re-check on the correct base, since student self-reports are not authoritative (run 7
+> finding 2: a plain-git student clobbered the shared `stress/base` ref and concurrent students reported
+> the resulting spurious diffs as success; only the oracle caught it). Give the **git** baseline a
+> guardrail — *operate only on its target branch; never `update-ref`/`branch -f` shared refs, never leave
+> a detached HEAD* — and tell every student to keep its Tool Log in the **reply, not a repo file** (run 7
+> finding 3: a log written into the worktree dirtied the tree and failed the clean-tree gate).
 
 ### Between repeats of a task on the same worktree
 `git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**

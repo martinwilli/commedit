@@ -4,7 +4,7 @@
 //! the git backend is synchronous under the hood, so we drive them to
 //! completion with [`pollster::block_on`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -916,10 +916,33 @@ impl Repo {
         // legitimately moves) and protect every other local branch — including the
         // checked-out one when its branch is not in the set (off-worktree).
         let exempt: Vec<&str> = self.edited.refs().collect();
+        // Consider only branches jj actually tracks in its view. The import is
+        // *scoped* (`import_some_refs` admits only the editable set), so jj's
+        // export can only ever move a ref it imported; a branch jj never imported
+        // cannot have been moved by *this* session's export, so it must not be
+        // force-restored to our snapshot. That guard is what makes the backstop
+        // multi-tenant-safe: the MCP server hosts several sessions over one shared
+        // git common-dir, and another session's branch — never imported here —
+        // would otherwise look like an "unrelated move" and get clobbered back to
+        // this session's stale snapshot (a silent revert-to-an-old-tip). A branch
+        // jj *does* track but that sits outside the editable set (a just-unticked
+        // one) is still protected, keeping the narrowing-freeze behavior.
+        let managed: HashSet<&str> = self
+            .repo
+            .view()
+            .git_refs()
+            .keys()
+            .map(|name| name.as_str())
+            .collect();
+        let scoped: BTreeMap<String, String> = before
+            .iter()
+            .filter(|(name, _)| managed.contains(name.as_str()))
+            .map(|(name, oid)| (name.clone(), oid.clone()))
+            .collect();
         let restored = crate::transparency::restore_unrelated_heads(
             self.workspace.workspace_root(),
             &exempt,
-            before,
+            &scoped,
         );
         if !restored.is_empty() {
             eprintln!(

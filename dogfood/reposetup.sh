@@ -520,15 +520,51 @@ GIT_COMMITTER_NAME="Alex Fixer" GIT_COMMITTER_EMAIL="alex@example.com" \
 git commit -q -m "Fix null deref in parser [BUG-123]"
 git checkout -q stress/base
 
+# stress/feature (T11 cross-branch MOVE source): a feature branch carrying a commit
+# that actually belongs on the trunk. `Add version string` (own file src/version.txt)
+# was committed here by mistake — it belongs on stress/base — sitting BELOW a legit
+# feature commit `Add experimental flag` (own file src/flag.txt), so dropping the
+# misplaced one rebases the legit one. Both own-file, so the cross-branch move
+# (cherry-pick onto trunk + drop from feature) and the rebase are CLEAN + deterministic:
+# T11's difficulty is multi-session management + off-worktree editing, not a conflict.
+# Explicit Feb dates (don't consume the January DAY budget).
+git checkout -q -b stress/feature stress/base
+cat > src/version.txt <<'EOF'
+VERSION = "0.2.0"
+EOF
+git add -A
+GIT_AUTHOR_DATE="2025-02-02T09:00:00" GIT_COMMITTER_DATE="2025-02-02T09:00:00" \
+GIT_AUTHOR_NAME="Jane Doe" GIT_AUTHOR_EMAIL="jane.doe@example.com" \
+GIT_COMMITTER_NAME="Jane Doe" GIT_COMMITTER_EMAIL="jane.doe@example.com" \
+git commit -q -m "Add version string"
+cat > src/flag.txt <<'EOF'
+EXPERIMENTAL = False
+
+def enabled():
+    return EXPERIMENTAL
+EOF
+git add -A
+GIT_AUTHOR_DATE="2025-02-03T09:00:00" GIT_COMMITTER_DATE="2025-02-03T09:00:00" \
+GIT_AUTHOR_NAME="Jane Doe" GIT_AUTHOR_EMAIL="jane.doe@example.com" \
+GIT_COMMITTER_NAME="Jane Doe" GIT_COMMITTER_EMAIL="jane.doe@example.com" \
+git commit -q -m "Add experimental flag"
+git checkout -q stress/base
+
 # per-(task x solver) branches + worktrees, plus a calibration worktree.
 # solvers: op=operator, ctl=skill-less MCP control, git=plain-git baseline
 # (Sonnet). The model is chosen by the teacher's Agent(...) launch, not here —
 # these are just the isolated worktrees each student works in. (An Opus plain-git
 # baseline 'gito' ran in run 4 and was retired — see dogfood/runs/4.md.)
-for t in 1 2 3 4 5 6 7 8 9 10; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7 8 9 10 11; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done
+# T11 sibling: the feature branch with the misplaced commit. op/ctl edit it
+# OFF-WORKTREE (no checkout — that is the test: open_session anchors it at root),
+# so they get a branch but no worktree. The plain-git baseline cannot edit a branch
+# without a worktree, so 'git' gets one — that asymmetry is itself a T11 finding.
+for s in op ctl git; do git branch -q "stress/t11s-${s}" stress/feature; done
+git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t11s-git" stress/t11s-git
 git branch -q stress/cal stress/base
 git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-cal" stress/cal
 echo "DONE"

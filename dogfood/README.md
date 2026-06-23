@@ -29,6 +29,11 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 
 > Run history (Opus teacher; students on Sonnet unless a run says otherwise — run 5 added a Haiku
 > operator). Each run's scorecard and findings live under [`runs/`](runs/), newest first.
+>
+> [Run 7](runs/7.md) was the **k=2 ref-race fix verification**: 66 students at full 33-way concurrency,
+> twice, **with the `gc.auto 0` mitigation removed** — **zero** silent reverts (vs run 6's 4/33 *with* the
+> mitigation). The "ref-write race" was re-diagnosed (commit `c6f56ca`) as a cross-session
+> `protect_unrelated_heads` clobber, not a git `pack-refs`/`gc` race, and the fix retires the mitigation.
 
 ---
 
@@ -77,7 +82,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~35-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -95,6 +100,7 @@ A ~35-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add experimental telemetry` (own file `src/telemetry.txt`) + `Add metrics endpoint` (own file `src/metrics.txt`), both buried | one to revert, one to drop-then-recover | T8 |
 | `Add report header`/`body`/`footer` (own file `src/report.txt`), a contiguous range by `jdoe <jane.doe@bigcorp.example>` dated 2000 | wrong author+committer identity and bogus dates across 3 commits | T9 |
 | `Add cache module` + `Bump cache capacity to 256` + `Bump cache capacity to 512` (own file `src/cache.txt`) | two same-line bumps that conflict when reordered | T10 |
+| `stress/feature`: `Add version string` (own file `src/version.txt`) under `Add experimental flag` (own file `src/flag.txt`) | a commit on the **wrong branch** — belongs on the trunk | T11 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -141,6 +147,17 @@ Design notes that matter (learned the hard way):
   Deliberately *genuine* (not spurious) — constructing a reliably-spurious reorder is finicky (the
   T1 drop's spurious auto-resolve famously *didn't* fire; see [run 1](runs/1.md) finding #2), so
   whether a spurious reorder now auto-resolves stays a **calibration probe**, not a baked answer key.
+- T11 is the **multi-tenant / cross-branch** axis — the MCP's headline architecture, which no other
+  task touches. Every other task hands the student a single pre-opened, worktree-bound session; T11
+  forces it to **drive sessions itself** and operate **two at once**. `stress/feature` carries `Add
+  version string` (own file `src/version.txt`), committed there by mistake but belonging on the trunk,
+  sitting **below** a legit `Add experimental flag` (own file `src/flag.txt`) so dropping the misplaced
+  one rebases the legit one. Both own-file ⇒ the move (cherry-pick onto trunk + drop from feature) and
+  the rebase are **clean + deterministic** — T11's difficulty is session management and **off-worktree
+  editing**, not a conflict. The feature sibling is checked out **nowhere** for op/ctl, so `open_session`
+  opens it **off-worktree** (anchored at the launch root, ref-move only) — the engine path no other task
+  exercises. Plain git can't edit a branch without a worktree, so `git` gets one; that asymmetry is the
+  finding.
 
 ---
 
@@ -182,6 +199,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T8** | The buried `Add experimental telemetry` shipped a privacy bug — **revert** it (inverse at the tip, keep the original). Separately, **drop** the buried `Add metrics endpoint`, then change your mind and **restore** it from the trash to the tip. | `revert_commit(telemetry)` + `drop_commit(metrics)` + `list_trash` (read) + `restore_commit(metrics, new_parent=tip)` (3 mutations + 1 read) | a revert commit removing `src/telemetry.txt` near the tip; original telemetry commit still present; `Add metrics endpoint` back in history (at the tip) with `src/metrics.txt` present; trash empty; `git diff stress/base` = only `src/telemetry.txt` deleted; descendants rebased; clean |
 | **T9** | The three `report` commits (`Add report header`/`body`/`footer`) were authored on a misconfigured machine: fix all three in one batch — set author+committer email to `jane.doe@example.com`, name `Jane Doe`, and re-date them to 2025-01-25/26/27 (keep their order). | `edit_commits([3 × {commit, identity: name+email+author_time+committer_time}])` (1 mutation) | all three carry author+committer `Jane Doe <jane.doe@example.com>` and the 2025 dates, in order; subjects unchanged; descendants rebased; `git diff stress/base` empty (metadata-only); clean |
 | **T10** | Reorder `Bump cache capacity to 512` to come *before* `Bump cache capacity to 256` — the same-line edits conflict and the rewrite holds. First **abort** to confirm the safety net (history/tree untouched), then redo it and **resolve** oldest-first so the final `capacity = 256`. | `reorder_commit(512-bump, new_parent=cache-module)` → `abort_rewrite`; then again → loop `read_conflict(oldest)`/`resolve_conflicts(oldest)` until `pending:false` (chain holds **two** conflicted commits) | after the abort: region identical to `stress/base`, `pending:false`; after the resolve: `512-bump` precedes `256-bump`, final tip `capacity = 256`, both commits present, `pending:false`; descendants rebased; clean |
+| **T11** | `Add version string` was committed on the feature branch `stress/t11s-<solver>` but belongs on the trunk `stress/t11-<solver>`. Move it: land it on the trunk and remove it from the feature branch, keeping the feature's own `Add experimental flag` intact. | open the trunk session (given) + `open_session(stress/t11s-…)` (opens **off-worktree**) → `cherry_pick_commit(full sha, new_parent=trunk tip)` on the **trunk** session + `drop_commit` on the **feature** session (1 open + 2 mutations across **two** sessions) | trunk has `Add version string` + `src/version.txt` (and *not* `src/flag.txt`); feature no longer has it (no `src/version.txt`) but keeps `Add experimental flag` + `src/flag.txt`, rebased; both clean — `./dogfood/verify.sh t11 <trunk-wt>` exits 0 |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -230,6 +248,36 @@ that aborting is *not* an `undo` of a landed mutation — nothing landed; the re
 exported. A conflict-aware student left to its own judgment will (correctly) stop and ask before
 resolving, so the prompt must carry the resolve-and-abort intent explicitly (as T3's does).
 
+**T11 is the discriminator for the multi-tenant surface.** It is the only task where the student
+**opens a session itself** (`open_session`) rather than being handed one, the only one that operates
+**two sessions in one task**, and the only one that edits an **off-worktree** branch (the feature
+sibling is checked out nowhere for op/ctl, so the drop is a pure ref-move + rebase, no working copy).
+The trap is addressing: every MCP call carries a required `session`, and the move spans two of them —
+cherry-pick on the *trunk* session, drop on the *feature* session — so a student that loses track of
+which id goes where mutates the wrong branch. There is no single "move across branches" MCP tool (that
+is the GTK drag); the student must compose copy-then-drop, and the PASS gate fails a partial job
+(copied but not dropped, or vice versa). For plain git there are no sessions — it just needs both
+branches as worktrees and a `cherry-pick` + `rebase --onto`; the second worktree it needs (vs
+commedit's off-worktree session) is the comparison.
+
+**Session-hygiene probe (calibration, not a scored task).** While calibrating T11, also confirm the
+refusal ergonomics the model leans on: `open_session` on a branch **already open** is refused (a branch
+is editable by at most one session), as is a **non-existent** branch, and `close_session` on the **last**
+remaining session. These are judgment checks (does the agent read the refusal and recover, or flail?) —
+so, like T10's spurious-reorder probe, they stay a probe, not a baked answer key.
+
+### Automated correctness gate (`./dogfood/verify.sh`)
+The PASS column above is codified as a deterministic, **git-only** oracle:
+`./dogfood/verify.sh <t1..t11> <worktree-path>` asserts each task's end state (subjects, file
+contents, topology, tree-vs-`stress/base`, clean tree) and exits `0`=PASS / `1`=FAIL, ending with a
+`PASS: t<n>` / `FAIL: t<n>` line. It addresses commits by their stable fixture **subject** and by
+**content**, never by sha/change_id (both churn), so it survives a rebuild and grades any solving
+path identically — MCP *or* plain git (validated: the same script passes the operator solutions and
+the mechanically-different plain-git ones). Because it touches no MCP session it is also the
+**post-settle re-check** for the ref-write race (§5): a silently-reverted result fails the oracle even
+when the student self-reported success. It grades the **end state only** — transient beats (T10's
+`abort_rewrite`, the resolution loop itself) are still read from the Tool Log.
+
 ### Plain-git baseline (what the git student faces)
 The git student gets the *same* intents and PASS criteria — same topology, same file content —
 but only `git`, and **non-interactive only** (no `rebase -i` prompt; drive the sequence editor).
@@ -269,6 +317,11 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>` to fold → unstash → commit the
   `backup` fn + `git add src/backup.txt` as one commit, then `average` as another. Fiddly; that's
   the point.
+- **T11** — no sessions for git: it gets **both** branches as worktrees, `git cherry-pick`s the
+  `Add version string` commit onto the trunk, then drops it from the feature branch with
+  `git rebase --onto stress/base <version-sha>` (replays `Add experimental flag` onto the fork point).
+  Both halves are clean (own files). The off-worktree convenience commedit has — editing the feature
+  branch with no checkout — has no git analogue; the extra worktree git needs is the friction to grade.
 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
@@ -278,7 +331,10 @@ two parents, T8's dropped commit lands in the trash where `restore_commit` can r
 re-date batch stays tree-identical, and T10's reorder actually *holds* a conflict — and that
 `abort_rewrite` leaves the region identical to `stress/base`). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
-the dirty WC, then confirm the fold rebases clean and the partition lands.
+the dirty WC, then confirm the fold rebases clean and the partition lands. After solving each task,
+run `./dogfood/verify.sh <task> <cal>` and confirm it exits 0 — calibration is also where the oracle
+is validated to agree with your hand-checked answer key (and where you'd fix it if a tool change
+moved the minimal path).
 Open the calibration session once with `open_session(branch=stress/cal)` (worktree-bound at
 `<cal>`); between tasks `git -C <cal> reset --hard stress/base && reload_repo(session=<cal id>)`
 (scoped — does not disturb other sessions).
@@ -287,7 +343,7 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
-For each task T (1→10), each solver S (operator, control, git):
+For each task T (1→11), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for
@@ -296,6 +352,10 @@ For each task T (1→10), each solver S (operator, control, git):
    checked out at `.worktrees/<task>`, so the session opens **worktree-bound** there. The returned id
    (= the branch short-name) is the session selector for every later MCP call on this task. **git
    student:** skip this — it never touches the server.
+   **T11 (cross-branch):** the teacher opens only the **trunk** session (`stress/t11-<solver>`); the
+   *student* must `open_session(stress/t11s-<solver>)` itself — that sibling is checked out nowhere, so
+   it opens **off-worktree** — and pass the right `session` on each call (cherry-pick on the trunk, drop
+   on the feature). The **git** student instead gets **both** worktree paths (`…-t11-git`, `…-t11s-git`).
 3. Launch the student(s) and **await fully**. Students for **different** tasks/sessions may run
    **concurrently**: op/ctl on distinct sessions share no state, and the git student shares nothing
    (it touches no session at all, working only on its own `stress/t<task>-git` worktree).
@@ -309,10 +369,11 @@ For each task T (1→10), each solver S (operator, control, git):
      conflict-aware operator correctly stops and asks), and **require a `## Tool Log`** appended.
      **op/ctl prompts must state the session id** and instruct the student to pass `session=<id>` on
      **every** MCP tool call (the server's own MCP instructions document the required selector).
-4. **Verify out-of-band**: for op/ctl, `list_operations(session=<id>)` then
-   `git -C <wt> log --graph / show / diff stress/base / fsck / status`; for the git student,
-   verify **purely from `git -C <wt>`** (`list_operations` is N/A — it never touched the server).
-   Compare to the answer key.
+4. **Verify out-of-band**: run the oracle — `./dogfood/verify.sh <task> <wt>` — as the correctness
+   **gate** (exit 0 = PASS); it is pure `git -C <wt>`, so it grades op/ctl and the git student
+   identically. Then eyeball the soft axes: for op/ctl `list_operations(session=<id>)` plus
+   `git -C <wt> log --graph / show`; for the git student its Tool Log. (`list_operations` is N/A for
+   the git student — it never touched the server.)
 5. **Capture metrics** (before the next `reload_repo(session=<id>)` resets that session's op-log):
    record the student's **tokens + wall-clock** from its transcript (recipe below).
 6. **Score** (rubric below). If correctness fails or there's a clear teachable miss, `SendMessage`
@@ -320,20 +381,56 @@ For each task T (1→10), each solver S (operator, control, git):
    conflict left dangling in a session is discarded by reloading **that** session
    (`reload_repo(session=<id>)`; it's not pending-guarded).
 
-> ⚠️ **Ref-write race under full parallelism (run-4 finding).** Running all 40 students at once puts
-> ~40 git ref-writers (the plain-git rebases/commits **and** the MCP sessions' git-export bookkeeping)
-> on the **one shared `.git` common-dir** simultaneously. A concurrent `pack-refs`/`gc --auto` can then
-> silently drop a freshly-written loose ref, **reverting a student's correct result to an earlier value
-> after it finished** (run 4 lost 3 of 40 this way; 3 more self-recovered from reflog). The object store
-> is safe (append-only); only **ref updates** race. Before a fully-parallel run, prefer one of: a
-> separate clone/common-dir per student; `git config gc.auto 0` (+ `maintenance.auto false`) on the
-> repo; or capped concurrency. Either way, **verify out-of-band from `git` after the run settles** — the
-> revert can land post-completion, so student self-reports are not authoritative. See [run 4](runs/4.md).
+> ✅ **The "ref-write race" was fixed in `c6f56ca` (verified in [run 7](runs/7.md)).** Runs 4–6 saw a
+> student's correct result silently **revert to an earlier value after it finished** under full
+> parallelism (run 4 lost 3/40, run 6 lost 4/33) and blamed a git `pack-refs`/`gc --auto` race on the
+> shared common-dir. The real cause: `protect_unrelated_heads` was force-restoring **another session's**
+> branch (one this session never imported) back to *this* session's stale snapshot — a cross-session
+> clobber. Scoping the backstop to jj-tracked refs (`view().git_refs()`) fixed it. Run 7 ran 66 students
+> at peak 33-way concurrency, twice, **with the old `gc.auto 0` + `maintenance.auto false` mitigation
+> removed**, and saw **zero** reverts — so that mitigation is **no longer needed**; keep it rolled back.
+> `tests/refrace_repro.rs` is the unit guard.
+> Still mandatory regardless: **re-run the oracle (`./dogfood/verify.sh`) after the run settles** — an
+> out-of-band `git` re-check on the correct base, since student self-reports are not authoritative (run 7
+> finding 2: a plain-git student clobbered the shared `stress/base` ref and concurrent students reported
+> the resulting spurious diffs as success; only the oracle caught it). Give the **git** baseline a
+> guardrail — *operate only on its target branch; never `update-ref`/`branch -f` shared refs, never leave
+> a detached HEAD* — and tell every student to keep its Tool Log in the **reply, not a repo file** (run 7
+> finding 3: a log written into the worktree dirtied the tree and failed the clean-tree gate).
 
 ### Between repeats of a task on the same worktree
 `git -C <wt> reset --hard stress/base` then `reload_repo(session=<id>)` — scoped, so it does **not**
 disturb other sessions running other tasks. A held conflict left in the session is discarded by the
-same reload.
+same reload. **T11:** also reset the sibling — `git -C <repo> branch -f stress/t11s-<solver> stress/feature`
+(op/ctl, no worktree) or `git -C <sibwt> reset --hard stress/feature` (git) — and `reload_repo` the
+sibling session if it was opened.
+
+### Repeats for variance (k per cell)
+**N=1 per (task × solver) can't tell a skill gap from a dice roll.** Run 5 saw Sonnet *lose* T1 to
+Haiku because it grabbed the wrong `change_id` *once*; runs 4–5 saw the ref-race silently revert a
+*correct* result post-completion on a handful of cells. With one sample you can't separate
+"consistently better" from "one bad roll," yet the scorecards keep ranking cells 4.97 vs 4.75. Repeat
+each cell **k** times and report the spread, so a rank-order claim rests on signal, not noise.
+
+- **No fixture change, no extra concurrency.** Run a cell's k repeats **serially on its own worktree**,
+  using the *Between repeats* reset+reload recipe above between them; **different cells still run in
+  parallel.** Peak concurrent ref-writers — and thus the ref-race exposure (§5 box) — is unchanged; only
+  each cell's wall-clock grows ~k×. Each repeat is an independent cold spawn with its own transcript,
+  identified by its Agent id (not by recency — see *Metrics capture*).
+- **How big is k.** `k=1` for a quick **regression** run (is a tool still correct? cheapest). `k=3` is
+  the **variance floor** — enough to expose a flaky cell and a wide score spread. `k=5` when two cells
+  you mean to rank sit close. The runs that draw *comparative* conclusions (the operator↔control delta,
+  the model A/Bs of runs 4–5) are exactly the ones that should use `k≥3`; a smoke run can stay at 1.
+- **Aggregate per cell, don't average blindly.**
+  - **correctness** = the **`verify.sh` pass-fraction** `k_pass/k`. The gate is deterministic per end
+    state (§4), so a cell that lands `2/3` is *flaky* — a finding in itself, usually a ref-race revert:
+    re-run the oracle after settle and record both numbers.
+  - **soft scores** (1–5) → **median [min–max]**; a wide spread means the cell is not safe to rank.
+  - **cost / wall-clock / calls** → **median [range]** (one outlier — a recovery loop, a stale-read
+    detour — shouldn't set the headline).
+- **The scorecard cell becomes** e.g. `5.0 [5.0–5.0] · 3/3` (robust) or `4.3 [3.5–5.0] · 2/3` (flaky +
+  spread). Carry the per-component `cost=$…` as a median with its range. **Two cells whose score
+  spreads overlap are a tie, not a delta** — don't read a 0.2 rank gap across overlapping ranges.
 
 ### Metrics capture (tokens + wall-clock, per student)
 Each subagent writes its own transcript. ⚠️ **Under parallel execution the "newest file" shortcut is
@@ -387,7 +484,7 @@ When done: `close_session(session=<id>)` each per-task session (the registry ref
 checked-out branch).
 
 ### Grading rubric (1–5 each + overall)
-correctness (gate) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
+correctness (gate — `./dogfood/verify.sh <task> <wt>` must exit 0) · **efficiency — `cost=$…` first** (per-component dollars, recipe under *Metrics
 capture* — the only currency comparable across all three solvers; tokens-by-component and wall-clock
 are noisier secondaries; mutations-vs-minimal an MCP-students-only secondary, since `list_operations`
 undercounts — `undo` prunes — read the **Tool Log** for true effort) · tool-fit (op/ctl: surgical
@@ -395,7 +492,8 @@ vs whole-file, `change_id` addressing, `suggest_squash_targets`, oldest-first co
 split partition; git: idiomatic *non-interactive* git — `--autosquash`, `--onto`, `rerere`) ·
 robustness/recovery · reporting (compact, accurate, flags decisions) · cleanliness (`fsck`/`status`
 clean, descendants rebased). Deltas per task: **operator↔control** (skill value) and
-**(op|ctl)↔git** (MCP value — the headline).
+**(op|ctl)↔git** (MCP value — the headline). Report each cell **aggregated over its k repeats** (see
+*Repeats for variance*); a delta whose two cells' score spreads overlap is noise, not a finding.
 
 > **Token caveat.** The operator pays a **prompt tax** (large system prompt + on-demand skills) it
 > must earn back through fewer/cheaper turns. Report `cache_creation` vs `cache_read` separately so
@@ -458,6 +556,10 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
 - Rebuild the fixture (`./dogfood/reposetup.sh`), re-derive change ids with `list_history` (they
   differ per build), re-run calibration (§4) — **don't trust last run's answer keys blindly**; a
   tool change may alter call counts or which path is "minimal."
+- **The oracle (`./dogfood/verify.sh`) keys on fixture SUBJECTS + file content, not shas**, so it
+  survives a rebuild untouched — but if you rename a fixture commit subject or move a smell to a new
+  file, update the matching assertion in `verify.sh`. Run it as the correctness gate for every
+  student, and **re-run it after a parallel run settles** to catch a ref-race revert (§5).
 - If tools were **added/renamed**: update the minimal paths in §4 and the rubric's tool-fit notes.
   Re-check whether the footguns recorded under [`runs/`](runs/) are fixed (does `split_commit` now
   warn on an empty child? does the interior-drop auto-resolve fire?).
@@ -467,6 +569,9 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
 - **Capture per-student metrics** every run (§5 step 5): tokens (components — esp. `cache_read`
   vs `cache_create`) + wall-clock from each `subagents/agent-*.jsonl`. Judge efficiency by token
   cost across MCP versions, not call counts.
+- **Pick k for the run's purpose** (§5 *Repeats for variance*): a smoke/regression run stays at `k=1`;
+  a run that draws a **comparative** conclusion (a model A/B, an operator↔control claim) uses `k≥3` per
+  cell and reports median + spread, so the headline delta isn't one dice roll.
 - 🔒 **Never** run a commedit *mutation* on a session other than a `stress/*` one (don't open or
   mutate the launch session's real branch), and keep all test refs under `stress/*`. Use
   `git -C <abs>` everywhere.

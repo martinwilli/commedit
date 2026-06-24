@@ -800,36 +800,44 @@ impl Repo {
         }
     }
 
-    /// Resolve `change_hex` to the commit carrying it on the *current* branch
-    /// chain (the ancestors of jj's head — the same set [`Self::collect_conflicts`]
-    /// walks). Conflict resolution always targets a commit on the pending
-    /// rewritten chain, so scoping the lookup to that chain — rather than the
-    /// store-wide `resolve_change_id` — disambiguates change ids that have
-    /// divergent siblings left over from concurrent or earlier operations, which
-    /// would otherwise make the global resolver bail as ambiguous.
+    /// Resolve `change_hex` to the commit carrying it among the very sources
+    /// conflict *detection* scans — every editable worktree's `@`
+    /// ([`Self::all_worktree_chain_ids`]: the launch `@` chain plus each extra
+    /// worktree's `@`) and every editable branch's rewritten range
+    /// ([`Self::editable_heads_in_jj`]). Mirroring [`Self::collect_conflicts`] keeps
+    /// `read_conflict`/`resolve_conflicts` in agreement with what is displayed, so a
+    /// conflict shown on a *sibling* branch or a *sibling* worktree's `@` is
+    /// resolvable, not just the primary's. Scoping the lookup to these chains —
+    /// rather than the store-wide `resolve_change_id` — disambiguates change ids
+    /// with divergent siblings left over from earlier operations, which would
+    /// otherwise make the global resolver bail as ambiguous. A singleton editable
+    /// set with only the launch `@` chain reproduces the old primary-only behaviour.
     fn resolve_change_on_chain(&self, change_hex: &str) -> Result<CommitId> {
         let change_id = ChangeId::try_from_hex(change_hex).context("invalid change id")?;
-        // The working-copy chain (@ and any split-off entries) sits above the
-        // branch tip, so the ancestor walk below never sees it; match those
-        // entries first.
-        for wc_id in self.working_copy_chain_ids() {
+        // Working copies first: they sit above the tips, so the ancestor walks below
+        // never reach them. Launch `@` chain, then each extra worktree's `@`.
+        for wc_id in self.all_worktree_chain_ids() {
             if let Ok(commit) = self.repo.store().get_commit(&wc_id) {
                 if commit.change_id() == &change_id {
                     return Ok(wc_id);
                 }
             }
         }
-        let head = self
-            .current_head_in_jj()
-            .context("no current branch head to resolve the conflict against")?;
-        // The conflict being resolved is always a rewritten commit, so it lives in
-        // the rewritten range; walk only that, not the whole ancestry.
-        let infos = self.rewritten_history(&head)?;
-        infos
-            .into_iter()
-            .find(|i| i.change_id == change_id)
-            .map(|i| i.id)
-            .with_context(|| format!("change {change_hex} is not on the current branch chain"))
+        // Then every editable branch's rewritten range (primary-first), de-duped so
+        // a shared ancestor rewritten on several branches is checked once. Only
+        // rewritten commits can be conflicted, so each branch walks just that range.
+        let mut seen = HashSet::new();
+        for head in self.editable_heads_in_jj() {
+            for info in self.rewritten_history(&head)? {
+                if !seen.insert(info.id.clone()) {
+                    continue;
+                }
+                if info.change_id == change_id {
+                    return Ok(info.id);
+                }
+            }
+        }
+        bail!("change {change_hex} is not on any editable branch chain or worktree")
     }
 
     /// The branch history that conflict detection must scan: the range rewritten

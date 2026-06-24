@@ -1383,6 +1383,35 @@ impl Repo {
         out
     }
 
+    /// Every editable worktree's working-copy commit ids: the launch `@` chain
+    /// (newest first) followed by each extra worktree's single `@`. The id-level,
+    /// flattened analogue of [`Self::worktree_uncommitted`], used by conflict
+    /// resolution ([`Repo::resolve_change_on_chain`]) to locate a conflicted `@` on
+    /// *any* worktree — the same working-copy sources [`Repo::collect_conflicts`]
+    /// scans. A singleton set with no extra worktrees yields just the launch chain.
+    pub(crate) fn all_worktree_chain_ids(&self) -> Vec<CommitId> {
+        let mut ids = self.working_copy_chain_ids();
+        for view in &self.extra_worktrees {
+            if let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Every editable worktree's working-copy *entries* that change files — the
+    /// launch `@` chain plus each extra worktree's single dirty `@`, in the order
+    /// [`Self::all_worktree_chain_ids`] lists them. The flat, all-worktree analogue
+    /// of [`Self::working_copy_chain`], used by the GTK conflict view to render a
+    /// conflicted *sibling* `@` as an inline resolvable row (a clean/empty `@` is
+    /// skipped, like [`Self::working_copy_chain`]).
+    pub fn worktree_chain_entries(&self) -> Vec<WorkingCopyEntry> {
+        self.all_worktree_chain_ids()
+            .iter()
+            .filter_map(|id| self.wc_entry_for(id))
+            .collect()
+    }
+
     /// Resolve a working-copy entry's stable change id to its *current* commit id
     /// within the chain. Commit ids churn (the leaf's on every snapshot), so the
     /// UI hands edits/splits/squashes a change id and we resolve it here, after

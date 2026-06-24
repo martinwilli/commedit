@@ -1326,3 +1326,161 @@ fn undo_redo_across_a_tip_moving_sibling_op_still_works() {
     assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Bug 2: a *genuine* conflict on a sibling-branch drop is now resolvable in-app,
+/// not abort-only. The drop defers (the auto-resolve bails on a real conflict);
+/// the conflicted commit lives on the *sibling* branch, so the resolver must
+/// search every editable head, not just the primary — before the fix
+/// `read_conflict`/`resolve_conflict` bailed "not on the current branch chain".
+#[test]
+fn a_genuine_conflict_on_a_sibling_drop_resolves_manually() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // feature rewrites the SAME single line each commit, so dropping C1 leaves C2's
+    // edit un-applicable onto the base — a genuine conflict on the sibling.
+    common::init_repo(dir, &[("f.txt", "one\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+    g(&["commit", "-aqm", "C1"]);
+    std::fs::write(dir.join("f.txt"), "three\n").unwrap();
+    g(&["commit", "-aqm", "C2"]);
+    g(&["checkout", "-q", "main"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let c1 = find_commit(&repo, &[head, feature_head], "C1");
+    let outcome = repo.abandon_commit(&c1).expect("drop C1 on feature");
+    let conflicted = match outcome {
+        SaveOutcome::Conflicts { commits } => commits,
+        other => panic!("expected a deferred conflict, got {other:?}"),
+    };
+    // The conflict is C2, on the sibling branch — its change id drives resolution.
+    let c2_change = conflicted
+        .iter()
+        .find(|c| c.subject == "C2")
+        .expect("C2 is the conflicted commit")
+        .change_id_hex();
+
+    // read_conflict reaches the sibling commit and returns Git-style markers
+    // (this bailed before the resolver searched every editable head).
+    let cf = repo
+        .read_conflict(&c2_change, "f.txt")
+        .expect("read the sibling conflict");
+    assert!(
+        cf.text.contains("<<<<<<<") && cf.text.contains(">>>>>>>"),
+        "materialized conflict markers: {:?}",
+        cf.text
+    );
+
+    // Resolve to the intended content; the whole chain goes clean and exports.
+    let outcome = repo
+        .resolve_conflict(&c2_change, "f.txt", "three\n", cf.marker_len)
+        .expect("resolve the sibling conflict");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["C2", "base"],
+        "C1 dropped, C2 resolved onto base"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "three");
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Bug 2: a conflicted *sibling worktree `@`* (not a branch commit) is resolvable.
+/// Rewriting a sibling commit so re-applying that worktree's uncommitted `@` no
+/// longer merges leaves the `@` itself conflicted; the resolver locates it among
+/// the worktree `@`s and the resolved content lands on disk in that worktree.
+#[test]
+fn a_conflicted_sibling_at_is_resolvable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // main stays at base; feature adds F editing line 1.
+    common::init_repo(dir, &[("f.txt", "a\nb\nc\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "A\nb\nc\n").unwrap();
+    g(&["commit", "-aqm", "F"]);
+    g(&["checkout", "-q", "main"]);
+
+    // feature in a second worktree, with an uncommitted edit to the SAME line.
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    std::fs::write(wt.join("f.txt"), "AA\nb\nc\n").unwrap();
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    // Rewrite F's line 1 too: the sibling worktree's `@` (line 1 "A"->"AA") can no
+    // longer be re-applied onto the rewritten tip ("X"), so the `@` conflicts.
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let outcome = repo
+        .rewrite_file(&f, "f.txt", "X\nb\nc\n")
+        .expect("rewrite F");
+    let conflicted = match outcome {
+        SaveOutcome::Conflicts { commits } => commits,
+        other => panic!("expected a deferred conflict, got {other:?}"),
+    };
+    // The single conflict is the sibling worktree's uncommitted `@`.
+    assert_eq!(
+        conflicted.len(),
+        1,
+        "only the @ conflicts, F is a clean rewrite"
+    );
+    assert_eq!(conflicted[0].subject, "Uncommitted changes");
+    let at_change = conflicted[0].change_id_hex();
+
+    let cf = repo
+        .read_conflict(&at_change, "f.txt")
+        .expect("read the sibling @ conflict");
+    assert!(
+        cf.text.contains("<<<<<<<"),
+        "materialized markers: {:?}",
+        cf.text
+    );
+
+    let outcome = repo
+        .resolve_conflict(&at_change, "f.txt", "RESOLVED\nb\nc\n", cf.marker_len)
+        .expect("resolve the sibling @");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    // The resolved content is materialized into that worktree on disk.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "RESOLVED\nb\nc\n",
+        "the sibling worktree holds the resolved @ content"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "X\nb\nc");
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    g(&["fsck", "--no-progress"]);
+}

@@ -372,13 +372,13 @@ impl Repo {
         else {
             return Ok(());
         };
-        // Already anchored? `@`'s single parent is the tip → nothing to do.
-        if let Some(wc_id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
-            if let Ok(wc) = self.repo.store().get_commit(&wc_id) {
-                if wc.parent_ids() == std::slice::from_ref(&tip) {
-                    return Ok(());
-                }
-            }
+        // Already anchored on a clean chain descending from the tip → nothing to
+        // do. Chain-aware (not just `@`'s direct parent), so a sibling split chain
+        // (`tip → @' → @`) survives this re-anchor instead of being collapsed back
+        // to a single `@` on the very next snapshot; only a genuinely detached `@`
+        // or an out-of-band tip move still falls through to the re-checkout below.
+        if self.wc_on_tip(&view.name, &tip)? {
+            return Ok(());
         }
         let tip_commit = self
             .repo
@@ -1592,18 +1592,20 @@ impl Repo {
         Some(info)
     }
 
-    /// Whether the working-copy commit `@` sits on a clean linear chain rooted at
-    /// `head`: walk single-parent edges up from `@` and return `true` iff we reach
-    /// `head`. This keeps a split chain (`HEAD → @' → @`) intact — `@`'s parent
-    /// need not be `head` directly, only an ancestor reached through our own
+    /// Whether the `@` of the workspace named `name` sits on a clean linear chain
+    /// rooted at `tip`: walk single-parent edges up from that `@` and return `true`
+    /// iff we reach `tip`. This keeps a split chain (`tip → @' → @`) intact — `@`'s
+    /// parent need not be `tip` directly, only an ancestor reached through our own
     /// uncommitted commits. Returns `false` (→ re-attach) on a merge in the way,
-    /// the root, or when `head` isn't an ancestor (e.g. plain `git` moved HEAD).
-    fn working_copy_on_head(&self, head: &CommitId) -> Result<bool> {
-        let Some(mut id) = self.working_copy_commit_id() else {
+    /// the root, or when `tip` isn't an ancestor (e.g. plain `git` moved the tip).
+    /// Shared by the launch wrapper [`Self::working_copy_on_head`] and the
+    /// per-worktree re-anchor [`Self::reanchor_extra_worktree`].
+    fn wc_on_tip(&self, name: &jj_lib::ref_name::WorkspaceName, tip: &CommitId) -> Result<bool> {
+        let Some(mut id) = self.repo.view().get_wc_commit_id(name).cloned() else {
             return Ok(false);
         };
         loop {
-            if &id == head {
+            if &id == tip {
                 return Ok(true);
             }
             let commit = self
@@ -1617,6 +1619,12 @@ impl Repo {
             }
             id = parents[0].clone();
         }
+    }
+
+    /// The launch wrapper over [`Self::wc_on_tip`]: whether the launch `@` sits on a
+    /// clean linear chain rooted at `head`.
+    fn working_copy_on_head(&self, head: &CommitId) -> Result<bool> {
+        self.wc_on_tip(self.workspace.workspace_name(), head)
     }
 
     /// Re-parent `@` onto the current git HEAD when it isn't already there (e.g.

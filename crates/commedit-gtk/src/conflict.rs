@@ -311,10 +311,12 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                 (HashSet::new(), 0, 0)
             }
         };
-        // The working-copy chain entries resolve inline among the conflicted
-        // commits; gather them (newest first) and the change ids they cover, so
-        // the history walk below can exclude them from what it must reach.
-        let wc_chain = repo.borrow().working_copy_chain();
+        // The working-copy entries resolve inline among the conflicted commits;
+        // gather every editable worktree's (the launch `@` chain plus each sibling
+        // worktree's `@`) and the change ids they cover, so the history walk below
+        // can exclude them from what it must reach — and a conflicted *sibling* `@`
+        // is reachable as an inline row, not just the launch one's.
+        let wc_chain = repo.borrow().worktree_chain_entries();
         let wc_changes: HashSet<String> = wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
         let branch_conflicts: Vec<String> = badges
             .iter()

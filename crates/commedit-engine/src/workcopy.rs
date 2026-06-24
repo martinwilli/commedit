@@ -1178,9 +1178,11 @@ impl Repo {
         }
     }
 
-    /// The `@` commit id of `target`'s worktree: the launch leaf (resolving
-    /// `change_hex` within its chain) or an extra worktree's single `@` (which has
-    /// no chain, so `change_hex` is irrelevant).
+    /// The `@` commit id of `target`'s worktree, resolving `change_hex` to a
+    /// specific entry within that worktree's chain: the launch leaf
+    /// ([`Self::resolve_working_copy_change`]) or an extra worktree's chain entry
+    /// (searched by stable change id, mirroring the launch resolver). Falls back to
+    /// the leaf `@` when `change_hex` is `None` or matches no chain entry.
     pub(crate) fn resolve_wc(
         &self,
         target: &WcTarget,
@@ -1190,7 +1192,21 @@ impl Repo {
             WcTarget::Launch => self.resolve_working_copy_change(change_hex),
             WcTarget::Worktree(branch) => {
                 let view = self.find_worktree(branch)?;
-                self.repo.view().get_wc_commit_id(&view.name).cloned()
+                let leaf = self.repo.view().get_wc_commit_id(&view.name).cloned();
+                let Some(change_hex) = change_hex else {
+                    return leaf;
+                };
+                let Some(change_id) = jj_lib::backend::ChangeId::try_from_hex(change_hex) else {
+                    return leaf;
+                };
+                for id in self.worktree_chain_ids(view) {
+                    if let Ok(commit) = self.repo.store().get_commit(&id) {
+                        if commit.change_id() == &change_id {
+                            return Some(id);
+                        }
+                    }
+                }
+                leaf
             }
         }
     }

@@ -1634,3 +1634,286 @@ fn an_out_of_band_branch_switch_in_a_sibling_worktree_errors() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Open `main` (launch) + `feature` (in a linked worktree) with the feature
+/// worktree dirtied on *two* tracked files (`f.txt` and `a.txt`) — the raw
+/// material for peeling a sibling `@` into two entries with a split.
+fn open_feature_worktree_dirty_on_two_files(
+    dir: &std::path::Path,
+    wt_parent: &tempfile::TempDir,
+) -> (Repo, std::path::PathBuf) {
+    setup(dir);
+    let wt = add_feature_worktree(dir, wt_parent);
+    std::fs::write(wt.join("f.txt"), "f\nFF\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "a\nAA\n").unwrap();
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    (repo, wt)
+}
+
+/// The `feature` worktree's uncommitted entries (newest-first), or empty when
+/// clean — the per-worktree slice of [`Repo::worktree_uncommitted`].
+fn feature_entries(repo: &Repo) -> Vec<commedit_engine::workcopy::WorkingCopyEntry> {
+    repo.worktree_uncommitted()
+        .into_iter()
+        .find(|(b, _)| b == "feature")
+        .map(|(_, e)| e)
+        .unwrap_or_default()
+}
+
+/// Splitting a *sibling* worktree's uncommitted changes peels its `@` into two
+/// entries — exactly like the checked-out one's — as a pure jj-side reorg: git
+/// stays frozen (the sibling log, both dirty files, the launch branch untouched).
+#[test]
+fn splitting_a_sibling_worktrees_uncommitted_changes_peels_into_two_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    // Keep the f.txt change in the entry, revert a.txt → it spills into a new leaf.
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+
+    let entries = feature_entries(&repo);
+    assert_eq!(entries.len(), 2, "the sibling @ peeled into two entries");
+    assert!(
+        entries.iter().all(|e| e.changed_files == 1),
+        "each entry holds exactly one file's change"
+    );
+    let mut files: Vec<String> = entries.iter().flat_map(|e| e.file_names.clone()).collect();
+    files.sort();
+    assert_eq!(files, vec!["a.txt".to_string(), "f.txt".to_string()]);
+
+    // git is completely untouched and the worktree keeps both dirty files.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"]
+    );
+    let status = common::git(&wt, &["status", "--porcelain"]);
+    assert!(
+        status.contains("a.txt") && status.contains("f.txt"),
+        "got: {status:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    // The launch branch and its worktree never moved.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// A sibling split chain survives a re-snapshot (run at the start of every
+/// mutation): the chain-aware re-anchor must not collapse it back to one `@`.
+/// Mirrors `split_working_copy_chain_survives_a_snapshot` for a sibling worktree.
+#[test]
+fn a_sibling_split_chain_survives_a_resnapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+    assert_eq!(feature_entries(&repo).len(), 2);
+
+    // A bare snapshot snapshots every worktree (and re-anchors each first); the
+    // sibling split chain must not be collapsed onto its tip.
+    repo.snapshot_working_copy().expect("snapshot");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        2,
+        "the sibling split chain must survive a snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+}
+
+/// Committing one peeled entry of a sibling `@` lands a single commit on *that*
+/// branch holding only that slice, leaves the other entry uncommitted on the
+/// worktree, and never touches the launch branch.
+#[test]
+fn committing_one_peeled_sibling_entry_lands_on_its_branch_and_keeps_the_remainder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+
+    // Commit just the f.txt entry; the a.txt entry must stay uncommitted.
+    let entries = feature_entries(&repo);
+    let f_entry = entries
+        .iter()
+        .find(|e| e.file_names == vec!["f.txt".to_string()])
+        .expect("an f.txt entry");
+    let change = f_entry.info.change_id_hex();
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_entry_at(target, Some(&change), "feature: tweak f", None)
+        .expect("commit one sibling entry");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // feature gained exactly one commit, holding only the f.txt slice.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature: tweak f", "F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nFF");
+    assert_eq!(
+        common::git(dir, &["show", "feature:a.txt"]),
+        "a",
+        "the a.txt change was NOT committed"
+    );
+
+    // The a.txt change stays uncommitted on the worktree, files byte-identical.
+    let remaining = feature_entries(&repo);
+    assert_eq!(remaining.len(), 1, "the a.txt entry stays uncommitted");
+    assert_eq!(remaining[0].file_names, vec!["a.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M a.txt");
+    // The launch branch never moved.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// A *lone* sibling entry (`change_hex = None`, no split) committed via the
+/// entry-commit collapses to a fresh empty `@`, behaving like
+/// `commit_working_copy_at`: the whole change lands and the worktree ends clean.
+#[test]
+fn committing_a_lone_sibling_entry_behaves_like_commit_working_copy_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nlone\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_entry_at(target, None, "feature: whole @", None)
+        .expect("commit the lone sibling entry");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature: whole @", "F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nlone");
+    // A fresh empty @: the worktree is clean, with nothing left uncommitted.
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    assert!(
+        feature_entries(&repo).is_empty(),
+        "no uncommitted entries remain"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Undo/redo of a sibling split: undo collapses the chain back to one entry,
+/// redo re-peels it into two — disk byte-identical throughout (a pure jj peel).
+#[test]
+fn undo_redo_of_a_sibling_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+    assert_eq!(feature_entries(&repo).len(), 2);
+
+    repo.undo().expect("undo the split");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        1,
+        "undo collapses the split chain to one entry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+
+    repo.redo().expect("redo the split");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        2,
+        "redo re-peels into two entries"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

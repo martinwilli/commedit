@@ -135,8 +135,8 @@ an interactive-rebase session.
   discard it — and until you commit it, it rides through every rewrite untouched,
   still uncommitted when you're done. Every branch you're editing that is checked
   out in a worktree shows its own hollow node, so you can tidy several worktrees'
-  uncommitted work from one window (Split and partial-commit apply only to the
-  checked-out launch worktree's node).
+  uncommitted work from one window — Split and per-piece Save work on any of those
+  nodes, not just the checked-out launch worktree's.
 
 - **Review before you're done** — the toolbar's **Review** toggle flips the
   window into a read-only, full-window diff of every content change you've made
@@ -302,9 +302,10 @@ the checked-out worktree's — and a rewrite that moves the branch re-materializ
 that worktree's files and index (its own uncommitted changes ride along), so
 editing it no longer desyncs the other checkout. A plain `git commit` you make in
 that worktree out of band is absorbed onto its branch on the next operation,
-rather than reappearing as a phantom uncommitted change. (Split and partial-commit
-stay launch-only: a sibling worktree carries a single working-copy commit with no
-split chain.)
+rather than reappearing as a phantom uncommitted change. Its uncommitted changes
+can be **split** into separate pieces and committed one at a time, exactly like
+the checked-out worktree's; only the sub-hunk *partial-selection* commit (via the
+MCP server) remains a launch-worktree capability.
 
 Opening several windows on one repository — typically one per branch — lets you
 drag a commit from one onto another to cherry-pick it across branches. The

@@ -1356,16 +1356,15 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     ),
                     Ok(edits) if !edits.is_empty()
                 );
-            // Split peels the launch `@` chain only — a sibling worktree's `@` has no
-            // chain, so disable Split when viewing one (the engine refuses it too).
+            // Split peels any editable worktree's `@` chain — the launch one or a
+            // sibling's. Disable it only for a branch with no worktree (no `@` to
+            // split); the engine refuses that too.
             let splittable = if viewing_wc.get() {
-                matches!(
-                    selected_wc_branch
-                        .borrow()
-                        .as_deref()
-                        .and_then(|b| repo.borrow().wc_target_for_branch(b)),
-                    Some(WcTarget::Launch)
-                )
+                selected_wc_branch
+                    .borrow()
+                    .as_deref()
+                    .and_then(|b| repo.borrow().wc_target_for_branch(b))
+                    .is_some()
             } else {
                 true
             };
@@ -3571,13 +3570,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
                     return;
                 }
-                // A message was given: commit the displayed diff on the worktree's tip.
-                // On the launch worktree, `commit_working_copy_entry` commits exactly
-                // the selected entry's slice (a split chain commits one piece at a
-                // time); an extra worktree carries a single `@` with no chain, so its
-                // whole `@` is committed via `commit_working_copy_at`. Pass the identity
-                // only when the user overrode the prefilled git default; otherwise let
-                // the engine stamp git config + a fresh "now".
+                // A message was given: commit the displayed entry's slice on its
+                // worktree's branch tip. Both the launch and a sibling worktree's `@`
+                // commit exactly the selected entry (a split chain commits one piece
+                // at a time, the rest staying uncommitted); a lone entry collapses to
+                // committing the whole `@`. Pass the identity only when the user
+                // overrode the prefilled git default; otherwise let the engine stamp
+                // git config + a fresh "now".
                 let baseline = wc_identity_baseline.borrow().clone();
                 let current: [String; 4] =
                     std::array::from_fn(|i| identity_fields[i].text().to_string());
@@ -3588,8 +3587,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         message,
                         identity.as_ref(),
                     ),
-                    _ => repo.borrow_mut().commit_working_copy_at(
+                    _ => repo.borrow_mut().commit_working_copy_entry_at(
                         target.clone(),
+                        change.as_deref(),
                         message,
                         identity.as_ref(),
                     ),
@@ -3868,28 +3868,25 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             };
 
             // Splitting a working-copy `@`: a pure jj-side peel — no history change,
-            // so only the `@` rows and this diff reload. Launch-only (the `@`-chain
-            // machinery): an extra worktree carries a single `@` with no chain, so the
-            // button is disabled for sibling `@`s — guard here anyway. The edited entry
-            // keeps its change id, so `refresh` re-selects it and reloads the diff.
+            // so only the `@` rows and this diff reload. Works on any editable
+            // worktree's `@` (the launch one or a sibling's); a branch with no
+            // worktree has no `@` to split. The edited entry keeps its change id, so
+            // `refresh` re-selects it and reloads the diff.
             if viewing_wc.get() {
                 let change = selected_wc_change.borrow().clone();
                 let branch = selected_wc_branch.borrow().clone();
-                let is_launch = matches!(
-                    branch
-                        .as_deref()
-                        .and_then(|b| repo.borrow().wc_target_for_branch(b)),
-                    Some(WcTarget::Launch)
-                );
-                if !is_launch {
+                let Some(target) = branch
+                    .as_deref()
+                    .and_then(|b| repo.borrow().wc_target_for_branch(b))
+                else {
                     show_status(
-                        "Split is only available for the checked-out worktree's uncommitted changes",
+                        "This branch has no worktree, so its uncommitted changes can't be split",
                     );
                     return;
-                }
-                if let Err(err) = repo
-                    .borrow_mut()
-                    .split_working_copy_edits(change.as_deref(), &edits)
+                };
+                if let Err(err) =
+                    repo.borrow_mut()
+                        .split_working_copy_edits_at(target, change.as_deref(), &edits)
                 {
                     show_status(&format!("Split failed: {err}"));
                     return;

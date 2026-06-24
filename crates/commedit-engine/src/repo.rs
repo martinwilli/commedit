@@ -1323,6 +1323,71 @@ impl Repo {
         Ok(true)
     }
 
+    /// Absorb any out-of-band `git commit` made in a *sibling* worktree before its
+    /// next snapshot — the per-worktree analogue of [`Self::sync_to_git_head`]. jj
+    /// imports git state only at open, so a plain `git commit` in a linked worktree
+    /// leaves that branch's bookmark (and the worktree's `@`) on the old tip; the
+    /// next snapshot would otherwise record the just-committed change as if it were
+    /// still uncommitted. For each extra worktree this refuses an out-of-band
+    /// *branch switch* (the worktree's branch→jj-workspace mapping is then stale,
+    /// mirroring the launch's "reopen the repository" guard), else detects whether
+    /// its branch's live git tip is ahead of jj's bookmark. Every drifted branch's
+    /// ref is re-seeded into the session git dir and a **single** [`Self::import_git`]
+    /// catches jj up to all of them (it re-imports the whole editable set, so one
+    /// import suffices); [`Repo::snapshot_extra_worktree`]'s re-anchor then moves
+    /// each `@` onto its new tip before the snapshot. A no-op when nothing drifted,
+    /// and skipped while a conflicted rewrite is pending (git is frozen, so the live
+    /// tips are the ones jj already knows). Called by
+    /// [`Repo::snapshot_extra_worktrees`].
+    pub(crate) fn catch_up_extra_worktrees(&mut self) -> Result<()> {
+        if self.is_pending() {
+            return Ok(());
+        }
+        let mut drifted: Vec<String> = Vec::new();
+        for view in &self.extra_worktrees {
+            let root = view.workspace.workspace_root();
+            // Structural guard: the worktree must still have *its* branch checked out.
+            let live_branch = crate::transparency::head_branch(root);
+            if live_branch.as_deref() != Some(view.branch.as_str()) {
+                anyhow::bail!(
+                    "the worktree at {} changed its checked-out branch outside commedit \
+                     (now {:?}, was {:?}); reopen the repository to edit it",
+                    root.display(),
+                    live_branch,
+                    view.branch
+                );
+            }
+            let short = view
+                .branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&view.branch);
+            let bookmark: RefNameBuf = short.into();
+            let jj_tip = self
+                .repo
+                .view()
+                .get_local_bookmark(&bookmark)
+                .as_normal()
+                .map(|id| id.hex());
+            let live_tip = crate::transparency::ref_commit(root, &view.branch);
+            if live_tip.is_some() && live_tip != jj_tip {
+                drifted.push(view.branch.clone());
+            }
+        }
+        if drifted.is_empty() {
+            return Ok(());
+        }
+        // Re-seed each drifted branch's ref into the session git dir (no HEAD
+        // change), then a single import catches jj up to all of them at once.
+        let git_dir = self._workdir.path().join("git");
+        let root = self.workspace.workspace_root();
+        for full in &drifted {
+            if let Some(tip) = crate::transparency::ref_commit(root, full) {
+                crate::transparency::seed_session_ref(&git_dir, full, &tip)?;
+            }
+        }
+        self.import_git()
+    }
+
     /// Change the editable set *in place* — widen it (a branch ticked in the GTK
     /// dropdown) or narrow it (unticked) — **without** the full reopen
     /// [`Self::open_multi`] would do, so the session's undo op-log and trash survive

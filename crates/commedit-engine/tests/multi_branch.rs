@@ -1548,3 +1548,89 @@ fn a_sibling_worktrees_index_only_content_survives_a_rewrite() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Gap 5: a plain `git commit` made out-of-band inside a sibling worktree is
+/// absorbed onto its branch before the next snapshot, so it is *not* re-recorded
+/// as a phantom uncommitted change. After the catch-up the worktree's `@` holds
+/// only the still-uncommitted delta on top of the new tip.
+#[test]
+fn an_out_of_band_commit_in_a_sibling_worktree_is_caught_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent); // feature checked out, clean at F
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Out of band: commit one tracked change as G, then leave a *further*
+    // uncommitted edit on disk.
+    std::fs::write(wt.join("f.txt"), "f\ncommitted\n").unwrap();
+    common::git(&wt, &["commit", "-aqm", "G"]);
+    std::fs::write(wt.join("f.txt"), "f\ncommitted\nuncommitted\n").unwrap();
+
+    // A launch-side snapshot runs the per-worktree catch-up: it imports G and
+    // re-anchors feature's `@` onto it, so `@` now diffs only the uncommitted line.
+    repo.snapshot_working_copy().expect("snapshot (catch up)");
+
+    // Crystallizing the remaining `@` proves G was absorbed (not double-counted):
+    // it lands on top of G and carries only the still-uncommitted line.
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_at(target, "rest", None)
+        .expect("commit the remaining @");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["rest", "G", "F", "B", "A"],
+        "G is on the branch and 'rest' stacks on top of it (not on F)"
+    );
+    assert_eq!(
+        common::git(dir, &["show", "feature:f.txt"]),
+        "f\ncommitted\nuncommitted"
+    );
+    let diff = common::git(dir, &["show", "--format=", "feature"]);
+    assert!(
+        diff.contains("+uncommitted") && !diff.contains("+committed"),
+        "'rest' adds only the uncommitted line, not the already-committed one: {diff}"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Gap 5: an out-of-band `git checkout` of a *different* branch in a sibling
+/// worktree leaves its branch→workspace mapping stale; the next snapshot surfaces
+/// a clear "reopen the repository" error rather than silently mis-snapshotting.
+#[test]
+fn an_out_of_band_branch_switch_in_a_sibling_worktree_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Switch the sibling worktree to a different branch out of band.
+    common::git(&wt, &["checkout", "-q", "-b", "other"]);
+
+    let err = repo
+        .snapshot_working_copy()
+        .expect_err("a stale worktree mapping must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed its checked-out branch outside commedit")
+            && msg.contains("reopen the repository"),
+        "the error tells the user to reopen: {msg}"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

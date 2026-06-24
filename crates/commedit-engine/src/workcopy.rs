@@ -274,13 +274,16 @@ impl Repo {
     }
 
     /// Snapshot every extra worktree (see [`Self::snapshot_extra_worktree`]) before
-    /// a mutation. The worktree list is temporarily moved out so each snapshot can
-    /// borrow `&mut self` and the view together; it is always restored (including on
-    /// error). A no-op in the classic singleton path (no extra worktrees).
+    /// a mutation. First catches each worktree up to any out-of-band `git commit`
+    /// on its branch ([`Self::catch_up_extra_worktrees`]), then snapshots: the
+    /// worktree list is temporarily moved out so each snapshot can borrow `&mut self`
+    /// and the view together; it is always restored (including on error). A no-op in
+    /// the classic singleton path (no extra worktrees).
     pub(crate) fn snapshot_extra_worktrees(&mut self) -> Result<()> {
         if self.extra_worktrees.is_empty() {
             return Ok(());
         }
+        self.catch_up_extra_worktrees()?;
         let mut views = std::mem::take(&mut self.extra_worktrees);
         let result = views
             .iter_mut()
@@ -293,14 +296,20 @@ impl Repo {
     /// view's per-worktree workspace name), so its uncommitted changes are recorded
     /// and ride through a later `rebase_descendants` exactly like the launch
     /// worktree's. The per-worktree analogue of [`Self::snapshot_working_copy`],
-    /// minus the launch-only HEAD catch-up / `@`-chain reconciliation: an extra
-    /// worktree has a single `@` directly on its branch tip (anchored at
-    /// registration), and its branch is moved only by commedit, never by an
-    /// out-of-band `git commit`. A no-op when its disk matches the last snapshot.
+    /// minus the launch-only `@`-chain reconciliation (an extra worktree carries a
+    /// single `@`). First re-anchors `@` onto the branch tip
+    /// ([`Self::reanchor_extra_worktree`]) so an out-of-band `git commit` caught up
+    /// by [`Self::catch_up_extra_worktrees`] lands on the branch rather than as a
+    /// phantom uncommitted change — a no-op in the common case where `@` already
+    /// sits on the tip. A no-op overall when its disk matches the last snapshot.
     pub(crate) fn snapshot_extra_worktree(
         &mut self,
         view: &mut crate::repo::WorktreeView,
     ) -> Result<()> {
+        // Catch @ up if its branch tip moved out from under it (a plain `git commit`
+        // in this worktree, imported by snapshot_extra_worktrees) so the snapshot
+        // below records only the still-uncommitted delta, not the committed change.
+        self.reanchor_extra_worktree(view)?;
         let name = view.name.clone();
         let wc_id = self.repo.view().get_wc_commit_id(&name).cloned();
         let tracked = self.tracked_paths_matcher_for(wc_id.clone(), &[])?;
@@ -336,6 +345,52 @@ impl Repo {
         }
         let op_id = self.repo.operation().id().clone();
         block_on(locked_ws.finish(op_id)).context("saving worktree working-copy state")?;
+        Ok(())
+    }
+
+    /// Reparent an extra worktree's `@` onto its branch's current tip when the tip
+    /// moved out from under it — e.g. a plain `git commit` in that worktree, caught
+    /// up by [`Repo::catch_up_extra_worktrees`]'s import. A fresh empty `@` is
+    /// checked out on the tip (a jj-view pointer move only): the previous `@` and
+    /// its delta is abandoned, but the worktree's on-disk content is untouched, so
+    /// the snapshot that follows re-records the still-uncommitted delta against the
+    /// new tip. The per-worktree analogue of [`Self::ensure_working_copy_on_head`];
+    /// a no-op when `@` already sits directly on the tip (the common case, including
+    /// right after registration).
+    fn reanchor_extra_worktree(&mut self, view: &crate::repo::WorktreeView) -> Result<()> {
+        let short = view
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&view.branch);
+        let bookmark: jj_lib::ref_name::RefNameBuf = short.into();
+        let Some(tip) = self
+            .repo
+            .view()
+            .get_local_bookmark(&bookmark)
+            .as_normal()
+            .cloned()
+        else {
+            return Ok(());
+        };
+        // Already anchored? `@`'s single parent is the tip → nothing to do.
+        if let Some(wc_id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
+            if let Ok(wc) = self.repo.store().get_commit(&wc_id) {
+                if wc.parent_ids() == std::slice::from_ref(&tip) {
+                    return Ok(());
+                }
+            }
+        }
+        let tip_commit = self
+            .repo
+            .store()
+            .get_commit(&tip)
+            .context("loading the worktree branch tip")?;
+        let mut tx = self.repo.start_transaction();
+        block_on(tx.repo_mut().check_out(view.name.clone(), &tip_commit))
+            .context("re-anchoring the worktree working copy on its tip")?;
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing after re-anchor")?;
+        self.repo = block_on(tx.commit("commedit: re-anchor worktree working copy"))
+            .context("committing the worktree re-anchor")?;
         Ok(())
     }
 

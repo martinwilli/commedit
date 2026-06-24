@@ -1275,7 +1275,7 @@ impl Repo {
     /// rewrite (the branch tip didn't move, so the shared export tail wouldn't).
     /// The launch case reuses [`Self::materialize_after_rewrite`]; a named target
     /// re-checks-out just that worktree.
-    fn materialize_wc(&mut self, target: &WcTarget) -> Result<()> {
+    pub(crate) fn materialize_wc(&mut self, target: &WcTarget) -> Result<()> {
         match target {
             WcTarget::Launch => self.materialize_after_rewrite(self.head_commit()),
             WcTarget::Worktree(branch) => {

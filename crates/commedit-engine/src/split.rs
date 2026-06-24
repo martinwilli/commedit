@@ -21,6 +21,7 @@ use jj_lib::repo::Repo as _;
 use crate::conflict::SaveOutcome;
 use crate::repo::Repo;
 use crate::tree::FileEdit;
+use crate::workcopy::WcTarget;
 
 impl Repo {
     /// Split commit `target` from `(path, content)` write edits — the write-only
@@ -152,20 +153,38 @@ impl Repo {
     }
 
     /// The [`FileEdit`] form of [`Self::split_working_copy`], so a revert that
-    /// drops a file the entry adds peels through as a deletion.
+    /// drops a file the entry adds peels through as a deletion. The launch wrapper
+    /// over [`Self::split_working_copy_edits_at`].
     pub fn split_working_copy_edits(
         &mut self,
         change_hex: Option<&str>,
         edits: &[FileEdit],
     ) -> Result<()> {
-        self.require_worktree("split the working copy")?;
+        self.split_working_copy_edits_at(WcTarget::Launch, change_hex, edits)
+    }
+
+    /// Like [`Self::split_working_copy_edits`] but peels `target`'s worktree `@` —
+    /// the launch worktree's `@` chain or a *sibling* editable worktree's (see
+    /// [`WcTarget`]) — so a sibling's uncommitted changes split exactly like the
+    /// checked-out one's. Still a pure jj-side reorganization: the transaction is
+    /// committed directly with no git export, so HEAD / refs / index / working tree
+    /// are untouched and the on-disk content is byte-identical; only how jj groups
+    /// the uncommitted changes into entries changes.
+    pub fn split_working_copy_edits_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+        edits: &[FileEdit],
+    ) -> Result<()> {
+        self.require_wc_target(&target, "split the working copy")?;
         crate::repo::catch_jj("splitting the working copy", || {
-            self.split_working_copy_inner(change_hex, edits)
+            self.split_working_copy_inner(&target, change_hex, edits)
         })
     }
 
     fn split_working_copy_inner(
         &mut self,
+        target: &WcTarget,
         change_hex: Option<&str>,
         edits: &[FileEdit],
     ) -> Result<()> {
@@ -174,14 +193,14 @@ impl Repo {
         }
         // Snapshot the disk into the leaf @ first (its commit id churns here),
         // then resolve the target entry's stable change id to its current id.
-        self.snapshot_working_copy()?;
-        let target = self
-            .resolve_working_copy_change(change_hex)
+        self.snapshot_wc(target)?;
+        let entry_id = self
+            .resolve_wc(target, change_hex)
             .context("no working copy to split")?;
         let commit = self
             .repo
             .store()
-            .get_commit(&target)
+            .get_commit(&entry_id)
             .context("loading the working-copy entry")?;
         let change_hex = commit.change_id().hex();
         let store = self.repo.store().clone();
@@ -218,14 +237,11 @@ impl Repo {
         self.repo = pollster::block_on(tx.commit("commedit: split working copy"))
             .context("committing the working-copy split")?;
 
-        // The leaf @ holds the unchanged full tree, so this re-checkout is a
-        // no-op on disk; it just resets the git index to HEAD (unchanged).
-        self.materialize_after_rewrite(self.head_commit())?;
-        self.record_working_copy_op(
-            &crate::workcopy::WcTarget::Launch,
-            "Split uncommitted changes",
-            change_hex,
-        );
+        // The leaf @ still holds the unchanged full tree, so this re-checkout is a
+        // no-op on disk; it just resets the target worktree's git index to its
+        // (unchanged) branch tip.
+        self.materialize_wc(target)?;
+        self.record_working_copy_op(target, "Split uncommitted changes", change_hex);
         Ok(())
     }
 }

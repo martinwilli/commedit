@@ -1182,3 +1182,27 @@ fn committing_a_sibling_worktrees_uncommitted_changes() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Bug 3: a *clean* `@`-only edit on a sibling worktree is recorded as a session
+/// op, so it can be undone — the record decision keys on the mutated worktree's
+/// `@` (clean here), not the launch `@`. Before the fix `record_working_copy_op`
+/// inspected only the launch chain, so a sibling edit's op recording was decided
+/// by the wrong working copy.
+#[test]
+fn a_clean_sibling_edit_is_undoable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, _wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    assert!(!repo.can_undo(), "no recorded op before the edit");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f set by edit\n"))
+        .expect("edit the sibling @");
+
+    assert!(
+        repo.can_undo(),
+        "the clean sibling edit was recorded as a session op"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

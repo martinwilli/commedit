@@ -498,7 +498,7 @@ impl Repo {
 
         // Write the edited @ to disk (the branch tip is unchanged).
         self.materialize_wc(target)?;
-        self.record_working_copy_op("Edit uncommitted changes", change_hex);
+        self.record_working_copy_op(target, "Edit uncommitted changes", change_hex);
         Ok(())
     }
 
@@ -1007,7 +1007,7 @@ impl Repo {
 
         // Check the rebased leaf @ back out to disk (the branch tip is unchanged).
         self.materialize_wc(target)?;
-        self.record_working_copy_op("Drop uncommitted changes", change_hex);
+        self.record_working_copy_op(target, "Drop uncommitted changes", change_hex);
         Ok(())
     }
 
@@ -1180,10 +1180,8 @@ impl Repo {
         }
     }
 
-    /// True when any entry in the working-copy chain has a conflicted tree.
-    /// Gates recording a working-copy-direct edit as a session op: we record
-    /// only clean, materialized states, so the time-travel jumps can always land
-    /// [`crate::conflict::SaveOutcome::Clean`].
+    /// True when any entry in the **launch** working-copy chain has a conflicted
+    /// tree — the launch arm of [`Self::working_copy_has_conflict_at`].
     pub(crate) fn working_copy_has_conflict(&self) -> bool {
         self.working_copy_chain_ids().iter().any(|id| {
             self.repo
@@ -1194,13 +1192,39 @@ impl Repo {
         })
     }
 
+    /// Whether `target`'s working copy is conflicted. The launch arm walks the
+    /// whole `@` chain ([`Self::working_copy_has_conflict`]); an extra worktree
+    /// carries a single `@`, so its own conflict state is read directly. Gates
+    /// recording a working-copy-direct edit as a session op: we record only clean,
+    /// materialized states, so the time-travel jumps can always land
+    /// [`crate::conflict::SaveOutcome::Clean`]. Keying on the *mutated* worktree's
+    /// `@` (not always the launch's) keeps a sibling edit recordable even when the
+    /// launch `@` is conflicted, and never records a conflicted sibling `@` as if
+    /// it were clean.
+    pub(crate) fn working_copy_has_conflict_at(&self, target: &WcTarget) -> bool {
+        match target {
+            WcTarget::Launch => self.working_copy_has_conflict(),
+            WcTarget::Worktree(branch) => self
+                .find_worktree(branch)
+                .and_then(|v| self.repo.view().get_wc_commit_id(&v.name).cloned())
+                .and_then(|id| self.repo.store().get_commit(&id).ok())
+                .map(|c| c.has_conflict())
+                .unwrap_or(false),
+        }
+    }
+
     /// Record a working-copy-direct edit (one that commits straight to jj with no
     /// `finish_mutation`/export) as a session op-log entry the "Edit history"
-    /// dropdown can travel back to — unless it left the working copy conflicted.
-    /// `change_hex` is the edited entry's change id, for the dropdown's
+    /// dropdown can travel back to — unless it left `target`'s working copy
+    /// conflicted. `change_hex` is the edited entry's change id, for the dropdown's
     /// hover-highlight.
-    pub(crate) fn record_working_copy_op(&mut self, label: &str, change_hex: String) {
-        if self.working_copy_has_conflict() {
+    pub(crate) fn record_working_copy_op(
+        &mut self,
+        target: &WcTarget,
+        label: &str,
+        change_hex: String,
+    ) {
+        if self.working_copy_has_conflict_at(target) {
             return;
         }
         self.record_op(crate::conflict::OpDescriptor::new(

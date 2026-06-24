@@ -221,7 +221,11 @@ impl Repo {
         // The leaf @ holds the unchanged full tree, so this re-checkout is a
         // no-op on disk; it just resets the git index to HEAD (unchanged).
         self.materialize_after_rewrite(self.head_commit())?;
-        self.record_working_copy_op("Split uncommitted changes", change_hex);
+        self.record_working_copy_op(
+            &crate::workcopy::WcTarget::Launch,
+            "Split uncommitted changes",
+            change_hex,
+        );
         Ok(())
     }
 }

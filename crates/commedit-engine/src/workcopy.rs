@@ -1303,9 +1303,15 @@ impl Repo {
             WcTarget::Launch => self.working_copy_has_conflict(),
             WcTarget::Worktree(branch) => self
                 .find_worktree(branch)
-                .and_then(|v| self.repo.view().get_wc_commit_id(&v.name).cloned())
-                .and_then(|id| self.repo.store().get_commit(&id).ok())
-                .map(|c| c.has_conflict())
+                .map(|view| {
+                    self.worktree_chain_ids(view).iter().any(|id| {
+                        self.repo
+                            .store()
+                            .get_commit(id)
+                            .map(|c| c.has_conflict())
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false),
         }
     }
@@ -1330,32 +1336,24 @@ impl Repo {
         ));
     }
 
-    /// The uncommitted-changes chain as commit ids, newest first: the
-    /// working-copy commit `@` (leaf) followed by each single-parent ancestor up
-    /// to but excluding the current git HEAD. When `@` is not a clean linear
-    /// descendant of HEAD (detached HEAD, a merge in the way, or HEAD moved by
-    /// plain `git`), this falls back to just the leaf `@`, matching the
-    /// pre-chain single-`@` behaviour. Empty when there is no working copy.
-    pub(crate) fn working_copy_chain_ids(&self) -> Vec<CommitId> {
-        // Off-worktree there is no working copy on the edited branch: `@` is left
-        // on jj's root commit, which must never surface as uncommitted changes.
-        if !self.is_worktree_bound() {
-            return Vec::new();
-        }
-        let Some(leaf) = self.working_copy_commit_id() else {
+    /// Walk single-parent edges from `leaf` up to (but excluding) the first id in
+    /// `boundary`, newest-first — the uncommitted chain between a worktree's `@`
+    /// (the leaf, inclusive) and its branch tip (a boundary id, exclusive). When
+    /// `@` is not a clean linear descendant of a boundary id (detached HEAD, a
+    /// merge in the way, or the tip moved by plain `git`), this falls back to just
+    /// the leaf `@`, matching the pre-chain single-`@` behaviour. Empty when
+    /// `leaf` is `None` (no working copy). The shared walk behind both the launch
+    /// reader ([`Self::working_copy_chain_ids`]) and the per-worktree reader
+    /// ([`Self::worktree_chain_ids`]); they differ only in the boundary.
+    fn chain_ids_from(&self, leaf: Option<CommitId>, boundary: &[CommitId]) -> Vec<CommitId> {
+        let Some(leaf) = leaf else {
             return Vec::new();
         };
-        // The branch tip the chain descends from: git HEAD when clean, but jj's
-        // bookmark target while a conflicted rewrite is pending (git HEAD lags
-        // behind the rewritten tip until the deferred export runs). Stop at
-        // either, so the walk works in both the normal and the resolving state.
-        let git_head = self.head_commit_id();
-        let jj_head = self.current_head_in_jj();
-        let is_tip = |id: &CommitId| Some(id) == git_head.as_ref() || Some(id) == jj_head.as_ref();
+        let is_boundary = |id: &CommitId| boundary.contains(id);
         let mut ids = Vec::new();
         let mut id = leaf.clone();
         loop {
-            if is_tip(&id) {
+            if is_boundary(&id) {
                 // Reached the tip: `ids` is the clean uncommitted chain, leaf first.
                 return ids;
             }
@@ -1371,6 +1369,51 @@ impl Repo {
         }
         // The walk didn't cleanly reach the tip; treat only the leaf as uncommitted.
         vec![leaf]
+    }
+
+    /// The launch worktree's uncommitted-changes chain as commit ids, newest
+    /// first: the working-copy commit `@` (leaf) followed by each single-parent
+    /// ancestor up to but excluding the current git HEAD. Empty when there is no
+    /// working copy (including off-worktree). The boundary is two-valued: git HEAD
+    /// when clean, but jj's bookmark target while a conflicted rewrite is pending
+    /// (git HEAD lags behind the rewritten tip until the deferred export runs), so
+    /// the walk works in both the normal and the resolving state.
+    pub(crate) fn working_copy_chain_ids(&self) -> Vec<CommitId> {
+        // Off-worktree there is no working copy on the edited branch: `@` is left
+        // on jj's root commit, which must never surface as uncommitted changes.
+        if !self.is_worktree_bound() {
+            return Vec::new();
+        }
+        let boundary: Vec<CommitId> = [self.head_commit_id(), self.current_head_in_jj()]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.chain_ids_from(self.working_copy_commit_id(), &boundary)
+    }
+
+    /// An extra worktree's uncommitted-changes chain as commit ids, newest first
+    /// (its `@` leaf, then each single-parent ancestor up to but excluding its
+    /// branch tip). The per-worktree analogue of [`Self::working_copy_chain_ids`]:
+    /// a sibling `@` sits directly on its branch's local bookmark, so its boundary
+    /// is that single tip (no pending-rewrite ambiguity to straddle). A single
+    /// entry in the common case; [`Self::split_working_copy_edits_at`] peels it
+    /// into more. Empty when the worktree has no `@`.
+    pub(crate) fn worktree_chain_ids(&self, view: &crate::repo::WorktreeView) -> Vec<CommitId> {
+        let leaf = self.repo.view().get_wc_commit_id(&view.name).cloned();
+        let short = view
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&view.branch);
+        let bookmark: jj_lib::ref_name::RefNameBuf = short.into();
+        let boundary: Vec<CommitId> = self
+            .repo
+            .view()
+            .get_local_bookmark(&bookmark)
+            .as_normal()
+            .cloned()
+            .into_iter()
+            .collect();
+        self.chain_ids_from(leaf, &boundary)
     }
 
     /// Build a [`WorkingCopyEntry`] for one working-copy commit `@`: its
@@ -1430,15 +1473,17 @@ impl Repo {
             }
         }
         for view in &self.extra_worktrees {
-            let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() else {
-                continue;
-            };
-            if let Some(entry) = self.wc_entry_for(&id) {
+            let entries: Vec<WorkingCopyEntry> = self
+                .worktree_chain_ids(view)
+                .iter()
+                .filter_map(|id| self.wc_entry_for(id))
+                .collect();
+            if !entries.is_empty() {
                 let short = view
                     .branch
                     .strip_prefix("refs/heads/")
                     .unwrap_or(&view.branch);
-                out.push((short.to_string(), vec![entry]));
+                out.push((short.to_string(), entries));
             }
         }
         out
@@ -1453,9 +1498,7 @@ impl Repo {
     pub(crate) fn all_worktree_chain_ids(&self) -> Vec<CommitId> {
         let mut ids = self.working_copy_chain_ids();
         for view in &self.extra_worktrees {
-            if let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
-                ids.push(id);
-            }
+            ids.extend(self.worktree_chain_ids(view));
         }
         ids
     }

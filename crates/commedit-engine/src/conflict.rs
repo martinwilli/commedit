@@ -924,7 +924,7 @@ impl Repo {
     /// [`Self::rewritten_history`] rather than its whole — possibly huge —
     /// ancestry; a shared ancestor rewritten on several branches is reported once
     /// (`seen`). The working copies — the launch `@` chain and every *extra*
-    /// worktree's single `@` (see [`crate::repo::WorktreeView`]) — are descendants
+    /// worktree's `@` chain (see [`crate::repo::WorktreeView`]) — are descendants
     /// of their tips, so the ancestor walks never reach them; they are appended,
     /// oldest first, so an overlap between any worktree's uncommitted changes and
     /// the rewrite defers the export and is resolved in the diff pane like any
@@ -950,13 +950,12 @@ impl Repo {
             }
         }
         // The launch `@` chain (newest-first → reverse to oldest-first), then each
-        // extra worktree's single `@`.
+        // extra worktree's `@` chain (likewise reversed to oldest-first) — a split
+        // sibling chain contributes every entry, not just its leaf.
         let mut wc_ids: Vec<CommitId> = self.working_copy_chain_ids();
         wc_ids.reverse();
         for view in &self.extra_worktrees {
-            if let Some(id) = self.repo.view().get_wc_commit_id(&view.name).cloned() {
-                wc_ids.push(id);
-            }
+            wc_ids.extend(self.worktree_chain_ids(view).into_iter().rev());
         }
         for wc_id in wc_ids {
             if !seen.insert(wc_id.clone()) {
@@ -1149,9 +1148,18 @@ impl Repo {
             } else {
                 self.find_worktree(&branch).map(|v| v.name.clone())
             };
-            // A split launch `@` chain isn't reconstructed (matches the old guard);
-            // extra worktrees always have a single `@`.
-            if is_launch && self.is_worktree_bound() && self.working_copy_chain_ids().len() > 1 {
+            // A split `@` chain (launch or sibling) isn't reconstructed by the
+            // leaf-only replay below — fall back to manual resolution. The launch
+            // reader is empty off-worktree (len 0), so this keeps the old guard for
+            // the launch and extends it to a now-splittable sibling worktree.
+            let chain_len = if is_launch {
+                self.working_copy_chain_ids().len()
+            } else {
+                self.find_worktree(&branch)
+                    .map(|v| self.worktree_chain_ids(v).len())
+                    .unwrap_or(0)
+            };
+            if chain_len > 1 {
                 return Ok(false);
             }
             let wc = if let Some(wc_name) = &wc_name {

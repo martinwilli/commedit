@@ -407,8 +407,11 @@ impl Repo {
     /// reflects the rewrite while preserving its uncommitted changes. The
     /// per-worktree analogue of [`Self::materialize_after_rewrite`]; called only for
     /// a worktree whose branch tip actually moved (see [`crate::conflict`]'s export
-    /// tail). The index-only-content backup is launch-worktree-specific and skipped
-    /// here.
+    /// tail). Like the launch path, any index-only staged content (staged then
+    /// reverted/removed on disk, so invisible to jj's `@`) is pinned to a recovery
+    /// ref before the index reset would drop it — namespaced by a per-worktree key
+    /// so the launch's and each sibling's recovery points don't evict one another in
+    /// the shared common-dir.
     pub(crate) fn materialize_extra_worktree(
         &mut self,
         view: &mut crate::repo::WorktreeView,
@@ -428,9 +431,12 @@ impl Repo {
         // Reset that worktree's index to its branch's new tip, so its `git status`
         // shows the preserved uncommitted changes against the rewritten history.
         let root = view.workspace.workspace_root();
+        let key = crate::transparency::worktree_backup_key(root);
+        let _ = crate::transparency::backup_index_only_content_at(root, &key);
         if let Some(new_tip) = crate::transparency::ref_commit(root, &view.branch) {
             crate::transparency::reset_index_to(root, &new_tip)?;
         }
+        crate::transparency::prune_backup_refs_at(root, &key);
         Ok(())
     }
 

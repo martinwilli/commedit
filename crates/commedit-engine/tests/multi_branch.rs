@@ -1484,3 +1484,67 @@ fn a_conflicted_sibling_at_is_resolvable() {
     assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
     g(&["fsck", "--no-progress"]);
 }
+
+/// Gap 4: index-only staged content in a *sibling* worktree (staged then reverted
+/// on disk, so invisible to jj's `@`) is pinned to a recovery ref before that
+/// worktree's index reset would drop it — the per-worktree analogue of the launch
+/// worktree's backup, namespaced under a worktree key so the two don't evict each
+/// other in the shared common-dir.
+#[test]
+fn a_sibling_worktrees_index_only_content_survives_a_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Stage content into the sibling worktree's f.txt, then revert the disk to its
+    // tip: the staged version now lives ONLY in that worktree's git index.
+    std::fs::write(wt.join("f.txt"), "staged-only\n").unwrap();
+    common::git(&wt, &["add", "f.txt"]);
+    std::fs::write(wt.join("f.txt"), "f\n").unwrap();
+
+    // Rewrite F (feature's tip) so the sibling worktree is re-materialized — its
+    // index is reset to the new tip, which would otherwise drop the staged content.
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    repo.rewrite_message(&f, "F (edited)").expect("rewrite F");
+
+    // The sibling's index-only content was pinned to a recovery ref, namespaced
+    // under a per-worktree key (an extra path segment under refs/commedit/backup/).
+    let backups = common::git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ],
+    );
+    let backup = backups
+        .lines()
+        .next()
+        .expect("a sibling index backup ref exists");
+    let rest = backup.strip_prefix("refs/commedit/backup/").unwrap();
+    assert!(
+        rest.contains('/'),
+        "the sibling backup is namespaced under a worktree key: {backup}"
+    );
+    assert_eq!(
+        common::git(dir, &["show", &format!("{backup}:f.txt")]),
+        "staged-only"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

@@ -366,6 +366,42 @@ impl Repo {
         result
     }
 
+    /// Re-materialize every extra worktree whose `@` id changed across a rewind but
+    /// whose branch tip did *not* move — the gap [`Self::materialize_moved_worktrees`]
+    /// (tip-gated, run inside `export_and_sync`) leaves for an `@`-only sibling op
+    /// (edit/discard uncommitted): undo/redo restores the sibling `@` in jj, but the
+    /// tip-gate skips the on-disk re-checkout, so the worktree's files would stay
+    /// stale. `before_tips` ([`Repo::snapshot_heads`]) and `before_wc` are the
+    /// pre-rewind branch tips and `@` ids, both keyed by full ref name. A worktree
+    /// whose tip moved was already re-checked-out by the tip gate, so it is skipped
+    /// here to avoid a redundant checkout. Used only by the rewind path (the
+    /// general export tail's tip gate is correct there — see [`crate::conflict`]); a
+    /// no-op in the classic singleton path (no extra worktrees).
+    pub(crate) fn materialize_changed_worktrees(
+        &mut self,
+        before_tips: &std::collections::BTreeMap<String, String>,
+        before_wc: &std::collections::BTreeMap<String, CommitId>,
+    ) -> Result<()> {
+        if self.extra_worktrees.is_empty() {
+            return Ok(());
+        }
+        let mut views = std::mem::take(&mut self.extra_worktrees);
+        let result = views.iter_mut().try_for_each(|view| {
+            let root = view.workspace.workspace_root();
+            let new_tip = crate::transparency::ref_commit(root, &view.branch);
+            if new_tip.as_deref() != before_tips.get(&view.branch).map(String::as_str) {
+                return Ok(()); // tip moved: the tip gate already re-materialized it
+            }
+            let new_wc = self.repo.view().get_wc_commit_id(&view.name).cloned();
+            if new_wc.as_ref() == before_wc.get(&view.branch) {
+                return Ok(()); // @ unchanged: leave the worktree frozen
+            }
+            self.materialize_extra_worktree(view)
+        });
+        self.extra_worktrees = views;
+        result
+    }
+
     /// Materialize one extra worktree's rebased `@'` back to its own on-disk root
     /// and reset *its* git index to its branch tip, so that worktree's `git status`
     /// reflects the rewrite while preserving its uncommitted changes. The

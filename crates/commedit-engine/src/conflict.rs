@@ -659,6 +659,26 @@ impl Repo {
         // away from; the git-level head backstop holds unrelated branches in place.
         let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
+        // Snapshot each extra worktree's current (pre-rewind) `@` id, keyed by full
+        // ref name like `heads`. The rewind below restores jj's view — and each
+        // worktree's `@` — to the target op, but `export_and_sync`'s extra-worktree
+        // tail only re-checks-out a worktree whose branch *tip* moved. An `@`-only
+        // sibling op (edit/discard) moves the sibling `@` without moving its tip, so
+        // without this its files would stay stale on disk after undo/redo. We
+        // re-materialize the `@`-changed worktrees ourselves after the export (the
+        // rewind owns this pre-state, so it is not threaded through
+        // `export_and_sync`, which has a tip-only caller in `settle` too).
+        let before_wc: BTreeMap<String, CommitId> = self
+            .extra_worktrees
+            .iter()
+            .filter_map(|v| {
+                self.repo
+                    .view()
+                    .get_wc_commit_id(&v.name)
+                    .cloned()
+                    .map(|id| (v.branch.clone(), id))
+            })
+            .collect();
         // jj's recorded git-ref state tracks what it last wrote to git's
         // refs/*; the session's clean saves left it at the current tips. Keep a
         // copy sampled from the *live* view (so chained undo/redo reconciles in
@@ -688,7 +708,10 @@ impl Repo {
         // Push the restored state back to git and check its working copy back out
         // to disk. Every recorded op was a clean exported git history, so the
         // restored chain is always conflict-free.
-        self.export_and_sync(old_head, &heads)
+        self.export_and_sync(old_head, &heads)?;
+        // Re-materialize any sibling worktree whose `@` changed but whose tip did
+        // not move (the tip-moved ones were already handled inside the export).
+        self.materialize_changed_worktrees(&heads, &before_wc)
     }
 
     /// Append a landed mutation to the session op-log the time-travel dropdown

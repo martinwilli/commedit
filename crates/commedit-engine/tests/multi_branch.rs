@@ -1206,3 +1206,123 @@ fn a_clean_sibling_edit_is_undoable() {
     );
     common::git(dir, &["fsck", "--no-progress"]);
 }
+
+/// Bug 1: an `@`-only discard on a sibling worktree (its tip does not move)
+/// followed by undo/redo keeps that worktree's files in sync with the DAG. The
+/// rewind path re-materializes a sibling whose `@` changed, not just one whose
+/// branch tip moved — before the fix undo restored the sibling `@` in jj but
+/// left the worktree's files stale on disk.
+#[test]
+fn an_at_only_sibling_drop_then_undo_redo_keeps_the_worktree_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    // Discard the sibling @: the worktree reverts to its tip content (passes today).
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.drop_working_copy_at(target, None)
+        .expect("discard the sibling @");
+    assert_eq!(std::fs::read_to_string(wt.join("f.txt")).unwrap(), "f\n");
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+
+    // Undo: the discarded uncommitted change must come back on disk AND in the
+    // worktree's index (this is what failed before the fix).
+    repo.undo().expect("undo the discard");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f dirty\n",
+        "undo restored the sibling worktree's uncommitted change on disk"
+    );
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "M f.txt",
+        "and its git index reflects the restored change"
+    );
+
+    // Redo: the discard reapplies, reverting the worktree again.
+    repo.redo().expect("redo the discard");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\n",
+        "redo reverted the sibling worktree again"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    // main never moved through any of this.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 1: an `@`-only edit on a sibling worktree, then `revert_all()` (→
+/// `set_op_cursor(0)` → `rewind_to_op`) resets that worktree on disk back to its
+/// session-start uncommitted state.
+#[test]
+fn an_at_only_sibling_edit_then_revert_all_resets_the_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    // Session starts with the sibling worktree dirty at "f start\n".
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f start\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f edited\n"))
+        .expect("edit the sibling @");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f edited\n"
+    );
+
+    repo.revert_all().expect("revert the whole session");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f start\n",
+        "revert_all reset the sibling worktree to its session-start @"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 1 guard: a *tip-moving* sibling op (fold its `@` into a commit) still
+/// undoes/redoes correctly — the new `@`-aware rewind gate must not regress the
+/// existing tip-move materialize path (which `export_and_sync` already handles).
+#[test]
+fn undo_redo_across_a_tip_moving_sibling_op_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nmore\n");
+
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.squash_working_copy_into_at(target, None, &f, None)
+        .expect("fold the sibling @ into F");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+
+    // Undo the fold: F reverts and the worktree's uncommitted change comes back.
+    repo.undo().expect("undo the fold");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n",
+        "undo restored the worktree's uncommitted change on the original tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+
+    // Redo the fold: back to the rewritten tip with a clean worktree.
+    repo.redo().expect("redo the fold");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}

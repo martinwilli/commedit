@@ -1710,7 +1710,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         let mut infos = Vec::new();
                         let mut targets = Vec::new();
                         for &i in &set {
-                            match repo.borrow().plan_drop(&c, i) {
+                            match repo.borrow().plan_drop_multi(&c, i) {
                                 Some(id) => {
                                     infos.push(c[i].clone());
                                     targets.push(id);
@@ -1762,9 +1762,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 let Some(info) = commits.borrow().get(from_ci).cloned() else {
                     return;
                 };
-                // Only commits on the current branch's linear chain (and not its
+                // Only commits on an editable branch's linear chain (and not its
                 // sole commit) can be dropped; refuse merges/off-branch/root rows.
-                let target = repo.borrow().plan_drop(&commits.borrow(), from_ci);
+                // `_multi` spans every editable head, so a sibling branch's commit
+                // is droppable too.
+                let target = repo.borrow().plan_drop_multi(&commits.borrow(), from_ci);
                 let Some(target) = target else {
                     show_status("Can't drop this commit");
                     return;

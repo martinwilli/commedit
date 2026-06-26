@@ -293,6 +293,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // longer on the branch but their objects survive, so they can be dragged back
     // into history to restore them (see `Repo::restore_commit`).
     let trashed: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // Each trashed commit's origin branch (change-id hex → short-name), recorded at
+    // drop time so "restore to working tree" routes back to that branch's worktree.
+    let trashed_origin: Rc<RefCell<HashMap<String, String>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     // A trash add/remove held back while a conflicted drop/restore is resolved —
     // applied on a clean resolution, discarded on abort (see `PendingTrashOp`).
     let pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>> = Rc::new(RefCell::new(None));
@@ -892,6 +896,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         hollow: hollow.clone(),
         commit_rows: commit_rows.clone(),
         trashed: trashed.clone(),
+        trashed_origin: trashed_origin.clone(),
         pending_trash_op: pending_trash_op.clone(),
         selected_change: selected_change.clone(),
         selected_changes: selected_changes.clone(),
@@ -2914,6 +2919,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     *on_restore_slot.borrow_mut() = Some({
         let repo = repo.clone();
         let trashed = trashed.clone();
+        let trashed_origin = trashed_origin.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
@@ -2925,6 +2931,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         Rc::new(move |idx: i32| {
             let repo = repo.clone();
             let trashed = trashed.clone();
+            let trashed_origin = trashed_origin.clone();
             let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
@@ -2943,7 +2950,26 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let Some(info) = trashed.borrow().get(idx as usize).cloned() else {
                     return;
                 };
-                let outcome = repo.borrow_mut().restore_to_working_copy(&info.id);
+                // Route the restore to the worktree of the branch this commit was
+                // dropped from (recorded at drop time). No origin recorded ⇒ the
+                // launch worktree (as before); an origin whose branch has no worktree
+                // to land in ⇒ refuse rather than silently use the launch one.
+                let origin = trashed_origin.borrow().get(&info.change_id_hex()).cloned();
+                let target = match &origin {
+                    Some(branch) => match repo.borrow().wc_target_for_branch(branch) {
+                        Some(t) => t,
+                        None => {
+                            show_status(&format!(
+                                "Can't restore: branch {branch} has no worktree to restore into"
+                            ));
+                            return;
+                        }
+                    },
+                    None => WcTarget::Launch,
+                };
+                let outcome = repo
+                    .borrow_mut()
+                    .restore_to_working_copy_at(target, &info.id);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
                         // Its changes are now uncommitted; drop it from the trash.
@@ -2951,6 +2977,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         trashed
                             .borrow_mut()
                             .retain(|c| c.change_id_hex() != change_hex);
+                        trashed_origin.borrow_mut().remove(&change_hex);
                         // refresh() rebuilds history + the working-copy rows (the new
                         // uncommitted entry); repopulate the trash to drop its row.
                         refresh();

@@ -51,6 +51,23 @@ fn lane_branches(repo: &Repo, commits: &[CommitInfo]) -> LaneBranches {
     LaneBranches::compute(commits, &tips)
 }
 
+/// Pick the origin branch to remember for `id` when it is dropped to the trash,
+/// so a later "restore to working tree" routes its changes back to that branch's
+/// worktree `@` rather than always the launch one. A commit reachable from the
+/// primary belongs to the launch line (restore there); a commit on *only* sibling
+/// branches takes the first such sibling. `None` ⇒ no editable branch reaches it,
+/// so restore falls back to the launch worktree, as before.
+fn trash_origin(lb: &LaneBranches, primary: Option<&str>, id: &CommitId) -> Option<String> {
+    let set = lb.branches_of(id);
+    if set.is_empty() {
+        return None;
+    }
+    if let Some(p) = primary.filter(|p| set.contains(*p)) {
+        return Some(p.to_string());
+    }
+    set.iter().next().cloned()
+}
+
 /// The commits that identify a reorder/insert candidate's destination *line* —
 /// the ones it re-parents (`new_children`), falling back to its `new_parents` for
 /// a top/childless splice. [`LaneBranches`] reads the branch identity off these.
@@ -86,6 +103,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     // recommendations, blame hint) on the right rows now that `@` nodes shift them.
     let commit_rows = d.commit_rows.clone();
     let trashed = d.trashed.clone();
+    let trashed_origin = d.trashed_origin.clone();
     let pending_trash_op = d.pending_trash_op.clone();
     let selected_change = d.selected_change.clone();
     let selected_changes = d.selected_changes.clone();
@@ -1651,6 +1669,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             let refresh = refresh.clone();
             let show_status = show_status.clone();
             let trashed = trashed.clone();
+            let trashed_origin = trashed_origin.clone();
             let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
@@ -1701,17 +1720,25 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 if set.len() > 1 {
                     // Group drop: trash every selected commit in one rebase. Refuse
                     // if it would empty the displayed branch (nothing left to anchor).
-                    let (infos, targets) = {
+                    // Each dropped commit, with its origin branch for restore
+                    // routing (computed from the pre-drop lanes, before the rebase
+                    // orphans them).
+                    let (infos, targets, origins) = {
                         let c = commits.borrow();
                         if set.len() >= c.len() {
                             show_status("Can't drop every commit");
                             return;
                         }
+                        let r = repo.borrow();
+                        let lb = lane_branches(&r, &c);
+                        let primary = r.target_branch_name();
                         let mut infos = Vec::new();
                         let mut targets = Vec::new();
+                        let mut origins = Vec::new();
                         for &i in &set {
-                            match repo.borrow().plan_drop_multi(&c, i) {
+                            match r.plan_drop_multi(&c, i) {
                                 Some(id) => {
+                                    origins.push(trash_origin(&lb, primary, &c[i].id));
                                     infos.push(c[i].clone());
                                     targets.push(id);
                                 }
@@ -1721,7 +1748,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 }
                             }
                         }
-                        (infos, targets)
+                        (infos, targets, origins)
                     };
                     let outcome = repo.borrow_mut().abandon_commits(targets);
                     match outcome {
@@ -1738,6 +1765,14 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             *selected_change.borrow_mut() = survivor;
                             selected_changes.borrow_mut().clear();
                             list.unselect_all();
+                            {
+                                let mut om = trashed_origin.borrow_mut();
+                                for (info, origin) in infos.iter().zip(&origins) {
+                                    if let Some(o) = origin {
+                                        om.insert(info.change_id_hex(), o.clone());
+                                    }
+                                }
+                            }
                             trashed.borrow_mut().extend(infos);
                             refresh();
                             populate_trash(
@@ -1748,7 +1783,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             );
                         }
                         Ok(SaveOutcome::Conflicts { commits }) => {
-                            *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(infos));
+                            *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(
+                                infos.into_iter().zip(origins).collect(),
+                            ));
                             enter_conflict_mode(commits);
                         }
                         Err(err) => show_status(&format!("Drop failed: {err}")),
@@ -1770,6 +1807,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 let Some(target) = target else {
                     show_status("Can't drop this commit");
                     return;
+                };
+                // The origin branch to remember for restore routing, read from the
+                // pre-drop lanes (the abandon below orphans the commit off them).
+                let origin = {
+                    let r = repo.borrow();
+                    let cs = commits.borrow();
+                    trash_origin(&lane_branches(&r, &cs), r.target_branch_name(), &info.id)
                 };
                 let outcome = repo.borrow_mut().abandon_commit(&target);
                 match outcome {
@@ -1793,6 +1837,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             *selected_change.borrow_mut() = neighbour;
                             list.unselect_all();
                         }
+                        if let Some(o) = &origin {
+                            trashed_origin
+                                .borrow_mut()
+                                .insert(info.change_id_hex(), o.clone());
+                        }
                         trashed.borrow_mut().push(info);
                         refresh();
                         populate_trash(
@@ -1807,7 +1856,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // git until the conflicts clear. Defer the add — applied on
                         // a clean resolution, dropped on abort. `enter_conflict_mode`
                         // selects the commit being resolved, so the pane refreshes.
-                        *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(vec![info]));
+                        *pending_trash_op.borrow_mut() =
+                            Some(PendingTrashOp::Drop(vec![(info, origin)]));
                         enter_conflict_mode(commits);
                     }
                     Err(err) => show_status(&format!("Drop failed: {err}")),

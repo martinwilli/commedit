@@ -504,6 +504,7 @@ pub(crate) fn build_resolve_current(
     let selected_change = d.selected_change.clone();
     let conflict_view = d.conflict_view.clone();
     let trashed = d.trashed.clone();
+    let trashed_origin = d.trashed_origin.clone();
     let pending_trash_op = d.pending_trash_op.clone();
     let trash_list = w.trash_list.clone();
     let trash_scroll = w.trash_scroll.clone();
@@ -554,10 +555,23 @@ pub(crate) fn build_resolve_current(
                 // the restored one leaves it).
                 if let Some(op) = pending_trash_op.borrow_mut().take() {
                     match op {
-                        PendingTrashOp::Drop(infos) => trashed.borrow_mut().extend(infos),
-                        PendingTrashOp::Restore(info) => trashed
-                            .borrow_mut()
-                            .retain(|c| c.change_id_hex() != info.change_id_hex()),
+                        PendingTrashOp::Drop(entries) => {
+                            let mut om = trashed_origin.borrow_mut();
+                            let mut t = trashed.borrow_mut();
+                            for (info, origin) in entries {
+                                if let Some(branch) = origin {
+                                    om.insert(info.change_id_hex(), branch);
+                                }
+                                t.push(info);
+                            }
+                        }
+                        PendingTrashOp::Restore(info) => {
+                            let change_hex = info.change_id_hex();
+                            trashed
+                                .borrow_mut()
+                                .retain(|c| c.change_id_hex() != change_hex);
+                            trashed_origin.borrow_mut().remove(&change_hex);
+                        }
                     }
                     populate_trash(
                         &trash_list,

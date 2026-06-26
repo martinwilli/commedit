@@ -6,7 +6,7 @@
 //! the vocabulary without depending on each other.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use commedit_engine::conflict::ConflictedCommit;
@@ -213,10 +213,11 @@ impl ConflictCtx {
 /// conflicts clear, so the trash list must not change yet either: the op is
 /// applied on a clean resolution and discarded on abort. `Drop` adds the
 /// commit(s) to the trash (a history→trash drop that conflicted — one entry per
-/// commit for a multi-selection drop); `Restore` removes one (a trash→history
-/// restore that conflicted).
+/// commit for a multi-selection drop, each paired with its origin branch short-
+/// name for restore routing); `Restore` removes one (a trash→history restore
+/// that conflicted).
 pub(crate) enum PendingTrashOp {
-    Drop(Vec<CommitInfo>),
+    Drop(Vec<(CommitInfo, Option<String>)>),
     Restore(Box<CommitInfo>),
 }
 
@@ -342,6 +343,11 @@ pub(crate) struct Data {
     /// for re-selecting / highlighting a commit by index after a refresh.
     pub(crate) commit_rows: Rc<RefCell<Vec<usize>>>,
     pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
+    /// Each trashed commit's origin branch (change-id hex → branch short-name),
+    /// recorded when it is dropped to the trash so "restore to working tree" can
+    /// route the changes back to *that* branch's worktree `@` rather than always
+    /// the launch one. Absent ⇒ restore falls back to the launch worktree.
+    pub(crate) trashed_origin: Rc<RefCell<HashMap<String, String>>>,
     /// A trash-list change deferred until a conflicted drop/restore resolves.
     pub(crate) pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>>,
     pub(crate) selected_change: Rc<RefCell<Option<String>>>,

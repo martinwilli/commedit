@@ -759,8 +759,26 @@ pub fn plan_restore_candidates(
 /// are refused. Returns `None` otherwise — the UI uses this both to gate the
 /// drop and to validate it.
 pub fn plan_drop(commits: &[CommitInfo], head: &CommitId, index: usize) -> Option<CommitId> {
+    plan_drop_multi(commits, std::slice::from_ref(head), index)
+}
+
+/// Multi-head variant of [`plan_drop`]: a single-parent commit reachable from
+/// *any* of `heads` (the editable set's tips) is droppable, so a commit that
+/// lives only on a sibling editable branch's lane can be trashed too — the
+/// cross-branch generalization the GTK multi-branch DAG needs (the apply,
+/// [`crate::repo::Repo::abandon_commit`], is already head-agnostic). A singleton
+/// `heads` is exactly [`plan_drop`], so the classic/MCP single-branch path is
+/// byte-identical.
+pub fn plan_drop_multi(
+    commits: &[CommitInfo],
+    heads: &[CommitId],
+    index: usize,
+) -> Option<CommitId> {
     let c = commits.get(index)?;
-    if commits.len() < 2 || c.parents.len() != 1 || !branch_commits(commits, head).contains(&c.id) {
+    if commits.len() < 2
+        || c.parents.len() != 1
+        || !branch_commits_multi(commits, heads).contains(&c.id)
+    {
         return None;
     }
     Some(c.id.clone())

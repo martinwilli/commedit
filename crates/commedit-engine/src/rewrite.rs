@@ -16,9 +16,10 @@ use jj_lib::rewrite::{
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::graph::GraphLayout;
 use crate::history::{
-    parse_timestamp, plan_drop, plan_insert_candidates, plan_insert_candidates_multi,
-    plan_reorder_candidates, plan_reorder_candidates_multi, plan_reorder_set_candidates,
-    plan_restore_candidates, CommitInfo, ReorderCandidate, ReorderSetCandidate,
+    parse_timestamp, plan_drop, plan_drop_multi, plan_insert_candidates,
+    plan_insert_candidates_multi, plan_reorder_candidates, plan_reorder_candidates_multi,
+    plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
+    ReorderSetCandidate,
 };
 use crate::repo::Repo;
 
@@ -402,11 +403,22 @@ impl Repo {
     }
 
     /// The id of the commit at display `index` if it can be dropped to the trash,
-    /// or `None` (a merge, an off-branch row, or the branch's only commit). See
-    /// [`crate::history::plan_drop`].
+    /// or `None` (a merge, an off-branch row, or the branch's only commit). Gates
+    /// on the primary branch tip only. See [`crate::history::plan_drop`].
     pub fn plan_drop(&self, commits: &[CommitInfo], index: usize) -> Option<CommitId> {
         let head = self.head_commit_id()?;
         plan_drop(commits, &head, index)
+    }
+
+    /// The id of the commit at display `index` if it can be dropped to the trash,
+    /// across the **multi-branch DAG** — a commit on any editable branch's lane
+    /// ([`Self::editable_heads`]), not just the primary's, is droppable, so a
+    /// sibling branch's commit can be trashed. The apply
+    /// ([`Self::abandon_commit`]) is head-agnostic. A singleton editable set
+    /// reproduces [`Self::plan_drop`] byte-for-byte. See
+    /// [`crate::history::plan_drop_multi`].
+    pub fn plan_drop_multi(&self, commits: &[CommitInfo], index: usize) -> Option<CommitId> {
+        plan_drop_multi(commits, &self.editable_heads(), index)
     }
 
     /// Move `target` to a new slot in the history graph: rebased onto

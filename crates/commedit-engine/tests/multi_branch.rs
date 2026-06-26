@@ -308,6 +308,47 @@ fn a_cross_branch_squash_lands_and_consumes_the_source() {
     g(&["fsck", "--no-progress"]);
 }
 
+/// Cross-branch **drop** (GTK trash drag): a commit that lives only on a sibling
+/// editable branch can be trashed. The single-head `plan_drop` refuses it (it is
+/// unreachable from the primary tip), but `plan_drop_multi` — gating on every
+/// editable head — allows it, and the head-agnostic `abandon_commit` apply moves
+/// only that branch's ref. Drives the engine path the GTK trash arm uses
+/// (`plan_drop_multi` → `abandon_commit`).
+#[test]
+fn a_cross_branch_drop_trashes_a_sibling_only_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let main_before = g(&["rev-parse", "main"]);
+
+    let (mut repo, heads) = open_two_branch_dag(dir);
+    // F lives only on feature (main: A-B-C, feature: A-B-F).
+    let (union, _) = repo.history_multi(&heads, 0, usize::MAX).unwrap();
+    let f_idx = union.iter().position(|c| c.subject == "F").unwrap();
+    assert!(
+        repo.plan_drop(&union, f_idx).is_none(),
+        "single-head planner refuses the sibling-only drop"
+    );
+    let id = repo
+        .plan_drop_multi(&union, f_idx)
+        .expect("multi-head planner allows the sibling drop");
+    repo.abandon_commit(&id).expect("drop F on feature");
+
+    // feature lost F (its tip is B again); main is untouched.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["B", "A"],
+        "feature lost F — the drop abandoned the sibling commit"
+    );
+    assert_eq!(
+        g(&["rev-parse", "main"]),
+        main_before,
+        "main is untouched — the drop only moved feature's ref"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
 /// Cross-branch **copy** (Phase 3 GTK Copy): cherry-picking a commit from one
 /// branch onto another grows a re-applied copy and leaves the source branch
 /// intact. Drives the engine path the GTK Copy popover uses

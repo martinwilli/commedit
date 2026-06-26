@@ -3303,44 +3303,22 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // lane); unticking narrows it (its ref freezes again). Both go through the
     // engine's in-place `set_editable_branches`, so the session's undo history and
     // trash survive a toggle — unlike a full reopen. The set defaults to just the
-    // opened branch; there is no pinned branch, only a last-branch rule (the final
-    // editable branch can't be unticked). The list is (re)populated every time the
-    // popover opens (branches move/appear out of band); it is a small transient
-    // list, not the segfault-sensitive history list, so rebuilding its rows is safe.
-    // The last-branch rule, applied live: disable the sole ticked branch's
-    // checkbox (so the set can never be emptied) and re-enable it as soon as a
-    // second branch is ticked. Run after (re)building the list and after every
-    // toggle, so the greyed-out state tracks the set without reopening the
-    // popover. It only flips `sensitive`/tooltip on the existing checkboxes — no
-    // row is added or removed — so it is safe to call from inside a checkbox's
-    // own `toggled` handler (unlike a rebuild, which would unparent that row
-    // mid-signal).
-    let apply_last_branch_rule: Rc<dyn Fn()> = {
-        let branch_list = branch_list.clone();
-        Rc::new(move || {
-            let mut checks: Vec<CheckButton> = Vec::new();
-            let mut child = branch_list.first_child();
-            while let Some(w) = child {
-                child = w.next_sibling();
-                if let Ok(cb) = w.downcast::<CheckButton>() {
-                    checks.push(cb);
-                }
-            }
-            let only_one = checks.iter().filter(|c| c.is_active()).count() == 1;
-            for cb in &checks {
-                let last = only_one && cb.is_active();
-                cb.set_sensitive(!last);
-                cb.set_tooltip_text(last.then_some("The last editable branch — keep at least one"));
-            }
-        })
-    };
-
+    // opened branch; there is no pinned branch and no last-branch rule — unticking
+    // the final branch empties the set, which simply shows no commits until a
+    // branch is re-ticked. The list is (re)populated every time the popover opens
+    // (branches move/appear out of band); it is a small transient list, not the
+    // segfault-sensitive history list, so rebuilding its rows is safe.
+    // Re-entrancy guard for the checkbox toggle: the Err-arm revert below calls
+    // `set_active`, which *synchronously* re-fires `toggled`. Without this guard a
+    // persistent `set_editable_branches` failure would ping-pong the checkbox
+    // forever and overflow the stack (the failing call recurses through the revert).
+    let branch_toggle_guard = Rc::new(Cell::new(false));
     branch_menu.connect_active_notify({
         let repo = repo.clone();
         let refresh = refresh.clone();
         let branch_list = branch_list.clone();
         let show_status = show_status.clone();
-        let apply_last_branch_rule = apply_last_branch_rule.clone();
+        let branch_toggle_guard = branch_toggle_guard.clone();
         move |mb| {
             if !mb.is_active() {
                 return;
@@ -3358,10 +3336,17 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     let repo = repo.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
-                    let apply_last_branch_rule = apply_last_branch_rule.clone();
+                    let branch_toggle_guard = branch_toggle_guard.clone();
                     move |c| {
+                        // Ignore the re-entrant toggle the Err-arm revert provokes
+                        // (see the guard's definition above).
+                        if branch_toggle_guard.get() {
+                            return;
+                        }
                         // Compute the desired set from the live editable set ± this
                         // branch, preserving order (existing first, newcomers appended).
+                        // Unticking the last branch leaves `desired` empty — that is
+                        // allowed and yields an empty history (no last-branch rule).
                         let mut desired = repo.borrow().editable_branches();
                         if c.is_active() {
                             if !desired.contains(&name) {
@@ -3369,12 +3354,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                             }
                         } else {
                             desired.retain(|n| n != &name);
-                        }
-                        if desired.is_empty() {
-                            // Last-branch rule backstop: revert the tick, do nothing.
-                            c.set_active(true);
-                            show_status("Keep at least one branch editable");
-                            return;
                         }
                         // Bind in a `let` so the `borrow_mut()` temporary is released at
                         // the `;` — `refresh()` re-borrows `repo`, and a temporary held in
@@ -3384,13 +3363,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         match outcome {
                             Ok(()) => {
                                 refresh();
-                                // Re-evaluate which checkbox is the now-sole ticked
-                                // branch so the greyed-out state stays in sync.
-                                apply_last_branch_rule();
                             }
                             Err(err) => {
-                                // Revert the checkbox to match the unchanged set.
+                                // Revert the checkbox to match the unchanged set,
+                                // guarding the programmatic `set_active` so the
+                                // re-fired `toggled` is ignored (no recursion).
+                                branch_toggle_guard.set(true);
                                 c.set_active(!c.is_active());
+                                branch_toggle_guard.set(false);
                                 show_status(&format!("Could not change the branch set: {err}"));
                             }
                         }
@@ -3398,8 +3378,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 });
                 branch_list.append(&check);
             }
-            // Seed the greyed-out state for the freshly built list.
-            apply_last_branch_rule();
         }
     });
 

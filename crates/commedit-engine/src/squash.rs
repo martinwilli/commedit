@@ -445,13 +445,31 @@ impl Repo {
     /// like any other rewrite. The engine behind the GTK trash-row "restore to
     /// working tree" button and the second half of [`Self::drop_keeping_changes`].
     pub fn restore_to_working_copy(&mut self, source: &CommitId) -> Result<SaveOutcome> {
-        self.require_worktree("restore changes to the working tree")?;
+        self.restore_to_working_copy_at(WcTarget::Launch, source)
+    }
+
+    /// Like [`Self::restore_to_working_copy`] but lands the orphan's changes on
+    /// `target`'s worktree `@` — so a *sibling* worktree's dropped commit,
+    /// restored from the trash, reappears as that worktree's uncommitted changes
+    /// rather than the launch worktree's (which would conflict with the launch's
+    /// own edits). Squashing the orphan into the sibling `@` moves only that `@`,
+    /// not the branch tip; `finish_mutation`'s export tail re-materializes the
+    /// launch worktree unconditionally but an *extra* worktree only when its tip
+    /// moved, so a sibling target needs an explicit `@`-materialize on a clean
+    /// outcome (a conflicted one stays frozen until resolved). `WcTarget::Launch`
+    /// reproduces [`Self::restore_to_working_copy`] byte-for-byte.
+    pub fn restore_to_working_copy_at(
+        &mut self,
+        target: WcTarget,
+        source: &CommitId,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "restore changes to the working tree")?;
         crate::repo::catch_jj("restoring the changes to the working copy", || {
             // Snapshot before resolving so the leaf id survives squash_into_inner's
             // own (now no-op) snapshot — otherwise a churned leaf id would go stale.
-            self.snapshot_working_copy()?;
+            self.snapshot_wc(&target)?;
             let dest = self
-                .working_copy_commit_id()
+                .resolve_wc(&target, None)
                 .context("no working copy to restore the changes into")?;
             let source_commit = self
                 .repo
@@ -459,14 +477,23 @@ impl Repo {
                 .get_commit(source)
                 .context("loading the commit to restore")?;
             let label = format!("Restore {} to working copy", op_subject(&source_commit));
-            self.squash_into_inner(
+            let outcome = self.squash_into_inner(
                 vec![source.clone()],
                 &dest,
                 SquashMode::Fixup,
                 None,
                 true,
                 Some(label),
-            )
+            )?;
+            // Write a sibling worktree's rebased `@` to its own disk: the export
+            // tail only re-materializes an extra worktree whose *tip* moved, and a
+            // restore moves the `@` alone. The launch path is already materialized
+            // by the export tail, so leave it untouched (keeps the `Launch` wrapper
+            // byte-identical to the old entry point).
+            if matches!(outcome, SaveOutcome::Clean) && matches!(target, WcTarget::Worktree(_)) {
+                self.materialize_wc(&target)?;
+            }
+            Ok(outcome)
         })
     }
 

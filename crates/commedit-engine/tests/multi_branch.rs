@@ -818,6 +818,73 @@ fn a_noop_set_editable_branches_succeeds_while_pending() {
     );
 }
 
+/// A trashed commit restored via `restore_to_working_copy_at` lands on the
+/// *sibling* worktree's `@` — not the launch worktree's. Drop `feature`'s tip F
+/// (orphaning it), then restore that orphan onto the feature worktree: its file
+/// surfaces as `feature`'s uncommitted change and the launch worktree stays clean.
+#[test]
+fn restore_to_working_copy_at_lands_on_the_sibling_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // `feature`'s tip is F (adds f.txt); abandon it to orphan it, then restore the
+    // orphan onto the feature worktree's @.
+    let f = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .expect("feature branch")
+        .head;
+    assert!(matches!(repo.abandon_commit(&f), Ok(SaveOutcome::Clean)));
+
+    let outcome = repo
+        .restore_to_working_copy_at(
+            commedit_engine::workcopy::WcTarget::Worktree("feature".into()),
+            &f,
+        )
+        .expect("restore to feature worktree");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // f.txt is now uncommitted on `feature` only; the launch worktree (`main`)
+    // stays clean — the orphan did not leak into the launch @.
+    let wc = repo.worktree_uncommitted();
+    let feature = wc
+        .iter()
+        .find(|(b, _)| b == "feature")
+        .expect("feature has an uncommitted @");
+    assert_eq!(
+        feature.1.last().unwrap().file_names,
+        vec!["f.txt".to_string()],
+        "the restored file surfaces on feature"
+    );
+    assert!(
+        !wc.iter().any(|(b, _)| b == "main"),
+        "the launch worktree must stay clean"
+    );
+
+    // And on disk: the feature worktree is materialized with the restored file,
+    // the launch worktree never receives it.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).ok(),
+        Some("f\n".to_string()),
+        "the feature worktree's file is materialized on disk"
+    );
+    assert!(
+        !dir.join("f.txt").exists(),
+        "the launch worktree must not receive the restored file"
+    );
+}
+
 /// `worktree_uncommitted` surfaces the launch worktree's `@` chain *and* every
 /// extra worktree's dirty `@`, each keyed by its branch's short-name, launch
 /// first. Dirtying happens before open so the open-time snapshot captures both

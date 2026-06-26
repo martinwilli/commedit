@@ -1408,16 +1408,13 @@ impl Repo {
     /// clean save bridged it out), so leaving the stale in-view bookmark behind is
     /// harmless: it is never bridged again.
     ///
-    /// Refused if `branches` is empty (the **last-branch rule**, mirroring the MCP's
-    /// "the last session can't be closed"), if a named branch does not exist, or
-    /// while a conflicted rewrite is pending (the held rewrite assumes a fixed set).
+    /// Emptying the set is allowed: it narrows to zero branches (`primary` becomes
+    /// `None`, like a detached-HEAD launch), so nothing is editable and the history
+    /// view shows no commits until a branch is re-ticked. Refused if a named branch
+    /// does not exist, or — for a request that actually *changes* the set — while a
+    /// conflicted rewrite is pending (the held rewrite assumes a fixed set); a
+    /// request equal to the current set is a no-op and always succeeds.
     pub fn set_editable_branches(&mut self, branches: &[String]) -> Result<()> {
-        if self.is_pending() {
-            anyhow::bail!(
-                "a conflicted rewrite is being resolved; finish or abort it before \
-                 changing the editable branch set"
-            );
-        }
         let root = self.workspace.workspace_root().to_path_buf();
         // Resolve to full refs (verifying existence), dedup, preserve order.
         let mut desired: Vec<String> = Vec::new();
@@ -1427,15 +1424,22 @@ impl Repo {
                 desired.push(full);
             }
         }
-        if desired.is_empty() {
-            anyhow::bail!(
-                "the editable set cannot be emptied — at least one branch must stay \
-                 editable"
-            );
-        }
         let current: Vec<String> = self.edited.refs().map(str::to_string).collect();
         if desired == current {
-            return Ok(()); // already exactly this set (same order)
+            // Already exactly this set (same order): a no-op. Checked *before*
+            // the pending guard so a request that changes nothing always
+            // succeeds — including a reverted UI toggle that lands back on the
+            // current set, which must not error (an erroring revert re-fires the
+            // toggle handler and recurses to a stack overflow).
+            return Ok(());
+        }
+        // A real change is refused while a conflicted rewrite is held (it assumes
+        // a fixed set); the no-op case above is already handled.
+        if self.is_pending() {
+            anyhow::bail!(
+                "a conflicted rewrite is being resolved; finish or abort it before \
+                 changing the editable branch set"
+            );
         }
 
         // Branches leaving the set: drop their registered worktree (if any). They

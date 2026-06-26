@@ -734,10 +734,44 @@ fn widen_then_narrow_preserves_the_undo_log() {
     g(&["fsck", "--no-progress"]);
 }
 
-/// Phase 2: the last-branch rule at the engine boundary — `set_editable_branches`
-/// refuses to empty the set, mirroring the MCP's "the last session can't be closed".
+/// The editable set may be emptied: narrowing to zero branches leaves no primary
+/// (like a detached-HEAD launch), so the history view shows no commits — and
+/// re-ticking a branch restores it. A disk no-op throughout (`main` stays at its
+/// tip), so the round-trip is lossless.
 #[test]
-fn the_editable_set_cannot_be_emptied() {
+fn the_editable_set_can_be_emptied_and_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    let tip = repo.head_commit_id().expect("primary tip");
+
+    // Untick everything: no branch editable, no primary tip, no commits to walk.
+    repo.set_editable_branches(&[]).expect("empty the set");
+    assert!(repo.editable_branches().is_empty());
+    assert_eq!(repo.head_commit_id(), None);
+    assert!(repo.editable_heads().is_empty());
+
+    // Re-tick `main`: the branch and its tip come back unchanged.
+    repo.set_editable_branches(&["main".into()])
+        .expect("restore main");
+    assert_eq!(repo.editable_branches(), vec!["main".to_string()]);
+    assert_eq!(repo.head_commit_id(), Some(tip));
+}
+
+/// A no-op `set_editable_branches` (desired == current) succeeds even while a
+/// conflicted rewrite is held — the pending guard only blocks a request that
+/// actually *changes* the set. Regression for the GTK stack-overflow: a reverted
+/// branch-toggle re-asserts the current set, and an erroring revert would re-fire
+/// the toggle handler and recurse until the stack overflows.
+#[test]
+fn a_noop_set_editable_branches_succeeds_while_pending() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     setup(dir);
@@ -749,15 +783,38 @@ fn the_editable_set_cannot_be_emptied() {
     )
     .expect("open multi");
 
-    let err = repo.set_editable_branches(&[]).unwrap_err().to_string();
+    // Drive the launch worktree into a held conflict: an uncommitted edit to
+    // a.txt that the rewrite of its introducing commit ("A") also touches.
+    std::fs::write(dir.join("a.txt"), "uncommitted\n").unwrap();
+    let a = commedit_engine::history::history(&repo.repo, &repo.head_commit_id().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|c| c.subject == "A")
+        .unwrap()
+        .id;
+    let outcome = repo
+        .rewrite_file(&a, "a.txt", "rewritten\n")
+        .expect("rewrite");
     assert!(
-        err.contains("cannot be emptied"),
-        "refusal mentions the last-branch rule: {err}"
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "the rewrite should conflict the uncommitted change and be held"
     );
-    // The set is unchanged after the refusal.
-    assert_eq!(
-        repo.editable_branches(),
-        vec!["main".to_string(), "feature".to_string()]
+    assert!(
+        repo.is_pending(),
+        "the held conflict leaves a pending resolution"
+    );
+
+    // The no-op (current set, same order) succeeds despite the pending hold...
+    repo.set_editable_branches(&["main".into(), "feature".into()])
+        .expect("a no-op set must be allowed while pending");
+    // ...while a request that actually changes the set is still refused.
+    let err = repo
+        .set_editable_branches(&["main".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("conflicted rewrite"),
+        "a real change is refused while pending: {err}"
     );
 }
 

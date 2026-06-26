@@ -1105,6 +1105,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let file_buffer = file_buffer.clone();
         let nav_sync = nav_sync.clone();
         Rc::new(move |cue: DiffCue, path: String| {
+            // Capture the line height while the current layout is still valid; the
+            // post-render scroll clamp below needs it to recompute `upper`.
+            let line_height = file_view.iter_location(&file_buffer.start_iter()).height() as f64;
             nav_sync.set(true);
             match cue {
                 DiffCue::Expand(first, last) => {
@@ -1130,6 +1133,26 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 }
             }
             rerender_diff_spliced();
+            // A revert shrinks the diff above/around the viewport, leaving the view
+            // scrolled past the now-shorter content; GTK validates the onscreen range
+            // lazily on the next frame and aborts when first-para sits beyond the
+            // buffer end (gtk_text_view_validate_onscreen). Clamp the scroll into the
+            // new bounds now — recomputing `upper` arithmetically, since splice leaves
+            // GTK's adjustment stale until that same deferred pass (mirrors the save
+            // reload's re-pin). Expansion only grows, so this is a no-op there.
+            if let Some(vadj) = file_view.vadjustment() {
+                let page = vadj.page_size();
+                if line_height > 0.0 && page > 0.0 {
+                    let top = file_view.top_margin() as f64;
+                    let bottom = file_view.bottom_margin() as f64;
+                    let height = file_buffer.line_count() as f64 * line_height + top + bottom;
+                    let upper = height.max(page);
+                    vadj.set_upper(upper);
+                    if vadj.value() > upper - page {
+                        vadj.set_value((upper - page).max(0.0));
+                    }
+                }
+            }
             // A revert that drops a file's whole change removes it from the view
             // (`visible_changes`); rebuild the dropdown to match and re-point it at
             // the file now at the viewport top. Only when the visible set shrank —

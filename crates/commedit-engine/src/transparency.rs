@@ -252,6 +252,37 @@ pub fn local_head_oids(workspace_root: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Local branches (`refs/heads/*`) and their tip commit ids, ordered most-recent
+/// commit first — `git for-each-ref --sort=-committerdate`, the same ordering as a
+/// `git recent` alias. Drives the recency-ordered branch dropdown. Unlike
+/// [`local_head_oids`], whose `BTreeMap` is an order-agnostic before-image lookup,
+/// this preserves git's sort, so it returns an ordered `Vec`. Each entry is
+/// `(refname, objectname)` to match [`local_head_oids`]'s tuple shape.
+/// Best-effort: empty on failure.
+pub fn local_heads_by_recency(workspace_root: &Path) -> Vec<(String, String)> {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(oid, name)| (name.to_string(), oid.to_string()))
+        .collect()
+}
+
 /// What kind of git ref a [`RefDecoration`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {

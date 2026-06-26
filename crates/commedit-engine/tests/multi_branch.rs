@@ -70,6 +70,57 @@ fn history_multi_unions_branch_ancestries() {
     assert!(!has_more, "whole history fit under the limit");
 }
 
+/// `local_branches` orders the dropdown candidates by tip-commit date, most
+/// recent first — the `git recent` ordering — independent of branch name. Build
+/// three branches whose names and tip dates disagree, so the recency order is
+/// distinguishable from both alphabetical and reverse-alphabetical.
+#[test]
+fn local_branches_are_ordered_by_recency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // Commit with an explicit, staggered date: the shared helper can't set one,
+    // and `--sort=-committerdate` is ambiguous within a single wall-clock second.
+    let commit_at = |msg: &str, date: &str| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-q", "-m", msg])
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git commit failed");
+    };
+    let stage = |file: &str| {
+        std::fs::write(dir.join(file), file).unwrap();
+        g(&["add", file]);
+    };
+
+    g(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    stage("base.txt");
+    commit_at("base", "2001-01-01T00:00:00"); // main: oldest tip
+    g(&["checkout", "-q", "-b", "zzz"]);
+    stage("z.txt");
+    commit_at("Z", "2002-01-01T00:00:00"); // zzz: middle
+    g(&["checkout", "-q", "-b", "aaa", "main"]);
+    stage("a.txt");
+    commit_at("A", "2003-01-01T00:00:00"); // aaa: newest tip
+    g(&["checkout", "-q", "main"]);
+
+    let repo = Repo::open(dir).expect("open");
+    let order: Vec<_> = repo.local_branches().into_iter().map(|b| b.name).collect();
+    assert_eq!(
+        order,
+        vec!["aaa", "zzz", "main"],
+        "branches ordered by tip date desc — not alphabetical [aaa, main, zzz]"
+    );
+}
+
 #[test]
 fn multi_head_read_does_not_entangle_a_later_rewrite() {
     let tmp = tempfile::tempdir().unwrap();

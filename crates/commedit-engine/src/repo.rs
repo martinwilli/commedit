@@ -1046,11 +1046,13 @@ impl Repo {
     /// multi-branch DAG dropdown. Each entry pairs the branch short-name with its
     /// current tip, a flag marking the primary (the launch/opened branch), and a
     /// flag marking whether it is currently in the editable set (ticked / imported).
-    /// Branches whose tip is not a readable commit are skipped.
+    /// Branches whose tip is not a readable commit are skipped. Ordered by tip
+    /// commit date, most recent first (matching a `git recent` alias), so the
+    /// dropdown lists the branches you touched last on top.
     pub fn local_branches(&self) -> Vec<BranchHead> {
         let current = self.current_bookmark();
         let current_name = current.as_ref().map(|c| c.as_str());
-        crate::transparency::local_head_oids(self.workspace.workspace_root())
+        crate::transparency::local_heads_by_recency(self.workspace.workspace_root())
             .into_iter()
             .filter_map(|(refname, sha)| {
                 let name = refname.strip_prefix("refs/heads/").unwrap_or(&refname);

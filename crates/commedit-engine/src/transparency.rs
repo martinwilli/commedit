@@ -252,6 +252,37 @@ pub fn local_head_oids(workspace_root: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Local branches (`refs/heads/*`) and their tip commit ids, ordered most-recent
+/// commit first — `git for-each-ref --sort=-committerdate`, the same ordering as a
+/// `git recent` alias. Drives the recency-ordered branch dropdown. Unlike
+/// [`local_head_oids`], whose `BTreeMap` is an order-agnostic before-image lookup,
+/// this preserves git's sort, so it returns an ordered `Vec`. Each entry is
+/// `(refname, objectname)` to match [`local_head_oids`]'s tuple shape.
+/// Best-effort: empty on failure.
+pub fn local_heads_by_recency(workspace_root: &Path) -> Vec<(String, String)> {
+    let Ok(out) = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8(out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(oid, name)| (name.to_string(), oid.to_string()))
+        .collect()
+}
+
 /// What kind of git ref a [`RefDecoration`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
@@ -454,13 +485,27 @@ pub fn reset_index_to(workspace_root: &Path, rev: &str) -> Result<()> {
 /// when there is no such index-only content. Best-effort: any git failure yields
 /// `None` rather than blocking the rewrite.
 pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
+    backup_index_only_content_under(workspace_root, "refs/commedit/backup")
+}
+
+/// [`backup_index_only_content`] for a *linked* worktree, namespacing the ref
+/// under a per-worktree `key` (`refs/commedit/backup/<key>/index-*`). Backup refs
+/// live in the shared common-dir, so without a per-worktree namespace
+/// [`prune_backup_refs`] (keep-newest-only) would evict the launch's recovery
+/// point for a sibling's and vice-versa; the key keeps one per worktree. See
+/// [`worktree_backup_key`].
+pub fn backup_index_only_content_at(workspace_root: &Path, key: &str) -> Option<String> {
+    backup_index_only_content_under(workspace_root, &format!("refs/commedit/backup/{key}"))
+}
+
+fn backup_index_only_content_under(workspace_root: &Path, prefix: &str) -> Option<String> {
     if !has_index_only_content(workspace_root) {
         return None;
     }
     let tree = git_line(workspace_root, &["write-tree"])?;
     // Name the ref after the index *tree*, so identical staged content reuses
     // (overwrites) one ref instead of piling up a new ref on every rewrite.
-    let refname = format!("refs/commedit/backup/index-{}", &tree[..tree.len().min(12)]);
+    let refname = format!("{prefix}/index-{}", &tree[..tree.len().min(12)]);
     let commit = git_line(
         workspace_root,
         &[
@@ -479,20 +524,50 @@ pub fn backup_index_only_content(workspace_root: &Path) -> Option<String> {
     ok.then_some(refname)
 }
 
-/// Keep only the most recently-created `refs/commedit/backup/index-*` ref,
-/// deleting any older ones. Each rewrite that finds index-only content writes a
-/// full snapshot of the index as its own ref; without pruning they accumulate
-/// one per distinct staged state across sessions. The newest is the freshest
-/// recovery point, so it is retained and the rest dropped. Best-effort: git
-/// failures are ignored (a stale ref is harmless clutter, never a loss).
+/// A short, stable, ref-safe key for a worktree root — the first 12 hex of the
+/// SHA-256 of its canonicalized path — used to namespace that worktree's index
+/// backup refs (see [`backup_index_only_content_at`]) so each worktree keeps an
+/// independent recovery point in the shared common-dir.
+pub fn worktree_backup_key(workspace_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canon.as_os_str().as_encoded_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Keep only the most recently-created backup ref directly under
+/// `refs/commedit/backup/`, deleting any older ones. Each rewrite that finds
+/// index-only content writes a full snapshot of the index as its own ref; without
+/// pruning they accumulate one per distinct staged state across sessions. The
+/// newest is the freshest recovery point, so it is retained and the rest dropped.
+/// Best-effort: git failures are ignored (a stale ref is harmless clutter, never a
+/// loss).
 pub fn prune_backup_refs(workspace_root: &Path) {
+    prune_backup_refs_under(workspace_root, "refs/commedit/backup/");
+}
+
+/// [`prune_backup_refs`] scoped to one linked worktree's namespace
+/// (`refs/commedit/backup/<key>/`), so a sibling's prune never touches the launch's
+/// recovery point (nor another sibling's).
+pub fn prune_backup_refs_at(workspace_root: &Path, key: &str) {
+    prune_backup_refs_under(workspace_root, &format!("refs/commedit/backup/{key}/"));
+}
+
+fn prune_backup_refs_under(workspace_root: &Path, prefix: &str) {
     let Ok(out) = Command::new("git")
         .current_dir(workspace_root)
         .args([
             "for-each-ref",
             "--sort=-committerdate",
             "--format=%(refname)",
-            "refs/commedit/backup/",
+            prefix,
         ])
         .output()
     else {
@@ -502,8 +577,15 @@ pub fn prune_backup_refs(workspace_root: &Path) {
         return;
     }
     let refs = String::from_utf8(out.stdout).unwrap_or_default();
-    // The first line is the newest; delete everything after it.
-    for refname in refs.lines().skip(1) {
+    // Only *direct* children of `prefix` (no further `/`): a launch prune over
+    // `refs/commedit/backup/` thus leaves the per-worktree `<key>/` subtrees alone,
+    // and a `<key>/` prune leaves the launch's and other siblings' refs alone. The
+    // first survivor is the newest; delete the rest.
+    let direct = refs.lines().filter(|r| {
+        r.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.contains('/'))
+    });
+    for refname in direct.skip(1) {
         let _ = Command::new("git")
             .current_dir(workspace_root)
             .args(["update-ref", "-d", refname])

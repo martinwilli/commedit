@@ -23,7 +23,7 @@ use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::{BatchEdit, Identity};
 use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
 use commedit_engine::tree::FileEdit;
-use commedit_engine::workcopy::WorkingCopyEntry;
+use commedit_engine::workcopy::WcTarget;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -203,10 +203,25 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     let tab_resolver = Rc::new(TabWidthResolver::new(repo.borrow().workspace_root()));
 
     // Shared UI state.
+    // The pure list of real commits (newest first). The reorder/squash/drop
+    // planners and the MCP path see it byte-identically — it never holds the
+    // working-copy `@` rows, which live only in `display` below.
     let commits: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
-    // The ancestry-graph lane layout drawn beside the history rows, recomputed
-    // whenever `commits` is reloaded (each row's drawing area reads its slice).
+    // The *planning* ancestry-graph lane layout over `commits` (no `@` nodes),
+    // recomputed whenever `commits` is reloaded; the planners read it.
     let graph: Rc<RefCell<GraphLayout>> = Rc::new(RefCell::new(GraphLayout::default()));
+    // The interleaved rows actually drawn: real commits with each worktree's
+    // uncommitted `@` spliced in above its tip (as a hollow lane node). The list's
+    // rows mirror this 1:1, so a *list* index is a `display` index — translate it
+    // to a commit index with `row_commit_index` / `row_commit_gap`.
+    let display: Rc<RefCell<Vec<DisplayRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // The *rendering* graph over `display` (including the `@` nodes), fed only to
+    // the row drawing areas; `hollow[i]` flags display row `i`'s node as a ring.
+    let draw_graph: Rc<RefCell<GraphLayout>> = Rc::new(RefCell::new(GraphLayout::default()));
+    let hollow: SharedHollow = Rc::new(RefCell::new(Vec::new()));
+    // Commit index → display-row index (the reverse of `row_commit_index`), so a
+    // commit can be re-selected / highlighted by index after `@` nodes shift it.
+    let commit_rows: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
     // How many history rows the normal (non-conflict) view currently loads, and
     // whether older commits remain below them. `refresh` reads the limit and sets
     // the flag; scrolling near the bottom bumps the limit by `HISTORY_PAGE`.
@@ -247,8 +262,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // fields the user actually changed. Order matches `read_identity`.
     let multi_identity_baseline: Rc<RefCell<[String; 4]>> =
         Rc::new(RefCell::new(Default::default()));
-    // The git-default identity prefilled into the fields when a working-copy entry
-    // is selected (see the `wc_list` row handler); the working-copy commit save
+    // The git-default identity prefilled into the fields when a working-copy `@`
+    // node is selected (see `update_selection_pane`); the working-copy commit save
     // compares the live fields against it to tell whether the user overrode the
     // author/committer — an unchanged set commits as `None`, letting the engine
     // stamp git config + a fresh "now". Order matches `read_identity`.
@@ -278,6 +293,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // longer on the branch but their objects survive, so they can be dragged back
     // into history to restore them (see `Repo::restore_commit`).
     let trashed: Rc<RefCell<Vec<CommitInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    // Each trashed commit's origin branch (change-id hex → short-name), recorded at
+    // drop time so "restore to working tree" routes back to that branch's worktree.
+    let trashed_origin: Rc<RefCell<HashMap<String, String>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     // A trash add/remove held back while a conflicted drop/restore is resolved —
     // applied on a clean resolution, discarded on abort (see `PendingTrashOp`).
     let pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>> = Rc::new(RefCell::new(None));
@@ -370,22 +389,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     placeholder.set_can_target(false);
 
     // --- History pane (left) ---
-    // The working-copy rows: read-only entries above the history showing the
-    // uncommitted changes (jj's `@` commit and any pieces split off it). They are
-    // their own list — not part of the history `list` — so the reorder/drop/squash
-    // index arithmetic below is untouched. Each row can be *dragged onto* a commit
-    // to fold its changes in as a fixup, but never reordered into history. Hidden
-    // while the tree is clean. `wc_entries` mirrors the rows (newest first, the
-    // leaf `@` first); `selected_wc_change` is the entry the diff pane shows.
-    let wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    // The working-copy `@` rows now live *in* the history `list` as hollow lane
+    // nodes (one per worktree, spliced above its tip — see `display`), so there is
+    // no separate working-copy list. The selection these two cells track is the
+    // currently-shown `@`: `selected_wc_change` is its stable change id (the diff
+    // pane follows it), `selected_wc_branch` the worktree's branch short-name
+    // (which `@` to edit/commit/fold/discard, via `Repo::wc_target_for_branch`).
     let selected_wc_change: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let wc_list = ListBox::new();
-    wc_list.set_visible(false);
-    wc_list.set_tooltip_text(Some(
-        "Uncommitted working-tree changes — edit the diff here, then Save (no commit \
-         message writes back to the working tree, a message commits on HEAD), Split to \
-         peel off a piece, or drag a row onto a commit to fold it in",
-    ));
+    let selected_wc_branch: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     let list = ListBox::new();
     // Allow ctrl/shift-click multi-selection: editing several commits' identity at
@@ -432,7 +443,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     trash_box.append(&trash_scroll);
 
     let history_box = GtkBox::new(Orientation::Vertical, 0);
-    history_box.append(&wc_list);
     history_box.append(&history_scroll);
     history_box.append(&trash_box);
 
@@ -868,7 +878,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         trash_list: trash_list.clone(),
         trash_scroll: trash_scroll.clone(),
         trash_box: trash_box.clone(),
-        wc_list: wc_list.clone(),
         file_buffer: file_buffer.clone(),
         file_view: file_view.clone(),
         save_button: save_button.clone(),
@@ -882,9 +891,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         repo: repo.clone(),
         commits: commits.clone(),
         graph: graph.clone(),
+        display: display.clone(),
+        draw_graph: draw_graph.clone(),
+        hollow: hollow.clone(),
+        commit_rows: commit_rows.clone(),
         trashed: trashed.clone(),
+        trashed_origin: trashed_origin.clone(),
         pending_trash_op: pending_trash_op.clone(),
-        wc_entries: wc_entries.clone(),
         selected_change: selected_change.clone(),
         selected_changes: selected_changes.clone(),
         pane_mode: pane_mode.clone(),
@@ -1335,6 +1348,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let changes = changes.clone();
         let orig_changes = orig_changes.clone();
         let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
+        let repo = repo.clone();
         Rc::new(move || {
             let has_edits = !pane_mode.borrow().is_conflict()
                 && matches!(
@@ -1345,7 +1361,19 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     ),
                     Ok(edits) if !edits.is_empty()
                 );
-            split_button.set_sensitive(has_edits);
+            // Split peels any editable worktree's `@` chain — the launch one or a
+            // sibling's. Disable it only for a branch with no worktree (no `@` to
+            // split); the engine refuses that too.
+            let splittable = if viewing_wc.get() {
+                selected_wc_branch
+                    .borrow()
+                    .as_deref()
+                    .and_then(|b| repo.borrow().wc_target_for_branch(b))
+                    .is_some()
+            } else {
+                true
+            };
+            split_button.set_sensitive(has_edits && splittable);
         })
     };
 
@@ -2059,14 +2087,25 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let repo = repo.clone();
         let apply_changes = apply_changes.clone();
         let selected_wc_change = selected_wc_change.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
         Rc::new(move || {
             let loaded = {
                 let r = repo.borrow();
-                let chain = r.working_copy_chain();
+                // The `@` entries of the selected worktree (launch chain or a
+                // sibling's single `@`), keyed by branch short-name. Resolve the
+                // viewed entry by its stable change id, falling back to that
+                // worktree's newest `@`.
+                let want_branch = selected_wc_branch.borrow().clone();
+                let entries = r
+                    .worktree_uncommitted()
+                    .into_iter()
+                    .find(|(b, _)| Some(b.as_str()) == want_branch.as_deref())
+                    .map(|(_, e)| e)
+                    .unwrap_or_default();
                 let want = selected_wc_change.borrow().clone();
                 let entry = want
-                    .and_then(|ch| chain.iter().find(|e| e.info.change_id_hex() == ch))
-                    .or_else(|| chain.first());
+                    .and_then(|ch| entries.iter().find(|e| e.info.change_id_hex() == ch))
+                    .or_else(|| entries.first());
                 match entry {
                     Some(e) => commit_changes(&r.repo, &e.info.id).unwrap_or_default(),
                     None => Vec::new(),
@@ -2085,18 +2124,22 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     let update_selection_pane: Rc<dyn Fn()> = {
         let list = list.clone();
         let commits = commits.clone();
+        let display = display.clone();
         let message_buffer = message_buffer.clone();
         let message_view = message_view.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
         let selection_sync = selection_sync.clone();
         let load_changes = load_changes.clone();
+        let load_wc_changes = load_wc_changes.clone();
         let load_conflict_files = load_conflict_files.clone();
         let pane_mode = pane_mode.clone();
         let identity_fields = identity_fields.clone();
         let original_identity = original_identity.clone();
         let viewing_wc = viewing_wc.clone();
-        let wc_list = wc_list.clone();
+        let selected_wc_change = selected_wc_change.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
+        let wc_identity_baseline = wc_identity_baseline.clone();
         let repo = repo.clone();
         let apply_changes = apply_changes.clone();
         let file_buffer = file_buffer.clone();
@@ -2109,26 +2152,76 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             if selection_sync.get() {
                 return;
             }
-            // The selected commits in display order (newest first).
-            let mut indices: Vec<usize> = list
-                .selected_rows()
-                .iter()
-                .filter_map(|r| {
-                    let i = r.index();
-                    (i >= 0).then_some(i as usize)
-                })
-                .collect();
-            indices.sort_unstable();
-            let infos: Vec<CommitInfo> = {
-                let cs = commits.borrow();
-                indices.iter().filter_map(|&i| cs.get(i).cloned()).collect()
+            // Split the selected rows into real commits and working-copy `@` rows
+            // (both now live in the one list). `select_click` keeps `@` rows out of
+            // multi-selections, so at most one `@` is ever selected; if one is, it
+            // wins (mutually exclusive with a history selection, as the old separate
+            // working-copy list was).
+            let (commit_infos, wc): (Vec<CommitInfo>, Option<(String, String)>) = {
+                let display = display.borrow();
+                let commits = commits.borrow();
+                let mut selected: Vec<usize> = list
+                    .selected_rows()
+                    .iter()
+                    .filter_map(|r| {
+                        let i = r.index();
+                        (i >= 0).then_some(i as usize)
+                    })
+                    .collect();
+                selected.sort_unstable();
+                let mut commit_infos = Vec::new();
+                let mut wc = None;
+                for di in selected {
+                    match display.get(di) {
+                        Some(DisplayRow::Commit(ci)) => {
+                            if let Some(c) = commits.get(*ci) {
+                                commit_infos.push(c.clone());
+                            }
+                        }
+                        Some(DisplayRow::Wc { branch, entry }) if wc.is_none() => {
+                            wc = Some((branch.clone(), entry.info.change_id_hex()));
+                        }
+                        _ => {}
+                    }
+                }
+                (commit_infos, wc)
             };
+
+            // A working-copy `@` is selected: show its editable diff and the
+            // craft-a-commit pane (empty message + git-default identity baseline) —
+            // Save with no message edits the `@` in place, with a message commits it
+            // on that worktree's tip (see the `save` closure). Conflict mode never
+            // selects `@` rows, so this can't collide with it.
+            if let Some((branch, change)) = wc {
+                viewing_wc.set(true);
+                *selected_wc_branch.borrow_mut() = Some(branch);
+                *selected_wc_change.borrow_mut() = Some(change);
+                selected_changes.borrow_mut().clear();
+                selected_change.borrow_mut().take();
+                clear_identity_differs(&identity_fields);
+                message_buffer.set_text("");
+                message_view.set_editable(true);
+                let baseline =
+                    set_identity_fields_from(&identity_fields, &repo.borrow().default_identity());
+                *wc_identity_baseline.borrow_mut() = baseline;
+                for f in identity_fields.iter() {
+                    f.set_sensitive(true);
+                }
+                save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
+                diff_read_only.set(false);
+                load_wc_changes();
+                update_save_sensitivity();
+                return;
+            }
+
+            let infos = commit_infos;
             *selected_changes.borrow_mut() = infos.iter().map(|c| c.change_id_hex()).collect();
             *selected_change.borrow_mut() = infos.first().map(|c| c.change_id_hex());
 
-            // Leaving the read-only working-copy view (mutually exclusive selection).
+            // Leaving the working-copy view for a history selection (or none).
             viewing_wc.set(false);
-            wc_list.unselect_all();
+            selected_wc_branch.borrow_mut().take();
+            selected_wc_change.borrow_mut().take();
 
             // Conflict mode is per-commit: show the anchor's conflicted files
             // regardless of how many rows are selected; never the multi view.
@@ -2243,6 +2336,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     select_click.set_propagation_phase(PropagationPhase::Capture);
     select_click.connect_released({
         let list = list.clone();
+        let display = display.clone();
         let update_selection_pane = update_selection_pane.clone();
         let selection_sync = selection_sync.clone();
         let selection_anchor = selection_anchor.clone();
@@ -2251,26 +2345,48 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 return;
             };
             let i = row.index();
+            let is_commit = |j: i32| {
+                matches!(
+                    display.borrow().get(j as usize),
+                    Some(DisplayRow::Commit(_))
+                )
+            };
+            let clicked_is_wc = !is_commit(i);
             let state = gesture.current_event_state();
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             // Drive the selection ourselves under `selection_sync`, then render once.
             selection_sync.set(true);
-            if shift {
+            if clicked_is_wc {
+                // A working-copy `@` is a single, exclusive selection: it never joins
+                // a multi-commit selection, and modifiers don't extend across it.
+                list.unselect_all();
+                list.select_row(Some(&row));
+                selection_anchor.set(Some(i));
+            } else if shift {
                 // Extend from the anchor (or the current selection's nearest row) to
-                // the clicked row, selecting everything between.
+                // the clicked row, selecting the commit rows between (skipping `@`s so
+                // a range stays a pure multi-commit selection).
                 let anchor = selection_anchor
                     .get()
                     .or_else(|| list.selected_rows().iter().map(|r| r.index()).min())
                     .unwrap_or(i);
                 list.unselect_all();
                 for j in i.min(anchor)..=i.max(anchor) {
-                    if let Some(r) = list.row_at_index(j) {
-                        list.select_row(Some(&r));
+                    if is_commit(j) {
+                        if let Some(r) = list.row_at_index(j) {
+                            list.select_row(Some(&r));
+                        }
                     }
                 }
             } else if ctrl {
-                // Toggle just this row, leaving the rest of the selection.
+                // Toggle just this commit row, leaving the rest of the selection — but
+                // first drop any working-copy `@` from it (the two never mix).
+                for r in list.selected_rows() {
+                    if !is_commit(r.index()) {
+                        list.unselect_row(&r);
+                    }
+                }
                 if row.is_selected() {
                     list.unselect_row(&row);
                 } else {
@@ -2296,106 +2412,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     });
     list.add_controller(select_click);
 
-    // Selecting a working-copy entry shows its editable diff and opens the
-    // message/identity fields to craft a commit from the uncommitted changes:
-    // Save with an empty message edits the entry in place, Save with a message
-    // commits it on HEAD (see the `save` closure). The identity is prefilled with
-    // the git default. The selected entry is tracked by its stable change id.
-    wc_list.connect_row_selected({
-        let viewing_wc = viewing_wc.clone();
-        let list = list.clone();
-        let load_wc_changes = load_wc_changes.clone();
-        let message_buffer = message_buffer.clone();
-        let message_view = message_view.clone();
-        let identity_fields = identity_fields.clone();
-        let pane_mode = pane_mode.clone();
-        let wc_entries = wc_entries.clone();
-        let selected_wc_change = selected_wc_change.clone();
-        let selected_changes = selected_changes.clone();
-        let selection_sync = selection_sync.clone();
-        let diff_read_only = diff_read_only.clone();
-        let repo = repo.clone();
-        let wc_identity_baseline = wc_identity_baseline.clone();
-        let save_button = save_button.clone();
-        move |_wc_list, row| {
-            let Some(row) = row else { return };
-            if pane_mode.borrow().is_conflict() {
-                return;
-            }
-            let idx = row.index();
-            if idx < 0 {
-                return;
-            }
-            let change = wc_entries
-                .borrow()
-                .get(idx as usize)
-                .map(|e| e.info.change_id_hex());
-            let Some(change) = change else { return };
-            *selected_wc_change.borrow_mut() = Some(change);
-            viewing_wc.set(true);
-            // Mutually exclusive with the history selection. Drop the multi-set and
-            // its "(differs)" styling, and clear it under `selection_sync` so the
-            // pane router doesn't fire and clobber the working-copy view below.
-            selected_changes.borrow_mut().clear();
-            clear_identity_differs(&identity_fields);
-            selection_sync.set(true);
-            list.unselect_all();
-            selection_sync.set(false);
-            // Craft a commit from the uncommitted changes: the message starts empty
-            // (typing one turns Save from "save the diff in place" into "commit on
-            // HEAD"), and the identity fields are prefilled with the git default so
-            // the author/committer can be overridden — recorded as the baseline the
-            // save compares against to tell an override from the untouched default.
-            message_buffer.set_text("");
-            message_view.set_editable(true);
-            let baseline =
-                set_identity_fields_from(&identity_fields, &repo.borrow().default_identity());
-            *wc_identity_baseline.borrow_mut() = baseline;
-            for f in identity_fields.iter() {
-                f.set_sensitive(true);
-            }
-            save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
-            // The working-copy diff is editable; clear any multi-select read-only.
-            diff_read_only.set(false);
-            load_wc_changes();
-        }
-    });
-
-    // Update the working-copy rows from the engine: one per uncommitted entry when
-    // the tree is dirty, hidden when clean or while resolving conflicts. Drops a
-    // stale selection that no longer names a live entry.
-    let refresh_wc: Rc<dyn Fn()> = {
-        let repo = repo.clone();
-        let wc_list = wc_list.clone();
-        let wc_entries = wc_entries.clone();
-        let selected_wc_change = selected_wc_change.clone();
-        let viewing_wc = viewing_wc.clone();
-        let pane_mode = pane_mode.clone();
-        Rc::new(move || {
-            if pane_mode.borrow().is_conflict() {
-                wc_list.set_visible(false);
-                return;
-            }
-            let chain = repo.borrow().working_copy_chain();
-            let visible = !chain.is_empty();
-            populate_wc(&wc_list, &chain);
-            let still_present = selected_wc_change
-                .borrow()
-                .as_ref()
-                .map(|ch| chain.iter().any(|e| e.info.change_id_hex() == *ch))
-                .unwrap_or(false);
-            *wc_entries.borrow_mut() = chain;
-            wc_list.set_visible(visible);
-            // If the viewed entry is gone (folded away, or the tree went clean),
-            // forget it so a later edit/split doesn't target the wrong entry.
-            if !still_present {
-                selected_wc_change.borrow_mut().take();
-                if !visible {
-                    viewing_wc.set(false);
-                }
-            }
-        })
-    };
+    // Working-copy `@` rows now live in the history `list` as hollow lane nodes;
+    // selecting one is handled by `update_selection_pane` (the unified selection
+    // router), and the rows are (re)built by `refresh` from the interleaved
+    // `display` list — so there is no separate working-copy list, row handler, or
+    // `refresh_wc` here any more.
 
     // The history rows' subject revert button calls back here with the clicked
     // row's display index. The real handler needs `refresh` / `enter_conflict_mode`
@@ -2460,15 +2481,21 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let repo = repo.clone();
         let commits = commits.clone();
         let graph = graph.clone();
+        let display = display.clone();
+        let draw_graph = draw_graph.clone();
+        let hollow = hollow.clone();
+        let commit_rows = commit_rows.clone();
         let list = list.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
+        let viewing_wc = viewing_wc.clone();
+        let selected_wc_change = selected_wc_change.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
         let selection_sync = selection_sync.clone();
         let update_selection_pane = update_selection_pane.clone();
         let identities = identities.clone();
         let history_limit = history_limit.clone();
         let history_has_more = history_has_more.clone();
-        let refresh_wc = refresh_wc.clone();
         let on_revert = on_revert.clone();
         let on_merge_out = on_merge_out.clone();
         let on_lint = on_lint.clone();
@@ -2512,19 +2539,66 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let root = repo.borrow().root_commit_id();
                 *graph.borrow_mut() = compute_graph(&commits.borrow(), &root);
             }
+            // Build the interleaved display list: each real commit, with every
+            // worktree's uncommitted `@` spliced in as a hollow lane node directly
+            // above its tip. `worktree_uncommitted` groups entries newest-first per
+            // branch; the *oldest* entry sits on the real tip, so a group splices in
+            // (newest first) just above the commit whose id is that entry's parent —
+            // robust for a detached-HEAD launch too. `commits` stays pure (the
+            // planners/MCP path see it byte-identically); `draw_graph` lays the
+            // interleaved rows out so each `@` lands on its tip's own lane.
+            {
+                let uncommitted = repo.borrow().worktree_uncommitted();
+                let cs = commits.borrow();
+                let mut new_display: Vec<DisplayRow> = Vec::new();
+                let mut draw_infos: Vec<CommitInfo> = Vec::new();
+                let mut new_hollow: Vec<bool> = Vec::new();
+                let mut new_commit_rows: Vec<usize> = Vec::with_capacity(cs.len());
+                for (ci, c) in cs.iter().enumerate() {
+                    for (branch, entries) in &uncommitted {
+                        let on_this_tip = entries
+                            .last()
+                            .and_then(|e| e.info.parents.first())
+                            .is_some_and(|p| *p == c.id);
+                        if on_this_tip {
+                            for entry in entries {
+                                new_display.push(DisplayRow::Wc {
+                                    branch: branch.clone(),
+                                    entry: Box::new(entry.clone()),
+                                });
+                                draw_infos.push(entry.info.clone());
+                                new_hollow.push(true);
+                            }
+                        }
+                    }
+                    new_commit_rows.push(new_display.len());
+                    new_display.push(DisplayRow::Commit(ci));
+                    draw_infos.push(c.clone());
+                    new_hollow.push(false);
+                }
+                drop(cs);
+                let root = repo.borrow().root_commit_id();
+                *draw_graph.borrow_mut() = compute_graph(&draw_infos, &root);
+                *display.borrow_mut() = new_display;
+                *hollow.borrow_mut() = new_hollow;
+                *commit_rows.borrow_mut() = new_commit_rows;
+            }
             {
                 let cs = commits.borrow();
+                let disp = display.borrow();
                 let refs = repo.borrow().commit_refs();
                 // Learn this repo's de-facto commit-message conventions from its own
                 // history, so the per-row lint badge flags drift from *its* norm.
                 let subjects: Vec<&str> = cs.iter().map(|c| c.subject.as_str()).collect();
                 let style = msglint::RepoStyle::learn(&subjects);
-                populate_list(
+                populate_history(
                     &list,
+                    &disp,
                     &cs,
+                    &draw_graph,
+                    &hollow,
                     &HashSet::new(),
                     &refs,
-                    &graph,
                     Some(&on_revert),
                     Some(&on_merge_out),
                     Some(&on_lint),
@@ -2560,31 +2634,78 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             };
             selection_sync.set(true);
             list.unselect_all();
-            for change in &targets {
-                let idx = commits
-                    .borrow()
-                    .iter()
-                    .position(|c| c.change_id_hex() == *change);
-                if let Some(idx) = idx {
-                    if let Some(row) = list.row_at_index(idx as i32) {
-                        list.select_row(Some(&row));
+            if viewing_wc.get() {
+                // Re-select the working-copy `@` row being viewed (by branch + change
+                // id, mapping past the interleaved commit rows). If its `@` is gone
+                // (committed / discarded / the tree went clean) drop the view.
+                let di = find_wc_row(
+                    &display.borrow(),
+                    selected_wc_branch.borrow().as_deref(),
+                    selected_wc_change.borrow().as_deref(),
+                );
+                match di {
+                    Some(di) => {
+                        if let Some(row) = list.row_at_index(di as i32) {
+                            list.select_row(Some(&row));
+                        }
+                    }
+                    None => {
+                        viewing_wc.set(false);
+                        selected_wc_branch.borrow_mut().take();
+                        selected_wc_change.borrow_mut().take();
+                    }
+                }
+            } else {
+                // A commit (or none): re-select by change id, mapping each commit
+                // index to its (shifted) display row via `commit_rows`.
+                for change in &targets {
+                    let di = commits
+                        .borrow()
+                        .iter()
+                        .position(|c| c.change_id_hex() == *change)
+                        .and_then(|ci| commit_rows.borrow().get(ci).copied());
+                    if let Some(di) = di {
+                        if let Some(row) = list.row_at_index(di as i32) {
+                            list.select_row(Some(&row));
+                        }
                     }
                 }
             }
             selection_sync.set(false);
             update_selection_pane();
-            // populate_list reset the row labels to plain text; re-apply an active
+            // populate_history reset the row labels to plain text; re-apply an active
             // search so its highlights survive the rebuild. The selection was just
             // restored by change id, so the Enter cursor is stale — reset it.
             {
                 let query = search_query.borrow();
                 if !query.is_empty() {
-                    *search_matches.borrow_mut() =
-                        rows::apply_search_highlight(&list, &commits.borrow(), &query);
+                    *search_matches.borrow_mut() = rows::apply_search_highlight(
+                        &list,
+                        &display.borrow(),
+                        &commits.borrow(),
+                        &query,
+                    );
                     search_cursor.set(None);
                 }
             }
-            refresh_wc();
+        })
+    };
+
+    // Select a sensible default row when nothing is selected: the newest *commit*
+    // row, skipping a leading working-copy `@` node (which would open the craft-a-
+    // commit pane rather than show a commit). Fires `selected-rows-changed`, so the
+    // pane router runs once afterwards.
+    let select_default: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let display = display.clone();
+        Rc::new(move || {
+            if list.selected_rows().is_empty() {
+                if let Some(di) = first_commit_row(&display.borrow()) {
+                    if let Some(row) = list.row_at_index(di as i32) {
+                        list.select_row(Some(&row));
+                    }
+                }
+            }
         })
     };
 
@@ -2634,6 +2755,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let repo = repo.clone();
         let commits = commits.clone();
         let graph = graph.clone();
+        let display = display.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
         let pane_mode = pane_mode.clone();
@@ -2644,6 +2766,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             let repo = repo.clone();
             let commits = commits.clone();
             let graph = graph.clone();
+            let display = display.clone();
             let selected_change = selected_change.clone();
             let selected_changes = selected_changes.clone();
             let pane_mode = pane_mode.clone();
@@ -2655,27 +2778,33 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     show_status("Resolve the pending conflict before reverting");
                     return;
                 }
+                // Map the clicked list row to its commit index (the revert button
+                // only sits on commit rows, but be defensive) — `idx` thereafter is
+                // a commit index, the space the plan graph's `boundaries` use.
+                let Some(idx) = row_commit_index(&display.borrow(), idx as usize) else {
+                    return;
+                };
                 // Resolve the clicked commit and the slot to splice its revert into.
                 let (target, change, new_children) = {
                     let commits = commits.borrow();
-                    let Some(commit) = commits.get(idx as usize) else {
+                    let Some(commit) = commits.get(idx) else {
                         return;
                     };
                     let target = commit.id.clone();
                     let change = commit.change_id_hex();
                     // Parent the revert on the clicked commit; its children are the
-                    // commit's current branch children, which rebase onto the
-                    // revert. The clicked commit (display index `idx`) is the parent
-                    // of the lane edge crossing the gap just above it
-                    // (`boundaries[idx - 1]`); at the tip (idx 0) there are no
-                    // children and the revert becomes the new HEAD.
+                    // commit's current branch children, which rebase onto the revert.
+                    // The clicked commit (commit index `idx`) is the parent of the
+                    // lane edge crossing the gap just above it (`boundaries[idx - 1]`);
+                    // at the tip (idx 0) there are no children and the revert becomes
+                    // the new HEAD.
                     let new_children = if idx == 0 {
                         Vec::new()
                     } else {
                         graph
                             .borrow()
                             .boundaries
-                            .get(idx as usize - 1)
+                            .get(idx - 1)
                             .and_then(|edges| edges.iter().find(|e| e.parent == target))
                             .map(|e| e.children.clone())
                             .unwrap_or_default()
@@ -2711,6 +2840,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let repo = repo.clone();
         let commits = commits.clone();
         let graph = graph.clone();
+        let display = display.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
         let pane_mode = pane_mode.clone();
@@ -2721,6 +2851,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             let repo = repo.clone();
             let commits = commits.clone();
             let graph = graph.clone();
+            let display = display.clone();
             let selected_change = selected_change.clone();
             let selected_changes = selected_changes.clone();
             let pane_mode = pane_mode.clone();
@@ -2732,10 +2863,16 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     show_status("Resolve the pending conflict before introducing a merge");
                     return;
                 }
+                // Map the clicked list row to its commit index — the space the plan
+                // graph's `boundaries` use (the merge-out button only sits on commit
+                // rows, but be defensive).
+                let Some(idx) = row_commit_index(&display.borrow(), idx as usize) else {
+                    return;
+                };
                 // Resolve the clicked commit and the slot the merge splices into.
                 let (target, change, new_children) = {
                     let commits = commits.borrow();
-                    let Some(commit) = commits.get(idx as usize) else {
+                    let Some(commit) = commits.get(idx) else {
                         return;
                     };
                     let target = commit.id.clone();
@@ -2751,7 +2888,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         graph
                             .borrow()
                             .boundaries
-                            .get(idx as usize - 1)
+                            .get(idx - 1)
                             .and_then(|edges| edges.iter().find(|e| e.parent == target))
                             .map(|e| e.children.clone())
                             .unwrap_or_default()
@@ -2782,6 +2919,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     *on_restore_slot.borrow_mut() = Some({
         let repo = repo.clone();
         let trashed = trashed.clone();
+        let trashed_origin = trashed_origin.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
@@ -2793,6 +2931,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         Rc::new(move |idx: i32| {
             let repo = repo.clone();
             let trashed = trashed.clone();
+            let trashed_origin = trashed_origin.clone();
             let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
@@ -2811,7 +2950,26 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let Some(info) = trashed.borrow().get(idx as usize).cloned() else {
                     return;
                 };
-                let outcome = repo.borrow_mut().restore_to_working_copy(&info.id);
+                // Route the restore to the worktree of the branch this commit was
+                // dropped from (recorded at drop time). No origin recorded ⇒ the
+                // launch worktree (as before); an origin whose branch has no worktree
+                // to land in ⇒ refuse rather than silently use the launch one.
+                let origin = trashed_origin.borrow().get(&info.change_id_hex()).cloned();
+                let target = match &origin {
+                    Some(branch) => match repo.borrow().wc_target_for_branch(branch) {
+                        Some(t) => t,
+                        None => {
+                            show_status(&format!(
+                                "Can't restore: branch {branch} has no worktree to restore into"
+                            ));
+                            return;
+                        }
+                    },
+                    None => WcTarget::Launch,
+                };
+                let outcome = repo
+                    .borrow_mut()
+                    .restore_to_working_copy_at(target, &info.id);
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
                         // Its changes are now uncommitted; drop it from the trash.
@@ -2819,6 +2977,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         trashed
                             .borrow_mut()
                             .retain(|c| c.change_id_hex() != change_hex);
+                        trashed_origin.borrow_mut().remove(&change_hex);
                         // refresh() rebuilds history + the working-copy rows (the new
                         // uncommitted entry); repopulate the trash to drop its row.
                         refresh();
@@ -2853,6 +3012,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     *on_lint_slot.borrow_mut() = Some({
         let repo = repo.clone();
         let commits = commits.clone();
+        let display = display.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
         let pane_mode = pane_mode.clone();
@@ -2863,6 +3023,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         Rc::new(move |idx: i32| {
             let repo = repo.clone();
             let commits = commits.clone();
+            let display = display.clone();
             let selected_change = selected_change.clone();
             let selected_changes = selected_changes.clone();
             let pane_mode = pane_mode.clone();
@@ -2875,11 +3036,16 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     show_status("Resolve the pending conflict before editing a message");
                     return;
                 }
+                // Map the clicked list row to its commit index (the lint badge only
+                // sits on commit rows, but be defensive).
+                let Some(idx) = row_commit_index(&display.borrow(), idx as usize) else {
+                    return;
+                };
                 // Resolve the clicked commit and re-learn the repo's style (commits
                 // may have changed since the badge was painted).
                 let resolved = {
                     let cs = commits.borrow();
-                    let Some(commit) = cs.get(idx as usize) else {
+                    let Some(commit) = cs.get(idx) else {
                         return;
                     };
                     let subjects: Vec<&str> = cs.iter().map(|c| c.subject.as_str()).collect();
@@ -3008,6 +3174,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let exit_conflict_mode = exit_conflict_mode.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let refresh = refresh.clone();
+        let select_default = select_default.clone();
         let show_status = show_status.clone();
         let list = list.clone();
         let commits = commits.clone();
@@ -3052,10 +3219,16 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 motion.connect_enter({
                     let list = list.clone();
                     let commits = commits.clone();
+                    let commit_rows = commit_rows.clone();
                     let affected = affected.clone();
                     move |_, _, _| {
                         clear_highlight(&list);
-                        highlight_affected(&list, &commits.borrow(), &affected);
+                        highlight_affected(
+                            &list,
+                            &commit_rows.borrow(),
+                            &commits.borrow(),
+                            &affected,
+                        );
                     }
                 });
                 motion.connect_leave({
@@ -3086,8 +3259,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let exit_conflict_mode = exit_conflict_mode.clone();
                 let enter_conflict_mode = enter_conflict_mode.clone();
                 let refresh = refresh.clone();
+                let select_default = select_default.clone();
                 let show_status = show_status.clone();
-                let list = list.clone();
                 let trashed = trashed.clone();
                 let pending_trash_op = pending_trash_op.clone();
                 let trash_list = trash_list.clone();
@@ -3132,11 +3305,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     // `refresh` re-selects the prior selection by change id and
                     // re-renders the pane; if it's gone after the jump, select the tip.
                     refresh();
-                    if list.selected_rows().is_empty() {
-                        if let Some(row) = list.row_at_index(0) {
-                            list.select_row(Some(&row));
-                        }
-                    }
+                    select_default();
                     if compare_button.is_active() {
                         render_compare();
                     }
@@ -3161,44 +3330,22 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // lane); unticking narrows it (its ref freezes again). Both go through the
     // engine's in-place `set_editable_branches`, so the session's undo history and
     // trash survive a toggle — unlike a full reopen. The set defaults to just the
-    // opened branch; there is no pinned branch, only a last-branch rule (the final
-    // editable branch can't be unticked). The list is (re)populated every time the
-    // popover opens (branches move/appear out of band); it is a small transient
-    // list, not the segfault-sensitive history list, so rebuilding its rows is safe.
-    // The last-branch rule, applied live: disable the sole ticked branch's
-    // checkbox (so the set can never be emptied) and re-enable it as soon as a
-    // second branch is ticked. Run after (re)building the list and after every
-    // toggle, so the greyed-out state tracks the set without reopening the
-    // popover. It only flips `sensitive`/tooltip on the existing checkboxes — no
-    // row is added or removed — so it is safe to call from inside a checkbox's
-    // own `toggled` handler (unlike a rebuild, which would unparent that row
-    // mid-signal).
-    let apply_last_branch_rule: Rc<dyn Fn()> = {
-        let branch_list = branch_list.clone();
-        Rc::new(move || {
-            let mut checks: Vec<CheckButton> = Vec::new();
-            let mut child = branch_list.first_child();
-            while let Some(w) = child {
-                child = w.next_sibling();
-                if let Ok(cb) = w.downcast::<CheckButton>() {
-                    checks.push(cb);
-                }
-            }
-            let only_one = checks.iter().filter(|c| c.is_active()).count() == 1;
-            for cb in &checks {
-                let last = only_one && cb.is_active();
-                cb.set_sensitive(!last);
-                cb.set_tooltip_text(last.then_some("The last editable branch — keep at least one"));
-            }
-        })
-    };
-
+    // opened branch; there is no pinned branch and no last-branch rule — unticking
+    // the final branch empties the set, which simply shows no commits until a
+    // branch is re-ticked. The list is (re)populated every time the popover opens
+    // (branches move/appear out of band); it is a small transient list, not the
+    // segfault-sensitive history list, so rebuilding its rows is safe.
+    // Re-entrancy guard for the checkbox toggle: the Err-arm revert below calls
+    // `set_active`, which *synchronously* re-fires `toggled`. Without this guard a
+    // persistent `set_editable_branches` failure would ping-pong the checkbox
+    // forever and overflow the stack (the failing call recurses through the revert).
+    let branch_toggle_guard = Rc::new(Cell::new(false));
     branch_menu.connect_active_notify({
         let repo = repo.clone();
         let refresh = refresh.clone();
         let branch_list = branch_list.clone();
         let show_status = show_status.clone();
-        let apply_last_branch_rule = apply_last_branch_rule.clone();
+        let branch_toggle_guard = branch_toggle_guard.clone();
         move |mb| {
             if !mb.is_active() {
                 return;
@@ -3216,10 +3363,17 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     let repo = repo.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
-                    let apply_last_branch_rule = apply_last_branch_rule.clone();
+                    let branch_toggle_guard = branch_toggle_guard.clone();
                     move |c| {
+                        // Ignore the re-entrant toggle the Err-arm revert provokes
+                        // (see the guard's definition above).
+                        if branch_toggle_guard.get() {
+                            return;
+                        }
                         // Compute the desired set from the live editable set ± this
                         // branch, preserving order (existing first, newcomers appended).
+                        // Unticking the last branch leaves `desired` empty — that is
+                        // allowed and yields an empty history (no last-branch rule).
                         let mut desired = repo.borrow().editable_branches();
                         if c.is_active() {
                             if !desired.contains(&name) {
@@ -3227,12 +3381,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                             }
                         } else {
                             desired.retain(|n| n != &name);
-                        }
-                        if desired.is_empty() {
-                            // Last-branch rule backstop: revert the tick, do nothing.
-                            c.set_active(true);
-                            show_status("Keep at least one branch editable");
-                            return;
                         }
                         // Bind in a `let` so the `borrow_mut()` temporary is released at
                         // the `;` — `refresh()` re-borrows `repo`, and a temporary held in
@@ -3242,13 +3390,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         match outcome {
                             Ok(()) => {
                                 refresh();
-                                // Re-evaluate which checkbox is the now-sole ticked
-                                // branch so the greyed-out state stays in sync.
-                                apply_last_branch_rule();
                             }
                             Err(err) => {
-                                // Revert the checkbox to match the unchanged set.
+                                // Revert the checkbox to match the unchanged set,
+                                // guarding the programmatic `set_active` so the
+                                // re-fired `toggled` is ignored (no recursion).
+                                branch_toggle_guard.set(true);
                                 c.set_active(!c.is_active());
+                                branch_toggle_guard.set(false);
                                 show_status(&format!("Could not change the branch set: {err}"));
                             }
                         }
@@ -3256,8 +3405,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 });
                 branch_list.append(&check);
             }
-            // Seed the greyed-out state for the freshly built list.
-            apply_last_branch_rule();
         }
     });
 
@@ -3267,8 +3414,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let branch = branch.clone();
         let exit_conflict_mode = exit_conflict_mode.clone();
         let refresh = refresh.clone();
+        let select_default = select_default.clone();
         let show_status = show_status.clone();
-        let list = list.clone();
         let trashed = trashed.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
@@ -3309,11 +3456,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // `refresh` re-selects the prior selection by change id and re-renders
             // the pane; if it's gone after the reload, select the tip.
             refresh();
-            if list.selected_rows().is_empty() {
-                if let Some(row) = list.row_at_index(0) {
-                    list.select_row(Some(&row));
-                }
-            }
+            select_default();
             if compare_button.is_active() {
                 render_compare();
             }
@@ -3361,24 +3504,33 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let resolve_current = resolve_current.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let viewing_wc = viewing_wc.clone();
-        let load_wc_changes = load_wc_changes.clone();
-        let refresh_wc = refresh_wc.clone();
         let selected_wc_change = selected_wc_change.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
+        let select_default = select_default.clone();
         let selected_changes = selected_changes.clone();
         let multi_identity_baseline = multi_identity_baseline.clone();
         let wc_identity_baseline = wc_identity_baseline.clone();
-        let list = list.clone();
         Rc::new(move || {
             // In conflict mode, "Save" means "resolve the current conflicted file".
             if pane_mode.borrow().is_conflict() {
                 resolve_current();
                 return;
             }
-            // Viewing a working-copy entry. The commit message gates what Save does:
-            // with no message, the edited diff is written back to the working copy
-            // in place (it stays uncommitted); with a message, the uncommitted
-            // changes are crystallized into a real commit on top of HEAD.
+            // Viewing a working-copy `@` (the selected `@` node). The commit message
+            // gates what Save does: with no message, the edited diff is written back
+            // to that worktree's `@` in place (it stays uncommitted); with a message,
+            // the uncommitted changes are crystallized into a real commit on its tip.
+            // The branch's `WcTarget` routes every action at the right worktree's `@`.
             if viewing_wc.get() {
+                let change = selected_wc_change.borrow().clone();
+                let branch = selected_wc_branch.borrow().clone();
+                let Some(target) = branch
+                    .as_deref()
+                    .and_then(|b| repo.borrow().wc_target_for_branch(b))
+                else {
+                    show_status("That working copy is no longer editable here");
+                    return;
+                };
                 let saved_file = current_file.borrow().clone();
                 let saved_cursor = file_buffer.cursor_position();
                 // Flush any pending diff edits into the working copy first — both
@@ -3396,9 +3548,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                         return;
                     }
                 };
-                let change = selected_wc_change.borrow().clone();
                 for edit in &edits {
-                    if let Err(err) = repo.borrow_mut().edit_working_copy_file(
+                    if let Err(err) = repo.borrow_mut().edit_working_copy_file_at(
+                        target.clone(),
                         change.as_deref(),
                         &edit.path,
                         edit.content.as_deref(),
@@ -3410,10 +3562,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let message = buffer_text(&message_buffer);
                 let message = message.trim();
                 if message.is_empty() {
-                    // No message: leave the changes uncommitted, just reload the diff
-                    // and rows where the user was.
-                    refresh_wc();
-                    load_wc_changes();
+                    // No message: leave the changes uncommitted. `refresh` rebuilds the
+                    // `@` rows and re-selects this one (its change id is stable across
+                    // the in-place edit), reloading the diff; restore the user's place.
+                    refresh();
                     if let Some(path) = saved_file {
                         if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
                             file_dropdown.set_selected(idx as u32);
@@ -3423,34 +3575,42 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
                     return;
                 }
-                // A message was given: commit exactly the displayed diff — the
-                // selected entry's slice — leaving every other "uncommitted changes"
-                // entry untouched (changes the user reverted in the buffer but didn't
-                // Split off were just dropped from the entry above, so they're gone).
-                // Pass the identity only when the user overrode the prefilled git
-                // default; otherwise let the engine stamp git config + a fresh "now".
+                // A message was given: commit the displayed entry's slice on its
+                // worktree's branch tip. Both the launch and a sibling worktree's `@`
+                // commit exactly the selected entry (a split chain commits one piece
+                // at a time, the rest staying uncommitted); a lone entry collapses to
+                // committing the whole `@`. Pass the identity only when the user
+                // overrode the prefilled git default; otherwise let the engine stamp
+                // git config + a fresh "now".
                 let baseline = wc_identity_baseline.borrow().clone();
                 let current: [String; 4] =
                     std::array::from_fn(|i| identity_fields[i].text().to_string());
                 let identity = (current != baseline).then(|| read_identity(&identity_fields));
-                let outcome = repo.borrow_mut().commit_working_copy_entry(
-                    change.as_deref(),
-                    message,
-                    identity.as_ref(),
-                );
+                let outcome = match &target {
+                    WcTarget::Launch => repo.borrow_mut().commit_working_copy_entry(
+                        change.as_deref(),
+                        message,
+                        identity.as_ref(),
+                    ),
+                    _ => repo.borrow_mut().commit_working_copy_entry_at(
+                        target.clone(),
+                        change.as_deref(),
+                        message,
+                        identity.as_ref(),
+                    ),
+                };
                 match outcome {
                     Ok(SaveOutcome::Clean) => {
-                        // The working copy is now clean (refresh hides its row) and
-                        // the new commit is the tip. Drop the working-copy selection
-                        // and select the tip so its just-committed message is shown,
-                        // ready to refine in place.
+                        // Committed: leave the `@` view and select the newest commit
+                        // (the new tip when the launch branch is topmost), ready to
+                        // refine its just-committed message in place.
+                        viewing_wc.set(false);
                         selected_wc_change.borrow_mut().take();
+                        selected_wc_branch.borrow_mut().take();
                         selected_change.borrow_mut().take();
                         selected_changes.borrow_mut().clear();
                         refresh();
-                        if let Some(row) = list.row_at_index(0) {
-                            list.select_row(Some(&row));
-                        }
+                        select_default();
                     }
                     Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
                     Err(err) => show_status(&format!("Commit failed: {err}")),
@@ -3667,9 +3827,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let viewing_wc = viewing_wc.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let selected_wc_change = selected_wc_change.clone();
-        let refresh_wc = refresh_wc.clone();
-        let wc_list = wc_list.clone();
-        let wc_entries = wc_entries.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
         move |_| {
             if pane_mode.borrow().is_conflict() {
                 return;
@@ -3714,30 +3872,31 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 }
             };
 
-            // Splitting a working-copy entry: a pure jj-side peel — no history
-            // change, so only the working-copy rows and this diff reload. The
-            // edited entry keeps its change id; re-select it so the highlight and
-            // the reloaded diff stay in sync.
+            // Splitting a working-copy `@`: a pure jj-side peel — no history change,
+            // so only the `@` rows and this diff reload. Works on any editable
+            // worktree's `@` (the launch one or a sibling's); a branch with no
+            // worktree has no `@` to split. The edited entry keeps its change id, so
+            // `refresh` re-selects it and reloads the diff.
             if viewing_wc.get() {
                 let change = selected_wc_change.borrow().clone();
-                if let Err(err) = repo
-                    .borrow_mut()
-                    .split_working_copy_edits(change.as_deref(), &edits)
+                let branch = selected_wc_branch.borrow().clone();
+                let Some(target) = branch
+                    .as_deref()
+                    .and_then(|b| repo.borrow().wc_target_for_branch(b))
+                else {
+                    show_status(
+                        "This branch has no worktree, so its uncommitted changes can't be split",
+                    );
+                    return;
+                };
+                if let Err(err) =
+                    repo.borrow_mut()
+                        .split_working_copy_edits_at(target, change.as_deref(), &edits)
                 {
                     show_status(&format!("Split failed: {err}"));
                     return;
                 }
-                refresh_wc();
-                wc_list.unselect_all();
-                if let Some(ch) = &change {
-                    let idx = wc_entries
-                        .borrow()
-                        .iter()
-                        .position(|e| e.info.change_id_hex() == *ch);
-                    if let Some(row) = idx.and_then(|i| wc_list.row_at_index(i as i32)) {
-                        wc_list.select_row(Some(&row)); // fires row-selected -> reload
-                    }
-                }
+                refresh();
                 restore_place();
                 return;
             }
@@ -3780,12 +3939,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let list = list.clone();
         let history_scroll = history_scroll.clone();
         let commits = commits.clone();
+        let display = display.clone();
         let search_query = search_query.clone();
         let search_matches = search_matches.clone();
         let search_cursor = search_cursor.clone();
         move |entry| {
             let query = entry.text().to_string();
-            let matches = rows::apply_search_highlight(&list, &commits.borrow(), &query);
+            let matches =
+                rows::apply_search_highlight(&list, &display.borrow(), &commits.borrow(), &query);
             let first = matches.first().copied();
             *search_query.borrow_mut() = query;
             *search_matches.borrow_mut() = matches;
@@ -3895,11 +4056,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
     // Initial population and selection.
     refresh();
-    if list.selected_rows().is_empty() {
-        if let Some(row) = list.row_at_index(0) {
-            list.select_row(Some(&row));
-        }
-    }
+    select_default();
 
     window.present();
 }

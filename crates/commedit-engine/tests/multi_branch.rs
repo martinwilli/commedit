@@ -7,6 +7,7 @@
 
 mod common;
 
+use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::repo::Repo;
 
 /// Build `main: A-B-C` (checked out) with `feature` branching off `B` and adding
@@ -67,6 +68,57 @@ fn history_multi_unions_branch_ancestries() {
     subj.sort();
     assert_eq!(subj, vec!["A", "B", "C", "F"], "union of both branches");
     assert!(!has_more, "whole history fit under the limit");
+}
+
+/// `local_branches` orders the dropdown candidates by tip-commit date, most
+/// recent first — the `git recent` ordering — independent of branch name. Build
+/// three branches whose names and tip dates disagree, so the recency order is
+/// distinguishable from both alphabetical and reverse-alphabetical.
+#[test]
+fn local_branches_are_ordered_by_recency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // Commit with an explicit, staggered date: the shared helper can't set one,
+    // and `--sort=-committerdate` is ambiguous within a single wall-clock second.
+    let commit_at = |msg: &str, date: &str| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-q", "-m", msg])
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git commit failed");
+    };
+    let stage = |file: &str| {
+        std::fs::write(dir.join(file), file).unwrap();
+        g(&["add", file]);
+    };
+
+    g(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    stage("base.txt");
+    commit_at("base", "2001-01-01T00:00:00"); // main: oldest tip
+    g(&["checkout", "-q", "-b", "zzz"]);
+    stage("z.txt");
+    commit_at("Z", "2002-01-01T00:00:00"); // zzz: middle
+    g(&["checkout", "-q", "-b", "aaa", "main"]);
+    stage("a.txt");
+    commit_at("A", "2003-01-01T00:00:00"); // aaa: newest tip
+    g(&["checkout", "-q", "main"]);
+
+    let repo = Repo::open(dir).expect("open");
+    let order: Vec<_> = repo.local_branches().into_iter().map(|b| b.name).collect();
+    assert_eq!(
+        order,
+        vec!["aaa", "zzz", "main"],
+        "branches ordered by tip date desc — not alphabetical [aaa, main, zzz]"
+    );
 }
 
 #[test]
@@ -303,6 +355,47 @@ fn a_cross_branch_squash_lands_and_consumes_the_source() {
         g(&["show", "main:f.txt"]),
         "f",
         "F's change folded into main's C"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Cross-branch **drop** (GTK trash drag): a commit that lives only on a sibling
+/// editable branch can be trashed. The single-head `plan_drop` refuses it (it is
+/// unreachable from the primary tip), but `plan_drop_multi` — gating on every
+/// editable head — allows it, and the head-agnostic `abandon_commit` apply moves
+/// only that branch's ref. Drives the engine path the GTK trash arm uses
+/// (`plan_drop_multi` → `abandon_commit`).
+#[test]
+fn a_cross_branch_drop_trashes_a_sibling_only_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let g = |args: &[&str]| common::git(dir, args);
+    let main_before = g(&["rev-parse", "main"]);
+
+    let (mut repo, heads) = open_two_branch_dag(dir);
+    // F lives only on feature (main: A-B-C, feature: A-B-F).
+    let (union, _) = repo.history_multi(&heads, 0, usize::MAX).unwrap();
+    let f_idx = union.iter().position(|c| c.subject == "F").unwrap();
+    assert!(
+        repo.plan_drop(&union, f_idx).is_none(),
+        "single-head planner refuses the sibling-only drop"
+    );
+    let id = repo
+        .plan_drop_multi(&union, f_idx)
+        .expect("multi-head planner allows the sibling drop");
+    repo.abandon_commit(&id).expect("drop F on feature");
+
+    // feature lost F (its tip is B again); main is untouched.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["B", "A"],
+        "feature lost F — the drop abandoned the sibling commit"
+    );
+    assert_eq!(
+        g(&["rev-parse", "main"]),
+        main_before,
+        "main is untouched — the drop only moved feature's ref"
     );
     g(&["fsck", "--no-progress"]);
 }
@@ -692,10 +785,44 @@ fn widen_then_narrow_preserves_the_undo_log() {
     g(&["fsck", "--no-progress"]);
 }
 
-/// Phase 2: the last-branch rule at the engine boundary — `set_editable_branches`
-/// refuses to empty the set, mirroring the MCP's "the last session can't be closed".
+/// The editable set may be emptied: narrowing to zero branches leaves no primary
+/// (like a detached-HEAD launch), so the history view shows no commits — and
+/// re-ticking a branch restores it. A disk no-op throughout (`main` stays at its
+/// tip), so the round-trip is lossless.
 #[test]
-fn the_editable_set_cannot_be_emptied() {
+fn the_editable_set_can_be_emptied_and_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    let tip = repo.head_commit_id().expect("primary tip");
+
+    // Untick everything: no branch editable, no primary tip, no commits to walk.
+    repo.set_editable_branches(&[]).expect("empty the set");
+    assert!(repo.editable_branches().is_empty());
+    assert_eq!(repo.head_commit_id(), None);
+    assert!(repo.editable_heads().is_empty());
+
+    // Re-tick `main`: the branch and its tip come back unchanged.
+    repo.set_editable_branches(&["main".into()])
+        .expect("restore main");
+    assert_eq!(repo.editable_branches(), vec!["main".to_string()]);
+    assert_eq!(repo.head_commit_id(), Some(tip));
+}
+
+/// A no-op `set_editable_branches` (desired == current) succeeds even while a
+/// conflicted rewrite is held — the pending guard only blocks a request that
+/// actually *changes* the set. Regression for the GTK stack-overflow: a reverted
+/// branch-toggle re-asserts the current set, and an erroring revert would re-fire
+/// the toggle handler and recurse until the stack overflows.
+#[test]
+fn a_noop_set_editable_branches_succeeds_while_pending() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     setup(dir);
@@ -707,14 +834,1302 @@ fn the_editable_set_cannot_be_emptied() {
     )
     .expect("open multi");
 
-    let err = repo.set_editable_branches(&[]).unwrap_err().to_string();
+    // Drive the launch worktree into a held conflict: an uncommitted edit to
+    // a.txt that the rewrite of its introducing commit ("A") also touches.
+    std::fs::write(dir.join("a.txt"), "uncommitted\n").unwrap();
+    let a = commedit_engine::history::history(&repo.repo, &repo.head_commit_id().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|c| c.subject == "A")
+        .unwrap()
+        .id;
+    let outcome = repo
+        .rewrite_file(&a, "a.txt", "rewritten\n")
+        .expect("rewrite");
     assert!(
-        err.contains("cannot be emptied"),
-        "refusal mentions the last-branch rule: {err}"
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "the rewrite should conflict the uncommitted change and be held"
     );
-    // The set is unchanged after the refusal.
+    assert!(
+        repo.is_pending(),
+        "the held conflict leaves a pending resolution"
+    );
+
+    // The no-op (current set, same order) succeeds despite the pending hold...
+    repo.set_editable_branches(&["main".into(), "feature".into()])
+        .expect("a no-op set must be allowed while pending");
+    // ...while a request that actually changes the set is still refused.
+    let err = repo
+        .set_editable_branches(&["main".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("conflicted rewrite"),
+        "a real change is refused while pending: {err}"
+    );
+}
+
+/// A trashed commit restored via `restore_to_working_copy_at` lands on the
+/// *sibling* worktree's `@` — not the launch worktree's. Drop `feature`'s tip F
+/// (orphaning it), then restore that orphan onto the feature worktree: its file
+/// surfaces as `feature`'s uncommitted change and the launch worktree stays clean.
+#[test]
+fn restore_to_working_copy_at_lands_on_the_sibling_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // `feature`'s tip is F (adds f.txt); abandon it to orphan it, then restore the
+    // orphan onto the feature worktree's @.
+    let f = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .expect("feature branch")
+        .head;
+    assert!(matches!(repo.abandon_commit(&f), Ok(SaveOutcome::Clean)));
+
+    let outcome = repo
+        .restore_to_working_copy_at(
+            commedit_engine::workcopy::WcTarget::Worktree("feature".into()),
+            &f,
+        )
+        .expect("restore to feature worktree");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // f.txt is now uncommitted on `feature` only; the launch worktree (`main`)
+    // stays clean — the orphan did not leak into the launch @.
+    let wc = repo.worktree_uncommitted();
+    let feature = wc
+        .iter()
+        .find(|(b, _)| b == "feature")
+        .expect("feature has an uncommitted @");
     assert_eq!(
-        repo.editable_branches(),
-        vec!["main".to_string(), "feature".to_string()]
+        feature.1.last().unwrap().file_names,
+        vec!["f.txt".to_string()],
+        "the restored file surfaces on feature"
     );
+    assert!(
+        !wc.iter().any(|(b, _)| b == "main"),
+        "the launch worktree must stay clean"
+    );
+
+    // And on disk: the feature worktree is materialized with the restored file,
+    // the launch worktree never receives it.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).ok(),
+        Some("f\n".to_string()),
+        "the feature worktree's file is materialized on disk"
+    );
+    assert!(
+        !dir.join("f.txt").exists(),
+        "the launch worktree must not receive the restored file"
+    );
+}
+
+/// `worktree_uncommitted` surfaces the launch worktree's `@` chain *and* every
+/// extra worktree's dirty `@`, each keyed by its branch's short-name, launch
+/// first. Dirtying happens before open so the open-time snapshot captures both
+/// worktrees (`snapshot_working_copy` snapshots the extras first).
+#[test]
+fn worktree_uncommitted_lists_the_launch_and_each_dirty_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "a dirty on feature\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let wc = repo.worktree_uncommitted();
+    assert_eq!(
+        wc.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(),
+        vec!["main", "feature"],
+        "the launch worktree comes first, then each extra worktree"
+    );
+    for (branch, entries) in &wc {
+        assert_eq!(entries.len(), 1, "{branch}: a single dirty @");
+        assert_eq!(
+            entries[0].file_names,
+            vec!["a.txt".to_string()],
+            "{branch}: the one dirtied tracked file"
+        );
+        assert_eq!(entries[0].changed_files, 1, "{branch}: one changed file");
+        assert!(!entries[0].has_conflict, "{branch}: a clean snapshot");
+    }
+}
+
+/// A clean extra worktree contributes nothing — only the dirty launch worktree
+/// is listed.
+#[test]
+fn worktree_uncommitted_skips_a_clean_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent); // feature checked out, left clean
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert_eq!(
+        repo.worktree_uncommitted()
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main"],
+        "the clean feature worktree is absent"
+    );
+}
+
+/// An editable branch with no worktree (a pure ref-move) has no `@`, so it
+/// contributes nothing even while it is in the editable set.
+#[test]
+fn worktree_uncommitted_ignores_a_worktreeless_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir); // `feature` exists as a ref only — never checked out anywhere
+
+    std::fs::write(dir.join("a.txt"), "a dirty on main\n").unwrap();
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert_eq!(
+        repo.worktree_uncommitted()
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main"],
+        "feature has no worktree, so no uncommitted @"
+    );
+}
+
+/// A clean tree across every worktree yields no entries at all.
+#[test]
+fn worktree_uncommitted_is_empty_when_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    assert!(
+        repo.worktree_uncommitted().is_empty(),
+        "no uncommitted changes anywhere"
+    );
+}
+
+/// Multi-head conflict *detection*: a rewrite of a *shared* ancestor that
+/// conflicts only on a **sibling** branch's tip — the primary stays clean — must
+/// still defer (git frozen) rather than silently exporting the conflicted
+/// sibling. Before detection went multi-head it scanned only the primary chain
+/// plus the launch `@`, so this exact case exported a conflicted commit to git.
+#[test]
+fn a_conflict_on_a_sibling_tip_defers_the_whole_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // main: A(x.txt) - B(adds m.txt) - C(adds c.txt). `feature` branches at B and
+    // edits x.txt's middle line.
+    common::init_repo(
+        dir,
+        &[
+            ("x.txt", "a\nb\nc\n", "A"),
+            ("m.txt", "m\n", "B"),
+            ("c.txt", "c\n", "C"),
+        ],
+    );
+    g(&["checkout", "-q", "-b", "feature", "HEAD~1"]); // at B
+    std::fs::write(dir.join("x.txt"), "a\nF\nc\n").unwrap();
+    g(&["add", "x.txt"]);
+    g(&["commit", "-q", "-m", "F"]);
+    g(&["checkout", "-q", "main"]);
+
+    let main_before = g(&["rev-parse", "main"]);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Rewrite the shared ancestor B's x.txt middle line: main's C (touches only
+    // c.txt) rebases clean, but feature's F (also edited that line) conflicts —
+    // on the *sibling* tip, not the primary's.
+    let b = find_commit(&repo, &heads, "B");
+    let outcome = repo
+        .rewrite_file(&b, "x.txt", "a\nB\nc\n")
+        .expect("rewrite shared ancestor B");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a conflict on the sibling tip must defer, not export dirty"
+    );
+    assert!(
+        repo.is_pending(),
+        "the rewrite is held back pending resolution"
+    );
+    // git stays frozen: neither branch's ref moved while the chain is conflicted.
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main ref frozen");
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature ref frozen"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Multi-head spurious auto-resolve (the data-loss-critical path): a *spurious*
+/// drop on a **sibling** branch checked out in another worktree auto-resolves
+/// cleanly, and that worktree's own dirty `@` rides onto the rebuilt tip —
+/// reconstructed from *its* pre-rewrite `@`, not the launch worktree's.
+#[test]
+fn spurious_drop_on_a_sibling_worktree_auto_resolves_and_preserves_its_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // base(f=foo) on main; `feature` branches there with the spurious shape
+    // +bar / +baz (dropping `bar` leaves the well-defined foo/baz). main then adds
+    // an unrelated commit so the two branches diverge above `base`.
+    common::init_repo(dir, &[("f.txt", "foo\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "foo\nbar\n").unwrap();
+    g(&["commit", "-aqm", "C1-bar"]);
+    std::fs::write(dir.join("f.txt"), "foo\nbar\nbaz\n").unwrap();
+    g(&["commit", "-aqm", "C2-baz"]);
+    g(&["checkout", "-q", "main"]);
+    std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+    g(&["add", "m.txt"]);
+    g(&["commit", "-qm", "M"]);
+
+    // Check feature out in a second worktree and dirty its @ (append `local`).
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    std::fs::write(wt.join("f.txt"), "foo\nbar\nbaz\nlocal\n").unwrap();
+
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let heads = [head, feature_head];
+
+    // Drop C1-bar on feature — a sibling-only spurious drop.
+    let c1bar = find_commit(&repo, &heads, "C1-bar");
+    let outcome = repo.abandon_commit(&c1bar).expect("drop C1-bar on feature");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "a spurious sibling drop must auto-resolve, got {outcome:?}"
+    );
+    assert!(!repo.is_pending(), "nothing left pending");
+    // feature: `bar` dropped, `baz` kept; tip is the well-defined foo/baz.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["C2-baz", "base"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "foo\nbaz");
+    // The sibling worktree's uncommitted delta (+local) rode onto the rebuilt tip —
+    // replayed from feature's own pre-rewrite @, not main's launch @.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "foo\nbaz\nlocal\n",
+        "the sibling worktree's uncommitted change survived the auto-resolve"
+    );
+    // main is untouched and the launch worktree stays clean and transparent.
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    assert_eq!(g(&["status", "--porcelain"]), "", "launch worktree clean");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// A *genuine* conflict on a sibling drop must still fall back to manual: the
+/// per-head auto-resolve bails (it can't prove the result well-defined), so the
+/// whole rewrite defers with git frozen — no half-applied sibling rewrite.
+#[test]
+fn a_genuine_conflict_on_a_sibling_drop_falls_back_to_manual() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // feature rewrites the SAME single line each commit, so dropping C1 leaves C2's
+    // edit un-applicable onto the base — a genuine conflict.
+    common::init_repo(dir, &[("f.txt", "one\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+    g(&["commit", "-aqm", "C1"]);
+    std::fs::write(dir.join("f.txt"), "three\n").unwrap();
+    g(&["commit", "-aqm", "C2"]);
+    g(&["checkout", "-q", "main"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+    let feature_before = g(&["rev-parse", "feature"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let c1 = find_commit(&repo, &[head, feature_head], "C1");
+    let outcome = repo.abandon_commit(&c1).expect("drop C1 on feature");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Conflicts { .. }),
+        "a genuine sibling conflict must defer, got {outcome:?}"
+    );
+    assert!(repo.is_pending(), "held pending for manual resolution");
+    assert_eq!(
+        g(&["rev-parse", "feature"]),
+        feature_before,
+        "feature ref frozen — no half-applied rewrite"
+    );
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Open `main` + `feature` (feature in a second worktree, dirty) and return the
+/// opened repo plus the worktree path. Shared by the sibling working-copy
+/// mutation tests below.
+fn open_with_dirty_feature_worktree(
+    dir: &std::path::Path,
+    wt_parent: &tempfile::TempDir,
+    f_contents: &str,
+) -> (Repo, std::path::PathBuf) {
+    setup(dir);
+    let wt = add_feature_worktree(dir, wt_parent);
+    std::fs::write(wt.join("f.txt"), f_contents).unwrap();
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    (repo, wt)
+}
+
+/// A `@`-only edit to a *sibling* worktree's working copy rewrites that
+/// worktree's file on disk, leaves its branch tip put, and never touches main.
+#[test]
+fn editing_a_sibling_worktrees_uncommitted_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f edited on disk\n");
+
+    let target = repo
+        .wc_target_for_branch("feature")
+        .expect("feature has a worktree");
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f set by edit\n"))
+        .expect("edit the sibling @");
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f set by edit\n",
+        "the sibling worktree's file reflects the edit"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+    // The @-only edit leaves feature's tip and main untouched.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Discarding a sibling worktree's uncommitted changes resets *its* `@` to its
+/// tip (jj recreates the per-worktree `@`) and re-materializes that worktree.
+#[test]
+fn discarding_a_sibling_worktrees_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.drop_working_copy_at(target, None)
+        .expect("discard the sibling @");
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\n",
+        "the sibling worktree reverts to its tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Folding a sibling worktree's uncommitted changes into one of its commits
+/// rewrites that commit, re-materializes the worktree onto the rewritten tip, and
+/// leaves main alone.
+#[test]
+fn folding_a_sibling_worktrees_uncommitted_changes_into_its_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nmore\n");
+
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .squash_working_copy_into_at(target, None, &f, None)
+        .expect("fold the sibling @ into F");
+
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n",
+        "the worktree sits clean on the rewritten tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"],
+        "F amended in place"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Committing a sibling worktree's uncommitted changes crystallizes a new commit
+/// on *that* branch's tip, leaves its worktree clean, and never moves main.
+#[test]
+fn committing_a_sibling_worktrees_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nnew\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_at(target, "feature WIP", None)
+        .expect("commit the sibling @");
+
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature WIP", "F", "B", "A"],
+        "a new commit on feature's tip"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nnew");
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "",
+        "the worktree is clean after committing its @"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 3: a *clean* `@`-only edit on a sibling worktree is recorded as a session
+/// op, so it can be undone — the record decision keys on the mutated worktree's
+/// `@` (clean here), not the launch `@`. Before the fix `record_working_copy_op`
+/// inspected only the launch chain, so a sibling edit's op recording was decided
+/// by the wrong working copy.
+#[test]
+fn a_clean_sibling_edit_is_undoable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, _wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    assert!(!repo.can_undo(), "no recorded op before the edit");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f set by edit\n"))
+        .expect("edit the sibling @");
+
+    assert!(
+        repo.can_undo(),
+        "the clean sibling edit was recorded as a session op"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 1: an `@`-only discard on a sibling worktree (its tip does not move)
+/// followed by undo/redo keeps that worktree's files in sync with the DAG. The
+/// rewind path re-materializes a sibling whose `@` changed, not just one whose
+/// branch tip moved — before the fix undo restored the sibling `@` in jj but
+/// left the worktree's files stale on disk.
+#[test]
+fn an_at_only_sibling_drop_then_undo_redo_keeps_the_worktree_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f dirty\n");
+
+    // Discard the sibling @: the worktree reverts to its tip content (passes today).
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.drop_working_copy_at(target, None)
+        .expect("discard the sibling @");
+    assert_eq!(std::fs::read_to_string(wt.join("f.txt")).unwrap(), "f\n");
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+
+    // Undo: the discarded uncommitted change must come back on disk AND in the
+    // worktree's index (this is what failed before the fix).
+    repo.undo().expect("undo the discard");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f dirty\n",
+        "undo restored the sibling worktree's uncommitted change on disk"
+    );
+    assert_eq!(
+        common::git(&wt, &["status", "--porcelain"]),
+        "M f.txt",
+        "and its git index reflects the restored change"
+    );
+
+    // Redo: the discard reapplies, reverting the worktree again.
+    repo.redo().expect("redo the discard");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\n",
+        "redo reverted the sibling worktree again"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    // main never moved through any of this.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 1: an `@`-only edit on a sibling worktree, then `revert_all()` (→
+/// `set_op_cursor(0)` → `rewind_to_op`) resets that worktree on disk back to its
+/// session-start uncommitted state.
+#[test]
+fn an_at_only_sibling_edit_then_revert_all_resets_the_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    // Session starts with the sibling worktree dirty at "f start\n".
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f start\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.edit_working_copy_file_at(target, None, "f.txt", Some("f edited\n"))
+        .expect("edit the sibling @");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f edited\n"
+    );
+
+    repo.revert_all().expect("revert the whole session");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f start\n",
+        "revert_all reset the sibling worktree to its session-start @"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 1 guard: a *tip-moving* sibling op (fold its `@` into a commit) still
+/// undoes/redoes correctly — the new `@`-aware rewind gate must not regress the
+/// existing tip-move materialize path (which `export_and_sync` already handles).
+#[test]
+fn undo_redo_across_a_tip_moving_sibling_op_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nmore\n");
+
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.squash_working_copy_into_at(target, None, &f, None)
+        .expect("fold the sibling @ into F");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+
+    // Undo the fold: F reverts and the worktree's uncommitted change comes back.
+    repo.undo().expect("undo the fold");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n",
+        "undo restored the worktree's uncommitted change on the original tip"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M f.txt");
+
+    // Redo the fold: back to the rewritten tip with a clean worktree.
+    repo.redo().expect("redo the fold");
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nmore");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nmore\n"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Bug 2: a *genuine* conflict on a sibling-branch drop is now resolvable in-app,
+/// not abort-only. The drop defers (the auto-resolve bails on a real conflict);
+/// the conflicted commit lives on the *sibling* branch, so the resolver must
+/// search every editable head, not just the primary — before the fix
+/// `read_conflict`/`resolve_conflict` bailed "not on the current branch chain".
+#[test]
+fn a_genuine_conflict_on_a_sibling_drop_resolves_manually() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // feature rewrites the SAME single line each commit, so dropping C1 leaves C2's
+    // edit un-applicable onto the base — a genuine conflict on the sibling.
+    common::init_repo(dir, &[("f.txt", "one\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+    g(&["commit", "-aqm", "C1"]);
+    std::fs::write(dir.join("f.txt"), "three\n").unwrap();
+    g(&["commit", "-aqm", "C2"]);
+    g(&["checkout", "-q", "main"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let _wt = add_feature_worktree(dir, &wt_parent);
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let c1 = find_commit(&repo, &[head, feature_head], "C1");
+    let outcome = repo.abandon_commit(&c1).expect("drop C1 on feature");
+    let conflicted = match outcome {
+        SaveOutcome::Conflicts { commits } => commits,
+        other => panic!("expected a deferred conflict, got {other:?}"),
+    };
+    // The conflict is C2, on the sibling branch — its change id drives resolution.
+    let c2_change = conflicted
+        .iter()
+        .find(|c| c.subject == "C2")
+        .expect("C2 is the conflicted commit")
+        .change_id_hex();
+
+    // read_conflict reaches the sibling commit and returns Git-style markers
+    // (this bailed before the resolver searched every editable head).
+    let cf = repo
+        .read_conflict(&c2_change, "f.txt")
+        .expect("read the sibling conflict");
+    assert!(
+        cf.text.contains("<<<<<<<") && cf.text.contains(">>>>>>>"),
+        "materialized conflict markers: {:?}",
+        cf.text
+    );
+
+    // Resolve to the intended content; the whole chain goes clean and exports.
+    let outcome = repo
+        .resolve_conflict(&c2_change, "f.txt", "three\n", cf.marker_len)
+        .expect("resolve the sibling conflict");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["C2", "base"],
+        "C1 dropped, C2 resolved onto base"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "three");
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Bug 2: a conflicted *sibling worktree `@`* (not a branch commit) is resolvable.
+/// Rewriting a sibling commit so re-applying that worktree's uncommitted `@` no
+/// longer merges leaves the `@` itself conflicted; the resolver locates it among
+/// the worktree `@`s and the resolved content lands on disk in that worktree.
+#[test]
+fn a_conflicted_sibling_at_is_resolvable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let g = |args: &[&str]| common::git(dir, args);
+    // main stays at base; feature adds F editing line 1.
+    common::init_repo(dir, &[("f.txt", "a\nb\nc\n", "base")]);
+    g(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("f.txt"), "A\nb\nc\n").unwrap();
+    g(&["commit", "-aqm", "F"]);
+    g(&["checkout", "-q", "main"]);
+
+    // feature in a second worktree, with an uncommitted edit to the SAME line.
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+    std::fs::write(wt.join("f.txt"), "AA\nb\nc\n").unwrap();
+    let main_before = g(&["rev-parse", "main"]);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    let head = repo.head_commit_id().expect("head");
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    // Rewrite F's line 1 too: the sibling worktree's `@` (line 1 "A"->"AA") can no
+    // longer be re-applied onto the rewritten tip ("X"), so the `@` conflicts.
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    let outcome = repo
+        .rewrite_file(&f, "f.txt", "X\nb\nc\n")
+        .expect("rewrite F");
+    let conflicted = match outcome {
+        SaveOutcome::Conflicts { commits } => commits,
+        other => panic!("expected a deferred conflict, got {other:?}"),
+    };
+    // The single conflict is the sibling worktree's uncommitted `@`.
+    assert_eq!(
+        conflicted.len(),
+        1,
+        "only the @ conflicts, F is a clean rewrite"
+    );
+    assert_eq!(conflicted[0].subject, "Uncommitted changes");
+    let at_change = conflicted[0].change_id_hex();
+
+    let cf = repo
+        .read_conflict(&at_change, "f.txt")
+        .expect("read the sibling @ conflict");
+    assert!(
+        cf.text.contains("<<<<<<<"),
+        "materialized markers: {:?}",
+        cf.text
+    );
+
+    let outcome = repo
+        .resolve_conflict(&at_change, "f.txt", "RESOLVED\nb\nc\n", cf.marker_len)
+        .expect("resolve the sibling @");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert!(!repo.is_pending());
+    // The resolved content is materialized into that worktree on disk.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "RESOLVED\nb\nc\n",
+        "the sibling worktree holds the resolved @ content"
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "X\nb\nc");
+    assert_eq!(g(&["rev-parse", "main"]), main_before, "main frozen");
+    g(&["fsck", "--no-progress"]);
+}
+
+/// Gap 4: index-only staged content in a *sibling* worktree (staged then reverted
+/// on disk, so invisible to jj's `@`) is pinned to a recovery ref before that
+/// worktree's index reset would drop it — the per-worktree analogue of the launch
+/// worktree's backup, namespaced under a worktree key so the two don't evict each
+/// other in the shared common-dir.
+#[test]
+fn a_sibling_worktrees_index_only_content_survives_a_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Stage content into the sibling worktree's f.txt, then revert the disk to its
+    // tip: the staged version now lives ONLY in that worktree's git index.
+    std::fs::write(wt.join("f.txt"), "staged-only\n").unwrap();
+    common::git(&wt, &["add", "f.txt"]);
+    std::fs::write(wt.join("f.txt"), "f\n").unwrap();
+
+    // Rewrite F (feature's tip) so the sibling worktree is re-materialized — its
+    // index is reset to the new tip, which would otherwise drop the staged content.
+    let head = repo.head_commit_id().unwrap();
+    let feature_head = repo
+        .local_branches()
+        .into_iter()
+        .find(|b| b.name == "feature")
+        .unwrap()
+        .head;
+    let f = find_commit(&repo, &[head, feature_head], "F");
+    repo.rewrite_message(&f, "F (edited)").expect("rewrite F");
+
+    // The sibling's index-only content was pinned to a recovery ref, namespaced
+    // under a per-worktree key (an extra path segment under refs/commedit/backup/).
+    let backups = common::git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/commedit/backup/",
+        ],
+    );
+    let backup = backups
+        .lines()
+        .next()
+        .expect("a sibling index backup ref exists");
+    let rest = backup.strip_prefix("refs/commedit/backup/").unwrap();
+    assert!(
+        rest.contains('/'),
+        "the sibling backup is namespaced under a worktree key: {backup}"
+    );
+    assert_eq!(
+        common::git(dir, &["show", &format!("{backup}:f.txt")]),
+        "staged-only"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Gap 5: a plain `git commit` made out-of-band inside a sibling worktree is
+/// absorbed onto its branch before the next snapshot, so it is *not* re-recorded
+/// as a phantom uncommitted change. After the catch-up the worktree's `@` holds
+/// only the still-uncommitted delta on top of the new tip.
+#[test]
+fn an_out_of_band_commit_in_a_sibling_worktree_is_caught_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent); // feature checked out, clean at F
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Out of band: commit one tracked change as G, then leave a *further*
+    // uncommitted edit on disk.
+    std::fs::write(wt.join("f.txt"), "f\ncommitted\n").unwrap();
+    common::git(&wt, &["commit", "-aqm", "G"]);
+    std::fs::write(wt.join("f.txt"), "f\ncommitted\nuncommitted\n").unwrap();
+
+    // A launch-side snapshot runs the per-worktree catch-up: it imports G and
+    // re-anchors feature's `@` onto it, so `@` now diffs only the uncommitted line.
+    repo.snapshot_working_copy().expect("snapshot (catch up)");
+
+    // Crystallizing the remaining `@` proves G was absorbed (not double-counted):
+    // it lands on top of G and carries only the still-uncommitted line.
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_at(target, "rest", None)
+        .expect("commit the remaining @");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["rest", "G", "F", "B", "A"],
+        "G is on the branch and 'rest' stacks on top of it (not on F)"
+    );
+    assert_eq!(
+        common::git(dir, &["show", "feature:f.txt"]),
+        "f\ncommitted\nuncommitted"
+    );
+    let diff = common::git(dir, &["show", "--format=", "feature"]);
+    assert!(
+        diff.contains("+uncommitted") && !diff.contains("+committed"),
+        "'rest' adds only the uncommitted line, not the already-committed one: {diff}"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Gap 5: an out-of-band `git checkout` of a *different* branch in a sibling
+/// worktree leaves its branch→workspace mapping stale; the next snapshot surfaces
+/// a clear "reopen the repository" error rather than silently mis-snapshotting.
+#[test]
+fn an_out_of_band_branch_switch_in_a_sibling_worktree_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = add_feature_worktree(dir, &wt_parent);
+
+    let mut repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+
+    // Switch the sibling worktree to a different branch out of band.
+    common::git(&wt, &["checkout", "-q", "-b", "other"]);
+
+    let err = repo
+        .snapshot_working_copy()
+        .expect_err("a stale worktree mapping must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed its checked-out branch outside commedit")
+            && msg.contains("reopen the repository"),
+        "the error tells the user to reopen: {msg}"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Open `main` (launch) + `feature` (in a linked worktree) with the feature
+/// worktree dirtied on *two* tracked files (`f.txt` and `a.txt`) — the raw
+/// material for peeling a sibling `@` into two entries with a split.
+fn open_feature_worktree_dirty_on_two_files(
+    dir: &std::path::Path,
+    wt_parent: &tempfile::TempDir,
+) -> (Repo, std::path::PathBuf) {
+    setup(dir);
+    let wt = add_feature_worktree(dir, wt_parent);
+    std::fs::write(wt.join("f.txt"), "f\nFF\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "a\nAA\n").unwrap();
+    let repo = Repo::open_multi(
+        dir,
+        commedit_engine::index_cache::IndexCache::Disabled,
+        &["main".into(), "feature".into()],
+    )
+    .expect("open multi");
+    (repo, wt)
+}
+
+/// The `feature` worktree's uncommitted entries (newest-first), or empty when
+/// clean — the per-worktree slice of [`Repo::worktree_uncommitted`].
+fn feature_entries(repo: &Repo) -> Vec<commedit_engine::workcopy::WorkingCopyEntry> {
+    repo.worktree_uncommitted()
+        .into_iter()
+        .find(|(b, _)| b == "feature")
+        .map(|(_, e)| e)
+        .unwrap_or_default()
+}
+
+/// Splitting a *sibling* worktree's uncommitted changes peels its `@` into two
+/// entries — exactly like the checked-out one's — as a pure jj-side reorg: git
+/// stays frozen (the sibling log, both dirty files, the launch branch untouched).
+#[test]
+fn splitting_a_sibling_worktrees_uncommitted_changes_peels_into_two_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    // Keep the f.txt change in the entry, revert a.txt → it spills into a new leaf.
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+
+    let entries = feature_entries(&repo);
+    assert_eq!(entries.len(), 2, "the sibling @ peeled into two entries");
+    assert!(
+        entries.iter().all(|e| e.changed_files == 1),
+        "each entry holds exactly one file's change"
+    );
+    let mut files: Vec<String> = entries.iter().flat_map(|e| e.file_names.clone()).collect();
+    files.sort();
+    assert_eq!(files, vec!["a.txt".to_string(), "f.txt".to_string()]);
+
+    // git is completely untouched and the worktree keeps both dirty files.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["F", "B", "A"]
+    );
+    let status = common::git(&wt, &["status", "--porcelain"]);
+    assert!(
+        status.contains("a.txt") && status.contains("f.txt"),
+        "got: {status:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    // The launch branch and its worktree never moved.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// A sibling split chain survives a re-snapshot (run at the start of every
+/// mutation): the chain-aware re-anchor must not collapse it back to one `@`.
+/// Mirrors `split_working_copy_chain_survives_a_snapshot` for a sibling worktree.
+#[test]
+fn a_sibling_split_chain_survives_a_resnapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+    assert_eq!(feature_entries(&repo).len(), 2);
+
+    // A bare snapshot snapshots every worktree (and re-anchors each first); the
+    // sibling split chain must not be collapsed onto its tip.
+    repo.snapshot_working_copy().expect("snapshot");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        2,
+        "the sibling split chain must survive a snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+}
+
+/// Committing one peeled entry of a sibling `@` lands a single commit on *that*
+/// branch holding only that slice, leaves the other entry uncommitted on the
+/// worktree, and never touches the launch branch.
+#[test]
+fn committing_one_peeled_sibling_entry_lands_on_its_branch_and_keeps_the_remainder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+
+    // Commit just the f.txt entry; the a.txt entry must stay uncommitted.
+    let entries = feature_entries(&repo);
+    let f_entry = entries
+        .iter()
+        .find(|e| e.file_names == vec!["f.txt".to_string()])
+        .expect("an f.txt entry");
+    let change = f_entry.info.change_id_hex();
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_entry_at(target, Some(&change), "feature: tweak f", None)
+        .expect("commit one sibling entry");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    // feature gained exactly one commit, holding only the f.txt slice.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature: tweak f", "F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nFF");
+    assert_eq!(
+        common::git(dir, &["show", "feature:a.txt"]),
+        "a",
+        "the a.txt change was NOT committed"
+    );
+
+    // The a.txt change stays uncommitted on the worktree, files byte-identical.
+    let remaining = feature_entries(&repo);
+    assert_eq!(remaining.len(), 1, "the a.txt entry stays uncommitted");
+    assert_eq!(remaining[0].file_names, vec!["a.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "M a.txt");
+    // The launch branch never moved.
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// A *lone* sibling entry (`change_hex = None`, no split) committed via the
+/// entry-commit collapses to a fresh empty `@`, behaving like
+/// `commit_working_copy_at`: the whole change lands and the worktree ends clean.
+#[test]
+fn committing_a_lone_sibling_entry_behaves_like_commit_working_copy_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_with_dirty_feature_worktree(dir, &wt_parent, "f\nlone\n");
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    let outcome = repo
+        .commit_working_copy_entry_at(target, None, "feature: whole @", None)
+        .expect("commit the lone sibling entry");
+    assert!(matches!(outcome, SaveOutcome::Clean), "got {outcome:?}");
+
+    assert_eq!(
+        common::git_log_subjects_of(dir, "feature"),
+        vec!["feature: whole @", "F", "B", "A"]
+    );
+    assert_eq!(common::git(dir, &["show", "feature:f.txt"]), "f\nlone");
+    // A fresh empty @: the worktree is clean, with nothing left uncommitted.
+    assert_eq!(common::git(&wt, &["status", "--porcelain"]), "");
+    assert!(
+        feature_entries(&repo).is_empty(),
+        "no uncommitted entries remain"
+    );
+    assert_eq!(
+        common::git_log_subjects_of(dir, "main"),
+        vec!["C", "B", "A"]
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// Undo/redo of a sibling split: undo collapses the chain back to one entry,
+/// redo re-peels it into two — disk byte-identical throughout (a pure jj peel).
+#[test]
+fn undo_redo_of_a_sibling_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let (mut repo, wt) = open_feature_worktree_dirty_on_two_files(dir, &wt_parent);
+
+    let target = repo.wc_target_for_branch("feature").unwrap();
+    repo.split_working_copy_edits_at(
+        target,
+        None,
+        &[commedit_engine::tree::FileEdit::write(
+            "a.txt".into(),
+            "a\n".into(),
+        )],
+    )
+    .expect("split the sibling @");
+    assert_eq!(feature_entries(&repo).len(), 2);
+
+    repo.undo().expect("undo the split");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        1,
+        "undo collapses the split chain to one entry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+
+    repo.redo().expect("redo the split");
+    assert_eq!(
+        feature_entries(&repo).len(),
+        2,
+        "redo re-peels into two entries"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "a\nAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "f\nFF\n"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
 }

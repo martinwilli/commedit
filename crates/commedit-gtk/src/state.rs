@@ -6,7 +6,7 @@
 //! the vocabulary without depending on each other.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use commedit_engine::conflict::ConflictedCommit;
@@ -65,8 +65,88 @@ pub(crate) type LintFixCallback = Rc<dyn Fn(i32)>;
 pub(crate) enum DragOrigin {
     History,
     Trash,
-    /// A working-copy entry being dragged onto a commit to fold it in (fixup).
+    /// A working-copy `@` node being dragged onto a commit to fold it in (fixup)
+    /// or onto the trash to discard it. Its branch + entry are read from the
+    /// dragged display row (`drag_from` indexes the unified display list).
     WorkingCopy,
+}
+
+/// One row in the unified history list: either a real commit (by index into the
+/// pure `Data.commits`, which the planners + MCP path see byte-identically) or a
+/// worktree's uncommitted changes `@`, drawn as a hollow lane node directly above
+/// its branch tip. Built by `build_ui`'s refresh from
+/// [`commedit_engine::repo::Repo::worktree_uncommitted`].
+#[derive(Clone)]
+pub(crate) enum DisplayRow {
+    /// A real commit, by index into `Data.commits`.
+    Commit(usize),
+    /// A worktree's uncommitted `@`: `branch` is the worktree's branch short-name
+    /// (`""` only for a detached-HEAD launch), `entry` the change summary shown.
+    /// Boxed: a `WorkingCopyEntry` dwarfs a `Commit(usize)`, and `@` rows are rare.
+    Wc {
+        branch: String,
+        entry: Box<WorkingCopyEntry>,
+    },
+}
+
+/// Per-display-row "draw the ancestry node hollow" flags, parallel to the draw
+/// graph's rows and indexed by display-row index — `true` for a working-copy `@`.
+pub(crate) type SharedHollow = Rc<RefCell<Vec<bool>>>;
+
+/// The commit index a display row stands for, or `None` for a working-copy row.
+/// The single choke point translating a list (display) index to a commit index;
+/// a miss here would reorder/squash the wrong commit.
+pub(crate) fn row_commit_index(display: &[DisplayRow], di: usize) -> Option<usize> {
+    match display.get(di)? {
+        DisplayRow::Commit(ci) => Some(*ci),
+        DisplayRow::Wc { .. } => None,
+    }
+}
+
+/// The commit-space insertion gap a display-space gap maps to: the count of
+/// real-commit rows above the gap. Working-copy rows don't count, so a gap just
+/// below a tip's `@` node maps to the same commit gap as just above the tip.
+pub(crate) fn row_commit_gap(display: &[DisplayRow], dgap: usize) -> usize {
+    display
+        .iter()
+        .take(dgap)
+        .filter(|r| matches!(r, DisplayRow::Commit(_)))
+        .count()
+}
+
+/// The display-row index of the first real commit — used to select a sensible
+/// default when nothing is selected, skipping any leading `@` node.
+pub(crate) fn first_commit_row(display: &[DisplayRow]) -> Option<usize> {
+    display
+        .iter()
+        .position(|r| matches!(r, DisplayRow::Commit(_)))
+}
+
+/// The display-row index of the working-copy `@` matching `branch` (short-name)
+/// and `change` (stable change id) — for re-selecting the viewed `@` after a
+/// refresh. Prefers the exact `(branch, change)` match; falls back to that
+/// branch's newest `@` (its change id churns on every snapshot), or `None` when
+/// the branch has no `@` left (committed / discarded / the tree went clean).
+pub(crate) fn find_wc_row(
+    display: &[DisplayRow],
+    branch: Option<&str>,
+    change: Option<&str>,
+) -> Option<usize> {
+    let mut fallback = None;
+    for (i, row) in display.iter().enumerate() {
+        if let DisplayRow::Wc {
+            branch: b, entry, ..
+        } = row
+        {
+            if Some(b.as_str()) == branch {
+                fallback.get_or_insert(i);
+                if change.is_some_and(|ch| entry.info.change_id_hex() == ch) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    fallback
 }
 
 /// Which content the diff pane is showing. In `Diff` mode it's the usual
@@ -133,10 +213,11 @@ impl ConflictCtx {
 /// conflicts clear, so the trash list must not change yet either: the op is
 /// applied on a clean resolution and discarded on abort. `Drop` adds the
 /// commit(s) to the trash (a history→trash drop that conflicted — one entry per
-/// commit for a multi-selection drop); `Restore` removes one (a trash→history
-/// restore that conflicted).
+/// commit for a multi-selection drop, each paired with its origin branch short-
+/// name for restore routing); `Restore` removes one (a trash→history restore
+/// that conflicted).
 pub(crate) enum PendingTrashOp {
-    Drop(Vec<CommitInfo>),
+    Drop(Vec<(CommitInfo, Option<String>)>),
     Restore(Box<CommitInfo>),
 }
 
@@ -227,7 +308,6 @@ pub(crate) struct Widgets {
     pub(crate) trash_list: ListBox,
     pub(crate) trash_scroll: ScrolledWindow,
     pub(crate) trash_box: GtkBox,
-    pub(crate) wc_list: ListBox,
     pub(crate) file_buffer: sourceview5::Buffer,
     pub(crate) file_view: sourceview5::View,
     pub(crate) save_button: Button,
@@ -242,13 +322,34 @@ pub(crate) struct Widgets {
 #[derive(Clone)]
 pub(crate) struct Data {
     pub(crate) repo: Rc<RefCell<Repo>>,
+    /// The pure list of real commits (newest first) — never holds working-copy
+    /// rows, so the reorder/squash/drop planners and the MCP path see it
+    /// byte-identically. The interleaved rendering list is `display`.
     pub(crate) commits: Rc<RefCell<Vec<CommitInfo>>>,
-    /// The history list's ancestry-graph layout, recomputed with `commits`.
+    /// The *planning* ancestry-graph layout over `commits` (no `@` nodes),
+    /// recomputed with `commits`. The reorder/restore/cherry-pick planners read
+    /// it; rendering uses `draw_graph`.
     pub(crate) graph: Rc<RefCell<GraphLayout>>,
+    /// The interleaved rows actually shown (commits with each worktree's `@`
+    /// spliced in above its tip), parallel to the list's rows. Translate a list
+    /// index to a commit index with [`row_commit_index`]/[`row_commit_gap`].
+    pub(crate) display: Rc<RefCell<Vec<DisplayRow>>>,
+    /// The *rendering* ancestry-graph layout over `display` (with the hollow `@`
+    /// nodes), indexed by display-row index — fed only to the row drawing areas.
+    pub(crate) draw_graph: Rc<RefCell<GraphLayout>>,
+    /// Hollow-node flags parallel to `draw_graph.rows` / `display`.
+    pub(crate) hollow: SharedHollow,
+    /// Commit index → display-row index, the reverse of [`row_commit_index`],
+    /// for re-selecting / highlighting a commit by index after a refresh.
+    pub(crate) commit_rows: Rc<RefCell<Vec<usize>>>,
     pub(crate) trashed: Rc<RefCell<Vec<CommitInfo>>>,
+    /// Each trashed commit's origin branch (change-id hex → branch short-name),
+    /// recorded when it is dropped to the trash so "restore to working tree" can
+    /// route the changes back to *that* branch's worktree `@` rather than always
+    /// the launch one. Absent ⇒ restore falls back to the launch worktree.
+    pub(crate) trashed_origin: Rc<RefCell<HashMap<String, String>>>,
     /// A trash-list change deferred until a conflicted drop/restore resolves.
     pub(crate) pending_trash_op: Rc<RefCell<Option<PendingTrashOp>>>,
-    pub(crate) wc_entries: Rc<RefCell<Vec<WorkingCopyEntry>>>,
     pub(crate) selected_change: Rc<RefCell<Option<String>>>,
     /// The full multi-selection as change ids, newest-first (the anchor
     /// `selected_change` is its first entry). `dragdrop` reads it to drag the

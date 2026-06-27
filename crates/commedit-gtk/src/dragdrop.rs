@@ -25,7 +25,10 @@ use gtk::{
 use crate::dnd::{DraggedCommit, DraggedCommits};
 use crate::lanebranch::{BranchTip, LaneBranches};
 use crate::rows::{lane_color, populate_trash};
-use crate::state::{Callbacks, Data, DragOrigin, DragState, PendingTrashOp, PostDrag, Widgets};
+use crate::state::{
+    row_commit_gap, row_commit_index, Callbacks, Data, DisplayRow, DragOrigin, DragState,
+    PendingTrashOp, PostDrag, Widgets,
+};
 
 /// Build the lane→branch map for the currently displayed `commits` from the
 /// repo's editable set: each editable branch paired with its current tip (via
@@ -46,6 +49,23 @@ fn lane_branches(repo: &Repo, commits: &[CommitInfo]) -> LaneBranches {
         })
         .collect();
     LaneBranches::compute(commits, &tips)
+}
+
+/// Pick the origin branch to remember for `id` when it is dropped to the trash,
+/// so a later "restore to working tree" routes its changes back to that branch's
+/// worktree `@` rather than always the launch one. A commit reachable from the
+/// primary belongs to the launch line (restore there); a commit on *only* sibling
+/// branches takes the first such sibling. `None` ⇒ no editable branch reaches it,
+/// so restore falls back to the launch worktree, as before.
+fn trash_origin(lb: &LaneBranches, primary: Option<&str>, id: &CommitId) -> Option<String> {
+    let set = lb.branches_of(id);
+    if set.is_empty() {
+        return None;
+    }
+    if let Some(p) = primary.filter(|p| set.contains(*p)) {
+        return Some(p.to_string());
+    }
+    set.iter().next().cloned()
 }
 
 /// The commits that identify a reorder/insert candidate's destination *line* —
@@ -71,13 +91,20 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let trash_list = w.trash_list.clone();
     let trash_scroll = w.trash_scroll.clone();
     let trash_box = w.trash_box.clone();
-    let wc_list = w.wc_list.clone();
     let repo = d.repo.clone();
     let commits = d.commits.clone();
     let graph = d.graph.clone();
+    // The interleaved display list: drag/drop work in *display* (list-row) indices
+    // (drag_from/drag_set/drop_gap/drop_onto), translating to *commit* indices at
+    // every planner / `commits[...]` site via `row_commit_index` / `row_commit_gap`
+    // — and a working-copy `@` row, which has no commit index, drags as a fold.
+    let display = d.display.clone();
+    // Commit index → display-row index, for placing planner results (squash
+    // recommendations, blame hint) on the right rows now that `@` nodes shift them.
+    let commit_rows = d.commit_rows.clone();
     let trashed = d.trashed.clone();
+    let trashed_origin = d.trashed_origin.clone();
     let pending_trash_op = d.pending_trash_op.clone();
-    let wc_entries = d.wc_entries.clone();
     let selected_change = d.selected_change.clone();
     let selected_changes = d.selected_changes.clone();
     let drag_origin = drag.drag_origin.clone();
@@ -119,9 +146,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     // placeholder must not be inserted when this runs, or row indices are off.
     let gap_at: Rc<dyn Fn(f64) -> usize> = {
         let list = list.clone();
-        let commits = commits.clone();
+        let display = display.clone();
         Rc::new(move |y: f64| -> usize {
-            let n = commits.borrow().len();
+            let n = display.borrow().len();
             match list.row_at_y(y as i32) {
                 Some(row) => {
                     let alloc = row.allocation();
@@ -143,6 +170,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let list = list.clone();
         let placeholder = placeholder.clone();
         let commits = commits.clone();
+        let display = display.clone();
         let graph = graph.clone();
         let drop_gap = drop_gap.clone();
         let repo = repo.clone();
@@ -153,7 +181,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let foreign_drag = foreign_drag.clone();
         let foreign_sha = foreign_sha.clone();
         Rc::new(move |y: f64| {
-            let n = commits.borrow().len();
+            let n = display.borrow().len();
             let current = drop_gap.get();
             let new_gap = match list.row_at_y(y as i32) {
                 Some(row) => {
@@ -182,6 +210,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             // the same gate runs through the restore candidates. A foreign
             // (cross-window) drag has no row in this process, so gate it on the
             // cherry-pick candidates for the hovering commit instead.
+            // The gap in commit space (working-copy rows don't count) — the space the
+            // planners use.
+            let to_ci = row_commit_gap(&display.borrow(), new_gap);
             let real_move = if foreign_drag.get() {
                 foreign_sha
                     .borrow()
@@ -194,7 +225,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 &commits.borrow(),
                                 &graph.borrow(),
                                 &target,
-                                new_gap,
+                                to_ci,
                             )
                             .is_empty()
                     })
@@ -203,34 +234,35 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     DragOrigin::History => {
                         let set = drag_set.borrow();
                         let commits = commits.borrow();
+                        let display = display.borrow();
                         if set.len() > 1 {
                             // Multi-drag: at least one ancestry line bounded by commits
-                            // outside the set must cross the gap.
+                            // outside the set must cross the gap (set holds display
+                            // indices — map each to its commit).
                             let ids: HashSet<_> = set
                                 .iter()
-                                .filter_map(|&i| commits.get(i).map(|c| c.id.clone()))
+                                .filter_map(|&di| row_commit_index(&display, di))
+                                .filter_map(|ci| commits.get(ci).map(|c| c.id.clone()))
                                 .collect();
                             !repo
                                 .borrow()
-                                .plan_reorder_set_candidates(
-                                    &commits,
-                                    &graph.borrow(),
-                                    &ids,
-                                    new_gap,
-                                )
+                                .plan_reorder_set_candidates(&commits, &graph.borrow(), &ids, to_ci)
                                 .is_empty()
                         } else {
                             // Across the whole editable DAG, so a gap that only a
                             // cross-branch line crosses still opens.
-                            !repo
-                                .borrow()
-                                .plan_reorder_candidates_multi(
-                                    &commits,
-                                    &graph.borrow(),
-                                    from,
-                                    new_gap,
-                                )
-                                .is_empty()
+                            match row_commit_index(&display, from) {
+                                Some(from_ci) => !repo
+                                    .borrow()
+                                    .plan_reorder_candidates_multi(
+                                        &commits,
+                                        &graph.borrow(),
+                                        from_ci,
+                                        to_ci,
+                                    )
+                                    .is_empty(),
+                                None => false,
+                            }
                         }
                     }
                     DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
@@ -240,7 +272,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 &commits.borrow(),
                                 &graph.borrow(),
                                 info,
-                                new_gap,
+                                to_ci,
                             )
                             .is_empty()
                     }),
@@ -281,15 +313,16 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let set_squash_target: Rc<dyn Fn(usize)> = {
         let list = list.clone();
         let commits = commits.clone();
+        let display = display.clone();
         let repo = repo.clone();
         let drag_from = drag_from.clone();
         let drag_set = drag_set.clone();
         let drag_origin = drag_origin.clone();
         let drop_onto = drop_onto.clone();
         let trashed = trashed.clone();
-        let wc_entries = wc_entries.clone();
-        Rc::new(move |ci: usize| {
-            if drop_onto.get() == Some(ci) {
+        // `di` is a *display* row index (the hovered row); `drop_onto` stores it.
+        Rc::new(move |di: usize| {
+            if drop_onto.get() == Some(di) {
                 return;
             }
             if let Some(prev) = drop_onto.get() {
@@ -297,44 +330,56 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     r.remove_css_class("squash-drop-target");
                 }
             }
-            // A history drag squashes one chain commit onto another; a trash drag
-            // squashes the trashed commit onto the chain commit at `ci`; a
-            // working-copy drag folds that uncommitted entry into it (a fixup).
-            let valid = drag_from.get().is_some_and(|from| match drag_origin.get() {
-                DragOrigin::History => {
-                    let set = drag_set.borrow();
-                    let commits = commits.borrow();
-                    // Validate across the whole editable DAG (`_multi`), so a
-                    // squash onto another branch's commit lights up too.
-                    if set.len() > 1 {
-                        // Every selected commit must fold onto the target, and the
-                        // target must not be one of them.
-                        !set.contains(&ci)
-                            && set.iter().all(|&i| {
-                                repo.borrow().plan_squash_multi(&commits, i, ci).is_some()
+            // The target must be a real commit (a working-copy `@` row is never a
+            // squash target); map the hovered display row to its commit index.
+            let target_ci = row_commit_index(&display.borrow(), di);
+            // A history drag squashes one commit onto another; a trash drag squashes
+            // the trashed commit onto the commit at `di`; a working-copy drag folds
+            // that uncommitted `@` into it (a fixup).
+            let valid = target_ci.is_some_and(|ci| {
+                drag_from.get().is_some_and(|from| match drag_origin.get() {
+                    DragOrigin::History => {
+                        let set = drag_set.borrow();
+                        let commits = commits.borrow();
+                        let display = display.borrow();
+                        // Validate across the whole editable DAG (`_multi`), so a
+                        // squash onto another branch's commit lights up too.
+                        if set.len() > 1 {
+                            // Every selected commit must fold onto the target, and the
+                            // target must not be one of them (compared in display space).
+                            !set.contains(&di)
+                                && set.iter().all(|&sd| {
+                                    row_commit_index(&display, sd).is_some_and(|si| {
+                                        repo.borrow().plan_squash_multi(&commits, si, ci).is_some()
+                                    })
+                                })
+                        } else {
+                            row_commit_index(&display, from).is_some_and(|from_ci| {
+                                repo.borrow()
+                                    .plan_squash_multi(&commits, from_ci, ci)
+                                    .is_some()
                             })
-                    } else {
-                        repo.borrow()
-                            .plan_squash_multi(&commits, from, ci)
-                            .is_some()
+                        }
                     }
-                }
-                DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
-                    repo.borrow()
-                        .plan_squash_restore(&commits.borrow(), info, ci)
-                        .is_some()
-                }),
-                DragOrigin::WorkingCopy => wc_entries.borrow().get(from).is_some_and(|e| {
-                    repo.borrow()
-                        .plan_squash_restore(&commits.borrow(), &e.info, ci)
-                        .is_some()
-                }),
+                    DragOrigin::Trash => trashed.borrow().get(from).is_some_and(|info| {
+                        repo.borrow()
+                            .plan_squash_restore(&commits.borrow(), info, ci)
+                            .is_some()
+                    }),
+                    DragOrigin::WorkingCopy => {
+                        matches!(display.borrow().get(from), Some(DisplayRow::Wc { entry, .. }) if {
+                            repo.borrow()
+                                .plan_squash_restore(&commits.borrow(), &entry.info, ci)
+                                .is_some()
+                        })
+                    }
+                })
             });
             if valid {
-                if let Some(r) = list.row_at_index(ci as i32) {
+                if let Some(r) = list.row_at_index(di as i32) {
                     r.add_css_class("squash-drop-target");
                 }
-                drop_onto.set(Some(ci));
+                drop_onto.set(Some(di));
             } else {
                 drop_onto.set(None);
             }
@@ -428,6 +473,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     drag_source.set_actions(gdk::DragAction::MOVE | gdk::DragAction::COPY);
     drag_source.connect_prepare({
         let list = list.clone();
+        let display = display.clone();
         let drag_row = drag_row.clone();
         let drag_from = drag_from.clone();
         let drag_set = drag_set.clone();
@@ -437,16 +483,30 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         move |source, _x, y| {
             let row = list.row_at_y(y as i32)?;
             let idx = row.index() as usize;
-            // Every commit in the unified DAG is editable, so every row is a drag
-            // source (cross-branch transplant routing lands in phase 3).
-            // If the grabbed row is part of a standing multi-selection, drag the
-            // whole set as a group; otherwise it's an ordinary single-commit drag.
-            // Indices are in commit space (no placeholder is inserted yet) and stay
-            // valid for the gesture — the rewrite only runs at drag-end.
+            // A working-copy `@` node drags as a fold/discard source (carrying its
+            // display index as an i32, read back from `display` at drop time); a
+            // commit row drags as history (a text payload). `drag_from`/`drag_set`
+            // are display indices throughout — translated to commit indices at the
+            // planner sites.
+            if matches!(display.borrow().get(idx), Some(DisplayRow::Wc { .. })) {
+                let paintable = gtk::WidgetPaintable::new(Some(&row));
+                source.set_icon(Some(&paintable), 0, 0);
+                *drag_row.borrow_mut() = Some(row.clone());
+                drag_set.borrow_mut().clear();
+                drag_from.set(Some(idx));
+                drag_origin.set(DragOrigin::WorkingCopy);
+                return Some(gdk::ContentProvider::for_value(&(idx as i32).to_value()));
+            }
+            // A commit row. Every commit in the unified DAG is editable, so every
+            // commit row is a drag source. If the grabbed row is part of a standing
+            // multi-selection, drag the whole set as a group (commit rows only —
+            // `@` nodes never join one); otherwise an ordinary single-commit drag.
+            // Indices stay valid for the gesture (the rewrite only runs at drag-end).
             let mut selected: Vec<usize> = list
                 .selected_rows()
                 .iter()
                 .map(|r| r.index() as usize)
+                .filter(|&di| matches!(display.borrow().get(di), Some(DisplayRow::Commit(_))))
                 .collect();
             selected.sort_unstable(); // ascending = newest-first (top row is newest)
             *drag_set.borrow_mut() = if selected.len() > 1 && selected.contains(&idx) {
@@ -460,10 +520,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             *drag_row.borrow_mut() = Some(row.clone());
             drag_from.set(Some(idx));
             drag_origin.set(DragOrigin::History);
-            // Carry the dragged commit(s) as a text payload, so a drop onto
-            // another commedit window — a separate process — can cherry-pick
-            // them. An in-process drop reads the very same string back; it just
-            // ignores the commit list and works from the live `drag_*` state.
+            // Carry the dragged commit(s) as a text payload, so a drop onto another
+            // commedit window — a separate process — can cherry-pick them. An
+            // in-process drop reads the very same string back; it just ignores the
+            // commit list and works from the live `drag_*` state.
             let dragged: Vec<usize> = {
                 let set = drag_set.borrow();
                 if set.is_empty() {
@@ -474,13 +534,15 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             };
             let payload = {
                 let c = commits.borrow();
+                let display = display.borrow();
                 DraggedCommits {
                     pid: std::process::id(),
                     repo_key: own_key.clone().unwrap_or_default(),
                     branch: None,
                     commits: dragged
                         .iter()
-                        .filter_map(|&i| c.get(i))
+                        .filter_map(|&di| row_commit_index(&display, di))
+                        .filter_map(|ci| c.get(ci))
                         .map(|info| DraggedCommit {
                             sha: info.id_hex(),
                             change_id: info.change_id_hex(),
@@ -498,41 +560,60 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let drag_row = drag_row.clone();
         let drag_from = drag_from.clone();
         let drag_set = drag_set.clone();
+        let drag_origin = drag_origin.clone();
         let repo = repo.clone();
         let commits = commits.clone();
+        let display = display.clone();
+        let commit_rows = commit_rows.clone();
         let list = list.clone();
         move |_source, _drag| {
             if let Some(row) = drag_row.borrow().as_ref() {
                 row.add_css_class("commit-dragging");
             }
-            // Highlight where this commit would squash: green for the real
-            // target(s), yellow for other autosquash commits aimed at the same
-            // target. Empty (no-op) unless the dragged commit is prefixed. Skipped
-            // for a multi-drag — a group squash always asks via the popover.
-            if let Some(from) = drag_from.get().filter(|_| drag_set.borrow().len() <= 1) {
-                let recs = repo
+            // Squash hints apply only to a single-commit history drag (a working-copy
+            // `@` carries no subject; a multi-drag always asks via the popover).
+            if drag_origin.get() != DragOrigin::History || drag_set.borrow().len() > 1 {
+                return;
+            }
+            // Map the dragged display row to its commit index for the planners; map
+            // their commit-index results back to display rows for the highlight.
+            let Some(from) = drag_from
+                .get()
+                .and_then(|di| row_commit_index(&display.borrow(), di))
+            else {
+                return;
+            };
+            let row_of = |ci: usize| {
+                commit_rows
                     .borrow()
-                    .squash_recommendations(&commits.borrow(), from);
-                for i in recs.targets {
-                    if let Some(r) = list.row_at_index(i as i32) {
-                        r.add_css_class("squash-recommended");
-                    }
+                    .get(ci)
+                    .and_then(|&di| list.row_at_index(di as i32))
+            };
+            // Highlight where this commit would squash: green for the real target(s),
+            // yellow for other autosquash commits aimed at the same target. Empty
+            // (no-op) unless the dragged commit is prefixed.
+            let recs = repo
+                .borrow()
+                .squash_recommendations(&commits.borrow(), from);
+            for i in recs.targets {
+                if let Some(r) = row_of(i) {
+                    r.add_css_class("squash-recommended");
                 }
-                for i in recs.siblings {
-                    if let Some(r) = list.row_at_index(i as i32) {
-                        r.add_css_class("squash-sibling");
-                    }
+            }
+            for i in recs.siblings {
+                if let Some(r) = row_of(i) {
+                    r.add_css_class("squash-sibling");
                 }
-                // Purple: every line this commit removes blames to one single
-                // commit — a content-derived "it belongs here", stronger than the
-                // name match. Wins over green/yellow on the same row, so strip
-                // those first to keep the colour unambiguous.
-                if let Some(i) = repo.borrow().blame_single_source(&commits.borrow(), from) {
-                    if let Some(r) = list.row_at_index(i as i32) {
-                        r.remove_css_class("squash-recommended");
-                        r.remove_css_class("squash-sibling");
-                        r.add_css_class("squash-blame");
-                    }
+            }
+            // Purple: every line this commit removes blames to one single commit — a
+            // content-derived "it belongs here", stronger than the name match. Wins
+            // over green/yellow on the same row, so strip those first to keep the
+            // colour unambiguous.
+            if let Some(i) = repo.borrow().blame_single_source(&commits.borrow(), from) {
+                if let Some(r) = row_of(i) {
+                    r.remove_css_class("squash-recommended");
+                    r.remove_css_class("squash-sibling");
+                    r.add_css_class("squash-blame");
                 }
             }
         }
@@ -629,6 +710,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     });
     drop_target.connect_drop({
         let commits = commits.clone();
+        let display = display.clone();
         let repo = repo.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
@@ -645,7 +727,6 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let on_restore = on_restore.clone();
         let selected_change = selected_change.clone();
         let selected_changes = selected_changes.clone();
-        let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let drag_set = drag_set.clone();
         let drag_from = drag_from.clone();
@@ -662,10 +743,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 .ok()
                 .and_then(|s| DraggedCommits::parse(&s));
             // Prefer the gap the placeholder marked; fall back to the drop point.
+            // `to` is a *display* gap (used to anchor the popovers at a list row);
+            // `to_ci` is its commit-space gap (used by the planners).
             let to = match drop_gap.get() {
                 Some(to) => to,
                 None => gap_at(y),
             };
+            let to_ci = row_commit_gap(&display.borrow(), to);
             clear_gap();
             foreign_drag.set(false);
             *foreign_sha.borrow_mut() = None;
@@ -705,12 +789,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     // The whole editable DAG is a graft target (a foreign commit
                     // can land on any visible lane), so plan across all editable
                     // heads, and label each candidate line with the branch it
-                    // carries.
+                    // carries. `to_ci` is the gap in commit space.
                     let cands = repo.borrow().plan_cherry_pick_candidates_multi(
                         &commits.borrow(),
                         &graph.borrow(),
                         &target,
-                        to,
+                        to_ci,
                     );
                     if cands.is_empty() {
                         show_status("Can't insert the commit here");
@@ -794,6 +878,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let onto = onto.unwrap();
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let display = display.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
@@ -803,20 +888,28 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     *post_drag.borrow_mut() = Some(Box::new(move || {
                         // Validate the target and collect the source ids (newest
                         // first) before mutating; bail if anything no longer fits.
+                        // `set`/`onto` are display indices — map each to its commit.
                         let (sources, dest, dest_change) = {
                             let c = commits.borrow();
+                            let disp = display.borrow();
+                            let Some(onto_ci) = row_commit_index(&disp, onto) else {
+                                return;
+                            };
                             if set.contains(&onto)
-                                || !set
-                                    .iter()
-                                    .all(|&i| repo.borrow().plan_squash(&c, i, onto).is_some())
+                                || !set.iter().all(|&sd| {
+                                    row_commit_index(&disp, sd).is_some_and(|si| {
+                                        repo.borrow().plan_squash(&c, si, onto_ci).is_some()
+                                    })
+                                })
                             {
                                 return;
                             }
                             let sources: Vec<_> = set
                                 .iter()
-                                .filter_map(|&i| c.get(i).map(|x| x.id.clone()))
+                                .filter_map(|&sd| row_commit_index(&disp, sd))
+                                .filter_map(|si| c.get(si).map(|x| x.id.clone()))
                                 .collect();
-                            let Some(dest) = c.get(onto) else {
+                            let Some(dest) = c.get(onto_ci) else {
                                 return;
                             };
                             (sources, dest.id.clone(), dest.change_id_hex())
@@ -862,23 +955,27 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     // their order and leaving the unselected commits in between.
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let display = display.clone();
                     let graph = graph.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
+                        // `set` holds display indices — map each to its commit id.
                         let ids: HashSet<_> = {
                             let c = commits.borrow();
+                            let disp = display.borrow();
                             set.iter()
-                                .filter_map(|&i| c.get(i).map(|x| x.id.clone()))
+                                .filter_map(|&sd| row_commit_index(&disp, sd))
+                                .filter_map(|si| c.get(si).map(|x| x.id.clone()))
                                 .collect()
                         };
                         let cands = repo.borrow().plan_reorder_set_candidates(
                             &commits.borrow(),
                             &graph.borrow(),
                             &ids,
-                            to,
+                            to_ci,
                         );
                         if cands.is_empty() {
                             return;
@@ -928,22 +1025,35 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let onto = onto.unwrap();
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let display = display.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let selected_change = selected_change.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
+                        // Map the source row and target row (display indices) to their
+                        // commit indices.
+                        let (from_ci, onto_ci) = {
+                            let disp = display.borrow();
+                            match (
+                                row_commit_index(&disp, from as usize),
+                                row_commit_index(&disp, onto),
+                            ) {
+                                (Some(f), Some(o)) => (f, o),
+                                _ => return,
+                            }
+                        };
                         let plan =
                             repo.borrow()
-                                .plan_squash_multi(&commits.borrow(), from as usize, onto);
+                                .plan_squash_multi(&commits.borrow(), from_ci, onto_ci);
                         let Some((source, dest)) = plan else {
                             return;
                         };
-                        let subject = commits.borrow()[from as usize].subject.clone();
+                        let subject = commits.borrow()[from_ci].subject.clone();
                         // After the squash, select the drop target: its change id is
                         // stable across the rewrite, the squashed-away source's is gone.
-                        let dest_change = commits.borrow()[onto].change_id_hex();
+                        let dest_change = commits.borrow()[onto_ci].change_id_hex();
 
                         // Run a chosen mode and report the outcome.
                         let apply: Rc<dyn Fn(SquashMode)> = {
@@ -985,12 +1095,19 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 DragOrigin::History => {
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let display = display.clone();
                     let graph = graph.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
+                        // Map the dragged row to its commit index (`to_ci` is the gap
+                        // in commit space).
+                        let Some(from_ci) = row_commit_index(&display.borrow(), from as usize)
+                        else {
+                            return;
+                        };
                         // One candidate per ancestry line crossing the gap, across
                         // *every* editable branch's lanes (so a line on another
                         // branch is a real destination); a no-op, merge or fully
@@ -998,13 +1115,13 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         let cands = repo.borrow().plan_reorder_candidates_multi(
                             &commits.borrow(),
                             &graph.borrow(),
-                            from as usize,
-                            to,
+                            from_ci,
+                            to_ci,
                         );
                         if cands.is_empty() {
                             return;
                         }
-                        let source = commits.borrow()[from as usize].id.clone();
+                        let source = commits.borrow()[from_ci].id.clone();
                         let lb = Rc::new(lane_branches(&repo.borrow(), &commits.borrow()));
 
                         // Run a Move (reparent — consume the source) and report.
@@ -1123,6 +1240,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let onto = onto.unwrap();
                     let repo = repo.clone();
                     let commits = commits.clone();
+                    let display = display.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
@@ -1133,12 +1251,17 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     let on_restore = on_restore.clone();
                     let list = list.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
+                        // `from` is the trash row index (a separate list); `onto` is a
+                        // history display row — map it to its commit index.
+                        let Some(onto_ci) = row_commit_index(&display.borrow(), onto) else {
+                            return;
+                        };
                         let Some(info) = trashed.borrow().get(from as usize).cloned() else {
                             return;
                         };
                         let plan =
                             repo.borrow()
-                                .plan_squash_restore(&commits.borrow(), &info, onto);
+                                .plan_squash_restore(&commits.borrow(), &info, onto_ci);
                         let Some((source, dest)) = plan else {
                             return;
                         };
@@ -1146,7 +1269,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         let change_hex = info.change_id_hex();
                         // After the squash, select the drop target: its change id is
                         // stable across the rewrite, the squashed-in source's is gone.
-                        let dest_change = commits.borrow()[onto].change_id_hex();
+                        let dest_change = commits.borrow()[onto_ci].change_id_hex();
 
                         // Run a chosen mode and report the outcome.
                         let apply: Rc<dyn Fn(SquashMode)> = {
@@ -1237,7 +1360,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             &commits.borrow(),
                             &graph.borrow(),
                             &info,
-                            to,
+                            to_ci,
                         );
                         if cands.is_empty() {
                             return;
@@ -1311,22 +1434,33 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     true
                 }
                 DragOrigin::WorkingCopy if onto.is_some() => {
-                    // Dropped a working-copy entry ONTO a commit: fold its changes
-                    // in as a Fixup — no popover, no message change.
+                    // Dropped a working-copy `@` node ONTO a commit: fold its changes
+                    // into that commit as a Fixup — no popover, no message change. The
+                    // `@`'s worktree (`WcTarget`) routes the fold at the right `@`.
                     let onto = onto.unwrap();
                     let repo = repo.clone();
                     let commits = commits.clone();
-                    let wc_entries = wc_entries.clone();
+                    let display = display.clone();
                     let refresh = refresh.clone();
                     let show_status = show_status.clone();
                     let enter_conflict_mode = enter_conflict_mode.clone();
                     let selected_change = selected_change.clone();
                     *post_drag.borrow_mut() = Some(Box::new(move || {
-                        let entry = wc_entries
-                            .borrow()
-                            .get(from as usize)
-                            .map(|e| e.info.clone());
-                        let Some(entry) = entry else {
+                        // Read the dragged `@` (branch + entry) and the target commit
+                        // from the display list (`from`/`onto` are display indices).
+                        let (branch, entry) = {
+                            let disp = display.borrow();
+                            match disp.get(from as usize) {
+                                Some(DisplayRow::Wc { branch, entry }) => {
+                                    (branch.clone(), entry.info.clone())
+                                }
+                                _ => return,
+                            }
+                        };
+                        let Some(onto_ci) = row_commit_index(&display.borrow(), onto) else {
+                            return;
+                        };
+                        let Some(target) = repo.borrow().wc_target_for_branch(&branch) else {
                             return;
                         };
                         // Validate the target sits on the branch chain (reuse the
@@ -1335,17 +1469,18 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // the internal snapshot.
                         if repo
                             .borrow()
-                            .plan_squash_restore(&commits.borrow(), &entry, onto)
+                            .plan_squash_restore(&commits.borrow(), &entry, onto_ci)
                             .is_none()
                         {
                             return;
                         }
-                        let dest = commits.borrow()[onto].id.clone();
+                        let dest = commits.borrow()[onto_ci].id.clone();
                         // After the fixup, select the drop target: its change id is
                         // stable across the rewrite.
-                        let dest_change = commits.borrow()[onto].change_id_hex();
+                        let dest_change = commits.borrow()[onto_ci].change_id_hex();
                         let change_hex = entry.change_id_hex();
-                        let outcome = repo.borrow_mut().squash_working_copy_into(
+                        let outcome = repo.borrow_mut().squash_working_copy_into_at(
+                            target,
                             Some(&change_hex),
                             &dest,
                             None,
@@ -1404,6 +1539,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let trashed = trashed.clone();
         let repo = repo.clone();
         let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
         let list = list.clone();
         move |_source, _drag| {
             if let Some(row) = drag_row.borrow().as_ref() {
@@ -1411,20 +1547,27 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             }
             // Same green/yellow squash hints as a history drag, for a trashed
             // commit whose subject carries an autosquash prefix. Empty otherwise.
+            // The recommendations are commit indices — map each to its display row.
             if let Some(info) = drag_from
                 .get()
                 .and_then(|f| trashed.borrow().get(f).cloned())
             {
+                let row_of = |ci: usize| {
+                    commit_rows
+                        .borrow()
+                        .get(ci)
+                        .and_then(|&di| list.row_at_index(di as i32))
+                };
                 let recs = repo
                     .borrow()
                     .squash_recommendations_for(&commits.borrow(), &info);
                 for i in recs.targets {
-                    if let Some(r) = list.row_at_index(i as i32) {
+                    if let Some(r) = row_of(i) {
                         r.add_css_class("squash-recommended");
                     }
                 }
                 for i in recs.siblings {
-                    if let Some(r) = list.row_at_index(i as i32) {
+                    if let Some(r) = row_of(i) {
                         r.add_css_class("squash-sibling");
                     }
                 }
@@ -1459,54 +1602,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     });
     trash_list.add_controller(trash_drag);
 
-    // The working-copy list is a drag *source* only (its rows can be folded onto a
-    // commit), never a drop target. It shares the history list's drop target and
-    // the deferred `post_drag` machinery; the drop handler's `WorkingCopy` arm
-    // folds the dragged entry in as a fixup.
-    let wc_drag = DragSource::new();
-    wc_drag.set_actions(gdk::DragAction::MOVE);
-    wc_drag.connect_prepare({
-        let wc_list = wc_list.clone();
-        let drag_row = drag_row.clone();
-        let drag_origin = drag_origin.clone();
-        let drag_from = drag_from.clone();
-        move |source, _x, y| {
-            let row = wc_list.row_at_y(y as i32)?;
-            let paintable = gtk::WidgetPaintable::new(Some(&row));
-            source.set_icon(Some(&paintable), 0, 0);
-            *drag_row.borrow_mut() = Some(row.clone());
-            drag_origin.set(DragOrigin::WorkingCopy);
-            // Index into `wc_entries`, read by the motion/drop handlers.
-            drag_from.set(Some(row.index() as usize));
-            Some(gdk::ContentProvider::for_value(&row.index().to_value()))
-        }
-    });
-    wc_drag.connect_drag_begin({
-        let drag_row = drag_row.clone();
-        move |_source, _drag| {
-            if let Some(row) = drag_row.borrow().as_ref() {
-                row.add_css_class("commit-dragging");
-            }
-            // No autosquash recommendations: uncommitted entries carry no subject.
-        }
-    });
-    wc_drag.connect_drag_end({
-        let drag_row = drag_row.clone();
-        let drag_from = drag_from.clone();
-        let clear_gap = clear_gap.clone();
-        let clear_squash_target = clear_squash_target.clone();
-        let post_drag = post_drag.clone();
-        move |_source, _drag, _delete| {
-            if let Some(row) = drag_row.borrow_mut().take() {
-                row.remove_css_class("commit-dragging");
-            }
-            drag_from.set(None);
-            clear_gap();
-            clear_squash_target();
-            run_post_drag(&post_drag);
-        }
-    });
-    wc_list.add_controller(wc_drag);
+    // Working-copy `@` nodes are dragged from the history `list` itself (its drag
+    // source sets `DragOrigin::WorkingCopy` for an `@` row — see `connect_prepare`),
+    // so there is no separate working-copy drag source any more. The history drop
+    // target's `WorkingCopy` arm folds the dragged `@` into a commit; the trash drop
+    // discards it.
 
     // History drags now arrive as a text payload, working-copy drags as an i32;
     // accept both. (Trash→trash and cross-window drops are rejected in the handler.)
@@ -1518,6 +1618,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     trash_drop.connect_enter(move |_target, _x, _y| gdk::DragAction::MOVE);
     trash_drop.connect_drop({
         let commits = commits.clone();
+        let display = display.clone();
         let repo = repo.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
@@ -1527,7 +1628,6 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let trash_list = trash_list.clone();
         let trash_scroll = trash_scroll.clone();
         let on_restore = on_restore.clone();
-        let wc_entries = wc_entries.clone();
         let post_drag = post_drag.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let list = list.clone();
@@ -1565,10 +1665,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             // frees a row GTK still tracks, crashing the next event).
             let repo = repo.clone();
             let commits = commits.clone();
-            let wc_entries = wc_entries.clone();
+            let display = display.clone();
             let refresh = refresh.clone();
             let show_status = show_status.clone();
             let trashed = trashed.clone();
+            let trashed_origin = trashed_origin.clone();
             let pending_trash_op = pending_trash_op.clone();
             let trash_list = trash_list.clone();
             let trash_scroll = trash_scroll.clone();
@@ -1579,42 +1680,65 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             let selected_changes = selected_changes.clone();
             *post_drag.borrow_mut() = Some(Box::new(move || {
                 if origin == DragOrigin::WorkingCopy {
-                    // Discard an uncommitted-changes entry. It has no git object to
-                    // graft back, so — unlike a dropped commit — it is gone for
-                    // good: not pushed to `trashed`, not listed in the trash. Drop
-                    // by the entry's stable change id (the leaf's commit id churns
-                    // on the internal snapshot).
-                    let change = wc_entries
-                        .borrow()
-                        .get(from as usize)
-                        .map(|e| e.info.change_id_hex());
-                    let Some(change) = change else {
+                    // Discard a working-copy `@`. It has no git object to graft back,
+                    // so — unlike a dropped commit — it is gone for good: not pushed to
+                    // `trashed`, not listed in the trash. Read its branch + change id
+                    // from the dragged display row, and discard *that* worktree's `@`
+                    // (the leaf's commit id churns on the internal snapshot).
+                    let (branch, change) = {
+                        let disp = display.borrow();
+                        match disp.get(from as usize) {
+                            Some(DisplayRow::Wc { branch, entry }) => {
+                                (branch.clone(), entry.info.change_id_hex())
+                            }
+                            _ => return,
+                        }
+                    };
+                    let Some(target) = repo.borrow().wc_target_for_branch(&branch) else {
                         return;
                     };
                     // Bind the outcome before matching so the `borrow_mut` is
                     // released — `refresh` borrows `repo` again (a `match`
                     // scrutinee's temporary otherwise lives across the arms).
-                    let outcome = repo.borrow_mut().drop_working_copy(Some(&change));
+                    let outcome = repo
+                        .borrow_mut()
+                        .drop_working_copy_at(target, Some(&change));
                     match outcome {
                         Ok(()) => refresh(),
                         Err(err) => show_status(&format!("Drop failed: {err}")),
                     }
                     return;
                 }
+                // `set` holds display indices of the dragged commit rows — map them to
+                // commit indices for the planners.
+                let set: Vec<usize> = {
+                    let disp = display.borrow();
+                    set.iter()
+                        .filter_map(|&di| row_commit_index(&disp, di))
+                        .collect()
+                };
                 if set.len() > 1 {
                     // Group drop: trash every selected commit in one rebase. Refuse
                     // if it would empty the displayed branch (nothing left to anchor).
-                    let (infos, targets) = {
+                    // Each dropped commit, with its origin branch for restore
+                    // routing (computed from the pre-drop lanes, before the rebase
+                    // orphans them).
+                    let (infos, targets, origins) = {
                         let c = commits.borrow();
                         if set.len() >= c.len() {
                             show_status("Can't drop every commit");
                             return;
                         }
+                        let r = repo.borrow();
+                        let lb = lane_branches(&r, &c);
+                        let primary = r.target_branch_name();
                         let mut infos = Vec::new();
                         let mut targets = Vec::new();
+                        let mut origins = Vec::new();
                         for &i in &set {
-                            match repo.borrow().plan_drop(&c, i) {
+                            match r.plan_drop_multi(&c, i) {
                                 Some(id) => {
+                                    origins.push(trash_origin(&lb, primary, &c[i].id));
                                     infos.push(c[i].clone());
                                     targets.push(id);
                                 }
@@ -1624,7 +1748,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 }
                             }
                         }
-                        (infos, targets)
+                        (infos, targets, origins)
                     };
                     let outcome = repo.borrow_mut().abandon_commits(targets);
                     match outcome {
@@ -1641,6 +1765,14 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             *selected_change.borrow_mut() = survivor;
                             selected_changes.borrow_mut().clear();
                             list.unselect_all();
+                            {
+                                let mut om = trashed_origin.borrow_mut();
+                                for (info, origin) in infos.iter().zip(&origins) {
+                                    if let Some(o) = origin {
+                                        om.insert(info.change_id_hex(), o.clone());
+                                    }
+                                }
+                            }
                             trashed.borrow_mut().extend(infos);
                             refresh();
                             populate_trash(
@@ -1651,22 +1783,37 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             );
                         }
                         Ok(SaveOutcome::Conflicts { commits }) => {
-                            *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(infos));
+                            *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(
+                                infos.into_iter().zip(origins).collect(),
+                            ));
                             enter_conflict_mode(commits);
                         }
                         Err(err) => show_status(&format!("Drop failed: {err}")),
                     }
                     return;
                 }
-                let Some(info) = commits.borrow().get(from as usize).cloned() else {
+                // The dragged history row in commit space.
+                let Some(from_ci) = row_commit_index(&display.borrow(), from as usize) else {
                     return;
                 };
-                // Only commits on the current branch's linear chain (and not its
+                let Some(info) = commits.borrow().get(from_ci).cloned() else {
+                    return;
+                };
+                // Only commits on an editable branch's linear chain (and not its
                 // sole commit) can be dropped; refuse merges/off-branch/root rows.
-                let target = repo.borrow().plan_drop(&commits.borrow(), from as usize);
+                // `_multi` spans every editable head, so a sibling branch's commit
+                // is droppable too.
+                let target = repo.borrow().plan_drop_multi(&commits.borrow(), from_ci);
                 let Some(target) = target else {
                     show_status("Can't drop this commit");
                     return;
+                };
+                // The origin branch to remember for restore routing, read from the
+                // pre-drop lanes (the abandon below orphans the commit off them).
+                let origin = {
+                    let r = repo.borrow();
+                    let cs = commits.borrow();
+                    trash_origin(&lane_branches(&r, &cs), r.target_branch_name(), &info.id)
                 };
                 let outcome = repo.borrow_mut().abandon_commit(&target);
                 match outcome {
@@ -1677,7 +1824,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // its slot, else its child) and force the reselect to
                         // re-fire `row-selected` so the diff reloads — the same idiom
                         // as the abort handler.
-                        let fi = from as usize;
+                        let fi = from_ci;
                         if selected_change.borrow().as_deref()
                             == Some(info.change_id_hex().as_str())
                         {
@@ -1689,6 +1836,11 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                             };
                             *selected_change.borrow_mut() = neighbour;
                             list.unselect_all();
+                        }
+                        if let Some(o) = &origin {
+                            trashed_origin
+                                .borrow_mut()
+                                .insert(info.change_id_hex(), o.clone());
                         }
                         trashed.borrow_mut().push(info);
                         refresh();
@@ -1704,7 +1856,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                         // git until the conflicts clear. Defer the add — applied on
                         // a clean resolution, dropped on abort. `enter_conflict_mode`
                         // selects the commit being resolved, so the pane refreshes.
-                        *pending_trash_op.borrow_mut() = Some(PendingTrashOp::Drop(vec![info]));
+                        *pending_trash_op.borrow_mut() =
+                            Some(PendingTrashOp::Drop(vec![(info, origin)]));
                         enter_conflict_mode(commits);
                     }
                     Err(err) => show_status(&format!("Drop failed: {err}")),

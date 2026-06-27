@@ -17,11 +17,11 @@ use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
 use crate::diff_cues::{expand_color, GutterCue};
-use crate::rows::{populate_list, populate_trash};
+use crate::rows::{populate_history, populate_trash};
 use crate::state::{
-    Callbacks, ConflictCtx, Data, PaneMode, PendingTrashOp, RestoreToWorktreeCallback, Side,
-    Widgets, CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE, HISTORY_PAGE, SAVE_HINT_CONFLICT,
-    SAVE_HINT_DIFF,
+    first_commit_row, Callbacks, ConflictCtx, Data, DisplayRow, PaneMode, PendingTrashOp,
+    RestoreToWorktreeCallback, Side, Widgets, CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE,
+    HISTORY_PAGE, SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -289,11 +289,14 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
     let repo = d.repo.clone();
     let commits = d.commits.clone();
     let graph = d.graph.clone();
+    let display = d.display.clone();
+    let draw_graph = d.draw_graph.clone();
+    let hollow = d.hollow.clone();
+    let commit_rows = d.commit_rows.clone();
     let list = w.list.clone();
     let pane_mode = d.pane_mode.clone();
     let conflict_label = w.conflict_label.clone();
     let selected_change = d.selected_change.clone();
-    let wc_list = w.wc_list.clone();
     Rc::new(move || {
         // Conflict metadata up front: which commits are still conflicted (badges)
         // and the totals shown in the banner.
@@ -308,10 +311,12 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                 (HashSet::new(), 0, 0)
             }
         };
-        // The working-copy chain entries resolve inline among the conflicted
-        // commits; gather them (newest first) and the change ids they cover, so
-        // the history walk below can exclude them from what it must reach.
-        let wc_chain = repo.borrow().working_copy_chain();
+        // The working-copy entries resolve inline among the conflicted commits;
+        // gather every editable worktree's (the launch `@` chain plus each sibling
+        // worktree's `@`) and the change ids they cover, so the history walk below
+        // can exclude them from what it must reach — and a conflicted *sibling* `@`
+        // is reachable as an inline row, not just the launch one's.
+        let wc_chain = repo.borrow().worktree_chain_entries();
         let wc_changes: HashSet<String> = wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
         let branch_conflicts: Vec<String> = badges
             .iter()
@@ -345,10 +350,11 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         };
         *commits.borrow_mut() = loaded;
         // The working-copy chain resolves inline among the conflicted commits, so
-        // hide the standalone rows and prepend each conflicted entry to the chain.
-        // Insert oldest-first (the chain is newest-first) so the newest entry lands
-        // at the top, above the branch tip.
-        wc_list.set_visible(false);
+        // prepend each conflicted entry to the chain. Insert oldest-first (the chain
+        // is newest-first) so the newest entry lands at the top, above the branch
+        // tip. In conflict mode these `@` entries are treated as ordinary commit rows
+        // (resolved one at a time), so they go into `commits` directly — there are no
+        // separate hollow `@` nodes while resolving.
         for entry in wc_chain.into_iter().rev() {
             if badges.contains(&entry.info.change_id_hex()) {
                 commits.borrow_mut().insert(0, entry.info);
@@ -361,6 +367,15 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
             let root = repo.borrow().root_commit_id();
             *graph.borrow_mut() = compute_graph(&commits.borrow(), &root);
         }
+        // Conflict mode shows a flat commit list (no hollow `@` nodes), so the
+        // display is a 1:1 mirror of `commits` and the draw graph is the plan graph.
+        {
+            let n = commits.borrow().len();
+            *display.borrow_mut() = (0..n).map(DisplayRow::Commit).collect();
+            *commit_rows.borrow_mut() = (0..n).collect();
+            *hollow.borrow_mut() = vec![false; n];
+            *draw_graph.borrow_mut() = graph.borrow().clone();
+        }
         // Ref pills still resolve against the user's git refs: the rewrite is
         // held back, so they keep decorating the untouched ancestors below it
         // (the rewritten commits' pending ids match no ref, correctly).
@@ -369,12 +384,14 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         // the buttons built by the normal refresh, and each callback's conflict-mode
         // guard refuses the action until the pending rewrite settles. No lint badge
         // either (`None` style) — message style is irrelevant mid-resolution.
-        populate_list(
+        populate_history(
             &list,
+            &display.borrow(),
             &commits.borrow(),
+            &draw_graph,
+            &hollow,
             &badges,
             &refs,
-            &graph,
             None,
             None,
             None,
@@ -487,6 +504,7 @@ pub(crate) fn build_resolve_current(
     let selected_change = d.selected_change.clone();
     let conflict_view = d.conflict_view.clone();
     let trashed = d.trashed.clone();
+    let trashed_origin = d.trashed_origin.clone();
     let pending_trash_op = d.pending_trash_op.clone();
     let trash_list = w.trash_list.clone();
     let trash_scroll = w.trash_scroll.clone();
@@ -537,10 +555,23 @@ pub(crate) fn build_resolve_current(
                 // the restored one leaves it).
                 if let Some(op) = pending_trash_op.borrow_mut().take() {
                     match op {
-                        PendingTrashOp::Drop(infos) => trashed.borrow_mut().extend(infos),
-                        PendingTrashOp::Restore(info) => trashed
-                            .borrow_mut()
-                            .retain(|c| c.change_id_hex() != info.change_id_hex()),
+                        PendingTrashOp::Drop(entries) => {
+                            let mut om = trashed_origin.borrow_mut();
+                            let mut t = trashed.borrow_mut();
+                            for (info, origin) in entries {
+                                if let Some(branch) = origin {
+                                    om.insert(info.change_id_hex(), branch);
+                                }
+                                t.push(info);
+                            }
+                        }
+                        PendingTrashOp::Restore(info) => {
+                            let change_hex = info.change_id_hex();
+                            trashed
+                                .borrow_mut()
+                                .retain(|c| c.change_id_hex() != change_hex);
+                            trashed_origin.borrow_mut().remove(&change_hex);
+                        }
                     }
                     populate_trash(
                         &trash_list,
@@ -586,6 +617,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
         let refresh = refresh.clone();
         let show_status = show_status.clone();
         let list = list.clone();
+        let display = d.display.clone();
         let pending_trash_op = d.pending_trash_op.clone();
         move |_| {
             if let Err(err) = repo.borrow_mut().abort() {
@@ -604,10 +636,12 @@ pub(crate) fn wire(w: &Widgets, d: &Data, cb: &Callbacks) {
             // The conflict may have been on a commit that abort removed from
             // history — a commit restored from trash that abort sends back to the
             // trash, say — so the reselect matched no row and the pane would keep
-            // the conflict markers. Fall back to the branch tip so the diff
-            // reloads onto a live commit.
+            // the conflict markers. Fall back to the newest *commit* row (skipping a
+            // leading working-copy `@` node) so the diff reloads onto a live commit.
             if list.selected_rows().is_empty() {
-                if let Some(row) = list.row_at_index(0) {
+                if let Some(row) =
+                    first_commit_row(&display.borrow()).and_then(|di| list.row_at_index(di as i32))
+                {
                     list.select_row(Some(&row));
                 }
             }

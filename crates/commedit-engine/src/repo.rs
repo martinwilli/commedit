@@ -720,6 +720,17 @@ impl Repo {
             .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
     }
 
+    /// The extra worktree whose checked-out branch is `branch` (short-name), if
+    /// any — the lookup that routes a working-copy mutation or a spurious-`@`
+    /// rebuild to the right [`WorktreeView`]. The launch worktree is *not* among
+    /// these (it is `self.workspace`); a branch with no separate worktree (a pure
+    /// ref-move, or the off-worktree primary) returns `None`.
+    pub(crate) fn find_worktree(&self, branch: &str) -> Option<&WorktreeView> {
+        self.extra_worktrees
+            .iter()
+            .find(|v| v.branch.strip_prefix("refs/heads/").unwrap_or(&v.branch) == branch)
+    }
+
     /// Refuse a working-copy operation when editing off-worktree: a branch you
     /// have not checked out has no working copy, so committing/squashing/splitting
     /// /discarding uncommitted changes is meaningless. `op` names the action for
@@ -798,6 +809,20 @@ impl Repo {
         if let Some(name) = self.current_bookmark() {
             mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
         }
+    }
+
+    /// Point an arbitrary local bookmark (`branch` short-name) at `target` inside
+    /// `mut_repo` — the multi-head generalization of [`Self::set_head_bookmark`],
+    /// used by the spurious-conflict rebuild to re-point every rebuilt editable
+    /// branch, not just the primary.
+    pub(crate) fn set_branch_bookmark(
+        &self,
+        mut_repo: &mut MutableRepo,
+        branch: &str,
+        target: CommitId,
+    ) {
+        let name: RefNameBuf = branch.into();
+        mut_repo.set_local_bookmark_target(&name, RefTarget::normal(target));
     }
 
     /// The git commit HEAD currently points at — capture this before a rewrite
@@ -1021,11 +1046,13 @@ impl Repo {
     /// multi-branch DAG dropdown. Each entry pairs the branch short-name with its
     /// current tip, a flag marking the primary (the launch/opened branch), and a
     /// flag marking whether it is currently in the editable set (ticked / imported).
-    /// Branches whose tip is not a readable commit are skipped.
+    /// Branches whose tip is not a readable commit are skipped. Ordered by tip
+    /// commit date, most recent first (matching a `git recent` alias), so the
+    /// dropdown lists the branches you touched last on top.
     pub fn local_branches(&self) -> Vec<BranchHead> {
         let current = self.current_bookmark();
         let current_name = current.as_ref().map(|c| c.as_str());
-        crate::transparency::local_head_oids(self.workspace.workspace_root())
+        crate::transparency::local_heads_by_recency(self.workspace.workspace_root())
             .into_iter()
             .filter_map(|(refname, sha)| {
                 let name = refname.strip_prefix("refs/heads/").unwrap_or(&refname);
@@ -1298,6 +1325,71 @@ impl Repo {
         Ok(true)
     }
 
+    /// Absorb any out-of-band `git commit` made in a *sibling* worktree before its
+    /// next snapshot — the per-worktree analogue of [`Self::sync_to_git_head`]. jj
+    /// imports git state only at open, so a plain `git commit` in a linked worktree
+    /// leaves that branch's bookmark (and the worktree's `@`) on the old tip; the
+    /// next snapshot would otherwise record the just-committed change as if it were
+    /// still uncommitted. For each extra worktree this refuses an out-of-band
+    /// *branch switch* (the worktree's branch→jj-workspace mapping is then stale,
+    /// mirroring the launch's "reopen the repository" guard), else detects whether
+    /// its branch's live git tip is ahead of jj's bookmark. Every drifted branch's
+    /// ref is re-seeded into the session git dir and a **single** [`Self::import_git`]
+    /// catches jj up to all of them (it re-imports the whole editable set, so one
+    /// import suffices); [`Repo::snapshot_extra_worktree`]'s re-anchor then moves
+    /// each `@` onto its new tip before the snapshot. A no-op when nothing drifted,
+    /// and skipped while a conflicted rewrite is pending (git is frozen, so the live
+    /// tips are the ones jj already knows). Called by
+    /// [`Repo::snapshot_extra_worktrees`].
+    pub(crate) fn catch_up_extra_worktrees(&mut self) -> Result<()> {
+        if self.is_pending() {
+            return Ok(());
+        }
+        let mut drifted: Vec<String> = Vec::new();
+        for view in &self.extra_worktrees {
+            let root = view.workspace.workspace_root();
+            // Structural guard: the worktree must still have *its* branch checked out.
+            let live_branch = crate::transparency::head_branch(root);
+            if live_branch.as_deref() != Some(view.branch.as_str()) {
+                anyhow::bail!(
+                    "the worktree at {} changed its checked-out branch outside commedit \
+                     (now {:?}, was {:?}); reopen the repository to edit it",
+                    root.display(),
+                    live_branch,
+                    view.branch
+                );
+            }
+            let short = view
+                .branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&view.branch);
+            let bookmark: RefNameBuf = short.into();
+            let jj_tip = self
+                .repo
+                .view()
+                .get_local_bookmark(&bookmark)
+                .as_normal()
+                .map(|id| id.hex());
+            let live_tip = crate::transparency::ref_commit(root, &view.branch);
+            if live_tip.is_some() && live_tip != jj_tip {
+                drifted.push(view.branch.clone());
+            }
+        }
+        if drifted.is_empty() {
+            return Ok(());
+        }
+        // Re-seed each drifted branch's ref into the session git dir (no HEAD
+        // change), then a single import catches jj up to all of them at once.
+        let git_dir = self._workdir.path().join("git");
+        let root = self.workspace.workspace_root();
+        for full in &drifted {
+            if let Some(tip) = crate::transparency::ref_commit(root, full) {
+                crate::transparency::seed_session_ref(&git_dir, full, &tip)?;
+            }
+        }
+        self.import_git()
+    }
+
     /// Change the editable set *in place* — widen it (a branch ticked in the GTK
     /// dropdown) or narrow it (unticked) — **without** the full reopen
     /// [`Self::open_multi`] would do, so the session's undo op-log and trash survive
@@ -1318,16 +1410,13 @@ impl Repo {
     /// clean save bridged it out), so leaving the stale in-view bookmark behind is
     /// harmless: it is never bridged again.
     ///
-    /// Refused if `branches` is empty (the **last-branch rule**, mirroring the MCP's
-    /// "the last session can't be closed"), if a named branch does not exist, or
-    /// while a conflicted rewrite is pending (the held rewrite assumes a fixed set).
+    /// Emptying the set is allowed: it narrows to zero branches (`primary` becomes
+    /// `None`, like a detached-HEAD launch), so nothing is editable and the history
+    /// view shows no commits until a branch is re-ticked. Refused if a named branch
+    /// does not exist, or — for a request that actually *changes* the set — while a
+    /// conflicted rewrite is pending (the held rewrite assumes a fixed set); a
+    /// request equal to the current set is a no-op and always succeeds.
     pub fn set_editable_branches(&mut self, branches: &[String]) -> Result<()> {
-        if self.is_pending() {
-            anyhow::bail!(
-                "a conflicted rewrite is being resolved; finish or abort it before \
-                 changing the editable branch set"
-            );
-        }
         let root = self.workspace.workspace_root().to_path_buf();
         // Resolve to full refs (verifying existence), dedup, preserve order.
         let mut desired: Vec<String> = Vec::new();
@@ -1337,15 +1426,22 @@ impl Repo {
                 desired.push(full);
             }
         }
-        if desired.is_empty() {
-            anyhow::bail!(
-                "the editable set cannot be emptied — at least one branch must stay \
-                 editable"
-            );
-        }
         let current: Vec<String> = self.edited.refs().map(str::to_string).collect();
         if desired == current {
-            return Ok(()); // already exactly this set (same order)
+            // Already exactly this set (same order): a no-op. Checked *before*
+            // the pending guard so a request that changes nothing always
+            // succeeds — including a reverted UI toggle that lands back on the
+            // current set, which must not error (an erroring revert re-fires the
+            // toggle handler and recurses to a stack overflow).
+            return Ok(());
+        }
+        // A real change is refused while a conflicted rewrite is held (it assumes
+        // a fixed set); the no-op case above is already handled.
+        if self.is_pending() {
+            anyhow::bail!(
+                "a conflicted rewrite is being resolved; finish or abort it before \
+                 changing the editable branch set"
+            );
         }
 
         // Branches leaving the set: drop their registered worktree (if any). They

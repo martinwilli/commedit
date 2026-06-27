@@ -63,11 +63,12 @@ pub struct WorkingCopyInfo {
     pub has_conflict: bool,
 }
 
-/// One entry in the working-copy *chain* — the linear stack of jj commits
-/// between the branch tip (HEAD, exclusive) and the working-copy commit `@`
-/// (the leaf, inclusive). A single entry in the common case; the diff view's
-/// Split peels `@` into more (see [`Repo::split_working_copy`]). None of these
-/// commits is exported to git.
+/// One entry in a working-copy *chain* — the linear stack of jj commits between
+/// a worktree's branch tip (exclusive; the launch worktree's is git HEAD) and its
+/// working-copy commit `@` (the leaf, inclusive). A single entry in the common
+/// case; the diff view's Split peels `@` into more (see
+/// [`Repo::split_working_copy_edits_at`]), for any editable worktree. None of
+/// these commits is exported to git.
 #[derive(Debug, Clone)]
 pub struct WorkingCopyEntry {
     /// The entry as a history row, subject overridden to "Uncommitted changes".
@@ -83,6 +84,24 @@ pub struct WorkingCopyEntry {
     /// Whether this entry's tree is conflicted (a rewrite reapplied onto it
     /// clashed with the user's uncommitted changes).
     pub has_conflict: bool,
+}
+
+/// Which worktree's working copy `@` a working-copy mutation targets. Defaults to
+/// the launch worktree (the classic single-worktree path); `Worktree` names an
+/// *extra* editable branch checked out in another git worktree (see
+/// [`crate::repo::WorktreeView`]), resolved by short-name via
+/// [`Repo::find_worktree`]. Built for a branch with [`Repo::wc_target_for_branch`].
+/// The whole-`@` mutations (fold / discard / edit a file / commit) and the
+/// `@`-chain operations (split, per-entry commit) all accept a non-launch target,
+/// so a sibling worktree's `@` chain is split and committed like the launch one's;
+/// only the [`PartialSelection`]-based partial commit/squash stays launch-only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WcTarget {
+    /// The launch worktree's working copy (`self.workspace`) — the default.
+    #[default]
+    Launch,
+    /// An extra editable worktree's working copy, by its branch short-name.
+    Worktree(String),
 }
 
 /// A subset of the uncommitted changes to commit, addressed in three tiers that
@@ -257,13 +276,16 @@ impl Repo {
     }
 
     /// Snapshot every extra worktree (see [`Self::snapshot_extra_worktree`]) before
-    /// a mutation. The worktree list is temporarily moved out so each snapshot can
-    /// borrow `&mut self` and the view together; it is always restored (including on
-    /// error). A no-op in the classic singleton path (no extra worktrees).
+    /// a mutation. First catches each worktree up to any out-of-band `git commit`
+    /// on its branch ([`Self::catch_up_extra_worktrees`]), then snapshots: the
+    /// worktree list is temporarily moved out so each snapshot can borrow `&mut self`
+    /// and the view together; it is always restored (including on error). A no-op in
+    /// the classic singleton path (no extra worktrees).
     pub(crate) fn snapshot_extra_worktrees(&mut self) -> Result<()> {
         if self.extra_worktrees.is_empty() {
             return Ok(());
         }
+        self.catch_up_extra_worktrees()?;
         let mut views = std::mem::take(&mut self.extra_worktrees);
         let result = views
             .iter_mut()
@@ -276,14 +298,22 @@ impl Repo {
     /// view's per-worktree workspace name), so its uncommitted changes are recorded
     /// and ride through a later `rebase_descendants` exactly like the launch
     /// worktree's. The per-worktree analogue of [`Self::snapshot_working_copy`],
-    /// minus the launch-only HEAD catch-up / `@`-chain reconciliation: an extra
-    /// worktree has a single `@` directly on its branch tip (anchored at
-    /// registration), and its branch is moved only by commedit, never by an
-    /// out-of-band `git commit`. A no-op when its disk matches the last snapshot.
+    /// minus the launch-only *open-time* chain reconciliation
+    /// ([`Self::collapse_working_copy_chain`]) — a sibling carries a full `@` chain
+    /// like the launch one, kept intact by the chain-aware re-anchor below. First
+    /// re-anchors `@` onto the branch tip
+    /// ([`Self::reanchor_extra_worktree`]) so an out-of-band `git commit` caught up
+    /// by [`Self::catch_up_extra_worktrees`] lands on the branch rather than as a
+    /// phantom uncommitted change — a no-op in the common case where `@` already
+    /// sits on the tip. A no-op overall when its disk matches the last snapshot.
     pub(crate) fn snapshot_extra_worktree(
         &mut self,
         view: &mut crate::repo::WorktreeView,
     ) -> Result<()> {
+        // Catch @ up if its branch tip moved out from under it (a plain `git commit`
+        // in this worktree, imported by snapshot_extra_worktrees) so the snapshot
+        // below records only the still-uncommitted delta, not the committed change.
+        self.reanchor_extra_worktree(view)?;
         let name = view.name.clone();
         let wc_id = self.repo.view().get_wc_commit_id(&name).cloned();
         let tracked = self.tracked_paths_matcher_for(wc_id.clone(), &[])?;
@@ -322,6 +352,52 @@ impl Repo {
         Ok(())
     }
 
+    /// Reparent an extra worktree's `@` onto its branch's current tip when the tip
+    /// moved out from under it — e.g. a plain `git commit` in that worktree, caught
+    /// up by [`Repo::catch_up_extra_worktrees`]'s import. A fresh empty `@` is
+    /// checked out on the tip (a jj-view pointer move only): the previous `@` and
+    /// its delta is abandoned, but the worktree's on-disk content is untouched, so
+    /// the snapshot that follows re-records the still-uncommitted delta against the
+    /// new tip. The per-worktree analogue of [`Self::ensure_working_copy_on_head`];
+    /// a no-op when `@` already sits directly on the tip (the common case, including
+    /// right after registration).
+    fn reanchor_extra_worktree(&mut self, view: &crate::repo::WorktreeView) -> Result<()> {
+        let short = view
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&view.branch);
+        let bookmark: jj_lib::ref_name::RefNameBuf = short.into();
+        let Some(tip) = self
+            .repo
+            .view()
+            .get_local_bookmark(&bookmark)
+            .as_normal()
+            .cloned()
+        else {
+            return Ok(());
+        };
+        // Already anchored on a clean chain descending from the tip → nothing to
+        // do. Chain-aware (not just `@`'s direct parent), so a sibling split chain
+        // (`tip → @' → @`) survives this re-anchor instead of being collapsed back
+        // to a single `@` on the very next snapshot; only a genuinely detached `@`
+        // or an out-of-band tip move still falls through to the re-checkout below.
+        if self.wc_on_tip(&view.name, &tip)? {
+            return Ok(());
+        }
+        let tip_commit = self
+            .repo
+            .store()
+            .get_commit(&tip)
+            .context("loading the worktree branch tip")?;
+        let mut tx = self.repo.start_transaction();
+        block_on(tx.repo_mut().check_out(view.name.clone(), &tip_commit))
+            .context("re-anchoring the worktree working copy on its tip")?;
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing after re-anchor")?;
+        self.repo = block_on(tx.commit("commedit: re-anchor worktree working copy"))
+            .context("committing the worktree re-anchor")?;
+        Ok(())
+    }
+
     /// Re-materialize every extra worktree whose branch tip moved across the
     /// rewrite — its bridged git ref now differs from its pre-rewrite oid in
     /// `before` ([`Repo::snapshot_heads`]). A worktree whose branch was untouched is
@@ -349,13 +425,52 @@ impl Repo {
         result
     }
 
+    /// Re-materialize every extra worktree whose `@` id changed across a rewind but
+    /// whose branch tip did *not* move — the gap [`Self::materialize_moved_worktrees`]
+    /// (tip-gated, run inside `export_and_sync`) leaves for an `@`-only sibling op
+    /// (edit/discard uncommitted): undo/redo restores the sibling `@` in jj, but the
+    /// tip-gate skips the on-disk re-checkout, so the worktree's files would stay
+    /// stale. `before_tips` ([`Repo::snapshot_heads`]) and `before_wc` are the
+    /// pre-rewind branch tips and `@` ids, both keyed by full ref name. A worktree
+    /// whose tip moved was already re-checked-out by the tip gate, so it is skipped
+    /// here to avoid a redundant checkout. Used only by the rewind path (the
+    /// general export tail's tip gate is correct there — see [`crate::conflict`]); a
+    /// no-op in the classic singleton path (no extra worktrees).
+    pub(crate) fn materialize_changed_worktrees(
+        &mut self,
+        before_tips: &std::collections::BTreeMap<String, String>,
+        before_wc: &std::collections::BTreeMap<String, CommitId>,
+    ) -> Result<()> {
+        if self.extra_worktrees.is_empty() {
+            return Ok(());
+        }
+        let mut views = std::mem::take(&mut self.extra_worktrees);
+        let result = views.iter_mut().try_for_each(|view| {
+            let root = view.workspace.workspace_root();
+            let new_tip = crate::transparency::ref_commit(root, &view.branch);
+            if new_tip.as_deref() != before_tips.get(&view.branch).map(String::as_str) {
+                return Ok(()); // tip moved: the tip gate already re-materialized it
+            }
+            let new_wc = self.repo.view().get_wc_commit_id(&view.name).cloned();
+            if new_wc.as_ref() == before_wc.get(&view.branch) {
+                return Ok(()); // @ unchanged: leave the worktree frozen
+            }
+            self.materialize_extra_worktree(view)
+        });
+        self.extra_worktrees = views;
+        result
+    }
+
     /// Materialize one extra worktree's rebased `@'` back to its own on-disk root
     /// and reset *its* git index to its branch tip, so that worktree's `git status`
     /// reflects the rewrite while preserving its uncommitted changes. The
     /// per-worktree analogue of [`Self::materialize_after_rewrite`]; called only for
     /// a worktree whose branch tip actually moved (see [`crate::conflict`]'s export
-    /// tail). The index-only-content backup is launch-worktree-specific and skipped
-    /// here.
+    /// tail). Like the launch path, any index-only staged content (staged then
+    /// reverted/removed on disk, so invisible to jj's `@`) is pinned to a recovery
+    /// ref before the index reset would drop it — namespaced by a per-worktree key
+    /// so the launch's and each sibling's recovery points don't evict one another in
+    /// the shared common-dir.
     pub(crate) fn materialize_extra_worktree(
         &mut self,
         view: &mut crate::repo::WorktreeView,
@@ -375,9 +490,12 @@ impl Repo {
         // Reset that worktree's index to its branch's new tip, so its `git status`
         // shows the preserved uncommitted changes against the rewritten history.
         let root = view.workspace.workspace_root();
+        let key = crate::transparency::worktree_backup_key(root);
+        let _ = crate::transparency::backup_index_only_content_at(root, &key);
         if let Some(new_tip) = crate::transparency::ref_commit(root, &view.branch) {
             crate::transparency::reset_index_to(root, &new_tip)?;
         }
+        crate::transparency::prune_backup_refs_at(root, &key);
         Ok(())
     }
 
@@ -409,21 +527,34 @@ impl Repo {
         path: &str,
         new_content: Option<&str>,
     ) -> Result<()> {
-        self.require_worktree("edit the working copy")?;
+        self.edit_working_copy_file_at(WcTarget::Launch, change_hex, path, new_content)
+    }
+
+    /// Like [`Self::edit_working_copy_file`] but on `target`'s worktree `@` — used
+    /// to edit a sibling worktree's uncommitted changes from the unified DAG.
+    pub fn edit_working_copy_file_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+        path: &str,
+        new_content: Option<&str>,
+    ) -> Result<()> {
+        self.require_wc_target(&target, "edit the working copy")?;
         crate::repo::catch_jj("editing the working copy", || {
-            self.edit_working_copy_file_inner(change_hex, path, new_content)
+            self.edit_working_copy_file_inner(&target, change_hex, path, new_content)
         })
     }
 
     fn edit_working_copy_file_inner(
         &mut self,
+        target: &WcTarget,
         change_hex: Option<&str>,
         path: &str,
         new_content: Option<&str>,
     ) -> Result<()> {
-        self.snapshot_working_copy()?;
+        self.snapshot_wc(target)?;
         let wc_id = self
-            .resolve_working_copy_change(change_hex)
+            .resolve_wc(target, change_hex)
             .context("no working copy to edit")?;
         let commit = self
             .repo
@@ -467,8 +598,8 @@ impl Repo {
             .context("committing the working-copy edit")?;
 
         // Write the edited @ to disk (the branch tip is unchanged).
-        self.materialize_after_rewrite(self.head_commit())?;
-        self.record_working_copy_op("Edit uncommitted changes", change_hex);
+        self.materialize_wc(target)?;
+        self.record_working_copy_op(target, "Edit uncommitted changes", change_hex);
         Ok(())
     }
 
@@ -485,37 +616,52 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
-        self.require_worktree("commit the working copy")?;
+        self.commit_working_copy_at(WcTarget::Launch, message, identity)
+    }
+
+    /// Like [`Self::commit_working_copy`] but crystallizes `target`'s worktree `@`
+    /// into a new commit on *that* branch's tip — used to commit a sibling
+    /// worktree's uncommitted changes from the unified DAG.
+    pub fn commit_working_copy_at(
+        &mut self,
+        target: WcTarget,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "commit the working copy")?;
         crate::repo::catch_jj("committing the working copy", || {
-            self.commit_working_copy_inner(message, identity)
+            self.commit_working_copy_inner(&target, message, identity)
         })
     }
 
     fn commit_working_copy_inner(
         &mut self,
+        target: &WcTarget,
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
-        // Fold the on-disk changes into the leaf @ first, then refuse if the tree
-        // turned out clean (nothing to commit).
-        self.snapshot_working_copy()?;
-        if self.working_copy_info().is_none() {
+        // Fold the on-disk changes into the @ first, then refuse if the tree turned
+        // out clean (nothing to commit).
+        self.snapshot_wc(target)?;
+        let leaf_id = self
+            .resolve_wc(target, None)
+            .context("no working copy to commit")?;
+        if self.wc_entry_for(&leaf_id).is_none() {
             bail!("no uncommitted changes to commit");
         }
-        let Some(head) = self.head_commit_id() else {
+        let Some(head) = self.wc_tip(target) else {
             bail!("the repository has no branch head; cannot commit the working copy");
         };
-        let leaf_id = self
-            .working_copy_commit_id()
-            .context("no working copy to commit")?;
         let store = self.repo.store().clone();
-        // The leaf @ holds the full on-disk tree, so committing it on HEAD captures
-        // every uncommitted change as one commit (including any split chain).
+        // The @ holds the full on-disk tree, so committing it on the branch tip
+        // captures every uncommitted change as one commit.
         let tree = store
             .get_commit(&leaf_id)
             .context("loading the working-copy commit")?
             .tree();
-        let name = self.workspace.workspace_name().to_owned();
+        let name = self
+            .wc_workspace_name(target)
+            .context("the target worktree has no workspace")?;
 
         let pre_op = self.repo.operation().clone();
         let old_head = self.edited_tip();
@@ -548,7 +694,7 @@ impl Repo {
         block_on(tx.repo_mut().check_out(name, &created))
             .context("starting a fresh working copy")?;
         block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        self.set_head_bookmark(tx.repo_mut(), created_id);
+        self.set_target_bookmark(tx.repo_mut(), target, created_id);
 
         let subject = message.lines().next().unwrap_or("").trim();
         let label = if subject.is_empty() {
@@ -680,33 +826,51 @@ impl Repo {
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
-        self.require_worktree("commit a working-copy entry")?;
+        self.commit_working_copy_entry_at(WcTarget::Launch, change_hex, message, identity)
+    }
+
+    /// Like [`Self::commit_working_copy_entry`] but crystallizes a single entry of
+    /// `target`'s worktree `@` chain — the launch worktree's or a *sibling*
+    /// editable worktree's (see [`WcTarget`]) — onto *that* branch's tip, leaving
+    /// the chain's other entries uncommitted. Used by the GTK working-copy view to
+    /// commit one peeled-apart slice of a sibling worktree's uncommitted changes; a
+    /// lone sibling entry collapses to a fresh empty `@`, behaving like
+    /// [`Self::commit_working_copy_at`].
+    pub fn commit_working_copy_entry_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+        message: &str,
+        identity: Option<&Identity>,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "commit a working-copy entry")?;
         crate::repo::catch_jj("committing a working-copy entry", || {
-            self.commit_working_copy_entry_inner(change_hex, message, identity)
+            self.commit_working_copy_entry_inner(&target, change_hex, message, identity)
         })
     }
 
     fn commit_working_copy_entry_inner(
         &mut self,
+        target: &WcTarget,
         change_hex: Option<&str>,
         message: &str,
         identity: Option<&Identity>,
     ) -> Result<SaveOutcome> {
         // Fold the on-disk changes into the leaf @ first, then refuse if the tree
         // turned out clean (nothing to commit).
-        self.snapshot_working_copy()?;
-        if self.working_copy_info().is_none() {
+        self.snapshot_wc(target)?;
+        let leaf_id = self
+            .resolve_wc(target, None)
+            .context("no working copy to commit")?;
+        if self.wc_entry_for(&leaf_id).is_none() {
             bail!("no uncommitted changes to commit");
         }
-        let Some(head) = self.head_commit_id() else {
+        let Some(head) = self.wc_tip(target) else {
             bail!("the repository has no branch head; cannot commit the working copy");
         };
         let entry_id = self
-            .resolve_working_copy_change(change_hex)
+            .resolve_wc(target, change_hex)
             .context("no working copy entry to commit")?;
-        let leaf_id = self
-            .working_copy_commit_id()
-            .context("no working copy to commit")?;
         let store = self.repo.store().clone();
         let entry_tree = store
             .get_commit(&entry_id)
@@ -735,13 +899,15 @@ impl Repo {
             bail!("the selected entry commits nothing");
         }
 
-        let name = self.workspace.workspace_name().to_owned();
+        let name = self
+            .wc_workspace_name(target)
+            .context("the target worktree has no workspace")?;
         let pre_op = self.repo.operation().clone();
         let old_head = self.edited_tip();
         let heads = self.snapshot_heads();
 
         let mut tx = self.repo.start_transaction();
-        // C: the new commit on HEAD, holding just the entry's slice.
+        // C: the new commit on the target branch's tip, holding just the entry's slice.
         let mut builder = tx
             .repo_mut()
             .new_commit(vec![head.clone()], t_commit.clone())
@@ -783,7 +949,7 @@ impl Repo {
                 .context("pointing the working copy at the remainder")?;
         }
         block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
-        self.set_head_bookmark(tx.repo_mut(), created_id);
+        self.set_target_bookmark(tx.repo_mut(), target, created_id);
 
         let subject = message.lines().next().unwrap_or("").trim();
         let label = if subject.is_empty() {
@@ -917,23 +1083,37 @@ impl Repo {
     /// object to graft back, so — unlike a dropped commit — a discarded entry is
     /// gone for good (not kept in the trash).
     pub fn drop_working_copy(&mut self, change_hex: Option<&str>) -> Result<()> {
-        self.require_worktree("discard the working copy")?;
+        self.drop_working_copy_at(WcTarget::Launch, change_hex)
+    }
+
+    /// Like [`Self::drop_working_copy`] but on `target`'s worktree `@` — discards a
+    /// sibling worktree's uncommitted changes from the unified DAG.
+    pub fn drop_working_copy_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+    ) -> Result<()> {
+        self.require_wc_target(&target, "discard the working copy")?;
         crate::repo::catch_jj("dropping the working copy", || {
-            self.drop_working_copy_inner(change_hex)
+            self.drop_working_copy_inner(&target, change_hex)
         })
     }
 
-    fn drop_working_copy_inner(&mut self, change_hex: Option<&str>) -> Result<()> {
+    fn drop_working_copy_inner(
+        &mut self,
+        target: &WcTarget,
+        change_hex: Option<&str>,
+    ) -> Result<()> {
         // Snapshot the disk into the leaf @ first (its commit id churns here),
         // then resolve the target entry's stable change id to its current id.
-        self.snapshot_working_copy()?;
-        let target = self
-            .resolve_working_copy_change(change_hex)
+        self.snapshot_wc(target)?;
+        let entry_id = self
+            .resolve_wc(target, change_hex)
             .context("no working copy to drop")?;
         let commit = self
             .repo
             .store()
-            .get_commit(&target)
+            .get_commit(&entry_id)
             .context("loading the working-copy entry")?;
         let change_hex = commit.change_id().hex();
 
@@ -947,8 +1127,8 @@ impl Repo {
             .context("committing the working-copy drop")?;
 
         // Check the rebased leaf @ back out to disk (the branch tip is unchanged).
-        self.materialize_after_rewrite(self.head_commit())?;
-        self.record_working_copy_op("Drop uncommitted changes", change_hex);
+        self.materialize_wc(target)?;
+        self.record_working_copy_op(target, "Drop uncommitted changes", change_hex);
         Ok(())
     }
 
@@ -987,10 +1167,162 @@ impl Repo {
         self.repo.view().get_wc_commit_id(name).cloned()
     }
 
-    /// True when any entry in the working-copy chain has a conflicted tree.
-    /// Gates recording a working-copy-direct edit as a session op: we record
-    /// only clean, materialized states, so the time-travel jumps can always land
-    /// [`crate::conflict::SaveOutcome::Clean`].
+    /// The working-copy target for `branch` (short-name): the launch worktree when
+    /// `branch` is the primary (worktree-bound), else the extra worktree checked
+    /// out on it. `None` when the branch has no worktree (a pure ref-move or the
+    /// off-worktree primary). The GTK passes the result to the `*_at` working-copy
+    /// mutators to act on a sibling worktree's `@`.
+    ///
+    /// The launch worktree is matched by its branch short name — or the empty
+    /// string on a worktree-bound *detached* HEAD, which has no branch name
+    /// ([`Self::target_branch_name`] is `None` there but
+    /// [`Self::worktree_uncommitted`] keys its `@` under `""`).
+    pub fn wc_target_for_branch(&self, branch: &str) -> Option<WcTarget> {
+        if branch == self.target_branch_name().unwrap_or("") {
+            self.is_worktree_bound().then_some(WcTarget::Launch)
+        } else {
+            self.find_worktree(branch)
+                .map(|_| WcTarget::Worktree(branch.to_string()))
+        }
+    }
+
+    /// Refuse a working-copy mutation when its target has no worktree: the launch
+    /// case reuses [`Self::require_worktree`] (off-worktree has no `@`); a named
+    /// worktree must exist in the editable set.
+    pub(crate) fn require_wc_target(&self, target: &WcTarget, op: &str) -> Result<()> {
+        match target {
+            WcTarget::Launch => self.require_worktree(op),
+            WcTarget::Worktree(branch) => {
+                if self.find_worktree(branch).is_some() {
+                    Ok(())
+                } else {
+                    bail!("no editable worktree checked out on branch {branch:?}")
+                }
+            }
+        }
+    }
+
+    /// The `@` commit id of `target`'s worktree, resolving `change_hex` to a
+    /// specific entry within that worktree's chain: the launch leaf
+    /// ([`Self::resolve_working_copy_change`]) or an extra worktree's chain entry
+    /// (searched by stable change id, mirroring the launch resolver). Falls back to
+    /// the leaf `@` when `change_hex` is `None` or matches no chain entry.
+    pub(crate) fn resolve_wc(
+        &self,
+        target: &WcTarget,
+        change_hex: Option<&str>,
+    ) -> Option<CommitId> {
+        match target {
+            WcTarget::Launch => self.resolve_working_copy_change(change_hex),
+            WcTarget::Worktree(branch) => {
+                let view = self.find_worktree(branch)?;
+                let leaf = self.repo.view().get_wc_commit_id(&view.name).cloned();
+                let Some(change_hex) = change_hex else {
+                    return leaf;
+                };
+                let Some(change_id) = jj_lib::backend::ChangeId::try_from_hex(change_hex) else {
+                    return leaf;
+                };
+                for id in self.worktree_chain_ids(view) {
+                    if let Ok(commit) = self.repo.store().get_commit(&id) {
+                        if commit.change_id() == &change_id {
+                            return Some(id);
+                        }
+                    }
+                }
+                leaf
+            }
+        }
+    }
+
+    /// `target`'s branch tip — the commit a freshly committed working copy lands
+    /// on. The launch tip is git HEAD; an extra worktree's tip is its local
+    /// bookmark target (read directly, *not* via the `@`'s parent: a split sibling
+    /// chain's leaf parent is an intermediate entry, not the branch tip).
+    fn wc_tip(&self, target: &WcTarget) -> Option<CommitId> {
+        match target {
+            WcTarget::Launch => self.head_commit_id(),
+            WcTarget::Worktree(branch) => {
+                let name: jj_lib::ref_name::RefNameBuf = branch.as_str().into();
+                self.repo
+                    .view()
+                    .get_local_bookmark(&name)
+                    .as_normal()
+                    .cloned()
+            }
+        }
+    }
+
+    /// The jj workspace name keying `target`'s `@`, for `check_out`.
+    fn wc_workspace_name(&self, target: &WcTarget) -> Option<jj_lib::ref_name::WorkspaceNameBuf> {
+        match target {
+            WcTarget::Launch => Some(self.workspace.workspace_name().to_owned()),
+            WcTarget::Worktree(branch) => self.find_worktree(branch).map(|v| v.name.clone()),
+        }
+    }
+
+    /// Point `target`'s branch bookmark at `id` — [`Self::set_head_bookmark`] for
+    /// the launch, [`Self::set_branch_bookmark`] for an extra worktree's branch.
+    fn set_target_bookmark(
+        &self,
+        mut_repo: &mut jj_lib::repo::MutableRepo,
+        target: &WcTarget,
+        id: CommitId,
+    ) {
+        match target {
+            WcTarget::Launch => self.set_head_bookmark(mut_repo, id),
+            WcTarget::Worktree(branch) => self.set_branch_bookmark(mut_repo, branch, id),
+        }
+    }
+
+    /// Snapshot `target`'s on-disk tree into its `@` before a mutation. The launch
+    /// case reuses [`Self::snapshot_working_copy`] (which also snapshots every
+    /// extra worktree); a named target snapshots just that worktree, via the
+    /// `mem::take` borrow dance [`Self::snapshot_extra_worktrees`] uses.
+    pub(crate) fn snapshot_wc(&mut self, target: &WcTarget) -> Result<()> {
+        match target {
+            WcTarget::Launch => self.snapshot_working_copy(),
+            WcTarget::Worktree(branch) => {
+                let mut views = std::mem::take(&mut self.extra_worktrees);
+                let found = views
+                    .iter_mut()
+                    .find(|v| v.branch.strip_prefix("refs/heads/").unwrap_or(&v.branch) == branch);
+                let result = match found {
+                    Some(v) => self.snapshot_extra_worktree(v),
+                    None => Err(anyhow!(
+                        "no editable worktree checked out on branch {branch:?}"
+                    )),
+                };
+                self.extra_worktrees = views;
+                result
+            }
+        }
+    }
+
+    /// Materialize `target`'s rebased `@` back to its worktree after a `@`-only
+    /// rewrite (the branch tip didn't move, so the shared export tail wouldn't).
+    /// The launch case reuses [`Self::materialize_after_rewrite`]; a named target
+    /// re-checks-out just that worktree.
+    pub(crate) fn materialize_wc(&mut self, target: &WcTarget) -> Result<()> {
+        match target {
+            WcTarget::Launch => self.materialize_after_rewrite(self.head_commit()),
+            WcTarget::Worktree(branch) => {
+                let mut views = std::mem::take(&mut self.extra_worktrees);
+                let found = views
+                    .iter_mut()
+                    .find(|v| v.branch.strip_prefix("refs/heads/").unwrap_or(&v.branch) == branch);
+                let result = match found {
+                    Some(v) => self.materialize_extra_worktree(v),
+                    None => Ok(()),
+                };
+                self.extra_worktrees = views;
+                result
+            }
+        }
+    }
+
+    /// True when any entry in the **launch** working-copy chain has a conflicted
+    /// tree — the launch arm of [`Self::working_copy_has_conflict_at`].
     pub(crate) fn working_copy_has_conflict(&self) -> bool {
         self.working_copy_chain_ids().iter().any(|id| {
             self.repo
@@ -1001,13 +1333,45 @@ impl Repo {
         })
     }
 
+    /// Whether `target`'s working copy is conflicted. Both arms walk the whole `@`
+    /// chain — the launch via [`Self::working_copy_has_conflict`], a sibling via
+    /// [`Self::worktree_chain_ids`] — so a conflict on any chain entry counts. Gates
+    /// recording a working-copy-direct edit as a session op: we record only clean,
+    /// materialized states, so the time-travel jumps can always land
+    /// [`crate::conflict::SaveOutcome::Clean`]. Keying on the *mutated* worktree's
+    /// `@` (not always the launch's) keeps a sibling edit recordable even when the
+    /// launch `@` is conflicted, and never records a conflicted sibling `@` as if
+    /// it were clean.
+    pub(crate) fn working_copy_has_conflict_at(&self, target: &WcTarget) -> bool {
+        match target {
+            WcTarget::Launch => self.working_copy_has_conflict(),
+            WcTarget::Worktree(branch) => self
+                .find_worktree(branch)
+                .map(|view| {
+                    self.worktree_chain_ids(view).iter().any(|id| {
+                        self.repo
+                            .store()
+                            .get_commit(id)
+                            .map(|c| c.has_conflict())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false),
+        }
+    }
+
     /// Record a working-copy-direct edit (one that commits straight to jj with no
     /// `finish_mutation`/export) as a session op-log entry the "Edit history"
-    /// dropdown can travel back to — unless it left the working copy conflicted.
-    /// `change_hex` is the edited entry's change id, for the dropdown's
+    /// dropdown can travel back to — unless it left `target`'s working copy
+    /// conflicted. `change_hex` is the edited entry's change id, for the dropdown's
     /// hover-highlight.
-    pub(crate) fn record_working_copy_op(&mut self, label: &str, change_hex: String) {
-        if self.working_copy_has_conflict() {
+    pub(crate) fn record_working_copy_op(
+        &mut self,
+        target: &WcTarget,
+        label: &str,
+        change_hex: String,
+    ) {
+        if self.working_copy_has_conflict_at(target) {
             return;
         }
         self.record_op(crate::conflict::OpDescriptor::new(
@@ -1016,32 +1380,24 @@ impl Repo {
         ));
     }
 
-    /// The uncommitted-changes chain as commit ids, newest first: the
-    /// working-copy commit `@` (leaf) followed by each single-parent ancestor up
-    /// to but excluding the current git HEAD. When `@` is not a clean linear
-    /// descendant of HEAD (detached HEAD, a merge in the way, or HEAD moved by
-    /// plain `git`), this falls back to just the leaf `@`, matching the
-    /// pre-chain single-`@` behaviour. Empty when there is no working copy.
-    pub(crate) fn working_copy_chain_ids(&self) -> Vec<CommitId> {
-        // Off-worktree there is no working copy on the edited branch: `@` is left
-        // on jj's root commit, which must never surface as uncommitted changes.
-        if !self.is_worktree_bound() {
-            return Vec::new();
-        }
-        let Some(leaf) = self.working_copy_commit_id() else {
+    /// Walk single-parent edges from `leaf` up to (but excluding) the first id in
+    /// `boundary`, newest-first — the uncommitted chain between a worktree's `@`
+    /// (the leaf, inclusive) and its branch tip (a boundary id, exclusive). When
+    /// `@` is not a clean linear descendant of a boundary id (detached HEAD, a
+    /// merge in the way, or the tip moved by plain `git`), this falls back to just
+    /// the leaf `@`, matching the pre-chain single-`@` behaviour. Empty when
+    /// `leaf` is `None` (no working copy). The shared walk behind both the launch
+    /// reader ([`Self::working_copy_chain_ids`]) and the per-worktree reader
+    /// ([`Self::worktree_chain_ids`]); they differ only in the boundary.
+    fn chain_ids_from(&self, leaf: Option<CommitId>, boundary: &[CommitId]) -> Vec<CommitId> {
+        let Some(leaf) = leaf else {
             return Vec::new();
         };
-        // The branch tip the chain descends from: git HEAD when clean, but jj's
-        // bookmark target while a conflicted rewrite is pending (git HEAD lags
-        // behind the rewritten tip until the deferred export runs). Stop at
-        // either, so the walk works in both the normal and the resolving state.
-        let git_head = self.head_commit_id();
-        let jj_head = self.current_head_in_jj();
-        let is_tip = |id: &CommitId| Some(id) == git_head.as_ref() || Some(id) == jj_head.as_ref();
+        let is_boundary = |id: &CommitId| boundary.contains(id);
         let mut ids = Vec::new();
         let mut id = leaf.clone();
         loop {
-            if is_tip(&id) {
+            if is_boundary(&id) {
                 // Reached the tip: `ids` is the clean uncommitted chain, leaf first.
                 return ids;
             }
@@ -1059,6 +1415,75 @@ impl Repo {
         vec![leaf]
     }
 
+    /// The launch worktree's uncommitted-changes chain as commit ids, newest
+    /// first: the working-copy commit `@` (leaf) followed by each single-parent
+    /// ancestor up to but excluding the current git HEAD. Empty when there is no
+    /// working copy (including off-worktree). The boundary is two-valued: git HEAD
+    /// when clean, but jj's bookmark target while a conflicted rewrite is pending
+    /// (git HEAD lags behind the rewritten tip until the deferred export runs), so
+    /// the walk works in both the normal and the resolving state.
+    pub(crate) fn working_copy_chain_ids(&self) -> Vec<CommitId> {
+        // Off-worktree there is no working copy on the edited branch: `@` is left
+        // on jj's root commit, which must never surface as uncommitted changes.
+        if !self.is_worktree_bound() {
+            return Vec::new();
+        }
+        let boundary: Vec<CommitId> = [self.head_commit_id(), self.current_head_in_jj()]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.chain_ids_from(self.working_copy_commit_id(), &boundary)
+    }
+
+    /// An extra worktree's uncommitted-changes chain as commit ids, newest first
+    /// (its `@` leaf, then each single-parent ancestor up to but excluding its
+    /// branch tip). The per-worktree analogue of [`Self::working_copy_chain_ids`]:
+    /// a sibling `@` sits directly on its branch's local bookmark, so its boundary
+    /// is that single tip (no pending-rewrite ambiguity to straddle). A single
+    /// entry in the common case; [`Self::split_working_copy_edits_at`] peels it
+    /// into more. Empty when the worktree has no `@`.
+    pub(crate) fn worktree_chain_ids(&self, view: &crate::repo::WorktreeView) -> Vec<CommitId> {
+        let leaf = self.repo.view().get_wc_commit_id(&view.name).cloned();
+        let short = view
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&view.branch);
+        let bookmark: jj_lib::ref_name::RefNameBuf = short.into();
+        let boundary: Vec<CommitId> = self
+            .repo
+            .view()
+            .get_local_bookmark(&bookmark)
+            .as_normal()
+            .cloned()
+            .into_iter()
+            .collect();
+        self.chain_ids_from(leaf, &boundary)
+    }
+
+    /// Build a [`WorkingCopyEntry`] for one working-copy commit `@`: its
+    /// git-tracked changed files, labelled "Uncommitted changes". `None` when the
+    /// `@` changes nothing (an empty leaf — e.g. the fresh `@` jj recreates after
+    /// the whole pile is folded into a commit — is never shown). Shared by the
+    /// launch chain ([`Self::working_copy_chain`]) and the per-worktree reader
+    /// ([`Self::worktree_uncommitted`]).
+    fn wc_entry_for(&self, id: &CommitId) -> Option<WorkingCopyEntry> {
+        let commit = self.repo.store().get_commit(id).ok()?;
+        let file_names: Vec<String> = crate::diff::commit_changes(&self.repo, id)
+            .map(|c| c.into_iter().map(|f| f.path).collect())
+            .unwrap_or_default();
+        if file_names.is_empty() {
+            return None;
+        }
+        let mut info = crate::history::CommitInfo::from_commit(&commit);
+        info.subject = "Uncommitted changes".to_string();
+        Some(WorkingCopyEntry {
+            info,
+            changed_files: file_names.len(),
+            file_names,
+            has_conflict: commit.has_conflict(),
+        })
+    }
+
     /// The uncommitted-changes entries to show as read-only rows above the
     /// history, newest first (the leaf `@` first). One per commit in the
     /// working-copy chain that actually changes files — an empty leaf (e.g. the
@@ -1067,27 +1492,73 @@ impl Repo {
     /// [`crate::history::history`] so the reorder/drop/squash index arithmetic is
     /// unaffected.
     pub fn working_copy_chain(&self) -> Vec<WorkingCopyEntry> {
+        self.working_copy_chain_ids()
+            .iter()
+            .filter_map(|id| self.wc_entry_for(id))
+            .collect()
+    }
+
+    /// Uncommitted changes per editable worktree, for the unified multi-branch
+    /// DAG. Each tuple is `(branch short-name, entries)` newest-first: the launch
+    /// worktree (when its branch is checked out here) contributes its full `@`
+    /// chain under the primary branch's name; every *extra* editable worktree (see
+    /// [`crate::repo::WorktreeView`]) contributes its own dirty `@` chain (one
+    /// entry unless [`Self::split_working_copy_edits_at`] peeled it) under its own
+    /// branch's name. A clean worktree, a branch with no worktree (a pure
+    /// ref-move), and the off-worktree primary all contribute nothing — an empty
+    /// `entries` list is never emitted. The launch `@` chain is read exactly as
+    /// [`Self::working_copy_chain`]; the extra worktrees' chains via
+    /// [`Self::worktree_chain_ids`], mirroring [`Self::snapshot_extra_worktree`].
+    pub fn worktree_uncommitted(&self) -> Vec<(String, Vec<WorkingCopyEntry>)> {
         let mut out = Vec::new();
-        for id in self.working_copy_chain_ids() {
-            let Ok(commit) = self.repo.store().get_commit(&id) else {
-                continue;
-            };
-            let file_names: Vec<String> = crate::diff::commit_changes(&self.repo, &id)
-                .map(|c| c.into_iter().map(|f| f.path).collect())
-                .unwrap_or_default();
-            if file_names.is_empty() {
-                continue;
+        if self.is_worktree_bound() {
+            let chain = self.working_copy_chain();
+            if !chain.is_empty() {
+                out.push((self.target_branch_name().unwrap_or("").to_string(), chain));
             }
-            let mut info = crate::history::CommitInfo::from_commit(&commit);
-            info.subject = "Uncommitted changes".to_string();
-            out.push(WorkingCopyEntry {
-                info,
-                changed_files: file_names.len(),
-                file_names,
-                has_conflict: commit.has_conflict(),
-            });
+        }
+        for view in &self.extra_worktrees {
+            let entries: Vec<WorkingCopyEntry> = self
+                .worktree_chain_ids(view)
+                .iter()
+                .filter_map(|id| self.wc_entry_for(id))
+                .collect();
+            if !entries.is_empty() {
+                let short = view
+                    .branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&view.branch);
+                out.push((short.to_string(), entries));
+            }
         }
         out
+    }
+
+    /// Every editable worktree's working-copy commit ids: the launch `@` chain
+    /// (newest first) followed by each extra worktree's `@` chain. The id-level,
+    /// flattened analogue of [`Self::worktree_uncommitted`], used by conflict
+    /// resolution ([`Repo::resolve_change_on_chain`]) to locate a conflicted `@` on
+    /// *any* worktree — the same working-copy sources [`Repo::collect_conflicts`]
+    /// scans. A singleton set with no extra worktrees yields just the launch chain.
+    pub(crate) fn all_worktree_chain_ids(&self) -> Vec<CommitId> {
+        let mut ids = self.working_copy_chain_ids();
+        for view in &self.extra_worktrees {
+            ids.extend(self.worktree_chain_ids(view));
+        }
+        ids
+    }
+
+    /// Every editable worktree's working-copy *entries* that change files — the
+    /// launch `@` chain plus each extra worktree's dirty `@` chain, in the order
+    /// [`Self::all_worktree_chain_ids`] lists them. The flat, all-worktree analogue
+    /// of [`Self::working_copy_chain`], used by the GTK conflict view to render a
+    /// conflicted *sibling* `@` as an inline resolvable row (a clean/empty `@` is
+    /// skipped, like [`Self::working_copy_chain`]).
+    pub fn worktree_chain_entries(&self) -> Vec<WorkingCopyEntry> {
+        self.all_worktree_chain_ids()
+            .iter()
+            .filter_map(|id| self.wc_entry_for(id))
+            .collect()
     }
 
     /// Resolve a working-copy entry's stable change id to its *current* commit id
@@ -1150,18 +1621,20 @@ impl Repo {
         Some(info)
     }
 
-    /// Whether the working-copy commit `@` sits on a clean linear chain rooted at
-    /// `head`: walk single-parent edges up from `@` and return `true` iff we reach
-    /// `head`. This keeps a split chain (`HEAD → @' → @`) intact — `@`'s parent
-    /// need not be `head` directly, only an ancestor reached through our own
+    /// Whether the `@` of the workspace named `name` sits on a clean linear chain
+    /// rooted at `tip`: walk single-parent edges up from that `@` and return `true`
+    /// iff we reach `tip`. This keeps a split chain (`tip → @' → @`) intact — `@`'s
+    /// parent need not be `tip` directly, only an ancestor reached through our own
     /// uncommitted commits. Returns `false` (→ re-attach) on a merge in the way,
-    /// the root, or when `head` isn't an ancestor (e.g. plain `git` moved HEAD).
-    fn working_copy_on_head(&self, head: &CommitId) -> Result<bool> {
-        let Some(mut id) = self.working_copy_commit_id() else {
+    /// the root, or when `tip` isn't an ancestor (e.g. plain `git` moved the tip).
+    /// Shared by the launch wrapper [`Self::working_copy_on_head`] and the
+    /// per-worktree re-anchor [`Self::reanchor_extra_worktree`].
+    fn wc_on_tip(&self, name: &jj_lib::ref_name::WorkspaceName, tip: &CommitId) -> Result<bool> {
+        let Some(mut id) = self.repo.view().get_wc_commit_id(name).cloned() else {
             return Ok(false);
         };
         loop {
-            if &id == head {
+            if &id == tip {
                 return Ok(true);
             }
             let commit = self
@@ -1175,6 +1648,12 @@ impl Repo {
             }
             id = parents[0].clone();
         }
+    }
+
+    /// The launch wrapper over [`Self::wc_on_tip`]: whether the launch `@` sits on a
+    /// clean linear chain rooted at `head`.
+    fn working_copy_on_head(&self, head: &CommitId) -> Result<bool> {
+        self.wc_on_tip(self.workspace.workspace_name(), head)
     }
 
     /// Re-parent `@` onto the current git HEAD when it isn't already there (e.g.

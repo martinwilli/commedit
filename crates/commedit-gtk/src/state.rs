@@ -292,6 +292,10 @@ pub(crate) const READ_ONLY_HINT: &str =
 /// layout lines (file headers, elision cues, notices).
 pub(crate) const CONFLICT_LAYOUT_HINT: &str =
     "Edit blocked — this line is part of the conflict view layout. Edit within a snippet.";
+/// Status-line hint shown when Alt+Up/Down can't move the current line — it isn't
+/// an added (`+`) line, or the move would cross a hunk boundary.
+pub(crate) const MOVE_LINE_HINT: &str =
+    "Can't move here — only added (+) lines move, and not past a hunk boundary.";
 
 // Grouped bundles of the `build_ui` state handed to the peeled modules
 // (`dragdrop`, `conflict`). Every field is an `Rc` or a GTK widget handle (itself

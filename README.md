@@ -178,6 +178,9 @@ an interactive-rebase session.
 - `Ctrl+S` — save the current edits, rewriting the selected commit in place.
 - `Ctrl+D` — in the diff pane, delete the line(s) under the selection (drops
   `+` additions, restores `-` removals to context).
+- `Alt+↑` / `Alt+↓` — in the diff pane, move the current `+` line (or a selected
+  block of them) up or down, sliding it over context and `-` lines to reorder the
+  added content.
 - `Ctrl+Z` / `Ctrl+Y` — in the diff pane, undo and redo your edits.
 - `Ctrl+Q` — close the window.
 

@@ -16,8 +16,8 @@ use commedit_engine::diff::{
 use commedit_engine::graph::{compute_graph, GraphLayout};
 use commedit_engine::history::{history, history_limited, CommitInfo};
 use commedit_engine::patch_edit::{
-    collapse_diff, deletion_is_safe, plan_edit, strip_selection_prefixes, Cursor, EditGesture,
-    EditPlan, Selection,
+    collapse_diff, deletion_is_safe, move_block_range, plan_edit, strip_selection_prefixes, Cursor,
+    EditGesture, EditPlan, Selection,
 };
 use commedit_engine::repo::Repo;
 use commedit_engine::rewrite::{BatchEdit, Identity};
@@ -1880,6 +1880,56 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // handle Enter/Backspace/Delete as ordinary text editing.
             if pane_mode.borrow().is_conflict() {
                 return glib::Propagation::Proceed;
+            }
+            // Alt+Up / Alt+Down move the caret's line — or, with a selection, the
+            // covered block of `+` lines — over its neighbour, *including* over
+            // context and `-` lines, as a structured reorder via the planner.
+            // SourceView binds its own move-lines here, but its raw delete+insert
+            // is re-planned mid-flight by the firewall (doubling prefixes and
+            // invalidating its iterators); the capture-phase `Stop` pre-empts it so
+            // only our planned edit runs.
+            let alt = state.contains(gdk::ModifierType::ALT_MASK);
+            if alt
+                && !ctrl
+                && !shift
+                && matches!(
+                    keyval,
+                    gdk::Key::Up | gdk::Key::Down | gdk::Key::KP_Up | gdk::Key::KP_Down
+                )
+            {
+                let down = matches!(keyval, gdk::Key::Down | gdk::Key::KP_Down);
+                let sel = buffer_selection(&file_buffer);
+                let had_selection = file_buffer.selection_bounds().is_some();
+                return match plan_edit(
+                    &buffer_text(&file_buffer),
+                    sel,
+                    EditGesture::MoveLine { down },
+                ) {
+                    EditPlan::Block => {
+                        show_status(MOVE_LINE_HINT);
+                        glib::Propagation::Stop
+                    }
+                    EditPlan::Edit(edit) => {
+                        apply_patch_edit(&file_buffer, &editing, &edit, &*highlight);
+                        // Re-select the moved block so a repeat press moves the same
+                        // lines (applying the edit collapsed the selection to a caret).
+                        if had_selection {
+                            let (a, b) = move_block_range(sel);
+                            let (na, nb) = if down { (a + 1, b + 1) } else { (a - 1, b - 1) };
+                            if let (Some(start), Some(mut end)) = (
+                                file_buffer.iter_at_line(na as i32),
+                                file_buffer.iter_at_line(nb as i32),
+                            ) {
+                                if !end.ends_line() {
+                                    end.forward_to_line_end();
+                                }
+                                file_buffer.select_range(&start, &end);
+                            }
+                        }
+                        glib::Propagation::Stop
+                    }
+                    EditPlan::Allow => glib::Propagation::Proceed,
+                };
             }
             // Cut / copy operate on the diff's content, not its raw prefixed text:
             // strip the one-char `+`/`-`/space marker per line so a later paste

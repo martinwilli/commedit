@@ -22,6 +22,10 @@
 //!   outright, a context line is marked removed (` ` → `-`), and a `-` line is
 //!   restored to context (`-` → ` `) — un-removing it.
 //! * Enter on a context line keeps it and inserts an empty `+` line below.
+//! * Alt+Up / Alt+Down move a `+` line — or a selected block of them — one
+//!   position up/down, swapping it with the adjacent line (which may be a
+//!   context or `-` line): only additive content is reordered, so the patch
+//!   still applies.
 //! * Header / `@@` / meta lines are read-only.
 //!
 //! The logic is pure and GTK-free: [`plan_edit`] maps `(text, selection,
@@ -47,6 +51,11 @@ pub enum EditGesture {
     /// Delete the whole current line (Ctrl+D): drop a `+` line, mark a context
     /// line removed, or restore a `-` line to context.
     DeleteLine,
+    /// Move the caret's line — or, with a selection, the covered block of `+`
+    /// lines — one position down (`down`) or up, swapping it with the adjacent
+    /// line (Alt+Down / Alt+Up). Only `+` lines move; they may pass *over*
+    /// context and `-` lines.
+    MoveLine { down: bool },
 }
 
 /// A caret position: `line` indexes `text.split('\n')`; `col` is a character
@@ -125,6 +134,7 @@ pub fn plan_edit(text: &str, sel: Selection, gesture: EditGesture) -> EditPlan {
         EditGesture::Backspace => plan_delete(&lines, sel, Dir::Back),
         EditGesture::Delete => plan_delete(&lines, sel, Dir::Forward),
         EditGesture::DeleteLine => plan_delete_line(&lines, sel),
+        EditGesture::MoveLine { down } => plan_move_line(&lines, sel, down),
     }
 }
 
@@ -473,6 +483,93 @@ fn plan_delete_line(lines: &[&str], sel: Selection) -> EditPlan {
         DiffLineKind::Removed => toggle_prefix(l, ' ', sel.end.col),
         _ => EditPlan::Block,
     }
+}
+
+/// The `[first, last]` buffer-line range an [`EditGesture::MoveLine`] relocates,
+/// derived from the selection: a bare caret moves its own line; a selection moves
+/// every line it covers, except one it only touches at column 0 (the boundary
+/// above it). Shared with the UI so its selection-follow lands on exactly the
+/// lines the planner moved.
+pub fn move_block_range(sel: Selection) -> (usize, usize) {
+    let (lo, hi) = sel.ordered();
+    let last = if hi.col == 0 && hi.line > lo.line {
+        hi.line - 1
+    } else {
+        hi.line
+    };
+    (lo.line, last)
+}
+
+/// Move a block of `+` lines up or down by one, swapping it with the single
+/// adjacent line. Only `+` (added) lines may be moved: they are invisible to the
+/// old-file projection, so reordering them past a neighbour — be it another `+`,
+/// a `-`, or a context line — leaves every context/`-` anchor in its original
+/// order and the patch still applies; it only relocates additive content in the
+/// new file. The pivot it swaps with must be an ordinary diff line (context /
+/// `-` / `+`); a structural header/`@@`/meta line or the trailing virtual-EOF
+/// line is a hard boundary the block can't cross.
+fn plan_move_line(lines: &[&str], sel: Selection, down: bool) -> EditPlan {
+    let (a, b) = move_block_range(sel);
+    if b >= lines.len() {
+        return EditPlan::Block;
+    }
+    // Every moved line must be a non-empty `+` line.
+    if lines[a..=b]
+        .iter()
+        .any(|l| l.is_empty() || classify_line(l) != DiffLineKind::Added)
+    {
+        return EditPlan::Block;
+    }
+    // The pivot: the one neighbour the block swaps with. It must exist and be a
+    // movable diff line — never a structural line or the virtual EOF.
+    let pivot = if down {
+        if b + 1 >= lines.len() {
+            return EditPlan::Block;
+        }
+        b + 1
+    } else {
+        if a == 0 {
+            return EditPlan::Block;
+        }
+        a - 1
+    };
+    if lines[pivot].is_empty()
+        || !matches!(
+            classify_line(lines[pivot]),
+            DiffLineKind::Added | DiffLineKind::Removed | DiffLineKind::Context
+        )
+    {
+        return EditPlan::Block;
+    }
+
+    // Replace the block+pivot span (whole lines, trailing newline preserved) with
+    // the two swapped. `start`/`end` stay inside the run, so the surrounding text
+    // and newlines are untouched.
+    let block = lines[a..=b].join("\n");
+    let (start, end, replacement, new_first) = if down {
+        (
+            Cursor::at(a, 0),
+            Cursor::at(pivot, char_len(lines[pivot])),
+            format!("{}\n{}", lines[pivot], block),
+            a + 1,
+        )
+    } else {
+        (
+            Cursor::at(pivot, 0),
+            Cursor::at(b, char_len(lines[b])),
+            format!("{}\n{}", block, lines[pivot]),
+            a - 1,
+        )
+    };
+    // A bare caret follows its line keeping its column; with a selection the UI
+    // re-establishes the caret over the moved block, so any in-block spot serves.
+    let caret_col = if sel.is_empty() { sel.end.col } else { 1 };
+    EditPlan::Edit(PatchEdit {
+        start,
+        end,
+        replacement,
+        cursor: Cursor::at(new_first, caret_col),
+    })
 }
 
 /// Drop a whole `+` line, newline and all. Removing additive content can't break
@@ -1603,6 +1700,129 @@ mod tests {
     }
 
     #[test]
+    fn move_added_line_up_over_context() {
+        let old = "a\nb\n";
+        let patch = unified_diff(old, "a\nb\nc\n", "f"); // " a" / " b" / "+c"
+        let lc = line_index(&patch, |l| l == "+c");
+        let plan = plan_edit(&patch, caret(lc, 1), EditGesture::MoveLine { down: false });
+        let out = apply(&patch, &edit(plan));
+        // The added line now sits above the ' b' context line.
+        assert!(
+            line_index(&out, |l| l == "+c") < line_index(&out, |l| l == " b"),
+            "added line moved above the context line:\n{out}"
+        );
+        // It still applies — and the new file has 'c' before 'b'.
+        assert_eq!(apply_patch(old, &out).unwrap(), "a\nc\nb\n");
+    }
+
+    #[test]
+    fn move_added_line_down_over_context() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let lp = line_index(&patch, |l| l == "+B");
+        let plan = plan_edit(&patch, caret(lp, 1), EditGesture::MoveLine { down: true });
+        let out = apply(&patch, &edit(plan));
+        assert!(
+            line_index(&out, |l| l == "+B") > line_index(&out, |l| l == " c"),
+            "added line moved below the context line:\n{out}"
+        );
+        assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nc\nB\n");
+    }
+
+    #[test]
+    fn move_added_line_up_over_removed() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let lp = line_index(&patch, |l| l == "+B");
+        let plan = plan_edit(&patch, caret(lp, 1), EditGesture::MoveLine { down: false });
+        let out = apply(&patch, &edit(plan));
+        // The '+' line crosses the '-' line; the resulting file is unchanged
+        // (moving additive content past a removed line is a display reorder).
+        assert!(
+            line_index(&out, |l| l == "+B") < line_index(&out, |l| l == "-b"),
+            "the +line moved above the -line:\n{out}"
+        );
+        assert_eq!(apply_patch("a\nb\nc\n", &out).unwrap(), "a\nB\nc\n");
+    }
+
+    #[test]
+    fn move_added_line_over_another_added_reorders_new_content() {
+        let old = "a\n";
+        let patch = unified_diff(old, "a\nx\ny\n", "f"); // " a" / "+x" / "+y"
+        let ly = line_index(&patch, |l| l == "+y");
+        // Move "+y" up over "+x".
+        let plan = plan_edit(&patch, caret(ly, 1), EditGesture::MoveLine { down: false });
+        let out = apply(&patch, &edit(plan));
+        assert_eq!(apply_patch(old, &out).unwrap(), "a\ny\nx\n");
+    }
+
+    #[test]
+    fn move_added_block_down_over_context() {
+        let old = "a\nz\n";
+        let patch = unified_diff(old, "a\nx\ny\nz\n", "f"); // " a" / "+x" / "+y" / " z"
+        let lx = line_index(&patch, |l| l == "+x");
+        // Select the whole "+x"/"+y" block (start of +x through start of " z").
+        let plan = plan_edit(
+            &patch,
+            sel((lx, 0), (lx + 2, 0)),
+            EditGesture::MoveLine { down: true },
+        );
+        let out = apply(&patch, &edit(plan));
+        assert!(
+            out.contains(" z\n+x\n+y\n"),
+            "the block moved below the context line as a unit:\n{out}"
+        );
+        assert_eq!(apply_patch(old, &out).unwrap(), "a\nz\nx\ny\n");
+    }
+
+    #[test]
+    fn move_a_context_line_is_blocked() {
+        // Only `+` lines move; a caret on a context line can't be moved.
+        let patch = sample();
+        let la = line_index(&patch, |l| l == " a");
+        assert_eq!(
+            plan_edit(&patch, caret(la, 1), EditGesture::MoveLine { down: true }),
+            EditPlan::Block
+        );
+    }
+
+    #[test]
+    fn move_a_block_containing_a_non_added_line_is_blocked() {
+        let patch = sample(); // " a" / "-b" / "+B" / " c"
+        let la = line_index(&patch, |l| l == " a");
+        // A selection over " a" / "-b" is not a pure `+` block.
+        assert_eq!(
+            plan_edit(
+                &patch,
+                sel((la, 0), (la + 2, 0)),
+                EditGesture::MoveLine { down: true }
+            ),
+            EditPlan::Block
+        );
+    }
+
+    #[test]
+    fn move_added_line_up_stops_at_the_hunk_header() {
+        // A pure-add diff: the "+a" line sits directly under "@@", a structural
+        // boundary it can't cross.
+        let patch = unified_diff("", "a\n", "f");
+        let lp = line_index(&patch, |l| l == "+a");
+        assert_eq!(
+            plan_edit(&patch, caret(lp, 1), EditGesture::MoveLine { down: false }),
+            EditPlan::Block
+        );
+    }
+
+    #[test]
+    fn move_added_line_down_stops_at_eof() {
+        // "+a" is the last real line; there is nothing below to swap with.
+        let patch = unified_diff("", "a\n", "f");
+        let lp = line_index(&patch, |l| l == "+a");
+        assert_eq!(
+            plan_edit(&patch, caret(lp, 1), EditGesture::MoveLine { down: true }),
+            EditPlan::Block
+        );
+    }
+
+    #[test]
     fn fuzz_handled_gestures_keep_the_patch_applicable() {
         // Apply a deterministic sequence of varied gestures and assert the patch
         // stays applicable at every step. Kept index-driven (not random) so a
@@ -1623,11 +1843,14 @@ mod tests {
             }
             let kind = classify_line(line);
             let col = 1 + (step % 3);
-            let gesture = match step % 4 {
+            let gesture = match step % 5 {
                 0 => EditGesture::Insert(typed[step % typed.len()].to_string()),
                 1 => EditGesture::Newline,
                 2 => EditGesture::Backspace,
-                _ => EditGesture::Delete,
+                3 => EditGesture::Delete,
+                _ => EditGesture::MoveLine {
+                    down: step % 2 == 0,
+                },
             };
             // Only exercise gestures on editable kinds; skip structural lines.
             if matches!(

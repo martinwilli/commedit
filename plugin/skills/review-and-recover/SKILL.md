@@ -2,10 +2,11 @@
 name: review-and-recover
 description: >-
   Use to lean on the commedit session as a safety net and a lens — review
-  everything the session changed as one diff, step back through recorded
-  operations or undo/redo a landed change, recover a commit you dropped, or
-  orient yourself in the history (commit order, a commit's diff, the branch
-  graph, uncommitted changes) before acting or after a save.
+  everything it changed as one diff, step back through recorded operations (undo /
+  redo / jump to any point), or recover a commit you dropped from the trash. A
+  richer net than `git reflog`: every landed edit is a reversible operation and
+  dropped commits stay restorable. Also how you orient — commit order, a commit's
+  diff, the branch graph, uncommitted changes — before acting or after a save.
 ---
 
 # Review, time-travel & recover with commedit

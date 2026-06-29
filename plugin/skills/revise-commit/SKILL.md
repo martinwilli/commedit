@@ -1,11 +1,11 @@
 ---
 name: revise-commit
 description: >-
-  Use when changing history that already exists — reword a commit message,
-  fix an author/committer name or date, or edit the file contents (the diff)
-  of a past commit. Works on any commit reachable from HEAD, including ones
-  buried below the tip that `git commit --amend` can't reach; commedit
-  rewrites the target in place and rebases its descendants automatically.
+  Use when changing a commit that already exists — reword its message, fix an
+  author / committer / date, or edit its file contents (the diff). `git commit
+  --amend` reaches only the tip; this revises **any** commit reachable from HEAD,
+  including ones buried below it, and rebases the descendants automatically. The
+  go-to for the everyday loop: fix a typo, amend a diff, re-author a past commit.
 ---
 
 # Revise an existing commit with commedit

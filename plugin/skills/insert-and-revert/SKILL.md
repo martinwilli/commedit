@@ -1,11 +1,12 @@
 ---
 name: insert-and-revert
 description: >-
-  Use when adding to history rather than editing it in place — create a
-  brand-new commit and splice it anywhere in the graph (not just on top of
-  HEAD), revert a commit (git-revert-style inverse), cherry-pick a commit
-  from another branch, or introduce a merge above a commit. Each rebases existing
-  descendants and can land mid-history.
+  Use when adding to history rather than editing it in place — create a brand-new
+  commit and splice it **anywhere** in the graph (not just on top of HEAD), revert
+  a commit (inverse diff, like `git revert`), cherry-pick one from another branch
+  (like `git cherry-pick`), or introduce a merge above a commit. Landing a commit
+  mid-history would take git a manual rebase; here each insert rebases the
+  existing descendants for you.
 ---
 
 # Insert, revert & cherry-pick with commedit

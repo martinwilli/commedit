@@ -1,11 +1,12 @@
 ---
 name: resolve-conflicts
 description: >-
-  Use when a commedit rewrite's rebase conflicts — it returns
-  `status: conflicts` and is held back in full, with git history, HEAD and the
-  working tree frozen until the whole chain is clean again. Covers seeing what
-  is held, resolving the deferred conflicts file-by-file oldest-first, the
-  binary/structural cases that can't be merged as text, and aborting.
+  Use when a commedit rewrite's rebase conflicts — it returns `status: conflicts`
+  and is held back **in full**: unlike a `git rebase` that drops you into a
+  conflicted working tree, git history, HEAD and the tree stay frozen until the
+  chain is clean. Covers seeing what's held, resolving the deferred conflicts
+  file-by-file oldest-first, the binary/structural cases that can't merge as text,
+  and aborting (which costs nothing — git was never touched).
 ---
 
 # Resolve a held conflict with commedit

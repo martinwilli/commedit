@@ -1,11 +1,13 @@
 ---
 name: reorder-and-squash
 description: >-
-  Use when tidying a branch before review or merge — reorder commits into a
-  logical sequence, fold fix/WIP commits into the ones they belong to (squash,
-  fixup or amend, honouring git autosquash `fixup!`/`squash!`/`amend!`
-  prefixes), or drop a commit entirely. Works on any commit reachable from
-  HEAD; descendants rebase automatically.
+  Use when tidying a branch into a clean, reviewable history — reorder commits
+  into a logical sequence, fold fix/WIP commits into the ones they belong to
+  (squash / fixup / amend, honouring `fixup!`/`squash!`/`amend!` prefixes), or
+  drop a commit. `git rebase -i` without the editor choreography, on any commit
+  reachable from HEAD. It can even route a fix with **no** `fixup!` prefix to the
+  commit that introduced the lines it touches (content-blame) — which git
+  autosquash can't.
 ---
 
 # Reorder, squash & fixup with commedit

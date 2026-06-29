@@ -106,6 +106,8 @@ reflex.
 - Dropped commits → `list_trash`; recorded ops → `list_operations`
 - Is a conflicted rewrite held? → `pending_status`
 - Route an autosquash `fixup!`/`squash!`/`amend!` source → `suggest_squash_targets`
+- Find where an UNLABELLED fix belongs (which commit introduced the code it edits) →
+  `blame_squash_targets` (omit `source` to content-blame the working copy)
 
 **Edit in place**
 - Message: surgical `replace_in_message`, else whole `edit_message`. Bodies are

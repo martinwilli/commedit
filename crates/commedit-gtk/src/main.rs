@@ -355,13 +355,17 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
              border: 1px dashed rgb(53, 132, 228); border-radius: 5px; margin: 1px 6px; } \
              row.commit-dragging { opacity: 0.35; } \
              row.squash-recommended { background-color: rgba(46, 194, 126, 0.18); \
-             border: 1px dashed rgb(46, 194, 126); border-radius: 5px; } \
+             border-radius: 5px; outline: 1px dashed rgb(46, 194, 126); \
+             outline-offset: -1px; } \
              row.squash-sibling { background-color: rgba(245, 194, 17, 0.18); \
-             border: 1px dashed rgb(245, 194, 17); border-radius: 5px; } \
+             border-radius: 5px; outline: 1px dashed rgb(245, 194, 17); \
+             outline-offset: -1px; } \
              row.squash-drop-target { background-color: rgba(224, 27, 36, 0.38); \
-             border: 1px solid rgb(224, 27, 36); border-radius: 5px; } \
+             border-radius: 5px; outline: 1px solid rgb(224, 27, 36); \
+             outline-offset: -1px; } \
              row.op-affected { background-color: rgba(53, 132, 228, 0.22); \
-             border: 1px dashed rgb(53, 132, 228); border-radius: 5px; } \
+             border-radius: 5px; outline: 1px dashed rgb(53, 132, 228); \
+             outline-offset: -1px; } \
              .commit-id-copy { background-color: @theme_base_color; \
              color: @theme_fg_color; border-radius: 4px; padding: 0 1px; } \
              .commit-revert { background-color: @theme_base_color; \
@@ -377,7 +381,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
              entry.identity-differs > text > placeholder { font-style: italic; } \
              .history-list row { padding-top: 0; padding-bottom: 0; } \
              row.squash-blame { background-color: rgba(145, 65, 172, 0.20); \
-             border: 1px dashed rgb(145, 65, 172); border-radius: 5px; } \
+             border-radius: 5px; outline: 1px dashed rgb(145, 65, 172); \
+             outline-offset: -1px; } \
              .blame-strip { min-width: 14px; padding: 0; color: #6e7781; \
              border-right: 1px solid alpha(@theme_fg_color, 0.12); } \
              .blame-strip:hover { background-color: alpha(@theme_fg_color, 0.08); }",

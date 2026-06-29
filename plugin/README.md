@@ -36,8 +36,8 @@ operation**: undo/redo, jump to any earlier point, roll the whole session back,
 or review everything the session changed as a single diff. If git history moves
 out of band (a commit or rebase made outside the agent), a reload picks it up.
 
-Tools surface under the `commedit` server (`list_history`, `show_commit`,
-`edit_message`, `replace_in_file`, `edit_commits`, `create_commit`,
+Tools surface under the `commedit` server (`open_session`, `list_history`,
+`show_commit`, `edit_message`, `replace_in_file`, `edit_commits`, `create_commit`,
 `revert_commit`, `cherry_pick_commit`, `reorder_commit`, `squash_commit`,
 `split_commit`, `commit_working_copy`, `resolve_conflicts`, `undo`, …). The
 server provides its own usage instructions to the agent on connect.
@@ -60,7 +60,8 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
   `git commit --amend` reaches.
 - **`reorder-and-squash`** — tidy a branch before review or merge: reorder
   commits, fold fix/WIP commits in (squash, fixup or amend, including autosquash
-  `fixup!`/`squash!`/`amend!` prefixes), or drop a commit.
+  `fixup!`/`squash!`/`amend!` prefixes — or a fix with *no* prefix, by
+  content-blame), or drop a commit.
 - **`insert-and-revert`** — add to history: create a commit and splice it
   anywhere in the graph, revert a commit, or cherry-pick one from another branch.
 - **`resolve-conflicts`** — when a rewrite's rebase conflicts, commedit holds it
@@ -70,18 +71,19 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
   the session changed as one diff, undo or jump back through recorded operations,
   recover a dropped commit, or orient yourself in the branch graph.
 - **`work-in-worktree`** — reshape a branch's history isolated in a `git
-  worktree`, leaving the main checkout untouched: create the worktree and point
-  commedit at it with `reload_repo`'s `path` (the server follows the retarget, not
-  your working directory). The same retarget is required for *any* worktree
-  commedit should act on — including one the harness creates — so the plugin also
-  reminds you on worktree entry. Then re-home and tear down afterward.
+  worktree`, leaving the main checkout untouched. The server hosts one editing
+  **session per branch**: `open_session(branch=<the worktree's branch>)` opens a
+  session bound to that worktree, which you then address with `session=<id>` on
+  every commedit call (the plugin also reminds you on worktree entry). Re-home or
+  tear down afterward.
 
-To edit a branch you have **not** checked out — without a worktree at all — pass
-its name to `reload_repo`'s `branch` (or launch the server as
-`commedit-mcp <path> <branch>`). commedit then moves only that branch's ref and
-leaves `HEAD`, the index and the worktree frozen, so there is no working copy and
-the working-copy tools are refused. A branch checked out in another worktree is
-refused (rewriting it would desync that worktree).
+To edit a branch you have **not** checked out — without a worktree at all —
+`open_session(branch=<name>)` on a branch checked out nowhere opens it
+**off-worktree**: commedit moves only that branch's ref and leaves `HEAD`, the
+index and the worktree frozen, so there is no working copy and the working-copy
+tools are refused. (The launch session can also start there when the server is run
+as `commedit-mcp <path> <branch>`.) A branch can be edited by at most one session
+at a time.
 
 ## Bundled agent
 

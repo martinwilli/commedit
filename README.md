@@ -41,6 +41,14 @@ an interactive-rebase session.
   numbers alongside the diff — the original number on removed lines, the resulting
   number on context and added lines.
 
+- **Blame the old side** — click the slim handle at the left edge of the diff
+  (a triangle, ▸, collapsed by default) to slide open a blame column annotating
+  each context and removed line, in a gutter *left* of the line numbers, with the
+  commit that last touched it in the *old* (pre-image) file. It's a true `git
+  blame`-style walk, computed in-process via jujutsu's annotator and only while
+  expanded (it's the one expensive view). Hovering a hash highlights that commit's
+  row in the history list, if it's shown.
+
 - **Revert hunks or files** — every changed file carries a *revert* button in the
   gutter to drop its change from the commit, and every hunk of a modified file one
   to drop just that hunk. It works whatever the change is: a modified file reverts to its

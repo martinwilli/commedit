@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 
 use rmcp::handler::server::tool::IntoCallToolResult;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -36,7 +36,7 @@ impl<T: Serialize + JsonSchema> IntoCallToolResult for Yaml<T> {
         })?;
         // No `structured_content`: a client that receives it surfaces the JSON
         // and hides this text block, defeating the readable YAML rendering.
-        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(yaml)]))
     }
 }
 

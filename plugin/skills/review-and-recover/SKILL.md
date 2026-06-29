@@ -23,8 +23,9 @@ where the session started and where it stands is always one diff away.
 
 ## Orient
 
-Read before you act, and address everything by **`change_id`** (stable across
-rewrites) once you have it:
+Read before you act. Address everything by **`change_id`** (stable across
+rewrites) once you have it, and pass the `session` id (the branch short-name) on
+every commedit call:
 
 - `list_history` — commit order and the `change_id`/sha of each. Pass a small
   `fields` set (or `fields: []` for a header-only overview) and `offset` to page;

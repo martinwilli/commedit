@@ -584,8 +584,15 @@ a warm session** across tasks — the per-task cold spawn here is the deliberate
   git -C "$REPO" worktree prune
   for b in $(git -C "$REPO" for-each-ref --format='%(refname:short)' 'refs/heads/stress/*'); do
     git -C "$REPO" branch -D "$b"; done
+  rm -rf "$(git -C "$REPO" rev-parse --git-common-dir)/rr-cache"   # clear rerere cache — see note below
   # optional: git -C "$REPO" gc --prune=now
   ```
+- **Clear the `rerere` cache on teardown** (the `rm -rf …/rr-cache` above). `rerere.enabled` is on in
+  this repo and its resolution cache lives in the **shared git common dir**, so a prior run's
+  hand-resolved T3/T10 conflicts persist there and get **auto-applied to the plain-git baseline on its
+  very first conflict encounter** in the next run — help a fresh clone would never have. It does not
+  change the *end state* (the oracle still grades correctly), but it flatters the git baseline's
+  conflict-task call count and wall-clock, so clear it to keep that comparison honest (run-8 finding).
 - Rebuild the fixture (`./dogfood/reposetup.sh`), re-derive change ids with `list_history` (they
   differ per build), re-run calibration (§4) — **don't trust last run's answer keys blindly**; a
   tool change may alter call counts or which path is "minimal."

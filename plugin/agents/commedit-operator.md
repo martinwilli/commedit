@@ -1,40 +1,23 @@
 ---
 name: commedit-operator
 description: >-
-  Delegate COMPLEX history editing here — work that is exploratory, multi-step,
-  conflict-prone, or verbose, or that would otherwise dump large diffs or
-  history into your own context. For a SINGLE mutation you can address directly
-  (you already hold the change_id or a clear ref), drive the commedit MCP tool
-  YOURSELF instead: each result is self-verifying — it returns the new
-  change_id, the reshaped topology, and (for working-copy commits) the remaining
-  uncommitted changes — so a one-shot reword / re-date / edit-one-file / reorder
-  / squash / drop / create / revert / cherry-pick / merge-out needs no subagent
-  and no follow-up read. Self-drive the ATTEMPT, but delegate the FALLOUT: if a
-  mutation you drove comes back `status: conflicts` (held, git frozen), hand the
-  held conflict to THIS agent rather than working the resolution loop in your
-  own context. Reach for it whenever the job is a loop, a search, or a conflict:
-  resolving a pending conflict (its signature job — while one is held no other
-  mutation runs); finding the right commit or routing an autosquash by reading
-  several diffs; an open-ended restructuring sequence (tidy a branch for review,
-  re-date a whole range, linearize or branchify); or splitting a commit (it
-  carves with working-copy selections rather than the error-prone split_commit).
-  It works on any commit reachable from HEAD (not just the tip), rebases
-  descendants automatically, and verifies the result. A plain new commit on top
-  of HEAD is never for this agent — that needs no rebase (use raw `git add` /
-  `git commit`, or commit_working_copy to stay in-session). Hand it the WHAT —
-  "resolve the pending conflict", "squash the fixup into Y across this messy
-  range", "re-date the whole feature branch", "find where this fix belongs and
-  fold it in", "reorder these four into a logical sequence" — and it picks the
-  tools, addresses by change_id, performs the action, confirms it, and returns a
-  compact summary (outcome, affected change_ids, what it verified). Delegate a
-  conflict WITH a resolution intent, or it will report the conflict and ask how
-  to proceed rather than guess. Delegate one operation, or a tightly-related
-  batch, per call. Editing an EXISTING merge is in scope (reword, squash into, or
-  move commits across it); only building a NEW merge between two divergent
-  branches, and managing branches, worktrees, remotes, tags or pushes, stay
-  plain-git tasks. It never
-  modifies working-tree files itself: make any on-disk edits first, then
-  delegate.
+  Delegate history editing that is exploratory, multi-step, conflict-prone, or
+  verbose — work that would otherwise churn your context with diffs and dead
+  ends. A single mutation you can address directly (you hold the change_id) is
+  cheaper to drive yourself: every commedit result is self-verifying (new
+  change_id, reshaped topology, working-copy remainder). So self-drive the
+  one-shot rewords / re-dates / reorders / squashes, but delegate the loops,
+  searches and conflicts — including the FALLOUT when a mutation you drove comes
+  back `status: conflicts` (held, git frozen). Typical asks: "resolve the pending
+  conflict", "fold this fixup into the right commit across a messy range",
+  "re-date this whole branch", "find where this fix belongs", "reorder these into
+  a logical sequence". It works on any commit reachable from HEAD, addresses by
+  change_id, rebases descendants, verifies, and returns a compact summary
+  (outcome, change_ids, what it checked). Delegate a conflict WITH a resolution
+  intent, or it stops and asks. One operation, or a tight batch, per call. It
+  never edits working-tree files — make on-disk edits first, then delegate.
+  Editing an existing merge is in scope; building a new merge between divergent
+  branches, and branch/worktree/remote management, are plain-git tasks.
 model: sonnet
 color: cyan
 tools: mcp__plugin_commedit_commedit__*, Bash, Read, Grep, Glob, Skill

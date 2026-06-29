@@ -1,11 +1,12 @@
 ---
 name: insert-and-revert
 description: >-
-  Use when adding to history rather than editing it in place — create a
-  brand-new commit and splice it anywhere in the graph (not just on top of
-  HEAD), revert a commit (git-revert-style inverse), cherry-pick a commit
-  from another branch, or introduce a merge above a commit. Each rebases existing
-  descendants and can land mid-history.
+  Use when adding to history rather than editing it in place — create a brand-new
+  commit and splice it **anywhere** in the graph (not just on top of HEAD), revert
+  a commit (inverse diff, like `git revert`), cherry-pick one from another branch
+  (like `git cherry-pick`), or introduce a merge above a commit. Landing a commit
+  mid-history would take git a manual rebase; here each insert rebases the
+  existing descendants for you.
 ---
 
 # Insert, revert & cherry-pick with commedit
@@ -71,8 +72,13 @@ commits onto the new side branch.
   cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - **Address commits by `change_id`, not sha** — shas churn on every rewrite,
   change_ids are stable, so you can chain edits without re-running `list_history`.
-- **After any out-of-band git operation** (a commit, branch switch or rebase made
-  outside the session) call `reload_repo` before continuing.
+  Each tool also needs a `session` id (the branch short-name) — pass it on every
+  call; editing across branches or worktrees is the `work-in-worktree` skill.
+- **A plain `git commit` on top of HEAD needs no reload** — the session catches up
+  automatically on the next tool call. Reserve `reload_repo(session, …)` for an
+  out-of-band change it can't absorb: a **branch switch**, or history **rewritten**
+  by `git rebase`/`reset`/`commit --amend` (it restarts that session's trash and
+  op-log, so don't run it reflexively).
 - **Safety net & review.** Every landed change is a recorded operation you can
   walk back, dropped commits stay recoverable, and the session is one inspectable
   diff — stepping back, reviewing, or recovering is the `review-and-recover`

@@ -1,11 +1,12 @@
 ---
 name: resolve-conflicts
 description: >-
-  Use when a commedit rewrite's rebase conflicts — it returns
-  `status: conflicts` and is held back in full, with git history, HEAD and the
-  working tree frozen until the whole chain is clean again. Covers seeing what
-  is held, resolving the deferred conflicts file-by-file oldest-first, the
-  binary/structural cases that can't be merged as text, and aborting.
+  Use when a commedit rewrite's rebase conflicts — it returns `status: conflicts`
+  and is held back **in full**: unlike a `git rebase` that drops you into a
+  conflicted working tree, git history, HEAD and the tree stay frozen until the
+  chain is clean. Covers seeing what's held, resolving the deferred conflicts
+  file-by-file oldest-first, the binary/structural cases that can't merge as text,
+  and aborting (which costs nothing — git was never touched).
 ---
 
 # Resolve a held conflict with commedit
@@ -36,7 +37,8 @@ Work the **oldest conflicted commit first** and climb:
 2. Edit it down to the content you want — **remove every conflict marker**,
    keeping the reconciled result.
 3. Submit it with `resolve_conflicts`, keyed by the commit's **`change_id`**
-   (stable across the rewrite — shas are not).
+   (stable across the rewrite — shas are not). As with every commedit tool, pass
+   the `session` id on the call.
 4. Re-check `pending_status` and repeat on the next-oldest until it's empty.
 
 Fixing the earliest conflict often **auto-clears its descendants**: a child's

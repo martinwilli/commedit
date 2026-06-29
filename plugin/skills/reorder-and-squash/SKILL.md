@@ -1,11 +1,13 @@
 ---
 name: reorder-and-squash
 description: >-
-  Use when tidying a branch before review or merge — reorder commits into a
-  logical sequence, fold fix/WIP commits into the ones they belong to (squash,
-  fixup or amend, honouring git autosquash `fixup!`/`squash!`/`amend!`
-  prefixes), or drop a commit entirely. Works on any commit reachable from
-  HEAD; descendants rebase automatically.
+  Use when tidying a branch into a clean, reviewable history — reorder commits
+  into a logical sequence, fold fix/WIP commits into the ones they belong to
+  (squash / fixup / amend, honouring `fixup!`/`squash!`/`amend!` prefixes), or
+  drop a commit. `git rebase -i` without the editor choreography, on any commit
+  reachable from HEAD. It can even route a fix with **no** `fixup!` prefix to the
+  commit that introduced the lines it touches (content-blame) — which git
+  autosquash can't.
 ---
 
 # Reorder, squash & fixup with commedit
@@ -63,13 +65,25 @@ into the answer. It ranks only commits whose lines the change actually edits, so
 a pure addition (new code, nothing modified) has nothing to blame; the reported
 `unattributed` count is lines tracing past a merge or outside the history.
 
+## Editing an existing merge
+
+You don't only *create* merges — an existing one is editable in place. Fold a
+follow-up commit **into** a merge with `squash_commit` (merge as `dest`): it keeps
+both parents, so the merge stays a merge. Reword it with `edit_message` (see the
+`revise-commit` skill; its committer isn't re-stamped). And move a commit onto one
+of its parent edges with `reorder_commit`'s `child`. Only *building* a new merge
+between two divergent branches stays a plain-git task.
+
 ## Drop
 
 `drop_commit(commit)` removes a commit; its children rebase onto its parent. The
 dropped commit goes to a session trash (`list_trash`), so it's recoverable —
 graft it back with `restore_commit(commit, new_parent)` or fold it somewhere
-with `squash_commit` (a trashed commit is a valid squash source). Merge commits
-and a branch's only commit can't be dropped.
+with `squash_commit` (a trashed commit is a valid squash source). Or pass
+`keep_changes: true` to **uncommit** instead: the commit leaves history for good
+and its diff returns to the working tree as uncommitted changes (git's
+`reset --mixed`) — handy to re-carve it into cleaner pieces. Merge commits and a
+branch's only commit can't be dropped.
 
 ## When things go sideways
 
@@ -79,8 +93,13 @@ and a branch's only commit can't be dropped.
   cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - **Address commits by `change_id`, not sha** — shas churn on every rewrite,
   change_ids are stable, so you can chain edits without re-running `list_history`.
-- **After any out-of-band git operation** (a commit, branch switch or rebase made
-  outside the session) call `reload_repo` before continuing.
+  Each tool also needs a `session` id (the branch short-name) — pass it on every
+  call; editing across branches or worktrees is the `work-in-worktree` skill.
+- **A plain `git commit` on top of HEAD needs no reload** — the session catches up
+  automatically on the next tool call. Reserve `reload_repo(session, …)` for an
+  out-of-band change it can't absorb: a **branch switch**, or history **rewritten**
+  by `git rebase`/`reset`/`commit --amend` (it restarts that session's trash and
+  op-log, so don't run it reflexively).
 - **Safety net & review.** Every landed change is a recorded operation you can
   walk back, dropped commits stay recoverable, and the session is one inspectable
   diff — stepping back, reviewing, or recovering is the `review-and-recover`

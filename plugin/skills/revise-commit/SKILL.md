@@ -1,11 +1,11 @@
 ---
 name: revise-commit
 description: >-
-  Use when changing history that already exists — reword a commit message,
-  fix an author/committer name or date, or edit the file contents (the diff)
-  of a past commit. Works on any commit reachable from HEAD, including ones
-  buried below the tip that `git commit --amend` can't reach; commedit
-  rewrites the target in place and rebases its descendants automatically.
+  Use when changing a commit that already exists — reword its message, fix an
+  author / committer / date, or edit its file contents (the diff). `git commit
+  --amend` reaches only the tip; this revises **any** commit reachable from HEAD,
+  including ones buried below it, and rebases the descendants automatically. The
+  go-to for the everyday loop: fix a typo, amend a diff, re-author a past commit.
 ---
 
 # Revise an existing commit with commedit
@@ -70,8 +70,13 @@ single-commit tools — it's atomic and won't re-stamp committers across the cas
   cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
 - **Address commits by `change_id`, not sha** — shas churn on every rewrite,
   change_ids are stable, so you can chain edits without re-running `list_history`.
-- **After any out-of-band git operation** (a commit, branch switch or rebase made
-  outside the session) call `reload_repo` before continuing.
+  Each tool also needs a `session` id (the branch short-name) — pass it on every
+  call; editing across branches or worktrees is the `work-in-worktree` skill.
+- **A plain `git commit` on top of HEAD needs no reload** — the session catches up
+  automatically on the next tool call. Reserve `reload_repo(session, …)` for an
+  out-of-band change it can't absorb: a **branch switch**, or history **rewritten**
+  by `git rebase`/`reset`/`commit --amend` (it restarts that session's trash and
+  op-log, so don't run it reflexively).
 - **Safety net & review.** Every landed change is a recorded operation you can
   walk back, dropped commits stay recoverable, and the session is one inspectable
   diff — stepping back, reviewing, or recovering is the `review-and-recover`

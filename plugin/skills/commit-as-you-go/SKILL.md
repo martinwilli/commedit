@@ -64,6 +64,8 @@ reorder or drop it later in one call, and descendants rebase automatically.
 
 5. **Address commits by `change_id`, not sha.** Shas churn on every rewrite;
    change_ids are stable, so you can chain edits without re-running `list_history`.
+   Each commedit tool also takes a `session` id (the branch short-name) — pass it
+   on every call.
 
 6. **Splitting — carve forward, don't split back.** Carving a pile you have
    *not yet committed* is the easy, recommended split: commit part of the working
@@ -91,13 +93,13 @@ reorder or drop it later in one call, and descendants rebase automatically.
   for out-of-band changes it can't absorb in place: a **branch switch**, or history
   **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
   trash and op-log, so don't run it reflexively).
-- **Off-worktree, this loop doesn't apply.** When commedit edits a branch you have
-  *not* checked out (`reload_repo`'s `branch`, or launched as `<path> <branch>`),
-  there is **no working copy**: no plain `git commit` to crystallize, and the
-  `commit_working_copy` / `squash_working_copy` / `discard_working_copy` tools are
-  refused. You edit the branch's existing commits directly instead. (This is a
-  different thing from the `work-in-worktree` skill, where you *create* a worktree
-  and keep a live working copy in it.)
+- **Off-worktree, this loop doesn't apply.** A session over a branch checked out
+  *nowhere* (`open_session` on an unchecked-out branch, `reload_repo`'s `branch`,
+  or launched as `<path> <branch>`) has **no working copy**: no plain `git commit`
+  to crystallize, and the `commit_working_copy` / `squash_working_copy` /
+  `discard_working_copy` tools are refused. You edit the branch's existing commits
+  directly instead. (Different from the `work-in-worktree` skill, where you
+  *create* a worktree and keep a live working copy in it.)
 - **Safety net & review.** Every landed change is a recorded operation you can
   walk back, dropped commits stay recoverable, and the session is one inspectable
   diff — stepping back, reviewing, or recovering is the `review-and-recover`

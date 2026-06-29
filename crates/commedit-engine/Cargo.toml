@@ -18,7 +18,7 @@ similar = "3"
 tempfile = "3"
 ec4rs = "1"
 jsonc-parser = "0.32"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 jj-lib.workspace = true

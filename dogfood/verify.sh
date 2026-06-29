@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deterministic correctness oracle for the dogfood tournament.
 #
-#   ./dogfood/verify.sh <t1..t11> <worktree-path>
+#   ./dogfood/verify.sh <t1..t12> <worktree-path>
 #
 # Codifies each task's PASS criteria from README §4 as git-observable assertions,
 # so the correctness GATE no longer rides on teacher attention and is byte-comparable
@@ -26,8 +26,8 @@
 set -u
 
 BASE="${BASE:-stress/base}"
-TASK="${1:?usage: verify.sh <t1..t11> <worktree-path>}"
-WT="${2:?usage: verify.sh <t1..t11> <worktree-path>}"
+TASK="${1:?usage: verify.sh <t1..t12> <worktree-path>}"
+WT="${2:?usage: verify.sh <t1..t12> <worktree-path>}"
 
 g()  { git -C "$WT" "$@"; }
 fail=0
@@ -246,10 +246,27 @@ t11() {
   check_clean
 }
 
+t12() {
+  # The stray fix `Tune retry policy` must be folded into the commit content-blame
+  # finds — `Add retry helper` — leaving the tree identical to base (topology-only).
+  subjects | grep -qxF 'Tune retry policy' \
+    && bad "standalone 'Tune retry policy' still present (not folded)" || ok "fix folded (no standalone 'Tune retry policy')"
+  has_subject 'Add retry helper' && ok "'Add retry helper' retained" || bad "'Add retry helper' missing"
+  local rc; rc=$(sha_of 'Add retry helper')
+  if [ -n "$rc" ]; then
+    local rt; rt=$(blob "$rc" src/retry.txt)
+    grep -qxF 'RETRY_LIMIT = 5' <<<"$rt" && ok "RETRY_LIMIT bump folded into target" || bad "RETRY_LIMIT=5 not at target (got: $(grep RETRY_LIMIT <<<"$rt"))"
+    grep -qxF 'BACKOFF_MS = 100' <<<"$rt" && ok "BACKOFF typo-fix folded into target" || bad "BACKOFF_MS fix not at target"
+    grep -qxF 'BACKOF_MS = 100' <<<"$rt" && bad "BACKOF typo still at target" || ok "BACKOF typo gone from target"
+  else bad "cannot locate 'Add retry helper' to check the fold"; fi
+  tree_eq_base && ok "tree identical to base (fold is topology-only)" || bad "tree differs from base: $(namestatus | tr '\n' ';')"
+  check_clean
+}
+
 echo "== verify ${TASK} @ ${WT} (base=${BASE}) =="
 case "${TASK,,}" in
   t1) t1;; t2) t2;; t3) t3;; t4) t4;; t5) t5;;
-  t6) t6;; t7) t7;; t8) t8;; t9) t9;; t10) t10;; t11) t11;;
-  *) echo "unknown task: ${TASK} (want t1..t11)" >&2; exit 2;;
+  t6) t6;; t7) t7;; t8) t8;; t9) t9;; t10) t10;; t11) t11;; t12) t12;;
+  *) echo "unknown task: ${TASK} (want t1..t12)" >&2; exit 2;;
 esac
 if [ "$fail" -eq 0 ]; then echo "PASS: ${TASK}"; exit 0; else echo "FAIL: ${TASK}"; exit 1; fi

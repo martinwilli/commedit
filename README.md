@@ -41,6 +41,14 @@ an interactive-rebase session.
   numbers alongside the diff — the original number on removed lines, the resulting
   number on context and added lines.
 
+- **Blame the old side** — click the slim handle at the left edge of the diff
+  (a triangle, ▸, collapsed by default) to slide open a blame column annotating
+  each context and removed line, in a gutter *left* of the line numbers, with the
+  commit that last touched it in the *old* (pre-image) file. It's a true `git
+  blame`-style walk, computed in-process via jujutsu's annotator and only while
+  expanded (it's the one expensive view). Hovering a hash highlights that commit's
+  row in the history list, if it's shown.
+
 - **Revert hunks or files** — every changed file carries a *revert* button in the
   gutter to drop its change from the commit, and every hunk of a modified file one
   to drop just that hunk. It works whatever the change is: a modified file reverts to its
@@ -250,6 +258,13 @@ change id, with descendants rebased automatically, conflicted rewrites held back
 from git until they resolve or abort, and every step undoable. Alongside the
 tools the plugin ships skills that teach the agent *when* to reach for these
 workflows and a `commedit-operator` subagent that drives them.
+
+Finding where a stray fix belongs is a first-class step: `blame_squash_targets`
+content-blames the lines a change touches and ranks the commits that own them —
+the same old-side blame the diff column shows, turned into ready-to-squash
+targets — so the agent can fold a fix into the commit that introduced the code
+even without knowing which one that is. It complements `suggest_squash_targets`,
+which instead routes an explicit `fixup!` / `squash!` / `amend!` subject prefix.
 
 One server hosts several **independent editing sessions** over the one repository
 it serves — one per branch — so an agent can edit several branches at once, and in

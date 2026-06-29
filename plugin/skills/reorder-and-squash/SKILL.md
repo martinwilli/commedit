@@ -51,6 +51,18 @@ matching destination commit(s), the `mode` it requests, and any sibling
 autosquash commits aimed at the same target. Pass a returned target straight
 into `squash_commit` as `dest`.
 
+### Find the target by content
+
+When a fix carries **no** prefix — or you simply don't know which commit
+introduced the code it touches — `blame_squash_targets(source)` content-blames
+the lines the change removes/modifies and returns the owning commits ranked by
+how many of those lines each owns; pass the top `change_id` into `squash_commit`
+as `dest`. Omit `source` to blame the working copy (all uncommitted changes) —
+*"where do my current edits belong?"* in one call, then `squash_working_copy`
+into the answer. It ranks only commits whose lines the change actually edits, so
+a pure addition (new code, nothing modified) has nothing to blame; the reported
+`unattributed` count is lines tracing past a merge or outside the history.
+
 ## Drop
 
 `drop_commit(commit)` removes a commit; its children rebase onto its parent. The

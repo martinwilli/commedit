@@ -1,32 +1,157 @@
-//! A scoped, content-derived "blame" for the drag-to-squash hint.
+//! Two flavours of blame over the history.
 //!
-//! When a single commit is dragged in the history list,
-//! [`Repo::blame_single_source`] asks: do *all* the lines this commit removes
-//! trace back to one single commit? If so, that commit is almost certainly where
-//! the change belongs — a stronger signal than the subject-string match
-//! [`crate::squash::squash_recommendations`] makes, so the UI highlights it in
-//! its own colour.
+//! [`Repo::blame_old_side`] is the diff-viewer's full annotation: for the *old*
+//! (pre-image) side of a commit's diff, attribute each line to the commit that
+//! last touched it. It uses jj-lib's [`FileAnnotator`] (a `git blame`-shaped
+//! walk: file-filtered, early-exits per line, in-process), fed the diff's actual
+//! pre-image text so it stays correct across merge bases.
 //!
-//! jj-lib exposes no blame/annotate API, so we compute one ourselves, narrowly:
-//! starting from the dragged commit's removed lines, we walk first-parent
-//! ancestry and attribute each tracked line to the commit that last introduced
-//! it. [`crate::diff::commit_changes`] already yields, per file, the parent
-//! version (`old_text`) and the commit version (`new_text`) — exactly the
-//! per-step diff this walk consumes — and `similar` maps line positions across
-//! it. Two early-outs keep it cheap: bail the instant a *second* distinct source
-//! commit appears (the "single commit" answer can no longer be yes), and stop
-//! once every tracked line is attributed.
+//! [`Repo::blame_single_source`] is the narrower, content-derived hint for
+//! drag-to-squash. When a single commit is dragged in the history list, it asks:
+//! do *all* the lines this commit removes trace back to one single commit? If
+//! so, that commit is almost certainly where the change belongs — a stronger
+//! signal than the subject-string match [`crate::squash::squash_recommendations`]
+//! makes, so the UI highlights it in its own colour. It computes its own narrow
+//! first-parent walk (jj-lib's annotator answers per-line origins, not the
+//! "do they all agree" question this needs): [`crate::diff::commit_changes`]
+//! yields, per file, the parent version (`old_text`) and the commit version
+//! (`new_text`), and `similar` maps line positions across it. Two early-outs keep
+//! it cheap: bail the instant a *second* distinct source commit appears (the
+//! "single commit" answer can no longer be yes), and stop once every tracked
+//! line is attributed.
 
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
 use similar::{DiffOp, TextDiff};
 
+use jj_lib::annotate::FileAnnotator;
 use jj_lib::backend::CommitId;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
 
-use crate::diff::commit_changes;
+use crate::diff::{combined_changes, commit_changes};
 use crate::history::CommitInfo;
 use crate::repo::Repo;
 
+/// Old-side blame for a single file: for each line of the file's pre-image
+/// version, which commit last touched it.
+#[derive(Debug, Clone)]
+pub struct FileBlame {
+    /// Path relative to the repo root (internal, forward-slash form), matching
+    /// [`crate::diff::FileChange::path`].
+    pub path: String,
+    /// The distinct originating commits referenced by [`Self::lines`], deduped.
+    pub origins: Vec<CommitInfo>,
+    /// Indexed by 0-based line in the old (pre-image) file: `Some(i)` points at
+    /// `origins[i]`, `None` is a line the walk couldn't attribute within the
+    /// domain (a merge / history boundary).
+    pub lines: Vec<Option<usize>>,
+}
+
+/// Per-origin attribution of the lines a change removes: the ranked
+/// content-blame behind the MCP squash-target finder, the multi-source
+/// generalization of [`Repo::blame_single_source`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlameOrigins {
+    /// `(display row, removed-line count)` into `commits`, most lines first.
+    pub candidates: Vec<(usize, usize)>,
+    /// Removed lines that hit a merge / history boundary before being
+    /// attributed, or whose origin isn't a row in `commits`.
+    pub unattributed: usize,
+}
+
 impl Repo {
+    /// Blame the *old* (pre-image) side of the diff for `commit_ids`.
+    ///
+    /// `commit_ids` are oldest-first, the same convention as
+    /// [`crate::diff::combined_changes`]; the pre-image is that combined diff's
+    /// old side (the parent tree of the oldest commit). Each changed file with a
+    /// text old side is annotated from the oldest commit's first parent over its
+    /// full ancestry, so every context / removed line maps to the commit that
+    /// introduced it. Added/binary files (no old side) are skipped, as is a
+    /// selection whose combined diff conflicts.
+    pub fn blame_old_side(&self, commit_ids: &[CommitId]) -> Result<Vec<FileBlame>> {
+        let store = self.repo.store().clone();
+        let Some(first_id) = commit_ids.first() else {
+            return Ok(Vec::new());
+        };
+        let oldest = store
+            .get_commit(first_id)
+            .context("loading oldest commit")?;
+        // The base commit whose file content the walk starts from. A commit with
+        // no parent (its parent is the virtual root) has an empty old side, so
+        // there is nothing to blame.
+        let Some(start_id) = oldest.parent_ids().first().cloned() else {
+            return Ok(Vec::new());
+        };
+
+        // The pre-image text + changed-file set, reused from the diff path so the
+        // blamed files match exactly what the buffer shows. A conflicting
+        // combination has no coherent old side.
+        let Some(changes) = combined_changes(&self.repo, commit_ids)? else {
+            return Ok(Vec::new());
+        };
+
+        // Domain for every file's walk: the base commit and all its ancestors
+        // (`::start_id`), resolved like the history walk. The annotator narrows it
+        // per file to commits that touched the path.
+        let symbol_resolver =
+            SymbolResolver::new(&*self.repo, &([] as [&Box<dyn SymbolResolverExtension>; 0]));
+        let domain = RevsetExpression::commits(vec![start_id.clone()])
+            .ancestors()
+            .resolve_user_expression(&*self.repo, &symbol_resolver)
+            .context("resolving blame domain")?;
+
+        let mut result = Vec::new();
+        for fc in &changes {
+            if fc.is_binary {
+                continue;
+            }
+            let Some(old_text) = fc.old_text.as_deref() else {
+                continue; // added file: no old side
+            };
+            let repo_path = RepoPathBuf::from_internal_string(&fc.path).context("invalid path")?;
+            let mut annotator =
+                FileAnnotator::with_file_content(&start_id, &repo_path, old_text.to_owned());
+            pollster::block_on(annotator.compute(&*self.repo, &domain))
+                .with_context(|| format!("blaming {}", fc.path))?;
+
+            // Per old-file line, the originating commit (or `None` at a boundary),
+            // deduped into `origins`.
+            let annotation = annotator.to_annotation();
+            let mut origins: Vec<CommitInfo> = Vec::new();
+            let mut index_of: HashMap<CommitId, usize> = HashMap::new();
+            let mut lines: Vec<Option<usize>> = Vec::new();
+            for (origin, _line) in annotation.lines() {
+                match origin {
+                    Ok(id) => {
+                        let idx = match index_of.get(id) {
+                            Some(&i) => i,
+                            None => {
+                                let commit =
+                                    store.get_commit(id).context("loading blame origin")?;
+                                let i = origins.len();
+                                origins.push(CommitInfo::from_commit(&commit));
+                                index_of.insert(id.clone(), i);
+                                i
+                            }
+                        };
+                        lines.push(Some(idx));
+                    }
+                    Err(_boundary) => lines.push(None),
+                }
+            }
+            result.push(FileBlame {
+                path: fc.path.clone(),
+                origins,
+                lines,
+            });
+        }
+        Ok(result)
+    }
+
     /// The display index of the single commit every line removed by the commit at
     /// row `from` blames to, or `None` when there is no such commit: the dragged
     /// commit is a merge (ambiguous), removes nothing, its removed lines trace to
@@ -112,6 +237,113 @@ impl Repo {
         }
         let target = source?;
         commits.iter().position(|c| c.id == target)
+    }
+
+    /// Per-origin tally of the lines `source` removes: walk `source`'s
+    /// first-parent ancestry and attribute each removed line to the commit that
+    /// introduced it, mapped to its row in `commits` (the candidate domain — the
+    /// displayed history). The multi-source generalization of
+    /// [`Self::blame_single_source`]: where that bails at the second distinct
+    /// origin, this counts every origin, so a fix spanning several commits still
+    /// yields a ranked answer. `source` is taken as a [`CommitInfo`] (not a row)
+    /// so the working-copy `@` — absent from `commits` — can drive it too.
+    ///
+    /// Candidates are `(row, lines)` sorted by line count (desc, ties by row);
+    /// `unattributed` counts removed lines that hit a merge / history boundary
+    /// before being attributed, or whose origin isn't a row in `commits`. Empty
+    /// (no candidates, zero unattributed) when `source` is a merge or removes
+    /// nothing.
+    pub fn blame_change_origins(
+        &self,
+        source: &CommitInfo,
+        commits: &[CommitInfo],
+    ) -> BlameOrigins {
+        // A merge's removed lines are ambiguous (two diffs to read); only a
+        // linear commit has one pre-image — the same gate as blame_single_source.
+        if source.parents.len() != 1 {
+            return BlameOrigins::default();
+        }
+        let Ok(changes) = commit_changes(&self.repo, &source.id) else {
+            return BlameOrigins::default();
+        };
+        // The lines `source` removes, per file, as indices into its parent's
+        // version — the version the walk starts from.
+        let mut tracking: Vec<(String, Vec<usize>)> = Vec::new();
+        for fc in &changes {
+            if fc.is_binary {
+                continue;
+            }
+            let removed = removed_old_indices(
+                fc.old_text.as_deref().unwrap_or(""),
+                fc.new_text.as_deref().unwrap_or(""),
+            );
+            if !removed.is_empty() {
+                tracking.push((fc.path.clone(), removed));
+            }
+        }
+        if tracking.is_empty() {
+            return BlameOrigins::default(); // nothing removed — nothing to blame
+        }
+
+        // Walk first-parent ancestry, tallying how many tracked lines each commit
+        // introduces (drops from the set). The tracked indices are always in the
+        // *version* of `current`.
+        let mut counts: HashMap<CommitId, usize> = HashMap::new();
+        let mut current = source.parents[0].clone();
+        loop {
+            let Ok(commit) = self.repo.store().get_commit(&current) else {
+                break;
+            };
+            let Ok(cc) = commit_changes(&self.repo, &current) else {
+                break;
+            };
+            for (path, lines) in tracking.iter_mut() {
+                if lines.is_empty() {
+                    continue;
+                }
+                let Some(fc) = cc.iter().find(|fc| &fc.path == path && !fc.is_binary) else {
+                    continue; // `current` left this file untouched; indices carry over
+                };
+                let before = lines.len();
+                let (_introduced, remapped) = step_through(
+                    fc.old_text.as_deref().unwrap_or(""),
+                    fc.new_text.as_deref().unwrap_or(""),
+                    lines,
+                );
+                let dropped = before - remapped.len();
+                if dropped > 0 {
+                    *counts.entry(current.clone()).or_default() += dropped;
+                }
+                *lines = remapped;
+            }
+            if tracking.iter().all(|(_, l)| l.is_empty()) {
+                break;
+            }
+            // A merge or history boundary ends the walk with lines still tracked;
+            // those stay unattributed.
+            let parents = commit.parent_ids();
+            if parents.len() != 1 {
+                break;
+            }
+            current = parents[0].clone();
+        }
+
+        // Lines still tracked never reached an introducing commit.
+        let mut unattributed: usize = tracking.iter().map(|(_, l)| l.len()).sum();
+        // Map each origin to its display row; an origin not shown can't be a
+        // candidate, so its lines fold into `unattributed` as well.
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for (id, count) in counts {
+            match commits.iter().position(|c| c.id == id) {
+                Some(row) => candidates.push((row, count)),
+                None => unattributed += count,
+            }
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        BlameOrigins {
+            candidates,
+            unattributed,
+        }
     }
 }
 

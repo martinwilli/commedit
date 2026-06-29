@@ -14,8 +14,9 @@ use crate::convert::{commit_dto, file_change_dto, graph_adjacency, DetailFields}
 /// history is reachable via `limit` or `offset` paging.
 const DEFAULT_HISTORY_LIMIT: usize = 30;
 use crate::dto::{
-    ListHistoryReq, ListHistoryResp, ListTrashResp, SessionSel, ShowCommitReq, ShowCommitResp,
-    ShowGraphResp, SuggestSquashReq, SuggestSquashResp,
+    BlameCandidateDto, BlameSquashReq, BlameSquashResp, ListHistoryReq, ListHistoryResp,
+    ListTrashResp, SessionSel, ShowCommitReq, ShowCommitResp, ShowGraphResp, SuggestSquashReq,
+    SuggestSquashResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -222,6 +223,77 @@ impl CommeditServer {
                 mode,
                 targets: to_dtos(&highlights.targets),
                 siblings: to_dtos(&highlights.siblings),
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Find where a change should be folded by content-blaming the lines it touches — the squash-target finder for the common case where you don't know which commit introduced the code you just fixed. Blames the lines the source removes/modifies against history and returns `candidates`: the branch commits that introduced them, ranked by how many of those lines each owns (`lines`). Pass the top candidate's change_id straight to squash_commit as `dest` — or to squash_working_copy for the default working-copy source. `source` is a history or working-copy commit by sha/change id; omit it to blame the working copy (all uncommitted changes), the default and primary case. `unattributed` counts changed lines tracing to a merge/boundary or an ancestor outside the listed history. Read-only. The content-blame complement to suggest_squash_targets, which instead routes an explicit `fixup!`/`squash!`/`amend!` subject prefix."
+    )]
+    pub async fn blame_squash_targets(
+        &self,
+        Parameters(req): Parameters<BlameSquashReq>,
+    ) -> Result<Yaml<BlameSquashResp>, ErrorData> {
+        self.with_session(req.session.session.clone(), move |repo, _| {
+            let (_, commits) = full_history(repo)?;
+            // Capture on-disk edits into @ so the working copy is a current blame
+            // source (no-op off-worktree), like working_copy_status.
+            repo.snapshot_working_copy().map_err(internal)?;
+            let wc = repo.working_copy_chain();
+            // Resolve the source: an explicit ref over history ∪ working copy, else
+            // the working-copy leaf @ (all uncommitted changes when unsplit). A
+            // clean tree with no explicit source has nothing to blame.
+            let source = match &req.source {
+                Some(r) => {
+                    let mut entries: Vec<RefEntry<_>> =
+                        commits.iter().map(|c| RefEntry::of(c, c.clone())).collect();
+                    entries.extend(wc.iter().map(|e| RefEntry::of(&e.info, e.info.clone())));
+                    resolve_ref(r, entries, || {
+                        invalid(format!(
+                            "source {r} not found in the branch history or the working copy \
+                             (see list_history / working_copy_status)"
+                        ))
+                    })?
+                }
+                None => {
+                    let Some(leaf) = wc.into_iter().next() else {
+                        return Ok(BlameSquashResp {
+                            mode: None,
+                            candidates: Vec::new(),
+                            unattributed: 0,
+                        });
+                    };
+                    leaf.info
+                }
+            };
+            let origins = repo.blame_change_origins(&source, &commits);
+            let refs = repo.commit_refs();
+            let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let candidates = origins
+                .candidates
+                .iter()
+                .map(|&(row, lines)| BlameCandidateDto {
+                    commit: commit_dto(&commits[row], &root, &refs, &abbrev, DetailFields::NONE),
+                    lines,
+                })
+                .collect();
+            // Parity with suggest_squash_targets: surface any autosquash prefix the
+            // source carries (a working-copy source has none).
+            let mode = parse_squash_mode(&source.subject).map(|m| {
+                match m {
+                    SquashMode::Fixup => "fixup",
+                    SquashMode::Squash => "squash",
+                    SquashMode::Amend => "amend",
+                }
+                .to_string()
+            });
+            Ok(BlameSquashResp {
+                mode,
+                candidates,
+                unattributed: origins.unattributed,
             })
         })
         .await

@@ -157,6 +157,14 @@ revert or pick may report conflicts like any rewrite. merge_out_commit \
 introduces a merge directly above a single-parent commit, turning that commit \
 into a one-commit side branch you can then move further commits onto.
 
+Folding a fix into the commit it belongs to: when the fix carries a \
+`fixup!`/`squash!`/`amend!` subject, suggest_squash_targets routes it by that \
+name; when you do NOT know which commit introduced the code being fixed (the \
+common case), blame_squash_targets content-blames the lines the fix touches and \
+ranks the commits that own them — omit its `source` to blame the uncommitted \
+working copy, then pass the top candidate's change_id to squash_working_copy (or \
+squash_commit for an already-committed fix). Both are read-only.
+
 Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
 grafted back (restore_commit) or folded into a commit (squash_commit).
 

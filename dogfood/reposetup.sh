@@ -343,6 +343,22 @@ def test_parse():
 EOF
 ci "Add tests for parser"
 
+# T12 target: a buried own-file helper whose lines a later UNLABELLED fix modifies
+# — the content-blame squash target. `Add retry helper` creates src/retry.txt with
+# a value to bump (RETRY_LIMIT) and a typo to fix (BACKOF). Nothing between here and
+# the fix touches the file, so the later fold rebases clean and leaves the tree
+# identical to base.
+cat > src/retry.txt <<'EOF'
+# retry policy
+RETRY_LIMIT = 3
+BACKOF_MS = 100
+
+def retry(fn):
+    for _ in range(RETRY_LIMIT):
+        fn()
+EOF
+ci "Add retry helper"
+
 # T8: two buried own-file commits for the revert + recover task (own files, so a
 # revert / drop / restore is a clean rebase). telemetry is the revert target
 # (inverse at the tip; the original stays in history for the record); metrics is
@@ -452,6 +468,23 @@ def fail(msg):
     print("error: " + msg)
 EOF
 ci "Tidy imports in main"
+
+# T12 fix (the stray to fold): UNLABELLED (no fixup!/squash!/amend! prefix) and its
+# subject names nothing in history, so suggest_squash_targets returns empty — the
+# target must be found by CONTENT (blame_squash_targets). It only MODIFIES lines
+# `Add retry helper` introduced (RETRY_LIMIT 3->5, BACKOF->BACKOFF — never a pure
+# addition, which has nothing to blame), so the blame yields that single buried
+# commit; folding it in (fixup) leaves the tree base-identical (topology-only).
+cat > src/retry.txt <<'EOF'
+# retry policy
+RETRY_LIMIT = 5
+BACKOFF_MS = 100
+
+def retry(fn):
+    for _ in range(RETRY_LIMIT):
+        fn()
+EOF
+ci "Tune retry policy"
 cat > README.md      <<'EOF'
 # todo
 
@@ -555,7 +588,7 @@ git checkout -q stress/base
 # (Sonnet). The model is chosen by the teacher's Agent(...) launch, not here —
 # these are just the isolated worktrees each student works in. (An Opus plain-git
 # baseline 'gito' ran in run 4 and was retired — see dogfood/runs/4.md.)
-for t in 1 2 3 4 5 6 7 8 9 10 11; do for s in op ctl git; do
+for t in 1 2 3 4 5 6 7 8 9 10 11 12; do for s in op ctl git; do
   git branch -q "stress/t${t}-${s}" stress/base
   git -C "$REPO" worktree add -q "$REPO/.worktrees/commedit-stress-t${t}-${s}" "stress/t${t}-${s}"
 done; done

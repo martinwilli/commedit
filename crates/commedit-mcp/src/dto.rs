@@ -411,6 +411,49 @@ pub struct SuggestSquashResp {
     pub siblings: Vec<CommitDto>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BlameSquashReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
+    /// The change to find a squash target for — sha or change id, full or a
+    /// unique prefix, from the history or the working copy (an uncommitted
+    /// entry). Omit to blame the working copy (all uncommitted changes) — the
+    /// default and primary case.
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BlameSquashResp {
+    /// The autosquash mode the source's subject prefix requests (`fixup`,
+    /// `squash`, `amend`), set only for a history-commit source carrying such a
+    /// prefix (the working copy has no subject); else null. Independent of the
+    /// candidates, which are derived from content, not the subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Candidate squash destinations, most-owned first: the branch commits that
+    /// introduced the lines the source removes/modifies, each with how many of
+    /// those lines it owns. Pass the top candidate's change_id straight to
+    /// squash_commit as `dest` (or to squash_working_copy for the default
+    /// working-copy source). Empty when nothing could be attributed.
+    pub candidates: Vec<BlameCandidateDto>,
+    /// Changed lines that couldn't be attributed to a listed commit — they trace
+    /// to a merge / history boundary, or to an ancestor outside the history.
+    /// Omitted when 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unattributed: usize,
+}
+
+/// A ranked squash-target candidate: a commit plus how many of the source's
+/// changed lines it introduced.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BlameCandidateDto {
+    #[serde(flatten)]
+    pub commit: CommitDto,
+    /// How many of the source's removed/modified lines this commit introduced —
+    /// the ranking weight, highest first.
+    pub lines: usize,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct WorkingCopyStatusResp {
     /// True when the working tree matches the branch tip.

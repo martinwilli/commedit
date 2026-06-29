@@ -82,7 +82,7 @@ These are *load-bearing* — verified in the source. Don't fight them; design ar
 
 ## 2. The fixture (`stress/base`)
 
-A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
+A ~26-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `server.txt`,
 `README.md`, `CHANGELOG.md`), with **one merge** (`Merge branch 'search'`) and a side branch
 `stress/hotfix`. Each task targets a disjoint "smell" region so the tasks never interfere:
 
@@ -101,6 +101,7 @@ A ~24-commit orphan history of a tiny plain-text "todo CLI" (`src/*.txt`, `serve
 | `Add report header`/`body`/`footer` (own file `src/report.txt`), a contiguous range by `jdoe <jane.doe@bigcorp.example>` dated 2000 | wrong author+committer identity and bogus dates across 3 commits | T9 |
 | `Add cache module` + `Bump cache capacity to 256` + `Bump cache capacity to 512` (own file `src/cache.txt`) | two same-line bumps that conflict when reordered | T10 |
 | `stress/feature`: `Add version string` (own file `src/version.txt`) under `Add experimental flag` (own file `src/flag.txt`) | a commit on the **wrong branch** — belongs on the trunk | T11 |
+| `Add retry helper` (own file `src/retry.txt`) + a near-tip `Tune retry policy` that edits its lines (RETRY_LIMIT, BACKOF typo) | an **unlabelled** fix whose squash target must be found by content-blame | T12 |
 
 Design notes that matter (learned the hard way):
 - The drop target (T1) lives in **its own file** so the drop is a clean rebase. An earlier
@@ -158,6 +159,17 @@ Design notes that matter (learned the hard way):
   opens it **off-worktree** (anchored at the launch root, ref-move only) — the engine path no other task
   exercises. Plain git can't edit a branch without a worktree, so `git` gets one; that asymmetry is the
   finding.
+- T12 is the **content-blame squash-target** axis — the one no subject prefix can route. `Add retry
+  helper` (own file `src/retry.txt`) is buried; a near-tip `Tune retry policy` *modifies* the lines it
+  introduced (`RETRY_LIMIT` 3→5 and the `BACKOF`→`BACKOFF` typo). The fix is deliberately **unlabelled**
+  (no `fixup!`/`squash!`/`amend!`) and its subject names nothing in history, so `suggest_squash_targets`
+  returns empty — the target must be found by **content** (`blame_squash_targets`). Because only `Add
+  retry helper` ever touched the file, the blame yields that single buried commit and the fold is clean;
+  it's a **modification**, not a pure addition (which has nothing to blame). Folding (fixup) leaves the
+  tree identical to base (topology-only, like T7/T9). The fix is a committed source so the answer key is
+  deterministic — `blame_squash_targets`'s default working-copy mode is covered by the engine/MCP unit
+  tests, not the tournament. Verified the blame lands on `Add retry helper` and the fold commutes clean
+  before wiring it up.
 
 ---
 
@@ -170,7 +182,7 @@ already exists; adjust `REPO` in the script if your checkout lives elsewhere):
 ./dogfood/reposetup.sh
 ```
 
-It builds the §2 fixture: a fresh ~24-commit orphan history with the baked smells, the merge, the
+It builds the §2 fixture: a fresh ~26-commit orphan history with the baked smells, the merge, the
 side hotfix branch, and per-(task × solver) branches + linked worktrees under `.worktrees/`. All
 refs are namespaced `stress/*`; nothing touches your real branches. See [§6](#6-re-run-checklist-as-the-mcp-evolves)
 for teardown.
@@ -200,6 +212,7 @@ storage/stats commits are new this version, so they had no run-1 change id.
 | **T9** | The three `report` commits (`Add report header`/`body`/`footer`) were authored on a misconfigured machine: fix all three in one batch — set author+committer email to `jane.doe@example.com`, name `Jane Doe`, and re-date them to 2025-01-25/26/27 (keep their order). | `edit_commits([3 × {commit, identity: name+email+author_time+committer_time}])` (1 mutation) | all three carry author+committer `Jane Doe <jane.doe@example.com>` and the 2025 dates, in order; subjects unchanged; descendants rebased; `git diff stress/base` empty (metadata-only); clean |
 | **T10** | Reorder `Bump cache capacity to 512` to come *before* `Bump cache capacity to 256` — the same-line edits conflict and the rewrite holds. First **abort** to confirm the safety net (history/tree untouched), then redo it and **resolve** oldest-first so the final `capacity = 256`. | `reorder_commit(512-bump, new_parent=cache-module)` → `abort_rewrite`; then again → loop `read_conflict(oldest)`/`resolve_conflicts(oldest)` until `pending:false` (chain holds **two** conflicted commits) | after the abort: region identical to `stress/base`, `pending:false`; after the resolve: `512-bump` precedes `256-bump`, final tip `capacity = 256`, both commits present, `pending:false`; descendants rebased; clean |
 | **T11** | `Add version string` was committed on the feature branch `stress/t11s-<solver>` but belongs on the trunk `stress/t11-<solver>`. Move it: land it on the trunk and remove it from the feature branch, keeping the feature's own `Add experimental flag` intact. | open the trunk session (given) + `open_session(stress/t11s-…)` (opens **off-worktree**) → `cherry_pick_commit(full sha, new_parent=trunk tip)` on the **trunk** session + `drop_commit` on the **feature** session (1 open + 2 mutations across **two** sessions) | trunk has `Add version string` + `src/version.txt` (and *not* `src/flag.txt`); feature no longer has it (no `src/version.txt`) but keeps `Add experimental flag` + `src/flag.txt`, rebased; both clean — `./dogfood/verify.sh t11 <trunk-wt>` exits 0 |
+| **T12** | The stray `Tune retry policy` fixes code but carries no `fixup!` prefix and names no target — find which commit introduced the lines it edits and fold it in. | `blame_squash_targets(source=Tune retry policy)` → top candidate `Add retry helper` → `squash_commit(source, dest, mode=fixup)` (1 read + 1 mutation) | no standalone `Tune retry policy`; `Add retry helper` now carries `RETRY_LIMIT = 5` + `BACKOFF_MS` (typo fixed); `git diff stress/base` empty (topology-only); descendants rebased; clean — `./dogfood/verify.sh t12 <wt>` exits 0 |
 
 **T2 is the discriminator for history-editing.** `split_commit`'s `files` are spliced onto the
 *original* commit tree; a changed file you **omit stays in the retained commit** (the child gets
@@ -260,6 +273,19 @@ is the GTK drag); the student must compose copy-then-drop, and the PASS gate fai
 branches as worktrees and a `cherry-pick` + `rebase --onto`; the second worktree it needs (vs
 commedit's off-worktree session) is the comparison.
 
+**T12 is the discriminator for content-blame target finding.** It is the only task whose fix is
+**unlabelled** — no `fixup!`/`squash!`/`amend!` prefix and a subject (`Tune retry policy`) that names
+nothing in history — so the subject-match route (`suggest_squash_targets`, the tool T1 leans on) comes
+back empty. The student must instead content-blame the lines the fix edits (`blame_squash_targets`) to
+discover that `Add retry helper` introduced them, then fold there. The trap is reaching for
+`suggest_squash_targets` first and concluding "nothing to suggest" — or hand-reading diffs commit by
+commit — instead of the one blame call; the operator earns its keep here only if its skills point it at
+the content-blame tool (they now do — `reorder-and-squash`). For plain git the analogue is
+`git blame`/`git log -S` on the changed lines to find the owning commit, then a non-interactive
+autosquash of an *unlabelled* commit (scripted sequence editor — `--autosquash` won't fire without the
+prefix); grade the blame hunt. The fix is a committed source (deterministic answer key);
+`blame_squash_targets`'s default working-copy mode is unit-tested, not exercised here.
+
 **Session-hygiene probe (calibration, not a scored task).** While calibrating T11, also confirm the
 refusal ergonomics the model leans on: `open_session` on a branch **already open** is refused (a branch
 is editable by at most one session), as is a **non-existent** branch, and `close_session` on the **last**
@@ -268,7 +294,7 @@ so, like T10's spurious-reorder probe, they stay a probe, not a baked answer key
 
 ### Automated correctness gate (`./dogfood/verify.sh`)
 The PASS column above is codified as a deterministic, **git-only** oracle:
-`./dogfood/verify.sh <t1..t11> <worktree-path>` asserts each task's end state (subjects, file
+`./dogfood/verify.sh <t1..t12> <worktree-path>` asserts each task's end state (subjects, file
 contents, topology, tree-vs-`stress/base`, clean tree) and exits `0`=PASS / `1`=FAIL, ending with a
 `PASS: t<n>` / `FAIL: t<n>` line. It addresses commits by their stable fixture **subject** and by
 **content**, never by sha/change_id (both churn), so it survives a rebuild and grades any solving
@@ -322,6 +348,12 @@ Loose, not prescriptive: grade what it *actually* does (from its Tool Log), not 
   `git rebase --onto stress/base <version-sha>` (replays `Add experimental flag` onto the fork point).
   Both halves are clean (own files). The off-worktree convenience commedit has — editing the feature
   branch with no checkout — has no git analogue; the extra worktree git needs is the friction to grade.
+- **T12** — `git blame -- src/retry.txt` (or `git log -S RETRY_LIMIT`) to find that `Add retry helper`
+  introduced the lines `Tune retry policy` edits, then fold the stray in. It carries no `fixup!`, so
+  `--autosquash` won't fire on its own — `git commit --amend` after a `reset` to the target, or a
+  scripted `GIT_SEQUENCE_EDITOR` `rebase -i` marking the stray `fixup` after moving it adjacent. The
+  friction is the **discovery** (blaming the right lines), which `blame_squash_targets` does in one
+  call; grade the blame hunt.
 
 ### Calibration (build the answer key before students run)
 On the `stress/cal` worktree, solve each task yourself via the MCP tools, record the resulting
@@ -329,7 +361,8 @@ shas / `git log` / file contents, and **confirm difficulty** (esp. that T3 actua
 multi-file conflict across both descendants, T2/T5 stay clean, T7's squash-into-merge keeps the
 two parents, T8's dropped commit lands in the trash where `restore_commit` can reach it, T9's
 re-date batch stays tree-identical, and T10's reorder actually *holds* a conflict — and that
-`abort_rewrite` leaves the region identical to `stress/base`). For T6, run
+`abort_rewrite` leaves the region identical to `stress/base`; and that T12's `blame_squash_targets`
+returns `Add retry helper` as the top candidate while `suggest_squash_targets` returns nothing). For T6, run
 `./dogfood/t6-dirty.sh <cal>` after the reset to seed
 the dirty WC, then confirm the fold rebases clean and the partition lands. After solving each task,
 run `./dogfood/verify.sh <task> <cal>` and confirm it exits 0 — calibration is also where the oracle
@@ -343,7 +376,7 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
-For each task T (1→11), each solver S (operator, control, git):
+For each task T (1→12), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
    **T6 only:** then `./dogfood/t6-dirty.sh <wt>` to seed the dirty working copy (identical for

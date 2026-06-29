@@ -259,6 +259,13 @@ from git until they resolve or abort, and every step undoable. Alongside the
 tools the plugin ships skills that teach the agent *when* to reach for these
 workflows and a `commedit-operator` subagent that drives them.
 
+Finding where a stray fix belongs is a first-class step: `blame_squash_targets`
+content-blames the lines a change touches and ranks the commits that own them —
+the same old-side blame the diff column shows, turned into ready-to-squash
+targets — so the agent can fold a fix into the commit that introduced the code
+even without knowing which one that is. It complements `suggest_squash_targets`,
+which instead routes an explicit `fixup!` / `squash!` / `amend!` subject prefix.
+
 One server hosts several **independent editing sessions** over the one repository
 it serves — one per branch — so an agent can edit several branches at once, and in
 parallel. Every tool names the session it acts on by id (the branch's short name);

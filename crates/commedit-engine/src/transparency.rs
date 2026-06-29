@@ -687,6 +687,33 @@ pub fn ref_commit(workspace_root: &Path, ref_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Expand a commit-ish (an abbreviated sha prefix, a full sha, or any
+/// rev-parse-able name) to its full hex sha against the shared object store,
+/// or `None` if it doesn't resolve to a unique commit. Used to accept a *short*
+/// sha for an off-branch cherry-pick source: that commit lives in the symlinked
+/// ODB git can read, but not in jj's index, so jj's own prefix resolver can't
+/// see it. The `^{commit}` peel forces a commit (rejecting a tag/tree/blob), and
+/// `--verify --quiet` makes an ambiguous or unknown prefix fail quietly.
+pub fn resolve_commit_prefix(workspace_root: &Path, rev: &str) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve a user-supplied branch name to its full local ref
 /// (`refs/heads/<name>`), verifying that such a branch exists. Accepts either the
 /// bare name or an already-full ref. Errors clearly when there is no such local

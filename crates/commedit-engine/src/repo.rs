@@ -993,16 +993,33 @@ impl Repo {
         self.repo.store().root_commit_id().clone()
     }
 
-    /// Resolve a full 40-char hex sha to its [`CommitId`] if that object exists
-    /// in the shared object store — even when it is *not* reachable from HEAD
-    /// (e.g. a commit on another branch). The object is read straight from the
-    /// ODB, so it needs no jj-side ref or index entry: editing the checked-out
-    /// branch imports only its own ref into jj's view, yet the symlinked object
-    /// store still holds every other branch's commits. Returns `None` for
-    /// malformed hex or a sha that is not an existing commit. Used to
-    /// cherry-pick a commit from outside the current branch's history.
-    pub fn lookup_commit_in_store(&self, hex: &str) -> Option<CommitId> {
-        let id = CommitId::try_from_hex(hex)?;
+    /// Resolve a sha — full or **abbreviated** — to its [`CommitId`] if that
+    /// object exists in the shared object store, even when it is *not* reachable
+    /// from HEAD (e.g. a commit on another branch). The object is read straight
+    /// from the ODB, so it needs no jj-side ref or index entry: editing the
+    /// checked-out branch imports only its own ref into jj's view, yet the
+    /// symlinked object store still holds every other branch's commits. A full
+    /// 40-char hex takes a subprocess-free fast path; a shorter prefix is
+    /// expanded against the ODB with git (`resolve_commit_prefix`), since jj's
+    /// own prefix resolver only indexes the imported branch and so can't see an
+    /// off-branch source. Returns `None` for an unknown, ambiguous, or
+    /// non-commit ref. Used to cherry-pick a commit from outside the current
+    /// branch's history.
+    pub fn lookup_commit_in_store(&self, rev: &str) -> Option<CommitId> {
+        // Fast path: a full hex that names an existing commit, no subprocess.
+        // (`try_from_hex` also accepts a too-short even-length hex, decoding it
+        // to a wrong-length id `get_commit` then rejects — so gate on the lookup
+        // succeeding, not merely on the hex parsing.)
+        if let Some(id) = CommitId::try_from_hex(rev) {
+            if self.repo.store().get_commit(&id).is_ok() {
+                return Some(id);
+            }
+        }
+        // Else expand an abbreviated prefix against the ODB with git, since jj's
+        // own prefix resolver only indexes the imported branch.
+        let full =
+            crate::transparency::resolve_commit_prefix(self.workspace.workspace_root(), rev)?;
+        let id = CommitId::try_from_hex(&full)?;
         self.repo.store().get_commit(&id).ok().map(|_| id)
     }
 

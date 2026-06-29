@@ -521,6 +521,42 @@ async fn cherry_pick_copies_a_commit_from_another_branch() {
 }
 
 #[tokio::test]
+async fn cherry_pick_accepts_an_abbreviated_off_branch_sha() {
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path(), &[("a.txt", "one\n", "first")]);
+    // A sibling branch carries an off-history commit, as in the full-sha case.
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.path().join("f.txt"), "feat\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    git(dir.path(), &["commit", "-q", "-m", "feature work"]);
+    let picked = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["checkout", "-q", "main"]);
+
+    let server = open_server(dir.path());
+    // An off-branch source isn't in jj's index, so jj's prefix resolver can't
+    // see it; a *short* sha must still resolve against the shared ODB via git.
+    let short = &picked[..12];
+    let result = server
+        .cherry_pick_commit(Parameters(pick(short, None)))
+        .await
+        .unwrap()
+        .0;
+    clean_head(&result);
+
+    // Same end state as the full-sha pick: the change lands on main, the source
+    // branch is untouched, and the provenance trailer records the *full* sha.
+    assert_eq!(git_log_subjects(dir.path()), ["feature work", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "feat");
+    let body = git(dir.path(), &["show", "-s", "--format=%b", "HEAD"]);
+    assert!(
+        body.contains(&format!("cherry picked from commit {picked}")),
+        "missing provenance trailer: {body}"
+    );
+    assert_eq!(git(dir.path(), &["rev-parse", "feature"]), picked);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
 async fn cherry_pick_resolves_an_in_history_change_id_and_places_it() {
     let dir = TempDir::new().unwrap();
     init_repo(

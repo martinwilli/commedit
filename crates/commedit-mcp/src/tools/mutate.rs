@@ -400,7 +400,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Create a commit that re-applies another commit's change (its forward diff, like `git cherry-pick`) and insert it into history. The source may live OUTSIDE the current branch — pass a commit on another branch by its full sha (from `git log <branch>`); its branch is never touched. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where the copy goes. By default the source's author is preserved and the committer is stamped afresh (git's `cherry-pick -x`, recording a provenance trailer). The pick may conflict where the insertion point diverged from the source. Merge commits cannot be cherry-picked."
+        description = "Create a commit that re-applies another commit's change (its forward diff, like `git cherry-pick`) and insert it into history. The source may live OUTSIDE the current branch — pass a commit on another branch by its sha, full or abbreviated (from `git log <branch>`); its branch is never touched. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where the copy goes. By default the source's author is preserved and the committer is stamped afresh (git's `cherry-pick -x`, recording a provenance trailer). The pick may conflict where the insertion point diverged from the source. Merge commits cannot be cherry-picked."
     )]
     pub async fn cherry_pick_commit(
         &self,

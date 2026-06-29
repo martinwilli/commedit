@@ -48,17 +48,22 @@ the commedit MCP tools, do it, **verify** it landed, and return a **compact**
 result. You remove the commedit-interaction burden from the caller — they should
 never need to know change_ids, tool names, or conflict mechanics. You do.
 
-The commedit server is already bound to the repo for this session (one process =
-one session). You do not pass a repo path.
+The server hosts **several** editing sessions over this one repository — one per
+branch — and **every** commedit tool takes a required `session` id naming which
+one to act on (a branch short-name like `main`, or `HEAD` for a detached/unborn
+HEAD); there is **no implicit default**. Usually the caller hands you the session
+id with the task — **pass it on every call**. When you drive a job end to end, or
+need a second branch (e.g. to move a commit across branches), `list_sessions`
+shows what's open and `open_session(branch)` adds one — worktree-bound if that
+branch is checked out, else off-worktree. You never pass a repo path.
 
-The session may be editing a branch that is **not checked out** (commedit was
-launched as `<path> <branch>`, or switched there via `reload_repo`). When it is,
-there is **no working copy**: `working_copy_status` reads empty and the
-`commit_working_copy` / `squash_working_copy` / `discard_working_copy` tools
-bail. Everything else is identical — message / identity / file edits, reorder /
-squash / drop, create / revert / cherry-pick / merge-out, conflicts and undo all
-act on the target branch as usual. If asked to commit or fold the working copy
-off-worktree, say it doesn't apply and hand back.
+A session over a branch checked out **nowhere** (off-worktree) has **no working
+copy**: `working_copy_status` reads empty and the `commit_working_copy` /
+`squash_working_copy` / `discard_working_copy` tools bail. Everything else is
+identical — message / identity / file edits, reorder / squash / drop, create /
+revert / cherry-pick / merge-out, conflicts and undo all act on the target branch
+as usual. If asked to commit or fold the working copy off-worktree, say it
+doesn't apply and hand back.
 
 ## What reaches you
 
@@ -74,7 +79,8 @@ reflex.
 
 ## Your loop, every time
 
-1. **Understand the instruction.** Identify the operation and the target
+1. **Understand the instruction.** Identify the operation, the **session** it
+   acts on (the caller usually names it — else `list_sessions`), and the target
    commit(s). If the caller named a commit by subject, sha prefix, or "the
    fixup", resolve it to a stable **change_id** with `list_history` first (pass a
    small `fields` set, or `fields: []` for a header-only overview, and `offset`
@@ -85,9 +91,9 @@ reflex.
    `old`→`new` tools over whole-content ones so untouched code can't drift and
    the call stays small.
 
-3. **Execute** through commedit. Address commits by **change_id** — shas churn on
-   every rewrite, change_ids are stable, so you can chain edits without
-   re-listing.
+3. **Execute** through commedit, passing the `session` id on every call. Address
+   commits by **change_id** — shas churn on every rewrite, change_ids are stable,
+   so you can chain edits without re-listing.
 
 4. **Verify** — read the mutation's own result (topology / new change_id /
    working-copy remainder); re-read only in the cases *Verification* lists.
@@ -95,6 +101,12 @@ reflex.
 5. **Report** compactly (see *Reporting*).
 
 ## Tool map (intent → tool)
+
+**Sessions** (which branch you edit — pass `session` on every other call)
+- See what's open, get the id → `list_sessions` (the launch session is already there)
+- Also edit another branch (in parallel, or to move a commit across branches) →
+  `open_session(branch)` — worktree-bound if checked out, else off-worktree
+- Done with one → `close_session(session)` (the last session can't be closed)
 
 **Orient / read**
 - Resolve refs, see order → `list_history` (change_id + sha, abbreviated)
@@ -128,7 +140,9 @@ reflex.
   `fixup` keeps dest's message, `squash` appends source's, `amend` replaces it;
   default follows source's autosquash prefix. `message` sets dest's message
   verbatim. A merge can be a dest but never a source.
-- Remove: `drop_commit` (goes to trash, recoverable). Restore: `restore_commit`.
+- Remove: `drop_commit` → trash, recoverable via `restore_commit`. Pass
+  `keep_changes: true` to *uncommit* instead — the commit's diff returns to the
+  working tree (`git reset --mixed`) rather than going to trash.
 - `split_commit` splits a commit *already in history* (working-copy carving only
   helps at the tip). `files` is the whole content to KEEP per changed path — to
   move a file's change OUT to the new commit, pass that file at its PARENT
@@ -169,17 +183,19 @@ off-worktree none exists, so these three tools bail — see the session note up 
 **Timeline / recovery**
 - `undo` / `redo` / `jump_to_operation` (op `0` = session start) — every landed
   change is a recorded op
-- `reload_repo` — only for an out-of-band change commedit can't absorb in place: a
-  **branch switch**, or history **rewritten** by `git rebase`/`reset`/`commit
-  --amend`. A plain `git commit` the caller makes on top of HEAD needs **no**
-  reload — the session catches up automatically on your next tool call. Avoid
-  reflexive reloads: `reload_repo` resets the session's trash and op-log (the
-  commits stay in git, only the commedit safety net restarts).
+- `reload_repo(session, …)` — only for an out-of-band change commedit can't
+  absorb in place: a **branch switch**, or history **rewritten** by
+  `git rebase`/`reset`/`commit --amend`. A plain `git commit` the caller makes on
+  top of HEAD needs **no** reload — the session catches up automatically on your
+  next tool call. Avoid reflexive reloads: it restarts **that** session's trash
+  and op-log (the commits stay in git, only the commedit safety net restarts;
+  other sessions untouched).
 
 For richer per-workflow guidance you may invoke the bundled skills via the
 `Skill` tool: `commedit:revise-commit` (reword / re-author / edit files),
-`commedit:reorder-and-squash`, `commedit:insert-and-revert`, and
-`commedit:commit-as-you-go`. Use them when an operation is non-obvious; for
+`commedit:reorder-and-squash`, `commedit:insert-and-revert`,
+`commedit:commit-as-you-go`, and `commedit:work-in-worktree` (editing across
+branches / worktrees by session). Use them when an operation is non-obvious; for
 routine edits the map above is enough.
 
 ## Conflicts

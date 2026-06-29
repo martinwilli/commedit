@@ -7,7 +7,7 @@
 
 mod common;
 
-use commedit_engine::blame::FileBlame;
+use commedit_engine::blame::{BlameOrigins, FileBlame};
 use commedit_engine::history::{history, CommitInfo};
 use commedit_engine::repo::Repo;
 
@@ -183,4 +183,105 @@ fn nothing_to_blame_on_a_root_commits_old_side() {
         .blame_old_side(std::slice::from_ref(&a.id))
         .expect("blame");
     assert!(blame.is_empty(), "no old side on the root commit");
+}
+
+/// `(subject, removed-line count)` for each ranked candidate — assert on origins
+/// by subject rather than churny row indices.
+fn origin_counts<'a>(commits: &'a [CommitInfo], o: &BlameOrigins) -> Vec<(&'a str, usize)> {
+    o.candidates
+        .iter()
+        .map(|&(row, n)| (commits[row].subject.as_str(), n))
+        .collect()
+}
+
+#[test]
+fn change_origins_attributes_a_single_source_like_the_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // C rewrites lines 2 and 3, both introduced by A (B never touched file.txt).
+    common::init_repo(
+        dir,
+        &[
+            ("file.txt", "1\n2\n3\n4\n5\n", "A"),
+            ("other.txt", "x\n", "B"),
+            ("file.txt", "1\nTWO\nTHREE\n4\n5\n", "C"),
+        ],
+    );
+    let repo = Repo::open(dir).expect("open");
+    let commits = commit_list(&repo);
+    let c = &commits[index_of(&commits, "C")];
+
+    let o = repo.blame_change_origins(c, &commits);
+    assert_eq!(origin_counts(&commits, &o), vec![("A", 2)]);
+    assert_eq!(o.unattributed, 0);
+    // A single clean origin agrees with the strict drag-to-squash hint.
+    assert_eq!(
+        Some(o.candidates[0].0),
+        repo.blame_single_source(&commits, index_of(&commits, "C"))
+    );
+}
+
+#[test]
+fn change_origins_ranks_lines_spanning_two_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A introduces "2"; B appends "4"/"5"; C rewrites line 2 (from A) and line 4
+    // (from B) — one removed line each, from two distinct sources.
+    common::init_repo(
+        dir,
+        &[
+            ("file.txt", "1\n2\n3\n", "A"),
+            ("file.txt", "1\n2\n3\n4\n5\n", "B"),
+            ("file.txt", "1\nTWO\n3\nFOUR\n5\n", "C"),
+        ],
+    );
+    let repo = Repo::open(dir).expect("open");
+    let commits = commit_list(&repo);
+    let c = &commits[index_of(&commits, "C")];
+
+    let o = repo.blame_change_origins(c, &commits);
+    let mut counts = origin_counts(&commits, &o);
+    counts.sort();
+    // Both origins, one line each — exactly where the strict hint gives up.
+    assert_eq!(counts, vec![("A", 1), ("B", 1)]);
+    assert_eq!(o.unattributed, 0);
+    assert_eq!(
+        repo.blame_single_source(&commits, index_of(&commits, "C")),
+        None
+    );
+}
+
+#[test]
+fn change_origins_is_empty_for_a_pure_addition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // B only appends — it removes nothing, so there is nothing to attribute.
+    common::init_repo(
+        dir,
+        &[("file.txt", "1\n", "A"), ("file.txt", "1\n2\n", "B")],
+    );
+    let repo = Repo::open(dir).expect("open");
+    let commits = commit_list(&repo);
+    let b = &commits[index_of(&commits, "B")];
+
+    assert_eq!(
+        repo.blame_change_origins(b, &commits),
+        BlameOrigins::default()
+    );
+}
+
+#[test]
+fn change_origins_is_empty_for_a_merge_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_merge_repo(dir);
+    let repo = Repo::open(dir).expect("open");
+    let commits = commit_list(&repo);
+    let m = &commits[index_of(&commits, "merge")];
+
+    // Two parents — ambiguous by construction, like blame_single_source.
+    assert_eq!(
+        repo.blame_change_origins(m, &commits),
+        BlameOrigins::default()
+    );
 }

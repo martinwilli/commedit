@@ -43,7 +43,7 @@ Key operations and their source files:
 - Reorder / drop / restore: `rewrite.rs` + planning in `history.rs`
 - Create / revert / cherry-pick: `create.rs` (shared `insert_new_commit`)
 - Squash and autosquash routing: `squash.rs` (`squash_into`, `squash_recommendations`)
-- Blame (`blame.rs`): `blame_old_side` annotates the *old* (pre-image) side of a commit's/selection's diff — each line → the commit that last touched it — via jj-lib's `FileAnnotator` (fed the diff's actual pre-image text, so it's correct across merge bases); drives the GTK diff-view blame column. `blame_single_source` is the narrower drag-to-squash hint: when every line a dragged commit removes blames to one commit, the UI highlights it purple — its own first-parent walk, since it answers "do they all agree", not per-line origins
+- Blame (`blame.rs`): `blame_old_side` annotates the *old* (pre-image) side of a commit's/selection's diff — each line → the commit that last touched it — via jj-lib's `FileAnnotator` (fed the diff's actual pre-image text, so it's correct across merge bases); drives the GTK diff-view blame column. `blame_single_source` is the narrower drag-to-squash hint: when every line a dragged commit removes blames to one commit, the UI highlights it purple — its own first-parent walk, since it answers "do they all agree", not per-line origins. `blame_change_origins` is the ranked, multi-source generalization of that walk (counts every origin instead of bailing at the second): it backs the MCP `blame_squash_targets` content-blame squash-target finder
 - Split: `split.rs` (the `set_rewritten_commit` trick makes descendants follow the split child)
 - Surgical text replace: `tree.rs` (`replace_in_files`)
 - Working-copy commit/fold: `workcopy.rs`

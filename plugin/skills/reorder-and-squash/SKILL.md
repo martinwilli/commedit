@@ -65,13 +65,25 @@ into the answer. It ranks only commits whose lines the change actually edits, so
 a pure addition (new code, nothing modified) has nothing to blame; the reported
 `unattributed` count is lines tracing past a merge or outside the history.
 
+## Editing an existing merge
+
+You don't only *create* merges — an existing one is editable in place. Fold a
+follow-up commit **into** a merge with `squash_commit` (merge as `dest`): it keeps
+both parents, so the merge stays a merge. Reword it with `edit_message` (see the
+`revise-commit` skill; its committer isn't re-stamped). And move a commit onto one
+of its parent edges with `reorder_commit`'s `child`. Only *building* a new merge
+between two divergent branches stays a plain-git task.
+
 ## Drop
 
 `drop_commit(commit)` removes a commit; its children rebase onto its parent. The
 dropped commit goes to a session trash (`list_trash`), so it's recoverable —
 graft it back with `restore_commit(commit, new_parent)` or fold it somewhere
-with `squash_commit` (a trashed commit is a valid squash source). Merge commits
-and a branch's only commit can't be dropped.
+with `squash_commit` (a trashed commit is a valid squash source). Or pass
+`keep_changes: true` to **uncommit** instead: the commit leaves history for good
+and its diff returns to the working tree as uncommitted changes (git's
+`reset --mixed`) — handy to re-carve it into cleaner pieces. Merge commits and a
+branch's only commit can't be dropped.
 
 ## When things go sideways
 

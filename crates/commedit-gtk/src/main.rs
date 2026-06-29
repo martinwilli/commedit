@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use commedit_engine::blame::FileBlame;
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::diff::{
     apply_patch, combined_changes, commit_changes, reconstruct_conflict_file, render_commit_diff,
@@ -24,6 +25,7 @@ use commedit_engine::rewrite::{BatchEdit, Identity};
 use commedit_engine::tabwidth::{TabWidthResolver, DEFAULT_TAB_WIDTH};
 use commedit_engine::tree::FileEdit;
 use commedit_engine::workcopy::WcTarget;
+use commedit_engine::CommitId;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -39,6 +41,7 @@ use syntect::parsing::SyntaxSet;
 
 mod state;
 use crate::state::*;
+mod blame_col;
 mod buffer_util;
 use crate::buffer_util::*;
 mod highlight;
@@ -282,6 +285,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // render): drives dropdown↔scroll navigation, expand-click file mapping, and
     // per-file editability.
     let combined_files: Rc<RefCell<Vec<CombinedFile>>> = Rc::new(RefCell::new(Vec::new()));
+    // Diff-blame state (the opt-in gutter column, `blame_col`). `blame_on` is the
+    // toggle; `blame_selection` is the commit id(s) whose old side is being
+    // blamed (oldest-first, as `blame_old_side` wants); `blame_data` caches the
+    // computed per-file blame for the current selection (None = off / not yet
+    // computed). The expensive walk runs only while toggled on.
+    let blame_on: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let blame_selection: Rc<RefCell<Vec<CommitId>>> = Rc::new(RefCell::new(Vec::new()));
+    let blame_data: Rc<RefCell<Option<HashMap<String, FileBlame>>>> = Rc::new(RefCell::new(None));
     // Guards the dropdown↔scroll feedback loop: set while one side programmatically
     // drives the other so the reaction doesn't bounce back.
     let nav_sync: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -366,7 +377,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
              entry.identity-differs > text > placeholder { font-style: italic; } \
              .history-list row { padding-top: 0; padding-bottom: 0; } \
              row.squash-blame { background-color: rgba(145, 65, 172, 0.20); \
-             border: 1px dashed rgb(145, 65, 172); border-radius: 5px; }",
+             border: 1px dashed rgb(145, 65, 172); border-radius: 5px; } \
+             .blame-strip { min-width: 14px; padding: 0; color: #6e7781; \
+             border-right: 1px solid alpha(@theme_fg_color, 0.12); } \
+             .blame-strip:hover { background-color: alpha(@theme_fg_color, 0.08); }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -538,7 +552,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             | sourceview5::SpaceTypeFlags::NBSP,
     );
     space_drawer.set_enable_matrix(true);
-    // The file gutter: two columns, old | new. Each draws *either* a line number
+    // The file gutter: the optional blame column, then the two number columns,
+    // old | new. Each number column draws *either* a line number
     // *or* a clickable cue button per line (the two never coincide — a `@@` header,
     // a `diff --git` separator or a conflict marker carries no number), so the
     // action buttons sit at the same level as the numbers rather than in extra
@@ -551,16 +566,96 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     let line_gutter = sourceview5::prelude::ViewExt::gutter(&file_view, gtk::TextWindowType::Left);
     let col_old = diff_cues::GutterColumn::new(linenums::NumColumn::Old);
     let col_new = diff_cues::GutterColumn::new(linenums::NumColumn::New);
-    line_gutter.insert(&col_old, 0);
-    line_gutter.insert(&col_new, 1);
+    // The optional blame column sits at the far left, *before* the line numbers
+    // (`blame_col`) — the IDE "annotate" convention. It carries no content (zero
+    // width — collapsed) until the user expands it via the chevron toggle; then
+    // `refresh_blame_column` repopulates it from `blame_data`.
+    let col_blame = blame_col::BlameColumn::new();
+    line_gutter.insert(&col_blame, 0);
+    line_gutter.insert(&col_old, 1);
+    line_gutter.insert(&col_new, 2);
+    // Hovering a blame cell highlights that commit's row in the history list, if
+    // it is shown (`highlight_affected` no-ops for a change id not in the list, so
+    // an origin older than the visible range simply doesn't light up). Leaving a
+    // cell clears it.
+    col_blame.set_on_hover({
+        let list = list.clone();
+        let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
+        Rc::new(move |change: Option<&str>| {
+            clear_highlight(&list);
+            if let Some(change) = change {
+                highlight_affected(
+                    &list,
+                    &commit_rows.borrow(),
+                    &commits.borrow(),
+                    &[change.to_string()],
+                );
+            }
+        })
+    });
+
+    // Recompute the blame for `blame_selection` into `blame_data` — but only while
+    // blame is toggled on (it's the expensive jj-lib walk). Called when the
+    // selection changes (before the diff text is rendered) and when the toggle
+    // flips on; clears the cache otherwise.
+    let recompute_blame: Rc<dyn Fn()> = {
+        let repo = repo.clone();
+        let blame_on = blame_on.clone();
+        let blame_selection = blame_selection.clone();
+        let blame_data = blame_data.clone();
+        Rc::new(move || {
+            if !blame_on.get() {
+                *blame_data.borrow_mut() = None;
+                return;
+            }
+            let ids = blame_selection.borrow().clone();
+            if ids.is_empty() {
+                *blame_data.borrow_mut() = None;
+                return;
+            }
+            let blamed = repo.borrow().blame_old_side(&ids);
+            *blame_data.borrow_mut() = blamed
+                .ok()
+                .map(|files| files.into_iter().map(|fb| (fb.path.clone(), fb)).collect());
+        })
+    };
+    // Repaint the blame column from the live buffer text + the cached `blame_data`
+    // (cheap: a per-line remap). Empty content collapses the column when blame is
+    // off or uncomputed. Shared by the buffer `changed` handler and the toggle.
+    let refresh_blame_column: Rc<dyn Fn()> = {
+        let file_buffer = file_buffer.clone();
+        let combined_files = combined_files.clone();
+        let blame_data = blame_data.clone();
+        let blame_on = blame_on.clone();
+        let col_blame = col_blame.clone();
+        Rc::new(move || {
+            if !blame_on.get() {
+                col_blame.set_content(&[]);
+                return;
+            }
+            let data = blame_data.borrow();
+            let Some(data) = data.as_ref() else {
+                col_blame.set_content(&[]);
+                return;
+            };
+            let text = buffer_text(&file_buffer);
+            let nums = linenums::diff_line_numbers(&text);
+            let cells = blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data);
+            col_blame.set_content(&cells);
+        })
+    };
+
     file_buffer.connect_changed({
         let pane_mode = pane_mode.clone();
         let col_old = col_old.clone();
         let col_new = col_new.clone();
+        let col_blame = col_blame.clone();
         let combined_files = combined_files.clone();
         let conflict_view = conflict_view.clone();
         let changes = changes.clone();
         let diff_read_only = diff_read_only.clone();
+        let refresh_blame_column = refresh_blame_column.clone();
         move |buffer| {
             let text = buffer_text(buffer);
             // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the columns show
@@ -573,6 +668,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let (elision, resolve) = conflict_cue_cells(&text);
                 col_old.set_content(&nums, &elision);
                 col_new.set_content(&nums, &resolve);
+                col_blame.set_content(&[]); // no blame while resolving conflicts
             } else {
                 let nums = linenums::diff_line_numbers(&text);
                 let (exp, rev) = diff_cues::diff_cue_cells(
@@ -583,6 +679,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 );
                 col_old.set_content(&nums, &exp);
                 col_new.set_content(&nums, &rev);
+                refresh_blame_column();
             }
         }
     });
@@ -595,13 +692,50 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         .hexpand(true)
         .child(&file_view)
         .build();
+    // The blame "sidebar": a thin, always-visible, full-height handle pinned at
+    // the very left of the editor — left of the gutter, hence left of the blame
+    // hashes it reveals. It carries a vertically-centred triangle (`▸` collapsed,
+    // `◂` expanded) and toggles the blame column. A *view* option, kept out of the
+    // Save/Split mutations in the bottom bar; collapsed by default, expanding is
+    // opt-in because blame is the one expensive view (it recomputes the selection's
+    // blame and widens the otherwise zero-width gutter column). `blame_on` reads as
+    // "expanded". It is a *sibling* of the scroll, not a gutter renderer, so the
+    // triangle stays pinned and centred instead of scrolling with the text.
+    let blame_arrow = Label::new(Some("▸"));
+    blame_arrow.set_valign(gtk::Align::Center);
+    blame_arrow.set_vexpand(true);
+    let blame_strip = ToggleButton::new();
+    blame_strip.set_child(Some(&blame_arrow));
+    blame_strip.add_css_class("flat");
+    blame_strip.add_css_class("blame-strip");
+    blame_strip.set_vexpand(true);
+    blame_strip.set_tooltip_text(Some(
+        "Blame: annotate context and removed lines with the commit that last touched them",
+    ));
+    blame_strip.connect_toggled({
+        let blame_on = blame_on.clone();
+        let recompute_blame = recompute_blame.clone();
+        let refresh_blame_column = refresh_blame_column.clone();
+        let blame_arrow = blame_arrow.clone();
+        move |btn| {
+            let on = btn.is_active();
+            // The triangle points the way the panel moves: `▸` opens it rightward,
+            // `◂` collapses it back to the strip.
+            blame_arrow.set_text(if on { "◂" } else { "▸" });
+            blame_on.set(on);
+            recompute_blame();
+            refresh_blame_column();
+        }
+    });
     // The horizontal Paned's ~9px resize handle overlaps the left edge of this
-    // pane, and its drag gesture (capture phase, on the Paned ancestor) claims
-    // presses over that band before they reach the gutter. Flush against the
-    // handle, the leftmost gutter column's buttons lost their left half to it.
-    // Inset the editor clear of the handle band (the analogue of the dropdown's
-    // top margin above).
-    file_scroll.set_margin_start(12);
+    // pane; its drag gesture (capture phase on the Paned ancestor) claims presses
+    // over that band before they reach the strip. Inset the strip — now the
+    // leftmost interactive element — clear of the handle band; the editor scroll
+    // follows it, so it no longer needs its own inset.
+    blame_strip.set_margin_start(12);
+    let editor_row = GtkBox::new(Orientation::Horizontal, 0);
+    editor_row.append(&blame_strip);
+    editor_row.append(&file_scroll);
     let files_box = GtkBox::new(Orientation::Vertical, 0);
     file_dropdown.set_margin_start(8);
     // The vertical Paned overlays its ~9px resize handle on top of the bottom
@@ -693,7 +827,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
     files_box.append(&conflict_banner);
     files_box.append(&file_dropdown);
-    files_box.append(&file_scroll);
+    files_box.append(&editor_row);
     files_box.append(&bottom_bar);
 
     // Window geometry remembered from the previous session (size + maximized
@@ -2198,10 +2332,18 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let multi_identity_baseline = multi_identity_baseline.clone();
         let update_save_sensitivity = update_save_sensitivity.clone();
         let save_button = save_button.clone();
+        let blame_selection = blame_selection.clone();
+        let recompute_blame = recompute_blame.clone();
         Rc::new(move || {
             if selection_sync.get() {
                 return;
             }
+            // Point the blame at this selection (cleared here, set in the
+            // commit-diff arms below) and recompute it *before* the diff text
+            // lands, so the buffer `changed` handler paints the column from a
+            // current cache. `recompute_blame` is a no-op while blame is toggled
+            // off. The closure runs again per arm that shows a real-commit diff.
+            *blame_selection.borrow_mut() = Vec::new();
             // Split the selected rows into real commits and working-copy `@` rows
             // (both now live in the one list). `select_click` keeps `@` rows out of
             // multi-selections, so at most one `@` is ever selected; if one is, it
@@ -2259,6 +2401,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 }
                 save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
                 diff_read_only.set(false);
+                recompute_blame(); // selection cleared above: drop any stale blame
                 load_wc_changes();
                 update_save_sensitivity();
                 return;
@@ -2298,6 +2441,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     }
                     *original_identity.borrow_mut() = None;
                     diff_read_only.set(false);
+                    recompute_blame(); // selection cleared above: drop any stale blame
                     apply_changes(Vec::new());
                 }
                 [info] => {
@@ -2311,6 +2455,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     set_identity_fields(&identity_fields, info);
                     *original_identity.borrow_mut() = Some(read_identity(&identity_fields));
                     diff_read_only.set(false);
+                    // Blame this commit's old side, before its diff text lands.
+                    *blame_selection.borrow_mut() = vec![info.id.clone()];
+                    recompute_blame();
                     load_changes(info);
                 }
                 infos => {
@@ -2337,7 +2484,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     };
                     diff_read_only.set(true);
                     match combined {
-                        Ok(Some(ch)) => apply_changes(ch),
+                        Ok(Some(ch)) => {
+                            // Blame the combined old side (oldest commit's parent),
+                            // before the diff text lands.
+                            *blame_selection.borrow_mut() = ids.clone();
+                            recompute_blame();
+                            apply_changes(ch);
+                        }
                         Ok(None) => {
                             apply_changes(Vec::new());
                             editing.set(true);

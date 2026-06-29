@@ -4,10 +4,11 @@
 mod common;
 
 use commedit_mcp::dto::{
-    CommitEditDto, CommitField, CreateCommitReq, DropCommitReq, EditCommitsReq, EditIdentityReq,
-    EditMessageReq, FileContentDto, IdentityFieldsDto, ListHistoryReq, ReorderCommitReq,
-    ReplaceFilesReq, ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq, SaveResultDto,
-    ShowCommitReq, SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq, TopologyDto,
+    BlameSquashReq, CommitEditDto, CommitField, CreateCommitReq, DropCommitReq, EditCommitsReq,
+    EditIdentityReq, EditMessageReq, FileContentDto, IdentityFieldsDto, ListHistoryReq,
+    ReorderCommitReq, ReplaceFilesReq, ReplaceInFileReq, ReplaceInMessageReq, RestoreCommitReq,
+    SaveResultDto, ShowCommitReq, SplitCommitReq, SquashCommitReq, StrReplaceDto, SuggestSquashReq,
+    TopologyDto,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_merge_repo, init_repo, open_server, sel};
@@ -1803,6 +1804,54 @@ async fn suggest_squash_targets_points_a_fixup_at_its_match() {
         .0;
     assert!(resp.mode.is_none());
     assert!(resp.targets.is_empty() && resp.siblings.is_empty());
+}
+
+#[tokio::test]
+async fn blame_squash_targets_finds_the_owning_commit_by_content() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[
+            ("f.txt", "1\n2\n3\n4\n5\n", "base"),
+            ("g.txt", "g\n", "noise"),
+            ("f.txt", "1\nTWO\nTHREE\n4\n5\n", "fix"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // The tip "fix" rewrites lines 2 and 3, both introduced by "base" — content
+    // blame lands there even though "fix" carries no autosquash prefix.
+    let fix = change_id_of(&server, "fix").await;
+    let resp = server
+        .blame_squash_targets(Parameters(BlameSquashReq {
+            session: sel("main"),
+            source: Some(fix),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(resp.mode.is_none(), "no fixup! prefix on the source");
+    assert_eq!(resp.candidates.len(), 1, "one owning commit");
+    assert_eq!(resp.candidates[0].commit.subject, "base");
+    assert_eq!(resp.candidates[0].lines, 2);
+    assert_eq!(resp.unattributed, 0);
+
+    // Default source = the working copy: edit lines 4 and 5 on disk (still owned
+    // by "base", untouched by "fix"), leave them uncommitted, and "base" is the
+    // top candidate.
+    std::fs::write(dir.path().join("f.txt"), "1\nTWO\nTHREE\nFOUR\nFIVE\n").unwrap();
+    let resp = server
+        .blame_squash_targets(Parameters(BlameSquashReq {
+            session: sel("main"),
+            source: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        resp.candidates.first().map(|c| c.commit.subject.as_str()),
+        Some("base")
+    );
 }
 
 // --- Topology feedback in mutation responses ------------------------------

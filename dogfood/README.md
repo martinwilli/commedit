@@ -35,6 +35,13 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 > mitigation). The "ref-write race" was re-diagnosed (commit `c6f56ca`) as a cross-session
 > `protect_unrelated_heads` clobber, not a git `pack-refs`/`gc` race, and the fix retires the mitigation.
 
+> [Run 13](runs/13.md) ran the first **reasoning-effort A/B**: the full 12×3×k=2 grid on Sonnet 5 at
+> **xhigh** effort against the (unlogged, assumed-lower) effort level of runs 9–12. Correctness came out
+> **72/72** clean — including both the persistent T1 reorder-judgment flake and run 12's T6-ctl miss —
+> but real `$` cost rose **~50% per solve-student**, driven up across `cache_read`, `cache_create`,
+> call count, and output tokens alike, not just reasoning verbosity. Effort level isn't yet a field any
+> run records explicitly; worth adding if this becomes a recurring axis.
+
 ---
 
 ## 1. Architecture constraints that shape the whole design

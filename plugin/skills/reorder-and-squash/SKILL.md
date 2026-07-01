@@ -34,6 +34,12 @@ so commits that don't commute report conflicts. When parallel lines converge on
 `new_parent` (a fork), pass `child` to pick which line to splice under. Merge
 commits can't be moved.
 
+**Mind the orientation.** `list_history` and `show_graph` are **newest-first**,
+so "earlier in history" is *lower* in the listing, not higher. To put A before B,
+A must become B's parent — A ends up below B. Judge the current order by parent
+`change_id`, never by which row prints on top; a commit sitting visually above
+another is *newer* than it, so it comes later in the branch, not first.
+
 ## Squash / fixup / amend
 
 `squash_commit(source, dest)` folds `source` into `dest` anywhere in the graph:

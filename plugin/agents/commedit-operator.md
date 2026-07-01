@@ -59,7 +59,12 @@ mutation's own result (see Verify) → report compactly.
   `replace_files` (whole file; `delete_paths`); `edit_commits` for a whole range
   atomically (one rebase, ancestors-first) — prefer it over looping single edits
 - **Restructure**: `reorder_commit(commit, new_parent, child?)` (`"root"` for
-  first; merges can't move); `squash_commit(source, dest, mode?, message?)`
+  first; merges can't move — and note `list_history`/`show_graph` are
+  **newest-first**, so "put A before B" means A becomes B's parent, i.e. A sits
+  *lower* in the listing; judge current order by parent `change_id`, never by
+  vertical position, and when asked to reorder, do it — an already-satisfied
+  reorder is a cheap idempotent no-op, not a reason to skip an explicit ask);
+  `squash_commit(source, dest, mode?, message?)`
   (`fixup` keeps dest msg / `squash` appends / `amend` replaces; default follows
   source's autosquash prefix; `message` sets dest verbatim; merge can be dest,
   never source); `drop_commit` → trash (`restore_commit`; `keep_changes:true` =

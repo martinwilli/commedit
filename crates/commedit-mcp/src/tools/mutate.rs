@@ -265,7 +265,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Replace text in a commit's message: find `old` and substitute `new`, requiring a unique match unless replace_all is set. The surgical alternative to edit_message — fix a typo or rename a term without resending the whole message. Descendants are rebased; the commit's sha changes. Match `old` against the RAW message, not its YAML rendering: message fields print as a `|` block scalar whose leading indentation is presentation only and is NOT part of the stored text — copy a line verbatim and that phantom indent makes `old` miss (the error names the whitespace difference so you can drop it)."
+        description = "Replace text in a commit's message: find `old` and substitute `new`, requiring a unique match unless replace_all is set. The surgical alternative to edit_message — fix a typo or rename a term without resending the whole message. Descendants are rebased; the commit's sha changes. Match `old` against the RAW stored message, not the YAML `|` block-scalar rendering whose leading indent is presentation only (see the manual's surgical-edits note)."
     )]
     pub async fn replace_in_message(
         &self,
@@ -633,7 +633,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Introduce a merge directly above a commit, to organize a linear history into a branchy one (the GTK app's merge-out button). Given a single-parent commit C with parent P, it inserts a merge M with parents [P, C] — P the mainline first parent, C the merged-out side branch — and M's tree equal to C's, so the merge introduces no change of its own and C's descendants rebase onto it cleanly (Clean absent an overlap with uncommitted changes). C becomes a one-commit side branch you can then move further commits onto (reorder_commit); M carries a pro-forma `Merge \"<subject>\"` message to reword later (edit_message). Merge commits and the repository root cannot be merged out — they have no single parent. This is the inverse of every other tool, which only edits or preserves merges; building a merge between two real branches stays a plain-git task. The clean result carries a `topology` slice with the new merge M and its two parents, and C gaining M as its child — so you can verify the merge landed without a follow-up read."
+        description = "Introduce a merge directly above a commit, to organize a linear history into a branchy one (the GTK app's merge-out button). Given a single-parent commit C with parent P, it inserts a merge M with parents [P, C] — P the mainline first parent, C the merged-out side branch — and M's tree equal to C's, so the merge introduces no change of its own and C's descendants rebase onto it cleanly (Clean absent an overlap with uncommitted changes). C becomes a one-commit side branch you can then move further commits onto (reorder_commit); M carries a pro-forma `Merge \"<subject>\"` message to reword later (edit_message). Merge commits and the repository root cannot be merged out — they have no single parent. This is the inverse of every other tool, which only edits or preserves merges; building a merge between two real branches stays a plain-git task. The clean result carries a `topology` slice (the new merge and its two parents)."
     )]
     pub async fn merge_out_commit(
         &self,

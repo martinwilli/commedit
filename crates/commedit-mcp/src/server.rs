@@ -55,151 +55,116 @@ New commits can also be created from scratch and spliced in anywhere. \
 The repository stays a plain git repo throughout — no jj state is left behind.
 
 Sessions: this server hosts SEVERAL independent editing sessions over the one \
-repository it launched against — one per branch — so you can edit several \
-branches at once and they run in parallel. EVERY tool that operates on a session \
-takes a required `session` selector naming which one; there is no implicit \
-default. The selector is the SESSION ID: the short name of the branch that \
-session edits (e.g. `main`, `feature`), or the reserved id `HEAD` for a \
-detached/unborn-HEAD session. A branch short-name is stable across rewrites \
-(unlike shas/change_ids, which churn), so it is always a safe handle. Start with \
-list_sessions to see what's open (the launch session is already there, named like \
-any other); open_session(branch) starts a new session over another branch \
-(worktree-bound if that branch is checked out in a worktree, else off-worktree); \
-close_session(session) drops one (the last session can't be closed). Two sessions \
-can never edit the same branch — open_session refuses a branch already open.
+repository it launched against — one per branch, editable in parallel. EVERY \
+session tool takes a required `session` selector; there is no default. The \
+selector is the session id: the short name of the branch it edits (e.g. `main`), \
+or `HEAD` for a detached/unborn-HEAD session — stable across rewrites, so always \
+a safe handle. list_sessions shows what's open (the launch session included); \
+open_session(branch) starts one over another branch (worktree-bound if that \
+branch is checked out, else off-worktree); close_session(session) drops one (not \
+the last). A branch already open can't be opened twice.
 
 Raw git vs commedit — the dividing line. A NEW commit on top of HEAD needs no \
-rebase, so for a one-off the simplest tool is plain `git add` + `git commit`. But \
-when you are in a commedit session you will keep editing — crystallizing units as \
-you go, then refining them — commit_working_copy is just as good and often better: \
-it keeps the session coherent and returns the new commit's change_id plus what is \
-left uncommitted, ready to chain the next edit. Reach for commedit whenever the \
-work touches history that ALREADY EXISTS, or lands a commit BELOW the tip — \
-rewording a message, changing an author or date, editing a commit's files, or \
+rebase, so a one-off is simplest as plain `git add` + `git commit`. Reach for \
+commedit whenever the work touches history that ALREADY EXISTS, or lands a commit \
+BELOW the tip — rewording, re-authoring/re-dating, editing a commit's files, or \
 reordering, squashing, splitting, dropping, reverting, cherry-picking or inserting \
-a commit. commedit rewrites in place and rebases the descendants for you, on any \
-commit reachable from HEAD (not just the tip), so reach for it instead of \
-`git commit --amend`, `git rebase -i`, `git cherry-pick` or `git revert`. \
-merge_out_commit can introduce a merge above a commit, to organize a linear \
-history into a branchy one, and an EXISTING merge can be reworded (edit_message), \
-squashed into, or have commits moved across it (reorder_commit, using `child` to \
-splice into a parent edge); only building a NEW merge between two divergent \
-branches, and managing branches, worktrees or remotes, stay plain-git tasks. (commedit \
-imports git state at startup but catches up automatically on the next tool call \
-when you commit on top of HEAD with plain git — so a plain commit needs no reload. \
-reload_repo is only for changes it can't absorb in place: a branch switch, or \
-history rewritten out of band by `git rebase`/`reset`/`commit --amend`.)
+a commit: it rewrites in place and rebases descendants on any commit reachable \
+from HEAD, replacing `git commit --amend`, `git rebase -i`, `git cherry-pick` and \
+`git revert`. Inside a session, commit_working_copy is also as good as a plain \
+commit and often better — it keeps the session coherent and returns the new \
+change_id plus what's left uncommitted, ready to chain. merge_out_commit \
+introduces a merge above a commit (linear→branchy), and an EXISTING merge can be \
+reworded, squashed into, or have commits moved across it (reorder_commit's \
+`child` splices into a parent edge). Only building a NEW merge between divergent \
+branches, and managing branches/worktrees/remotes, stay plain-git tasks.
 
-Off-worktree branches: this session may be editing a branch you have NOT checked \
-out — launched as `commedit-mcp <path> <branch>`, or switched via reload_repo's \
-`branch`. Then every history edit works exactly as above, but ONLY that branch's \
-ref moves: HEAD, the index and the worktree stay frozen, so there is no working \
-copy and the working-copy tools (commit_working_copy, squash_working_copy, \
-split/discard, edit a working-copy file) are refused. reload_repo reports the \
-edited branch and whether the session is worktree_bound.
+Off-worktree branches: this session may edit a branch you have NOT checked out — \
+launched as `commedit-mcp <path> <branch>`, or switched via reload_repo's \
+`branch`. Every history edit works as above, but ONLY that branch's ref moves: \
+HEAD, index and worktree stay frozen, so there is no working copy and the \
+working-copy tools (commit/squash_working_copy, split/discard) are refused. \
+reload_repo reports the edited branch and whether the session is worktree_bound.
 
-Addressing: every tool that takes a commit accepts its sha or its change_id, \
-full or a unique prefix of at least 4 characters, case-insensitive. Mutations \
-rewrite the target and its descendants, so shas change constantly; the \
-change_id is stable across rewrites — address commits by change_id to chain \
-mutations without re-listing history. An ambiguous prefix fails listing its \
-matches; list_history shows both ids. To save tokens, list_history returns \
-those ids already abbreviated to the shortest repo-unique prefix (>= 8 chars) — \
-pass them straight back as refs rather than echoing full 40/32-char ids.
+Addressing: a commit ref is its sha or its change_id, full or a unique prefix of \
+>= 4 chars, case-insensitive. Shas churn as mutations rewrite the target and its \
+descendants; the change_id is stable — address by change_id to chain mutations \
+without re-listing. An ambiguous prefix fails listing its matches. list_history \
+returns ids pre-abbreviated to the shortest repo-unique prefix (>= 8 chars); pass \
+them straight back rather than echoing full ids.
 
-Bulk & paging: to edit many commits at once (e.g. re-date or reword a range), \
-prefer edit_commits — it applies every message/identity edit in ONE transaction \
-with a single rebase, atomically. list_history returns 30 commits by default; \
-page deeper with its offset / next_offset rather than requesting a huge limit. \
-list_history returns every verbose field by default; pass its `fields` to fetch \
-only the ones you need (e.g. just the timestamps before a re-date, or `[]` for a \
-header-only overview) to keep responses small.
+Bulk & paging: to edit many commits at once (e.g. re-date/reword a range), prefer \
+edit_commits — every edit in ONE atomic transaction and rebase. list_history \
+returns 30 commits and every verbose field by default; page deeper with \
+offset/next_offset (not a huge limit) and pass `fields` for only what you need \
+(`[]` for a header-only overview) to keep responses small.
 
 Surgical edits: for a small change to a long message or file, prefer \
-replace_in_message / replace_in_file — they take an exact `old`→`new` \
-substitution (unique match unless replace_all) instead of the whole text, so \
-the untouched content can't drift and the call stays small. Make `old` long \
-enough to match exactly once; an ambiguous or missing match is rejected — a \
-miss reports the closest text with any whitespace/indentation difference named, \
-so correct `old` from that rather than re-guessing tabs from a rendered diff. \
-Match against the RAW stored text, not YAML-rendered output: a `|` block scalar \
-(how messages and file bodies print) adds leading indentation that is NOT part \
-of the string, so a line copied straight from the response carries phantom \
-spaces that make `old` miss. edit_message / replace_files remain for wholesale \
-rewrites.
+replace_in_message / replace_in_file — an exact `old`→`new` substitution (unique \
+unless replace_all) instead of the whole text, so untouched content can't drift. \
+Make `old` unique; a miss reports the closest text with whitespace differences \
+named — correct `old` from that. Match the RAW stored text: a YAML `|` block \
+scalar (how messages/file bodies print) adds leading indentation that is NOT part \
+of the string, so a line copied from the response carries phantom spaces that \
+make `old` miss. edit_message / replace_files remain for wholesale rewrites.
 
-Conflicts: a mutation whose rebase conflicts returns status=conflicts and is \
-held back IN FULL — git history, HEAD and the working tree stay untouched \
-until it settles. If the conflict came from the mutation you just issued (a \
-mistyped replace_in_file, a wrong edit), abort_rewrite and redo it correctly \
-is usually cheaper than resolving. Otherwise resolve the OLDEST conflicted \
-commit first (read_conflict each resolvable file, remove all markers, \
-resolve_conflicts echoing each file's marker_len); fixing the earliest often \
-auto-clears descendants, so don't hand-resolve every commit. abort_rewrite \
-discards the held rewrite (and is the only way out of a structural, \
-resolvable=false conflict). No other mutation runs while pending.
+Conflicts: a mutation whose rebase conflicts returns status=conflicts and is held \
+IN FULL — git history, HEAD and the working tree untouched until it settles, and \
+no other mutation runs meanwhile. If it came from the edit you just issued, \
+abort_rewrite and redo is usually cheaper than resolving. Otherwise resolve the \
+OLDEST conflicted commit first (read_conflict each resolvable file, remove all \
+markers, resolve_conflicts echoing each file's marker_len); fixing the earliest \
+often auto-clears descendants. abort_rewrite is the only way out of a structural \
+(resolvable=false) conflict.
 
-Creating commits: create_commit makes a new commit from given file contents \
-(empty for an empty commit) and inserts it — on top of HEAD by default, or under \
-any commit / at root via new_parent. revert_commit inserts the inverse of a \
-commit (like git revert). cherry_pick_commit copies a commit's change in (like \
-git cherry-pick) — the source may be off the current branch, named by its full \
-sha. commit_working_copy turns the current uncommitted changes into a commit on \
-top of HEAD (like git commit -a) and returns the new commit (sha + change_id) \
-plus the remaining working copy. For a one-off whole-tree commit plain git is \
-simplest, but inside a session you keep editing it is just as good — it stays \
-coherent and hands back the change_id to chain on — and it is the only way to \
-commit a deterministic SUBSET of the tree (its paths/hunks/patches selection). It \
-captures edits to already-tracked files only, so a brand-new \
-(untracked) file is silently skipped unless named in its add_paths (the same holds \
-for squash_working_copy). A mid-history insert, \
-revert or pick may report conflicts like any rewrite. merge_out_commit \
-introduces a merge directly above a single-parent commit, turning that commit \
-into a one-commit side branch you can then move further commits onto.
+Creating commits: create_commit inserts a new commit from given file contents \
+(empty for an empty commit) — on top of HEAD, or under any commit / at root via \
+new_parent. revert_commit inserts a commit's inverse (git revert); \
+cherry_pick_commit copies one in (git cherry-pick), its source possibly \
+off-branch by full sha. commit_working_copy turns uncommitted changes into a \
+commit on HEAD (git commit -a) and is the only way to commit a deterministic \
+SUBSET of the tree (paths/hunks/patches). It (and squash_working_copy) captures \
+already-tracked files only — a brand-new untracked file is skipped unless named \
+in add_paths. A mid-history insert/revert/pick may conflict like any rewrite.
 
-Folding a fix into the commit it belongs to: when the fix carries a \
-`fixup!`/`squash!`/`amend!` subject, suggest_squash_targets routes it by that \
-name; when you do NOT know which commit introduced the code being fixed (the \
-common case), blame_squash_targets content-blames the lines the fix touches and \
-ranks the commits that own them — omit its `source` to blame the uncommitted \
-working copy, then pass the top candidate's change_id to squash_working_copy (or \
-squash_commit for an already-committed fix). Both are read-only.
+Folding a fix into the commit it belongs to: a fix with a `fixup!`/`squash!`/\
+`amend!` subject is routed by suggest_squash_targets; when you don't know which \
+commit introduced the fixed code (the common case), blame_squash_targets \
+content-blames the touched lines and ranks the owning commits — omit `source` to \
+blame the working copy, then pass the top change_id to squash_working_copy (or \
+squash_commit for a committed fix). Both are read-only.
 
-Trash: dropped commits go to a session-scoped trash (list_trash) and can be \
-grafted back (restore_commit) or folded into a commit (squash_commit).
+Trash: dropped commits go to a session-scoped trash (list_trash), grafted back \
+(restore_commit) or folded into a commit (squash_commit).
 
 Safety net: every landed mutation is a recorded operation — list_operations \
-lists them, undo/redo step the cursor, jump_to_operation travels to any (0 \
-rolls the whole session back to its start). The one unrecoverable action is \
-discard_working_copy.
+lists them, undo/redo step the cursor, jump_to_operation travels to any (0 rolls \
+the session back to its start). Only discard_working_copy is unrecoverable.
 
-Uncommitted changes in the working tree are first-class: they ride through \
-every rewrite automatically (working_copy_status shows them; session_diff \
-shows everything this session changed, committed and uncommitted, against the \
-session-start tree). Git state is imported only at startup, but the session \
-catches up automatically on the next tool call when you commit on top of HEAD \
-with plain git — so plain commits need no reload. reload_repo(session, …) is only \
-for out-of-band changes one session can't absorb in place: a branch switch, or \
-history rewritten by `git rebase`/`reset`/`commit --amend`; it restarts THAT \
-session fresh, discarding its trash, operation log and any pending rewrite \
-(other sessions are untouched). Switching its branch re-keys the session — its \
-id becomes the new branch's short-name, returned in the result.
+Uncommitted changes are first-class: they ride through every rewrite \
+automatically (working_copy_status shows them; session_diff shows all this \
+session changed, committed and uncommitted, against the session-start tree). Git \
+state is imported at startup and the session catches up on the next tool call \
+when you commit on HEAD with plain git — so a plain commit needs no reload. \
+reload_repo(session, …) is only for out-of-band changes it can't absorb: a branch \
+switch, or history rewritten by `git rebase`/`reset`/`commit --amend`. It \
+restarts THAT session, discarding its trash, op log and any pending rewrite \
+(other sessions untouched); switching its branch re-keys the session to the new \
+branch's short-name (returned in the result).
 
 Verifying a rewrite: a topology-changing mutation (reorder, squash, split, drop, \
 restore, create, revert, cherry_pick, merge_out, squash_working_copy) returns a \
-`topology` slice on a clean save — the affected commits with their new parents and \
-children by change_id, plus a `merge_tip` when the new branch tip is a merge — so \
-you can confirm the resulting shape in place instead of a follow-up list_history. \
-commit_working_copy and squash_working_copy additionally hand back the new commit \
-and/or the remaining working copy. Plain \
-message/identity/file edits omit it (their shape is unchanged). show_graph reads \
-that same shape for the whole branch on demand — every commit with its parents \
-and children by change_id — to see how merges and side branches connect.
+`topology` slice on a clean save — the affected commits with their new parents \
+and children by change_id, plus `merge_tip` when the new tip is a merge — so you \
+confirm the shape in place, no follow-up list_history. commit/squash_working_copy \
+also hand back the new commit and/or remaining working copy; plain \
+message/identity/file edits omit it (shape unchanged). show_graph reads that same \
+shape for the whole branch on demand.
 
-Reading results: every tool result is YAML. Long multi-line strings such as \
-diffs and file contents render as a literal block scalar, or — when a line \
-carries a tab or trailing whitespace — as a YAML sequence with one string per \
-line; reassemble such a sequence by joining its entries with newlines.";
+Reading results: every tool result is YAML. Long multi-line strings (diffs, file \
+contents) render as a literal block scalar, or — when a line carries a tab or \
+trailing whitespace — as a YAML sequence, one string per line; reassemble by \
+joining its entries with newlines.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CommeditServer {

@@ -58,9 +58,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the commit's message is kept by default). Pass `message` to reword the destination in the same call. Only edits/deletions to already-tracked files are folded — a brand-new (untracked) file is SILENTLY skipped unless you name it in `add_paths`; in a partial fold a new file must be listed under BOTH `add_paths` (to track it) and `paths` (to select it). \
-\
-Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-process `git add -p` for a fixup), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to fold everything. The working tree stays byte-identical; an overlap with the commit's content reports conflicts like any rewrite. A clean fold returns the `topology` slice (the destination after the fold) and the remaining `working_copy` — clean for a whole fold, the unselected remainder for a partial one — so it is verifiable without a follow-up read."
+        description = "Fold the uncommitted changes into a commit as a fixup (the destination's message is kept; pass `message` to reword it in the same call). Pass `paths`/`hunks`/`patches` to fold only PART of the changes, leaving the rest uncommitted; omit all three to fold everything. Only already-tracked files are folded — an untracked file needs `add_paths` (see the field docs). A clean fold returns the `topology` slice and the remaining `working_copy` (the unselected remainder for a partial fold); an overlap with the commit conflicts like any rewrite."
     )]
     pub async fn squash_working_copy(
         &self,
@@ -124,9 +122,7 @@ Pass `paths`, `hunks` and/or `patches` to fold only PART of the changes (the in-
     }
 
     #[tool(
-        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the working tree clean. Only edits and deletions to already-tracked files are committed — a brand-new (untracked) file is SILENTLY skipped unless you name it in `add_paths`; in a partial commit a new file must be listed under BOTH `add_paths` (to track it) and `paths` (to select it). Or use create_commit to author files from explicit contents. \
-\
-Pass `paths`, `hunks` and/or `patches` to commit only PART of the changes (the in-process `git add -p`), leaving the rest uncommitted — call show_commit on the working-copy entry first to read each file's numbered `hunks`. Omit all three to commit everything. Refuses when there is nothing tracked to commit, or when the selection commits nothing. To insert a commit from explicit contents elsewhere in history instead, use create_commit. Returns the new `committed` commit (its sha and stable change_id, ready to chain) and the remaining `working_copy` — clean for a whole commit, the unselected remainder for a partial one — so it is verifiable without a follow-up read."
+        description = "Commit the uncommitted changes as a new commit on top of HEAD (like `git commit -a`), leaving the tree clean — and the only way to commit a deterministic SUBSET of the tree. Pass `paths`/`hunks`/`patches` to commit only PART of the changes, leaving the rest uncommitted; omit all three to commit everything. Only already-tracked files are committed — an untracked file needs `add_paths` (see the field docs). To author files from explicit contents, or insert a commit elsewhere in history, use create_commit instead. Returns the new `committed` commit (sha + stable change_id, ready to chain) and the remaining `working_copy` (the unselected remainder for a partial commit)."
     )]
     pub async fn commit_working_copy(
         &self,

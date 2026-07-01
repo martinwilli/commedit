@@ -35,6 +35,13 @@ wall-clock per student** (§5) — the only effort metric comparable across all 
 > mitigation). The "ref-write race" was re-diagnosed (commit `c6f56ca`) as a cross-session
 > `protect_unrelated_heads` clobber, not a git `pack-refs`/`gc` race, and the fix retires the mitigation.
 
+> [Run 13](runs/13.md) ran the first **reasoning-effort A/B**: the full 12×3×k=2 grid on Sonnet 5 at
+> **xhigh** effort against the (unlogged, assumed-lower) effort level of runs 9–12. Correctness came out
+> **72/72** clean — including both the persistent T1 reorder-judgment flake and run 12's T6-ctl miss —
+> but real `$` cost rose **~50% per solve-student**, driven up across `cache_read`, `cache_create`,
+> call count, and output tokens alike, not just reasoning verbosity. Effort level isn't yet a field any
+> run records explicitly; worth adding if this becomes a recurring axis.
+
 ---
 
 ## 1. Architecture constraints that shape the whole design
@@ -376,6 +383,21 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
+> 🔧 **Mandatory: drive this protocol with the `Workflow` tool, via the checked-in
+> [`dogfood/workflow.js`](workflow.js), not manual per-student `Agent` calls.** [Run 9](runs/9.md)
+> proved the approach out at k=2 (72 students): a `pipeline`/`parallel` script over the 36
+> (task × solver) cells, each cell running its `K` repeats serially (reset → solve → verify), gets a
+> deterministic, fully-parallel fan-out with the out-of-band `verify.sh` gate wired in as a second
+> `agent()` call right after each solve — no manual bookkeeping of which student is still running, no
+> risk of a teacher forgetting the between-repeats reset. Run it with
+> `Workflow({ scriptPath: 'dogfood/workflow.js' })`; set the `K` const at the top for the repeat count
+> (§5 *Repeats for variance* below). **Patch fixes into this file as they're found** (e.g. [run 10](
+> runs/10.md)'s T11-git reset-protocol fix, already folded in) rather than letting them live only in a
+> run's throwaway script copy. Known gap: the workflow harness's `agent()` only returns aggregate
+> `tokens`/`toolCalls`/`durationMs`, not the `cache_read`/`cache_create`/`input`/`output` component split
+> runs 1–8 used for real `$` accounting — see §5 *Metrics capture* below for the recipe to recover it
+> from each agent's transcript by `agentId` (used for [run 10](runs/10.md)'s comparative accounting).
+
 For each task T (1→12), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
@@ -498,6 +520,14 @@ PY
 `<TEACHER_SESSION>` is the controlling session's UUID (the dir under
 `projects/-home-mwilli-repos-commedit/` that owns a `subagents/`). `cache_read` is cheap re-read
 (≈0.1×), so report components — don't lump it into one number.
+
+**Recovering this under `Workflow` orchestration** (mandatory per §5 above): the workflow's own
+`agent()` return value has no component breakdown, but each `workflow_agent` progress entry carries
+the real `agentId` — locate that student's transcript at
+`<TEACHER_SESSION>/subagents/workflows/<runId>/agent-<agentId>.jsonl` and run the same snippet against
+it. Skip this for a smoke/regression run (run 9 did, and reported total tokens instead); do it for any
+run drawing a **comparative** cost conclusion (a model A/B, an operator↔control delta) — total tokens
+alone can't tell a cheap `cache_read` load from an expensive `cache_create` one.
 
 **Report `cost=$…` per student in every run's scorecard** (it's the one figure comparable across
 all three solvers — tokens-per-component aren't, since the mix differs). The snippet prices each

@@ -376,6 +376,19 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
+> 🔧 **Mandatory: drive this protocol with the `Workflow` tool, not manual per-student `Agent` calls.**
+> [Run 9](runs/9.md) proved it out at k=2 (72 students): a `pipeline`/`parallel` script over the 36
+> (task × solver) cells, each cell running its k repeats serially (reset → solve → verify), gets a
+> deterministic, fully-parallel 72-student fan-out with the out-of-band `verify.sh` gate wired in as a
+> second `agent()` call right after each solve — no manual bookkeeping of which student is still running,
+> no risk of a teacher forgetting the between-repeats reset. Known gap to carry forward: the workflow
+> harness's `agent()` only returns aggregate `tokens`/`toolCalls`/`durationMs`, not the
+> `cache_read`/`cache_create`/`input`/`output` component split runs 1–8 used for real `$` accounting —
+> see §5 *Metrics capture* below for how to recover it if a run needs precise cost comparisons (e.g. a
+> model A/B). A plain-git student still needs the same Bash-only / non-interactive constraints spelled
+> out in its `agent()` prompt (the harness has no built-in per-agent tool allowlist), and T11's two-session
+> dance still needs its own prompt path (see [the run 9 script](runs/9.md) for a worked template of both).
+
 For each task T (1→12), each solver S (operator, control, git):
 
 1. `git -C <wt> reset --hard stress/base -q && git -C <wt> clean -fdxq` — pristine start.
@@ -498,6 +511,14 @@ PY
 `<TEACHER_SESSION>` is the controlling session's UUID (the dir under
 `projects/-home-mwilli-repos-commedit/` that owns a `subagents/`). `cache_read` is cheap re-read
 (≈0.1×), so report components — don't lump it into one number.
+
+**Recovering this under `Workflow` orchestration** (mandatory per §5 above): the workflow's own
+`agent()` return value has no component breakdown, but each `workflow_agent` progress entry carries
+the real `agentId` — locate that student's transcript at
+`<TEACHER_SESSION>/subagents/workflows/<runId>/agent-<agentId>.jsonl` and run the same snippet against
+it. Skip this for a smoke/regression run (run 9 did, and reported total tokens instead); do it for any
+run drawing a **comparative** cost conclusion (a model A/B, an operator↔control delta) — total tokens
+alone can't tell a cheap `cache_read` load from an expensive `cache_create` one.
 
 **Report `cost=$…` per student in every run's scorecard** (it's the one figure comparable across
 all three solvers — tokens-per-component aren't, since the mix differs). The snippet prices each

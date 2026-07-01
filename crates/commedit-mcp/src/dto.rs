@@ -284,11 +284,9 @@ pub enum SaveResultDto {
 /// argument-less tools.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionSel {
-    /// The session to operate on: the short name of the branch it edits — its id
-    /// as returned by `list_sessions` / `open_session` (e.g. `main`, `feature`).
-    /// Use the reserved id `HEAD` for a detached/unborn-HEAD session. A branch
-    /// short-name is stable across rewrites (unlike shas), so it is always a safe
-    /// handle. Required on every session-operating tool.
+    /// Session to operate on: the branch short-name it edits (its id from
+    /// list_sessions/open_session, e.g. `main`), or `HEAD` for a detached/unborn
+    /// HEAD. Stable across rewrites. Required on every session-operating tool.
     pub session: String,
 }
 
@@ -352,9 +350,8 @@ pub struct ListHistoryResp {
 pub struct ShowCommitReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to show — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive — from the history, the working copy
-    /// (an uncommitted entry) or the trash.
+    /// Commit to show — change_id or sha (full/unique prefix >= 4 chars), from
+    /// the history, the working copy (an uncommitted entry) or the trash.
     pub commit: String,
     /// Also return each text file's full old/new content, not just the diff.
     pub include_contents: Option<bool>,
@@ -499,9 +496,8 @@ pub struct PendingStatusResp {
 pub struct EditMessageReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to edit — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
-    /// so they chain across mutations without re-listing.
+    /// Commit to edit — change_id (stable, preferred) or sha; full or a unique
+    /// prefix (>= 4 chars), case-insensitive.
     pub commit: String,
     /// The new full commit message (subject line + body). Stored verbatim and
     /// not reflowed — wrap the body at ~72 columns; keep the subject one line.
@@ -512,9 +508,8 @@ pub struct EditMessageReq {
 pub struct EditIdentityReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to edit — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
-    /// so they chain across mutations without re-listing.
+    /// Commit to edit — change_id (stable, preferred) or sha; full or a unique
+    /// prefix (>= 4 chars), case-insensitive.
     pub commit: String,
     /// New author/committer fields; omitted fields keep their current value.
     #[serde(flatten)]
@@ -526,11 +521,11 @@ pub struct EditIdentityReq {
 /// value. Like `edit_identity`, the committer timestamp is pinned, not re-stamped.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CommitEditDto {
-    /// The commit to edit — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites.
+    /// Commit to edit — change_id (stable, preferred) or sha; full or a unique
+    /// prefix (>= 4 chars), case-insensitive.
     pub commit: String,
-    /// New full commit message (subject + body). Omit to leave the message.
-    /// Stored verbatim and not reflowed — wrap the body at ~72 columns.
+    /// New full commit message (subject + body). Omit to leave it. Stored
+    /// verbatim, not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
     /// New author/committer fields; omitted fields keep their current value.
     #[serde(flatten)]
@@ -561,9 +556,8 @@ pub struct FileContentDto {
 pub struct ReplaceFilesReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to edit — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
-    /// so they chain across mutations without re-listing.
+    /// Commit to edit — change_id (stable, preferred) or sha; full or a unique
+    /// prefix (>= 4 chars), case-insensitive.
     pub commit: String,
     /// Files to write, each with its complete new content (a path the commit
     /// doesn't have yet is added).
@@ -594,9 +588,8 @@ pub struct StrReplaceDto {
 pub struct ReplaceInFileReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to edit — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive. Change ids are stable across rewrites,
-    /// so they chain across mutations without re-listing.
+    /// Commit to edit — change_id (stable, preferred) or sha; full or a unique
+    /// prefix (>= 4 chars), case-insensitive.
     pub commit: String,
     /// The replacements, applied in order; several may target the same file.
     pub edits: Vec<StrReplaceDto>,
@@ -606,9 +599,8 @@ pub struct ReplaceInFileReq {
 pub struct ReplaceInMessageReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit whose message to edit — sha or change id, full or a unique
-    /// prefix (>= 4 chars), case-insensitive. Change ids are stable across
-    /// rewrites.
+    /// Commit whose message to edit — change_id (stable, preferred) or sha;
+    /// full or a unique prefix (>= 4 chars), case-insensitive.
     pub commit: String,
     /// The exact text to find in the message. Must occur exactly once unless
     /// `replace_all` is set.
@@ -623,23 +615,19 @@ pub struct ReplaceInMessageReq {
 pub struct SplitCommitReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to split — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive.
+    /// Commit to split — change_id or sha (full/unique prefix >= 4 chars).
     pub commit: String,
-    /// The whole-file content this commit should KEEP, per path it changes
-    /// (like `replace_files`, spliced onto the original tree). A new `fixup!`
-    /// child commit receives the remainder, so both combined reproduce the
-    /// original change. To move a file's change OUT to the child, list that file
-    /// with its PARENT (pre-commit) content; a changed file you omit stays in
-    /// this commit. Contents that leave the tree unchanged (an empty child) are
-    /// refused.
+    /// Whole-file content this commit should KEEP, per changed path (spliced
+    /// onto the original tree, like `replace_files`); a new `fixup!` child gets
+    /// the remainder. To move a file's change OUT to the child, pass it at its
+    /// PARENT (pre-commit) content; an omitted changed file stays here. Content
+    /// leaving the tree unchanged (an empty child) is refused.
     pub files: Vec<FileContentDto>,
 }
 
-/// Optional author/committer fields (name, email, date), flattened into the
-/// requests that take an identity. How an *omitted* field is treated is
-/// tool-specific: a new-commit tool (create/revert/cherry_pick/commit_working_copy)
-/// fills it from the repository's git-configured identity at "now"; an edit tool
+/// Optional author/committer fields (name, email, date). An *omitted* field:
+/// a new-commit tool (create/revert/cherry_pick/commit_working_copy) fills it
+/// from the git-configured identity at "now"; an edit tool
 /// (edit_identity/edit_commits) keeps the commit's current value.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct IdentityFieldsDto {
@@ -718,8 +706,7 @@ pub struct CherryPickCommitReq {
 pub struct DropCommitReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to drop — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive.
+    /// Commit to drop — change_id or sha (full/unique prefix >= 4 chars).
     pub commit: String,
     /// When true, "uncommit" instead of trashing: the commit leaves history and
     /// its diff becomes *unstaged* changes in the working tree (git's
@@ -754,8 +741,7 @@ pub struct DropCommitResp {
 pub struct ReorderCommitReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The commit to move — sha or change id, full or a unique prefix
-    /// (>= 4 chars), case-insensitive.
+    /// Commit to move — change_id or sha (full/unique prefix >= 4 chars).
     pub commit: String,
     /// The commit that should become its parent (same ref forms), or the
     /// literal string `root` to make it the repository's first commit.
@@ -770,8 +756,8 @@ pub struct ReorderCommitReq {
 pub struct RestoreCommitReq {
     #[serde(flatten)]
     pub session: SessionSel,
-    /// The trashed commit to graft back (see `list_trash`) — sha or change
-    /// id, full or a unique prefix (>= 4 chars), case-insensitive.
+    /// The trashed commit to graft back (see `list_trash`) — change_id or sha
+    /// (full/unique prefix >= 4 chars).
     pub commit: String,
     /// The commit that should become its parent (same ref forms), or `root`.
     pub new_parent: String,
@@ -829,37 +815,27 @@ pub struct SquashWorkingCopyReq {
     /// destination in the same call instead of a follow-up edit_message. Stored
     /// verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
-    /// Optional partial fold: fold only *part* of the uncommitted changes into
-    /// `dest` and leave the rest in the working tree (the in-process `git add -p`
-    /// for a fixup). Omit `paths`, `hunks` and `patches` entirely to fold the
-    /// whole working copy (the default). The three tiers compose in one call, but
-    /// a given file path must appear in at most one of them.
+    /// Optional partial fold — fold only *part* of the uncommitted changes into
+    /// `dest`, leaving the rest in the tree (in-process `git add -p`). Omit
+    /// `paths`/`hunks`/`patches` to fold the whole working copy. The three tiers
+    /// compose, but a file may appear in at most one.
     ///
-    /// Whole files to fold, by repo-relative path: the file is taken entirely
-    /// (content + mode), and a path you deleted on disk folds in the deletion.
-    /// This is the only tier that handles binary or executable files. A brand-new
-    /// (untracked) file named here is still skipped unless it is ALSO in
-    /// `add_paths` — listing it under `paths` selects it, `add_paths` is what
-    /// begins tracking it.
+    /// `paths`: whole files by repo-relative path (content + mode; a deleted
+    /// path folds its deletion; the only tier for binary/executable files). An
+    /// untracked file also needs `add_paths` (and, in a partial fold, `paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// Whole hunks to fold, per file. First read the file's numbered `hunks`
-    /// from show_commit on the working-copy entry, then list the indices to fold;
-    /// the unlisted hunks stay uncommitted. Text files only.
+    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
+    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// Sub-hunk selections, per file: an edited unified-diff patch (à la
-    /// `git add -p` → `e`) applied to the file's content at HEAD. Use when one
-    /// hunk must be split finer than whole-hunk granularity. Text files only.
+    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
+    /// the file's content at HEAD, when a hunk must split finer. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// Optional: brand-new untracked files to fold in, by repo-relative path. The
-    /// working copy otherwise carries only edits/deletions to already-tracked
-    /// files, so a file you just created is invisible until you name it here.
-    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
-    /// intent). For a *whole* fold every named file folds in; for a *partial* fold
-    /// also list it under `paths` to select it. Already-tracked or absent paths are
-    /// ignored.
+    /// `add_paths`: brand-new untracked files to fold in (invisible until named;
+    /// naming begins tracking past `.gitignore`). Whole fold takes every named
+    /// file; partial fold also needs it under `paths`. Tracked/absent: ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }
@@ -874,37 +850,27 @@ pub struct CommitWorkingCopyReq {
     pub message: String,
     #[serde(flatten)]
     pub identity: IdentityFieldsDto,
-    /// Optional partial selection: commit only *part* of the uncommitted changes
-    /// and leave the rest in the working tree (the in-process `git add -p`).
-    /// Omit `paths`, `hunks` and `patches` entirely to commit the whole working
-    /// copy (the default). The three tiers compose in one call, but a given file
-    /// path must appear in at most one of them.
+    /// Optional partial selection — commit only *part* of the uncommitted
+    /// changes, leaving the rest in the tree (in-process `git add -p`). Omit
+    /// `paths`/`hunks`/`patches` to commit the whole working copy. The three
+    /// tiers compose, but a file may appear in at most one.
     ///
-    /// Whole files to commit, by repo-relative path: the file is taken entirely
-    /// (content + mode), and a path you deleted on disk commits the deletion.
-    /// This is the only tier that handles binary or executable files. A brand-new
-    /// (untracked) file named here is still skipped unless it is ALSO in
-    /// `add_paths` — listing it under `paths` selects it, `add_paths` is what
-    /// begins tracking it.
+    /// `paths`: whole files by repo-relative path (content + mode; a deleted
+    /// path commits its deletion; the only tier for binary/executable files). An
+    /// untracked file also needs `add_paths` (and, in a partial commit, `paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// Whole hunks to commit, per file. First read the file's numbered `hunks`
-    /// from show_commit on the working-copy entry, then list the `index` values to
-    /// keep; the unlisted hunks stay uncommitted. Text files only.
+    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
+    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// Sub-hunk selections, per file: an edited unified-diff patch (à la
-    /// `git add -p` → `e`) applied to the file's content at HEAD. Use when one
-    /// hunk must be split finer than whole-hunk granularity. Text files only.
+    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
+    /// the file's content at HEAD, when a hunk must split finer. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// Optional: brand-new untracked files to commit, by repo-relative path. The
-    /// working copy otherwise carries only edits/deletions to already-tracked
-    /// files, so a file you just created is invisible until you name it here.
-    /// Listing it begins tracking it (past any `.gitignore` — naming it is explicit
-    /// intent). For a *whole* commit every named file is committed; for a *partial*
-    /// commit also list it under `paths` to select it. Already-tracked or absent
-    /// paths are ignored.
+    /// `add_paths`: brand-new untracked files to commit (invisible until named;
+    /// naming begins tracking past `.gitignore`). Whole commit takes every named
+    /// file; partial commit also needs it under `paths`. Tracked/absent: ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }

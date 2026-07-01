@@ -21,6 +21,11 @@ is a silent no-op on an unchanged `plugin.json` `version` — see
 ## Layout
 
 - `reposetup.sh` — builds the stress fixture; self-contained and idempotent (bails if `stress/base` already exists).
+- `workflow.js` — the mandatory `Workflow` script driving the execution protocol (README §5): fans the
+  12 tasks × 3 solvers × `K` repeats grid out via `agent()` calls, verifies each repeat out-of-band. Run
+  with `Workflow({ scriptPath: 'dogfood/workflow.js' })`; edit the `K` const for the repeat count. Patch
+  protocol fixes into this file directly (see its header comment and README §5) rather than only into a
+  run's throwaway script copy.
 - `verify.sh` — the automated correctness **oracle**: `./dogfood/verify.sh <t1..t12> <worktree-path>` asserts each task's end state (subjects + file content, not shas) and must exit 0. Run it as the gate for every student.
 - `t6-dirty.sh` — seeds T6's dirty working copy after a reset (T6 tests the working-copy → history path).
-- `runs/` — recorded run scorecards and findings, newest first (`runs/1.md` … `runs/7.md`).
+- `runs/` — recorded run scorecards and findings, newest first (`runs/1.md` … `runs/10.md`).

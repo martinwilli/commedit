@@ -376,18 +376,20 @@ Open the calibration session once with `open_session(branch=stress/cal)` (worktr
 
 ## 5. Execution protocol (per-session, parallelizable)
 
-> 🔧 **Mandatory: drive this protocol with the `Workflow` tool, not manual per-student `Agent` calls.**
-> [Run 9](runs/9.md) proved it out at k=2 (72 students): a `pipeline`/`parallel` script over the 36
-> (task × solver) cells, each cell running its k repeats serially (reset → solve → verify), gets a
-> deterministic, fully-parallel 72-student fan-out with the out-of-band `verify.sh` gate wired in as a
-> second `agent()` call right after each solve — no manual bookkeeping of which student is still running,
-> no risk of a teacher forgetting the between-repeats reset. Known gap to carry forward: the workflow
-> harness's `agent()` only returns aggregate `tokens`/`toolCalls`/`durationMs`, not the
-> `cache_read`/`cache_create`/`input`/`output` component split runs 1–8 used for real `$` accounting —
-> see §5 *Metrics capture* below for how to recover it if a run needs precise cost comparisons (e.g. a
-> model A/B). A plain-git student still needs the same Bash-only / non-interactive constraints spelled
-> out in its `agent()` prompt (the harness has no built-in per-agent tool allowlist), and T11's two-session
-> dance still needs its own prompt path (see [the run 9 script](runs/9.md) for a worked template of both).
+> 🔧 **Mandatory: drive this protocol with the `Workflow` tool, via the checked-in
+> [`dogfood/workflow.js`](workflow.js), not manual per-student `Agent` calls.** [Run 9](runs/9.md)
+> proved the approach out at k=2 (72 students): a `pipeline`/`parallel` script over the 36
+> (task × solver) cells, each cell running its `K` repeats serially (reset → solve → verify), gets a
+> deterministic, fully-parallel fan-out with the out-of-band `verify.sh` gate wired in as a second
+> `agent()` call right after each solve — no manual bookkeeping of which student is still running, no
+> risk of a teacher forgetting the between-repeats reset. Run it with
+> `Workflow({ scriptPath: 'dogfood/workflow.js' })`; set the `K` const at the top for the repeat count
+> (§5 *Repeats for variance* below). **Patch fixes into this file as they're found** (e.g. [run 10](
+> runs/10.md)'s T11-git reset-protocol fix, already folded in) rather than letting them live only in a
+> run's throwaway script copy. Known gap: the workflow harness's `agent()` only returns aggregate
+> `tokens`/`toolCalls`/`durationMs`, not the `cache_read`/`cache_create`/`input`/`output` component split
+> runs 1–8 used for real `$` accounting — see §5 *Metrics capture* below for the recipe to recover it
+> from each agent's transcript by `agentId` (used for [run 10](runs/10.md)'s comparative accounting).
 
 For each task T (1→12), each solver S (operator, control, git):
 

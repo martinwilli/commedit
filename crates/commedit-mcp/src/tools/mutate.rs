@@ -328,7 +328,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Create a brand-new commit from given file contents and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes; existing descendants rebase onto it (a mid-history insert may report conflicts). Omit `files`/`delete_paths` for an empty commit. Uncommitted changes ride on top untouched — use commit_working_copy to commit those instead."
+        description = "Create a brand-new commit from given file contents and insert it into history. `new_parent` (sha/change id, or `root`; omitted = top of HEAD) sets where it goes; existing descendants rebase onto it (a mid-history insert may report conflicts). Omit `files`/`delete_paths` for an empty commit. Uncommitted changes ride on top untouched — use commit_working_copy to commit those instead; if they belong below HEAD, commit_working_copy them at the tip first and reorder_commit down rather than retyping their content here."
     )]
     pub async fn create_commit(
         &self,

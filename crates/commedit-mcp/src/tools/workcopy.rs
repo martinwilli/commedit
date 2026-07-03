@@ -44,7 +44,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree)."
+        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree). Each file's diff is capped at a line limit (a cut file is marked `truncated` with its `total_lines`)."
     )]
     pub async fn session_diff(
         &self,

@@ -80,7 +80,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content."
+        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Each file's diff is capped at a line limit (a cut file is marked `truncated` with its `total_lines`); pass `paths` to restrict to specific files, or include_contents to also get each text file's full old/new content."
     )]
     pub async fn show_commit(
         &self,
@@ -109,9 +109,11 @@ impl CommeditServer {
             let root = repo.root_commit_id().hex();
             let abbrev = IdAbbrev::new(&repo.repo);
             let include = req.include_contents.unwrap_or(false);
+            let wanted = req.paths.as_ref();
             let files = commit_changes(&repo.repo, &info.id)
                 .map_err(internal)?
                 .iter()
+                .filter(|fc| wanted.is_none_or(|p| p.iter().any(|w| w == &fc.path)))
                 .map(|fc| file_change_dto(fc, include))
                 .collect();
             Ok(ShowCommitResp {

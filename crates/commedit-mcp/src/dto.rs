@@ -126,9 +126,19 @@ pub struct FileChangeDto {
     /// Omitted when false (the default).
     #[serde(skip_serializing_if = "is_false")]
     pub conflicted_base: bool,
-    /// Unified diff of the change (absent for binary files).
+    /// Unified diff of the change (absent for binary files). Capped at a
+    /// per-file line limit; when it was cut, `truncated` is set and `total_lines`
+    /// gives the full count. Re-read a specific file in full via show_commit's
+    /// `paths` (it caps per file, so a large single file is still capped —
+    /// inspect its `hunks` for structure, or use include_contents for a side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// The `diff` was cut at the per-file line cap. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// The diff's full line count, present only when `truncated`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_lines: usize,
     /// The diff's hunks, numbered for partial selection (absent for binary files
     /// or a file with no textual change). To commit only some of a file's
     /// uncommitted hunks, pass these `index` values in `commit_working_copy.hunks`
@@ -353,6 +363,11 @@ pub struct ShowCommitReq {
     /// Commit to show — change_id or sha (full/unique prefix >= 4 chars), from
     /// the history, the working copy (an uncommitted entry) or the trash.
     pub commit: String,
+    /// Restrict the returned files to these repo-relative paths (forward-slash
+    /// form); omit for every changed file. Use it to re-read one file of a large
+    /// commit without pulling the whole diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
     /// Also return each text file's full old/new content, not just the diff.
     pub include_contents: Option<bool>,
 }

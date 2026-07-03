@@ -160,14 +160,37 @@ fn tidy_diff_for_display(diff: String) -> String {
     out
 }
 
+/// Per-file cap on the unified-diff lines a response carries. A diff longer than
+/// this is truncated (with `truncated`/`total_lines` set), so one huge or
+/// generated file can't dump tens of thousands of tokens; the hunk headers stay,
+/// and a caller can re-read a file whole via show_commit's `paths` /
+/// `include_contents`.
+const MAX_DIFF_LINES: usize = 500;
+
 /// Render one engine [`FileChange`] for a response: a unified diff for text
-/// files, plus the full contents when `include_contents` asks for them.
+/// files (capped at [`MAX_DIFF_LINES`]), plus the full contents when
+/// `include_contents` asks for them.
 pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto {
     let (old, new) = (
         fc.old_text.as_deref().unwrap_or(""),
         fc.new_text.as_deref().unwrap_or(""),
     );
-    let diff = (!fc.is_binary).then(|| tidy_diff_for_display(unified_diff(old, new, &fc.path)));
+    let (diff, truncated, total_lines) = if fc.is_binary {
+        (None, false, 0)
+    } else {
+        let full = tidy_diff_for_display(unified_diff(old, new, &fc.path));
+        let total = full.lines().count();
+        if total > MAX_DIFF_LINES {
+            let capped = full
+                .lines()
+                .take(MAX_DIFF_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (Some(capped), true, total)
+        } else {
+            (Some(full), false, 0)
+        }
+    };
     // Number the diff's hunks so an agent can select them for a partial
     // commit_working_copy. render_diff with the default expansion produces the
     // same hunks the `diff` field shows; we keep only their headers + index.
@@ -197,6 +220,8 @@ pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto
         is_binary: fc.is_binary,
         conflicted_base: fc.conflicted_base,
         diff,
+        truncated,
+        total_lines,
         hunks,
         old_text: include_contents.then(|| fc.old_text.clone()).flatten(),
         new_text: include_contents.then(|| fc.new_text.clone()).flatten(),

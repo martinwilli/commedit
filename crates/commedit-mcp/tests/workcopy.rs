@@ -384,6 +384,7 @@ async fn commit_working_copy_hunks_tier_uses_show_commit_numbering() {
         .show_commit(Parameters(ShowCommitReq {
             session: sel("main"),
             commit: wc_sha,
+            paths: None,
             include_contents: None,
         }))
         .await

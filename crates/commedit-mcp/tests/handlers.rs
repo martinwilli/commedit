@@ -303,6 +303,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
         .show_commit(Parameters(ShowCommitReq {
             session: sel("main"),
             commit: sha.clone(),
+            paths: None,
             include_contents: None,
         }))
         .await
@@ -320,6 +321,7 @@ async fn show_commit_renders_diffs_and_optionally_contents() {
         .show_commit(Parameters(ShowCommitReq {
             session: sel("main"),
             commit: sha,
+            paths: None,
             include_contents: Some(true),
         }))
         .await
@@ -340,6 +342,7 @@ async fn show_commit_rejects_an_unknown_ref() {
             .show_commit(Parameters(ShowCommitReq {
                 session: sel("main"),
                 commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                paths: None,
                 include_contents: None,
             }))
             .await,
@@ -392,6 +395,7 @@ async fn working_copy_status_reflects_dirty_tracked_files() {
         .show_commit(Parameters(ShowCommitReq {
             session: sel("main"),
             commit: dirty.entries[0].sha.clone(),
+            paths: None,
             include_contents: None,
         }))
         .await
@@ -1744,6 +1748,7 @@ async fn show_commit_finds_a_trashed_commit_by_change_id_prefix() {
         .show_commit(Parameters(ShowCommitReq {
             session: sel("main"),
             commit: dropped.dropped.change_id[..8].to_string(),
+            paths: None,
             include_contents: None,
         }))
         .await

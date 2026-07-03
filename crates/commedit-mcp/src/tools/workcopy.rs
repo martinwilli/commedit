@@ -10,13 +10,16 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
 use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::rewrite::Identity;
+use commedit_engine::workcopy::CarveEntry;
 
 use crate::convert::{commit_dto, file_change_dto, DetailFields};
 use crate::dto::{
     AbsorbFileStatDto, AbsorbPlanEntryDto, AbsorbSkipDto, AbsorbWorkingCopyReq,
-    AbsorbWorkingCopyResp, CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq,
-    HunkSelectionDto, OkResp, PatchSelectionDto, SaveResultDto, SessionDiffResp, SessionSel,
-    SquashWorkingCopyReq, SquashWorkingCopyResp, WorkingCopyStatusResp,
+    AbsorbWorkingCopyResp, CarveWorkingCopyReq, CarveWorkingCopyResp, CommitWorkingCopyReq,
+    CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp, PatchSelectionDto,
+    SaveResultDto, SessionDiffResp, SessionSel, SquashWorkingCopyReq, SquashWorkingCopyResp,
+    WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -180,6 +183,76 @@ impl CommeditServer {
                 result,
                 committed,
                 working_copy,
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Carve the uncommitted changes into SEVERAL commits in one call — an ordered (oldest-first) list of {message, selection}, each stacked on the previous on top of HEAD, with whatever no commit selects left uncommitted. This is the batch commit_working_copy: every selection addresses the one working-copy diff you already read, so hunk indices don't shift between commits the way they do across separate commit_working_copy calls. Each commit's `paths`/`hunks`/`patches` tiers work as in commit_working_copy; across the carve a path may be split by `hunks` (disjoint indices) but a whole-file/`patches` selection of a path must be unique. Untracked files need `add_paths`. Returns the new commits (oldest-first) and the remaining working copy."
+    )]
+    pub async fn carve_working_copy(
+        &self,
+        Parameters(req): Parameters<CarveWorkingCopyReq>,
+    ) -> Result<Yaml<CarveWorkingCopyResp>, ErrorData> {
+        self.with_session(req.session.session.clone(), move |repo, _| {
+            ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
+            repo.snapshot_working_copy_tracking(&req.add_paths.clone().unwrap_or_default())
+                .map_err(internal)?;
+            if repo.working_copy_chain().is_empty() {
+                return Err(invalid("the working copy is clean — nothing to carve"));
+            }
+
+            // Own each commit's message, identity and selection tiers, so the
+            // borrowed CarveEntry list outlives the carve call.
+            let mut owned: Vec<(String, Option<Identity>, PartialTiers)> =
+                Vec::with_capacity(req.commits.len());
+            for c in req.commits {
+                let tiers = parse_partial_selection(c.paths, c.hunks, c.patches)?;
+                let identity = new_commit_identity(repo, c.identity);
+                owned.push((c.message, identity, tiers));
+            }
+            if owned.is_empty() {
+                return Err(invalid("carve needs at least one commit to create"));
+            }
+            let entries: Vec<CarveEntry> = owned
+                .iter()
+                .map(|(message, identity, (paths, hunks, patches))| CarveEntry {
+                    message,
+                    identity: identity.as_ref(),
+                    selection: PartialSelection {
+                        paths,
+                        hunks,
+                        patches,
+                    },
+                })
+                .collect();
+
+            let (outcome, change_ids) = repo.carve_working_copy(&entries).map_err(internal)?;
+            drop(entries);
+            let result = save_result(repo, &outcome);
+
+            // Map the new change_ids (oldest-first) back to commit DTOs.
+            let (_, commits) = full_history(repo)?;
+            let refs = repo.commit_refs();
+            let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let committed = change_ids
+                .iter()
+                .filter_map(|cid| {
+                    commits
+                        .iter()
+                        .find(|c| &c.change_id_hex() == cid)
+                        .map(|info| commit_dto(info, &root, &refs, &abbrev, DetailFields::ALL))
+                })
+                .collect();
+            let working_copy = working_copy_status_resp(repo)?;
+            Ok(CarveWorkingCopyResp {
+                result,
+                committed,
+                working_copy: Some(working_copy),
             })
         })
         .await

@@ -936,6 +936,58 @@ pub struct PatchSelectionDto {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CarveWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
+    /// The commits to carve out of the uncommitted changes, **oldest-first** —
+    /// each is stacked on the previous one on top of HEAD, holding only its own
+    /// selection. Whatever no commit selects stays uncommitted. Every selection
+    /// addresses the *same* working-copy diff you already read (hunk indices from
+    /// show_commit on the working-copy entry), so they don't shift between
+    /// commits — the reason this beats several commit_working_copy calls.
+    pub commits: Vec<CarveCommitDto>,
+    /// Brand-new untracked files to include (invisible until named; naming begins
+    /// tracking past `.gitignore`). Name them here, then select them under a
+    /// commit's `paths`. Tracked/absent paths are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
+}
+
+/// One commit in a `carve_working_copy` request: its message, optional identity,
+/// and the partial selection of the working copy it holds. The `paths`/`hunks`/
+/// `patches` tiers work exactly as in commit_working_copy; across the whole carve
+/// a path may be split by `hunks` (disjoint indices) but a whole-file/`patches`
+/// selection of a path must be unique.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CarveCommitDto {
+    /// The full commit message (subject + optional body), stored verbatim.
+    pub message: String,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkSelectionDto>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Vec<PatchSelectionDto>>,
+}
+
+/// The result of `carve_working_copy`. The mutation outcome (always `clean` — a
+/// stack of fresh commits on HEAD has no descendants to conflict) is flattened in;
+/// the new commits and the remaining working copy ride alongside.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CarveWorkingCopyResp {
+    #[serde(flatten)]
+    pub result: SaveResultDto,
+    /// The commits created, **oldest-first** — each with its sha and stable
+    /// change_id, ready to chain further edits without a list_history.
+    pub committed: Vec<CommitDto>,
+    /// The uncommitted changes left after the carve (the unselected remainder).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AbsorbWorkingCopyReq {
     #[serde(flatten)]
     pub session: SessionSel,

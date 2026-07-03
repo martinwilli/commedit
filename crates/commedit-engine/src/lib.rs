@@ -3,6 +3,7 @@
 //! All interaction with jujutsu (`jj-lib`) lives here. The crate has no GTK
 //! dependency so it can be unit-tested headless against scratch git repos.
 
+pub mod absorb;
 pub mod blame;
 pub mod cli;
 pub mod conflict;

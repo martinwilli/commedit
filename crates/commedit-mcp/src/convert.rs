@@ -77,14 +77,13 @@ impl DetailFields {
     }
 }
 
-/// The fixed protocol reminder attached to every `Conflicts` result.
-pub const CONFLICT_GUIDANCE: &str = "History is untouched in git until this resolves. \
-If the conflict stems from the mutation you just issued (e.g. a mistyped replace_in_file \
-or a wrong edit), abort_rewrite and redo it correctly — usually far cheaper than resolving. \
-Otherwise resolve the OLDEST commit first; it often auto-clears its descendants, so don't \
-hand-resolve every commit: read_conflict each resolvable file, remove ALL conflict markers, \
-then resolve_conflicts echoing each file's marker_len. Files with resolvable=false are \
-structural; abort_rewrite is the only way out. No other mutation is allowed until status is clean.";
+/// The short protocol reminder attached to every `Conflicts` result. The full
+/// resolution protocol lives in the server instructions (and the resolve-conflicts
+/// skill); this is the actionable gist.
+pub const CONFLICT_GUIDANCE: &str = "Held — git untouched until the whole chain is clean. \
+abort_rewrite (free) if this mutation was the mistake; else resolve the OLDEST conflict first \
+(read_conflict → remove all markers → resolve_conflicts, echoing marker_len). resolvable=false \
+is structural: abort only. No other mutation until clean.";
 
 /// A commit row plus its ref decorations as one response object. `root` is the
 /// virtual root commit's id — a parent pointing at it is omitted, so the

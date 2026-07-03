@@ -13,7 +13,7 @@ license = "MIT"
 authors = ["Martin Willi <martin@strongswan.org>"]
 
 [workspace.dependencies]
-jj-lib = "=0.42.0"
+jj-lib = "=0.43.0"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

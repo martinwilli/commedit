@@ -830,27 +830,23 @@ pub struct SquashWorkingCopyReq {
     /// destination in the same call instead of a follow-up edit_message. Stored
     /// verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
-    /// Optional partial fold — fold only *part* of the uncommitted changes into
-    /// `dest`, leaving the rest in the tree (in-process `git add -p`). Omit
-    /// `paths`/`hunks`/`patches` to fold the whole working copy. The three tiers
-    /// compose, but a file may appear in at most one.
-    ///
-    /// `paths`: whole files by repo-relative path (content + mode; a deleted
-    /// path folds its deletion; the only tier for binary/executable files). An
-    /// untracked file also needs `add_paths` (and, in a partial fold, `paths`).
+    /// Optional partial fold — fold only PART of the changes (in-process `git
+    /// add -p`), leaving the rest uncommitted; omit all three for the whole
+    /// working copy. A file may appear in one tier only. `paths`: whole files
+    /// (content + mode; the only tier for binary/exec; an untracked file also
+    /// needs `add_paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
-    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
+    /// `hunks`: whole hunks per file by their show_commit indices; unlisted hunks
+    /// stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
-    /// the file's content at HEAD, when a hunk must split finer. Text files only.
+    /// `patches`: a unified-diff patch applied to the file's HEAD content, to
+    /// split finer than a whole hunk. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// `add_paths`: brand-new untracked files to fold in (invisible until named;
-    /// naming begins tracking past `.gitignore`). Whole fold takes every named
-    /// file; partial fold also needs it under `paths`. Tracked/absent: ignored.
+    /// `add_paths`: brand-new untracked files to fold in (naming begins tracking
+    /// past `.gitignore`); also list them under `paths` for a partial fold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }
@@ -865,27 +861,23 @@ pub struct CommitWorkingCopyReq {
     pub message: String,
     #[serde(flatten)]
     pub identity: IdentityFieldsDto,
-    /// Optional partial selection — commit only *part* of the uncommitted
-    /// changes, leaving the rest in the tree (in-process `git add -p`). Omit
-    /// `paths`/`hunks`/`patches` to commit the whole working copy. The three
-    /// tiers compose, but a file may appear in at most one.
-    ///
-    /// `paths`: whole files by repo-relative path (content + mode; a deleted
-    /// path commits its deletion; the only tier for binary/executable files). An
-    /// untracked file also needs `add_paths` (and, in a partial commit, `paths`).
+    /// Optional partial selection — commit only PART of the changes (in-process
+    /// `git add -p`), leaving the rest uncommitted; omit all three for the whole
+    /// working copy. A file may appear in one tier only. `paths`: whole files
+    /// (content + mode; the only tier for binary/exec; an untracked file also
+    /// needs `add_paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
-    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
+    /// `hunks`: whole hunks per file by their show_commit indices; unlisted hunks
+    /// stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
-    /// the file's content at HEAD, when a hunk must split finer. Text files only.
+    /// `patches`: a unified-diff patch applied to the file's HEAD content, to
+    /// split finer than a whole hunk. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// `add_paths`: brand-new untracked files to commit (invisible until named;
-    /// naming begins tracking past `.gitignore`). Whole commit takes every named
-    /// file; partial commit also needs it under `paths`. Tracked/absent: ignored.
+    /// `add_paths`: brand-new untracked files to commit (naming begins tracking
+    /// past `.gitignore`); also list them under `paths` for a partial commit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }

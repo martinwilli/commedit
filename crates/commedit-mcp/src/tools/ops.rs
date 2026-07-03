@@ -129,7 +129,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Open a new editing session over a branch of this repository and return its id (the branch short-name), so you can edit several branches at once and in parallel. git's branch→worktree mapping decides how it binds: a branch checked out in a worktree opens worktree-bound there (live working copy); a branch checked out nowhere opens off-worktree (only its ref moves, no working copy, working-copy tools refused). The branch must already exist. Refused if a session for that branch is already open (a branch can be edited by at most one session), or if it is checked out in a worktree commedit can't bind. Returns the new id plus the full session list."
+        description = "Open an editing session over a branch and return its id (the branch short-name), so several branches can be edited in parallel. Binding follows git: a branch checked out in a worktree opens worktree-bound (live working copy); one checked out nowhere opens off-worktree (only its ref moves, working-copy tools refused). The branch must exist. Refused if already open, or checked out in a worktree commedit can't bind. Returns the new id plus the full session list."
     )]
     pub async fn open_session(
         &self,
@@ -241,7 +241,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Re-open ONE session to pick up changes made outside this server (a git commit, branch switch, rebase, …) — git state is otherwise imported only at startup. This restarts that session fresh: its trash, operation log (the undo floor resets to now) and any pending rewrite are discarded; git itself, and every other session, are untouched. Pass `path` to re-home the session to a different worktree of the SAME repository (its main checkout or any linked worktree) — e.g. to edit history isolated in a `git worktree`; a path outside this repository's worktrees is refused. Pass `branch` to switch which branch the session edits — this RE-KEYS the session (its id becomes the new branch's short-name, returned in `session`), and is refused if a session for that branch is already open."
+        description = "Re-open ONE session to pick up out-of-band changes (git state isn't re-imported after startup): a branch switch, rebase or reset. Restarts that session fresh — its trash, op log (undo floor resets) and any pending rewrite are discarded; git and other sessions untouched. A plain `git commit` on HEAD needs no reload (absorbed automatically). `path` re-homes the session to another worktree of the SAME repo; `branch` switches which branch it edits and RE-KEYS the session (new id returned in `session`), refused if that branch is already open."
     )]
     pub async fn reload_repo(
         &self,

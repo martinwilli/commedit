@@ -1095,10 +1095,26 @@ impl Repo {
         // commit, by change id (a shared ancestor appears once). Drives both the
         // peel and the forward rebuild. Restore additionally seeds the restored
         // (orphan) commit, absent from the post-drop histories.
+        // The only changes we reconstruct trees for are the ones in each editable
+        // head's rewritten range — the near-tip commits collect_conflicts scans, not
+        // the whole ancestry. Gather those change ids first, then source each one's
+        // original (clean) diff from the pre-rewrite tips, walking only deep enough to
+        // cover them and loading a tree only for a needed change. Walking every
+        // pre-tip's full history and loading two trees per commit was O(history) and
+        // dominated the cost on a deep repo. A change id we don't locate (a rewrite
+        // reaching further back than the window) just won't be in the map, and
+        // plan_spurious_head then bails that head to manual resolution — safe.
+        let mut needed: HashSet<ChangeId> = HashSet::new();
+        for head in self.editable_heads_in_jj() {
+            for info in self.rewritten_history(&head)? {
+                needed.insert(info.change_id);
+            }
+        }
+        let limit = needed.len() + 64;
         let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
         for orig_tip in pre_tips.values() {
-            for info in crate::history::history(&self.repo, orig_tip)? {
-                if originals.contains_key(&info.change_id) {
+            for info in crate::history::history_limited(&self.repo, orig_tip, 0, limit)?.0 {
+                if !needed.contains(&info.change_id) || originals.contains_key(&info.change_id) {
                     continue;
                 }
                 let c = store
@@ -1293,12 +1309,25 @@ impl Repo {
         if !forward && tip.has_conflict() {
             return Ok(HeadPlan::Bail);
         }
-        let chain_infos = crate::history::history(&self.repo, head)?;
-        if chain_infos.is_empty() {
-            return Ok(HeadPlan::Clean);
-        }
-        let mut chain = Vec::with_capacity(chain_infos.len());
-        for info in chain_infos.iter().rev() {
+        // Only the rewritten range (near the tip) can be conflicted, so walk just
+        // that plus one clean anchor commit below it, rather than the whole ancestry
+        // (O(history), the deep-repo cost). The anchor is the range's oldest commit's
+        // parent — clean by construction — so the conflicted range [lo, n] rebuilds
+        // against it exactly as a full-chain walk would.
+        let range = self.rewritten_history(head)?; // newest-first, base-exclusive
+        let Some(oldest) = range.last() else {
+            return Ok(HeadPlan::Clean); // nothing rewritten here
+        };
+        let [anchor_id] = oldest.parents.as_slice() else {
+            return Ok(HeadPlan::Bail); // oldest rewritten commit is a merge or root
+        };
+        let mut chain = Vec::with_capacity(range.len() + 1);
+        chain.push(
+            store
+                .get_commit(anchor_id)
+                .context("loading the chain anchor")?,
+        );
+        for info in range.iter().rev() {
             chain.push(
                 store
                     .get_commit(&info.id)
@@ -1310,7 +1339,7 @@ impl Repo {
             return Ok(HeadPlan::Clean); // nothing conflicted on this branch
         };
         if lo == 0 {
-            return Ok(HeadPlan::Bail); // the root is conflicted: not a plain rewrite
+            return Ok(HeadPlan::Bail); // the anchor is conflicted: not a plain rewrite
         }
         // The rebuild rewrites `[lo, n]` as a single-parent chain anchored on
         // `chain[lo - 1]`; `history()`'s reversed order is only a parent chain when

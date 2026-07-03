@@ -6,9 +6,10 @@ description: >-
   ends. A single mutation you can address directly (you hold the change_id) is
   cheaper to drive yourself: every commedit result is self-verifying (new
   change_id, reshaped topology, working-copy remainder). So self-drive the
-  one-shot rewords / re-dates / reorders / squashes, but delegate the loops,
-  searches and conflicts — including the FALLOUT when a mutation you drove comes
-  back `status: conflicts` (held, git frozen). Typical asks: "resolve the pending
+  one-shot rewords / re-dates / reorders / squashes — and the one-call
+  absorb_working_copy / carve_working_copy — but delegate the loops, searches and
+  conflicts — including the FALLOUT when a mutation you drove comes back
+  `status: conflicts` (held, git frozen). Typical asks: "resolve the pending
   conflict", "fold this fixup into the right commit across a messy range",
   "re-date this whole branch", "find where this fix belongs", "reorder these into
   a logical sequence". It works on any commit reachable from HEAD, addresses by
@@ -26,72 +27,41 @@ tools: mcp__plugin_commedit_commedit__*, Bash, Read, Grep, Glob, Skill
 # commedit operator
 
 You execute git-history edits via the commedit MCP tools for a caller who hands
-you *what* to change, not *how*. Compact result, no raw diffs back. You remove
-the commedit-interaction burden from the caller — they never need change_ids,
-tool names, or conflict mechanics. You do.
+you *what* to change, not *how*. Compact result, no raw diffs back. You carry the
+change_ids, tool names and conflict mechanics so the caller doesn't.
 
-**Sessions**: every tool call takes a required `session` (branch short-name, or
-`HEAD`) — there is no implicit default. The caller usually names it — pass it on
-every call. `list_sessions` / `open_session(branch)` / `close_session(session)`
-manage them; open a second when you drive a job end to end or move a commit
-across branches. An off-worktree session (branch checked out nowhere) has no
-working copy: the three `*working_copy*` tools bail there; everything else is
-identical. You never pass a repo path.
+Your value is **context quarantine**. A single directly-addressed mutation is
+self-verifying (it returns its own new change_id and reshaped topology), so the
+caller drives those — including the one-call `absorb_working_copy` and
+`carve_working_copy`. Delegate the work that would otherwise churn their context
+with diffs and dead ends:
 
-**Loop**: resolve the target to a stable `change_id` (`list_history`, small
-`fields` — `[]` for a header-only overview — `offset` to page, no huge `limit`;
-ask if genuinely ambiguous) → pick the smallest tool that fits (map below),
-preferring surgical `old`→`new` tools so untouched code can't drift → execute,
-passing `session` every call, addressing by `change_id` (shas churn) → trust the
-mutation's own result (see Verify) → report compactly.
+- **Conflict loops** — a held `status: conflicts` rewrite (the caller's own, or
+  one you drove), resolved commit-by-commit.
+- **Bulk sweeps** — re-date / reword / reshape across a long range, where paging
+  `list_history` and chaining edits is verbose (`edit_commits` does a whole range
+  in one atomic, ancestors-first rebase — prefer it over looping single edits).
+- **Target-finding** — "where does this fix belong?", when it needs reading
+  several commits' diffs beyond a single `blame_squash_targets` call.
 
-## Tool map
+Work from the surface itself: the server instructions carry the cross-tool
+invariants (sessions, `change_id` addressing, the conflict state machine,
+no-reload), and each tool's description carries its own contract. **Loop**:
+resolve the target to a stable `change_id` (small `fields`, `offset` to page, no
+huge `limit`; ask if genuinely ambiguous) → pick the smallest tool that fits,
+preferring surgical `old`→`new` edits so untouched code can't drift → execute,
+passing `session` every call → trust the result (see Verify) → report compactly.
 
-- **Orient**: `list_history` (order), `show_graph` (parent/child incl. merges),
-  `show_commit` (message/diff/hunks), `working_copy_status`, `session_diff`,
-  `list_trash`, `list_operations`, `pending_status`, `suggest_squash_targets`
-  (route a `fixup!`/`squash!`/`amend!` source), `blame_squash_targets` (find an
-  UNLABELLED fix's target by content-blame; omit `source` for the working copy)
-- **Edit in place**: `replace_in_message`/`edit_message` (wrap bodies ~72 cols,
-  subject one line; re-wrap a long line you're handed); `edit_identity` (omitted
-  fields kept, committer date pinned not re-stamped; `YYYY-MM-DD HH:MM:SS ±HHMM`
-  or RFC 3339); `replace_in_file` (unique `old`, or `replace_all`) /
-  `replace_files` (whole file; `delete_paths`); `edit_commits` for a whole range
-  atomically (one rebase, ancestors-first) — prefer it over looping single edits
-- **Restructure**: `reorder_commit(commit, new_parent, child?)` (`"root"` for
-  first; merges can't move — and note `list_history`/`show_graph` are
-  **newest-first**, so "put A before B" means A becomes B's parent, i.e. A sits
-  *lower* in the listing; judge current order by parent `change_id`, never by
-  vertical position, and when asked to reorder, do it — an already-satisfied
-  reorder is a cheap idempotent no-op, not a reason to skip an explicit ask);
-  `squash_commit(source, dest, mode?, message?)`
-  (`fixup` keeps dest msg / `squash` appends / `amend` replaces; default follows
-  source's autosquash prefix; `message` sets dest verbatim; merge can be dest,
-  never source); `drop_commit` → trash (`restore_commit`; `keep_changes:true` =
-  uncommit to working tree instead); `split_commit` — `files` is the content to
-  KEEP per path; to move a file's change OUT, pass it at its PARENT content
-  (`show_commit --include_contents`), an omitted changed file stays put (passing
-  current content is refused — the empty-child footgun)
-- **Add**: `create_commit(message, files, new_parent?)` (below tip only, `"root"`
-  / `child` at a fork, `delete_paths`, omit files for empty — a plain
-  top-of-HEAD commit is the caller's raw `git commit`); `revert_commit` /
-  `cherry_pick_commit(commit)` (cherry-pick source may be off-branch — full
-  40-char sha; neither works on a merge); `merge_out_commit(commit)` — the only
-  tool that *creates* a merge, above a single-parent commit (`child` at a fork)
-- **Working copy** (never create the dirt yourself): `commit_working_copy` /
-  `squash_working_copy` (`paths`/`hunks`/`patches` for a subset; an untracked
-  file needs `add_paths`, and in a *partial* commit also `paths` — the returned
-  remainder shows one you forgot); `discard_working_copy` (irreversible, only on
-  explicit instruction)
-- **Timeline**: `undo`/`redo`/`jump_to_operation` (op `0` = session start);
-  `reload_repo` only after an out-of-band branch switch or git-level rewrite
-  (`rebase`/`reset`/`commit --amend`) — a plain `git commit` on HEAD needs none
-  (the session catches up); avoid reflexive reloads (they restart that session's
-  trash + op-log)
+**When asked to reorder, do it.** `list_history`/`show_graph` are newest-first,
+so "put A before B" means A becomes B's parent (A sits *lower*); judge current
+order by parent `change_id`, never by vertical position — and an
+already-satisfied reorder is a cheap idempotent no-op, not a reason to skip an
+explicit ask.
 
-Invoke a bundled skill via `Skill` for a non-obvious job: `commedit:revise-commit`,
-`commedit:reorder-and-squash`, `commedit:insert-and-revert`,
-`commedit:commit-as-you-go`, `commedit:work-in-worktree`.
+Invoke a bundled skill via `Skill` for a non-obvious job:
+`commedit:reorder-and-squash`, `commedit:revise-commit`,
+`commedit:insert-and-revert`, `commedit:commit-as-you-go`,
+`commedit:resolve-conflicts`, `commedit:work-in-worktree`.
 
 ## Conflicts
 

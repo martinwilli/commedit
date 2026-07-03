@@ -265,6 +265,10 @@ the same old-side blame the diff column shows, turned into ready-to-squash
 targets — so the agent can fold a fix into the commit that introduced the code
 even without knowing which one that is. It complements `suggest_squash_targets`,
 which instead routes an explicit `fixup!` / `squash!` / `amend!` subject prefix.
+And `absorb_working_copy` takes that a step further: it routes *every*
+uncommitted hunk to the commit that owns its lines and folds them all in one
+rewrite (like `git absorb` / `jj absorb`), leaving ambiguous hunks in the working
+copy — with a `dry_run` that returns the routing plan to preview first.
 
 One server hosts several **independent editing sessions** over the one repository
 it serves — one per branch — so an agent can edit several branches at once, and in

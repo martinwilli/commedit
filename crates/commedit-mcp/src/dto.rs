@@ -126,9 +126,19 @@ pub struct FileChangeDto {
     /// Omitted when false (the default).
     #[serde(skip_serializing_if = "is_false")]
     pub conflicted_base: bool,
-    /// Unified diff of the change (absent for binary files).
+    /// Unified diff of the change (absent for binary files). Capped at a
+    /// per-file line limit; when it was cut, `truncated` is set and `total_lines`
+    /// gives the full count. Re-read a specific file in full via show_commit's
+    /// `paths` (it caps per file, so a large single file is still capped —
+    /// inspect its `hunks` for structure, or use include_contents for a side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// The `diff` was cut at the per-file line cap. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// The diff's full line count, present only when `truncated`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_lines: usize,
     /// The diff's hunks, numbered for partial selection (absent for binary files
     /// or a file with no textual change). To commit only some of a file's
     /// uncommitted hunks, pass these `index` values in `commit_working_copy.hunks`
@@ -353,6 +363,11 @@ pub struct ShowCommitReq {
     /// Commit to show — change_id or sha (full/unique prefix >= 4 chars), from
     /// the history, the working copy (an uncommitted entry) or the trash.
     pub commit: String,
+    /// Restrict the returned files to these repo-relative paths (forward-slash
+    /// form); omit for every changed file. Use it to re-read one file of a large
+    /// commit without pulling the whole diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
     /// Also return each text file's full old/new content, not just the diff.
     pub include_contents: Option<bool>,
 }
@@ -815,27 +830,23 @@ pub struct SquashWorkingCopyReq {
     /// destination in the same call instead of a follow-up edit_message. Stored
     /// verbatim and not reflowed — wrap the body at ~72 columns.
     pub message: Option<String>,
-    /// Optional partial fold — fold only *part* of the uncommitted changes into
-    /// `dest`, leaving the rest in the tree (in-process `git add -p`). Omit
-    /// `paths`/`hunks`/`patches` to fold the whole working copy. The three tiers
-    /// compose, but a file may appear in at most one.
-    ///
-    /// `paths`: whole files by repo-relative path (content + mode; a deleted
-    /// path folds its deletion; the only tier for binary/executable files). An
-    /// untracked file also needs `add_paths` (and, in a partial fold, `paths`).
+    /// Optional partial fold — fold only PART of the changes (in-process `git
+    /// add -p`), leaving the rest uncommitted; omit all three for the whole
+    /// working copy. A file may appear in one tier only. `paths`: whole files
+    /// (content + mode; the only tier for binary/exec; an untracked file also
+    /// needs `add_paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
-    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
+    /// `hunks`: whole hunks per file by their show_commit indices; unlisted hunks
+    /// stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
-    /// the file's content at HEAD, when a hunk must split finer. Text files only.
+    /// `patches`: a unified-diff patch applied to the file's HEAD content, to
+    /// split finer than a whole hunk. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// `add_paths`: brand-new untracked files to fold in (invisible until named;
-    /// naming begins tracking past `.gitignore`). Whole fold takes every named
-    /// file; partial fold also needs it under `paths`. Tracked/absent: ignored.
+    /// `add_paths`: brand-new untracked files to fold in (naming begins tracking
+    /// past `.gitignore`); also list them under `paths` for a partial fold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }
@@ -850,27 +861,23 @@ pub struct CommitWorkingCopyReq {
     pub message: String,
     #[serde(flatten)]
     pub identity: IdentityFieldsDto,
-    /// Optional partial selection — commit only *part* of the uncommitted
-    /// changes, leaving the rest in the tree (in-process `git add -p`). Omit
-    /// `paths`/`hunks`/`patches` to commit the whole working copy. The three
-    /// tiers compose, but a file may appear in at most one.
-    ///
-    /// `paths`: whole files by repo-relative path (content + mode; a deleted
-    /// path commits its deletion; the only tier for binary/executable files). An
-    /// untracked file also needs `add_paths` (and, in a partial commit, `paths`).
+    /// Optional partial selection — commit only PART of the changes (in-process
+    /// `git add -p`), leaving the rest uncommitted; omit all three for the whole
+    /// working copy. A file may appear in one tier only. `paths`: whole files
+    /// (content + mode; the only tier for binary/exec; an untracked file also
+    /// needs `add_paths`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
-    /// `hunks`: whole hunks per file, by the indices from show_commit's numbered
-    /// `hunks` on the working-copy entry; unlisted hunks stay. Text files only.
+    /// `hunks`: whole hunks per file by their show_commit indices; unlisted hunks
+    /// stay. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
-    /// `patches`: sub-hunk selections — an edited unified-diff patch applied to
-    /// the file's content at HEAD, when a hunk must split finer. Text files only.
+    /// `patches`: a unified-diff patch applied to the file's HEAD content, to
+    /// split finer than a whole hunk. Text files only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
-    /// `add_paths`: brand-new untracked files to commit (invisible until named;
-    /// naming begins tracking past `.gitignore`). Whole commit takes every named
-    /// file; partial commit also needs it under `paths`. Tracked/absent: ignored.
+    /// `add_paths`: brand-new untracked files to commit (naming begins tracking
+    /// past `.gitignore`); also list them under `paths` for a partial commit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
 }
@@ -933,6 +940,131 @@ pub struct PatchSelectionDto {
     /// header needed — to apply to the file's content at HEAD. Context and `-`
     /// lines must match HEAD exactly or the commit is rejected.
     pub patch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CarveWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
+    /// The commits to carve out of the uncommitted changes, **oldest-first** —
+    /// each is stacked on the previous one on top of HEAD, holding only its own
+    /// selection. Whatever no commit selects stays uncommitted. Every selection
+    /// addresses the *same* working-copy diff you already read (hunk indices from
+    /// show_commit on the working-copy entry), so they don't shift between
+    /// commits — the reason this beats several commit_working_copy calls.
+    pub commits: Vec<CarveCommitDto>,
+    /// Brand-new untracked files to include (invisible until named; naming begins
+    /// tracking past `.gitignore`). Name them here, then select them under a
+    /// commit's `paths`. Tracked/absent paths are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_paths: Option<Vec<String>>,
+}
+
+/// One commit in a `carve_working_copy` request: its message, optional identity,
+/// and the partial selection of the working copy it holds. The `paths`/`hunks`/
+/// `patches` tiers work exactly as in commit_working_copy; across the whole carve
+/// a path may be split by `hunks` (disjoint indices) but a whole-file/`patches`
+/// selection of a path must be unique.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CarveCommitDto {
+    /// The full commit message (subject + optional body), stored verbatim.
+    pub message: String,
+    #[serde(flatten)]
+    pub identity: IdentityFieldsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<HunkSelectionDto>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Vec<PatchSelectionDto>>,
+}
+
+/// The result of `carve_working_copy`. The mutation outcome (always `clean` — a
+/// stack of fresh commits on HEAD has no descendants to conflict) is flattened in;
+/// the new commits and the remaining working copy ride alongside.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CarveWorkingCopyResp {
+    #[serde(flatten)]
+    pub result: SaveResultDto,
+    /// The commits created, **oldest-first** — each with its sha and stable
+    /// change_id, ready to chain further edits without a list_history.
+    pub committed: Vec<CommitDto>,
+    /// The uncommitted changes left after the carve (the unselected remainder).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AbsorbWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
+    /// Restrict the absorb to these files (repo-relative, forward-slash form).
+    /// Omit to consider every changed file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Preview only: return the routing plan (which hunks would fold where, what
+    /// is skipped, what would stay uncommitted) without changing anything.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
+}
+
+/// The result of `absorb_working_copy`, for both the dry-run preview and the
+/// applied rewrite.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbWorkingCopyResp {
+    /// True when this was a preview: nothing was changed.
+    pub dry_run: bool,
+    /// Per destination commit, ancestors-first, the hunks that route into it.
+    /// Empty when nothing could be attributed to a single commit.
+    pub plan: Vec<AbsorbPlanEntryDto>,
+    /// Paths skipped wholesale, each with jj's reason (binary, symlink, a
+    /// conflict, a submodule) — those can't be absorbed as text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<AbsorbSkipDto>,
+    /// Whether any uncommitted change remains after the absorb (an ambiguous or
+    /// unattributable hunk that stays in the working copy).
+    pub remaining: bool,
+    /// The mutation outcome — present only when applied (absent on a dry run, or
+    /// when nothing was attributable so no rewrite ran). `status: conflicts` here
+    /// means the fold couldn't merge cleanly and is held back like any rewrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<SaveResultDto>,
+    /// The uncommitted changes left after a clean apply (the unattributed
+    /// remainder). Present only when applied and clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
+/// One destination commit in an absorb plan.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbPlanEntryDto {
+    /// The target commit's stable change id — survives the rewrite, so it stays a
+    /// valid ref after applying.
+    pub change_id: String,
+    /// Its current sha (churns on the rewrite).
+    pub sha: String,
+    pub subject: String,
+    /// The changed files whose hunks route to this target.
+    pub files: Vec<AbsorbFileStatDto>,
+}
+
+/// One file's routed hunks within an [`AbsorbPlanEntryDto`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbFileStatDto {
+    pub path: String,
+    /// Lines the routed hunks add to the target.
+    pub added: usize,
+    /// Lines the routed hunks remove from the target.
+    pub removed: usize,
+    /// Number of contiguous hunks routed here for this file.
+    pub hunks: usize,
+}
+
+/// A path absorb left untouched, with why.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbSkipDto {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

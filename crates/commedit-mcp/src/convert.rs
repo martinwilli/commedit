@@ -54,11 +54,11 @@ impl DetailFields {
     };
 
     /// Build a selection from a `list_history` request's `fields`: an absent
-    /// list selects everything (full detail), an explicit list selects exactly
-    /// the named fields (so `[]` yields a header-only row).
+    /// list is a header-only overview (no verbose fields — verbose detail is
+    /// opt-in), and an explicit list selects exactly the named fields.
     pub fn from_request(fields: Option<&[CommitField]>) -> Self {
         let Some(fields) = fields else {
-            return Self::ALL;
+            return Self::NONE;
         };
         let mut sel = Self::NONE;
         for f in fields {
@@ -77,14 +77,13 @@ impl DetailFields {
     }
 }
 
-/// The fixed protocol reminder attached to every `Conflicts` result.
-pub const CONFLICT_GUIDANCE: &str = "History is untouched in git until this resolves. \
-If the conflict stems from the mutation you just issued (e.g. a mistyped replace_in_file \
-or a wrong edit), abort_rewrite and redo it correctly — usually far cheaper than resolving. \
-Otherwise resolve the OLDEST commit first; it often auto-clears its descendants, so don't \
-hand-resolve every commit: read_conflict each resolvable file, remove ALL conflict markers, \
-then resolve_conflicts echoing each file's marker_len. Files with resolvable=false are \
-structural; abort_rewrite is the only way out. No other mutation is allowed until status is clean.";
+/// The short protocol reminder attached to every `Conflicts` result. The full
+/// resolution protocol lives in the server instructions (and the resolve-conflicts
+/// skill); this is the actionable gist.
+pub const CONFLICT_GUIDANCE: &str = "Held — git untouched until the whole chain is clean. \
+abort_rewrite (free) if this mutation was the mistake; else resolve the OLDEST conflict first \
+(read_conflict → remove all markers → resolve_conflicts, echoing marker_len). resolvable=false \
+is structural: abort only. No other mutation until clean.";
 
 /// A commit row plus its ref decorations as one response object. `root` is the
 /// virtual root commit's id — a parent pointing at it is omitted, so the
@@ -161,14 +160,37 @@ fn tidy_diff_for_display(diff: String) -> String {
     out
 }
 
+/// Per-file cap on the unified-diff lines a response carries. A diff longer than
+/// this is truncated (with `truncated`/`total_lines` set), so one huge or
+/// generated file can't dump tens of thousands of tokens; the hunk headers stay,
+/// and a caller can re-read a file whole via show_commit's `paths` /
+/// `include_contents`.
+const MAX_DIFF_LINES: usize = 500;
+
 /// Render one engine [`FileChange`] for a response: a unified diff for text
-/// files, plus the full contents when `include_contents` asks for them.
+/// files (capped at [`MAX_DIFF_LINES`]), plus the full contents when
+/// `include_contents` asks for them.
 pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto {
     let (old, new) = (
         fc.old_text.as_deref().unwrap_or(""),
         fc.new_text.as_deref().unwrap_or(""),
     );
-    let diff = (!fc.is_binary).then(|| tidy_diff_for_display(unified_diff(old, new, &fc.path)));
+    let (diff, truncated, total_lines) = if fc.is_binary {
+        (None, false, 0)
+    } else {
+        let full = tidy_diff_for_display(unified_diff(old, new, &fc.path));
+        let total = full.lines().count();
+        if total > MAX_DIFF_LINES {
+            let capped = full
+                .lines()
+                .take(MAX_DIFF_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (Some(capped), true, total)
+        } else {
+            (Some(full), false, 0)
+        }
+    };
     // Number the diff's hunks so an agent can select them for a partial
     // commit_working_copy. render_diff with the default expansion produces the
     // same hunks the `diff` field shows; we keep only their headers + index.
@@ -198,6 +220,8 @@ pub fn file_change_dto(fc: &FileChange, include_contents: bool) -> FileChangeDto
         is_binary: fc.is_binary,
         conflicted_base: fc.conflicted_base,
         diff,
+        truncated,
+        total_lines,
         hunks,
         old_text: include_contents.then(|| fc.old_text.clone()).flatten(),
         new_text: include_contents.then(|| fc.new_text.clone()).flatten(),

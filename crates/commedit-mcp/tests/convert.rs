@@ -143,16 +143,18 @@ fn commit_dto_includes_only_the_selected_fields() {
     );
     assert!(d.description.is_none() && d.author_name.is_none() && d.parent_shas.is_none());
 
-    // An absent list (the `None` request) selects everything.
-    let all = DetailFields::from_request(None);
+    // An absent list (the `None` request) is a header-only overview — verbose
+    // detail is opt-in, so the default carries none of it.
+    let default = DetailFields::from_request(None);
     let dto = commit_dto(
         &ci(3, &[2]),
         &root_hex,
         &BTreeMap::new(),
         &IdAbbrev::full(),
-        all,
+        default,
     );
-    assert!(dto.detail.description.is_some() && dto.detail.parent_shas.is_some());
+    assert!(dto.detail.description.is_none() && dto.detail.parent_shas.is_none());
+    assert_eq!(dto.subject, "subject 3");
 }
 
 #[test]

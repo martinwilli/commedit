@@ -9,11 +9,17 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
+use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::rewrite::Identity;
+use commedit_engine::workcopy::CarveEntry;
+
 use crate::convert::{commit_dto, file_change_dto, DetailFields};
 use crate::dto::{
-    CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp,
-    PatchSelectionDto, SaveResultDto, SessionDiffResp, SessionSel, SquashWorkingCopyReq,
-    SquashWorkingCopyResp, WorkingCopyStatusResp,
+    AbsorbFileStatDto, AbsorbPlanEntryDto, AbsorbSkipDto, AbsorbWorkingCopyReq,
+    AbsorbWorkingCopyResp, CarveWorkingCopyReq, CarveWorkingCopyResp, CommitWorkingCopyReq,
+    CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp, PatchSelectionDto,
+    SaveResultDto, SessionDiffResp, SessionSel, SquashWorkingCopyReq, SquashWorkingCopyResp,
+    WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -38,7 +44,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree)."
+        description = "Diff everything this session changed so far — the current tree (uncommitted changes included) against the tree at session start. Message/identity-only edits don't show up (they change no tree). Each file's diff is capped at a line limit (a cut file is marked `truncated` with its `total_lines`)."
     )]
     pub async fn session_diff(
         &self,
@@ -176,6 +182,138 @@ impl CommeditServer {
             Ok(CommitWorkingCopyResp {
                 result,
                 committed,
+                working_copy,
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Carve the uncommitted changes into SEVERAL commits in one call — an ordered (oldest-first) list of {message, selection}, each stacked on the previous on top of HEAD, with whatever no commit selects left uncommitted. This is the batch commit_working_copy: every selection addresses the one working-copy diff you already read, so hunk indices don't shift between commits the way they do across separate commit_working_copy calls. Each commit's `paths`/`hunks`/`patches` tiers work as in commit_working_copy; across the carve a path may be split by `hunks` (disjoint indices) but a whole-file/`patches` selection of a path must be unique. Untracked files need `add_paths`. Returns the new commits (oldest-first) and the remaining working copy."
+    )]
+    pub async fn carve_working_copy(
+        &self,
+        Parameters(req): Parameters<CarveWorkingCopyReq>,
+    ) -> Result<Yaml<CarveWorkingCopyResp>, ErrorData> {
+        self.with_session(req.session.session.clone(), move |repo, _| {
+            ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
+            repo.snapshot_working_copy_tracking(&req.add_paths.clone().unwrap_or_default())
+                .map_err(internal)?;
+            if repo.working_copy_chain().is_empty() {
+                return Err(invalid("the working copy is clean — nothing to carve"));
+            }
+
+            // Own each commit's message, identity and selection tiers, so the
+            // borrowed CarveEntry list outlives the carve call.
+            let mut owned: Vec<(String, Option<Identity>, PartialTiers)> =
+                Vec::with_capacity(req.commits.len());
+            for c in req.commits {
+                let tiers = parse_partial_selection(c.paths, c.hunks, c.patches)?;
+                let identity = new_commit_identity(repo, c.identity);
+                owned.push((c.message, identity, tiers));
+            }
+            if owned.is_empty() {
+                return Err(invalid("carve needs at least one commit to create"));
+            }
+            let entries: Vec<CarveEntry> = owned
+                .iter()
+                .map(|(message, identity, (paths, hunks, patches))| CarveEntry {
+                    message,
+                    identity: identity.as_ref(),
+                    selection: PartialSelection {
+                        paths,
+                        hunks,
+                        patches,
+                    },
+                })
+                .collect();
+
+            let (outcome, change_ids) = repo.carve_working_copy(&entries).map_err(internal)?;
+            drop(entries);
+            let result = save_result(repo, &outcome);
+
+            // Map the new change_ids (oldest-first) back to commit DTOs.
+            let (_, commits) = full_history(repo)?;
+            let refs = repo.commit_refs();
+            let root = repo.root_commit_id().hex();
+            let abbrev = IdAbbrev::new(&repo.repo);
+            let committed = change_ids
+                .iter()
+                .filter_map(|cid| {
+                    commits
+                        .iter()
+                        .find(|c| &c.change_id_hex() == cid)
+                        .map(|info| commit_dto(info, &root, &refs, &abbrev, DetailFields::ALL))
+                })
+                .collect();
+            let working_copy = working_copy_status_resp(repo)?;
+            Ok(CarveWorkingCopyResp {
+                result,
+                committed,
+                working_copy: Some(working_copy),
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Fold each uncommitted hunk into the commit that introduced the lines it touches, in one rewrite (like `git absorb`/`jj absorb`) — the fast path for a pile of fixups spread across several ancestors, replacing a blame_squash_targets call plus one squash_working_copy per commit. Only hunks that blame unambiguously to a single commit move; ambiguous, binary or structural ones stay uncommitted (see `remaining` and `skipped`). Pass `dry_run: true` to preview the routing `plan` without changing anything, then call again to apply. `paths` restricts it to those files. Usually lands clean; a fold that can't merge cleanly is held back with `status: conflicts` like any rewrite."
+    )]
+    pub async fn absorb_working_copy(
+        &self,
+        Parameters(req): Parameters<AbsorbWorkingCopyReq>,
+    ) -> Result<Yaml<AbsorbWorkingCopyResp>, ErrorData> {
+        self.with_session(req.session.session.clone(), move |repo, _| {
+            ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
+            let paths = req.paths.unwrap_or_default();
+            let outcome = repo
+                .absorb_working_copy(&paths, req.dry_run)
+                .map_err(internal)?;
+
+            let plan = outcome
+                .plan
+                .iter()
+                .map(|e| AbsorbPlanEntryDto {
+                    change_id: e.target.change_id_hex(),
+                    sha: e.target.id_hex(),
+                    subject: e.target.subject.clone(),
+                    files: e
+                        .files
+                        .iter()
+                        .map(|f| AbsorbFileStatDto {
+                            path: f.path.clone(),
+                            added: f.added,
+                            removed: f.removed,
+                            hunks: f.hunks,
+                        })
+                        .collect(),
+                })
+                .collect();
+            let skipped = outcome
+                .skipped
+                .iter()
+                .map(|(path, reason)| AbsorbSkipDto {
+                    path: path.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            let applied = outcome.applied.as_ref().map(|o| save_result(repo, o));
+            // On a clean apply, report what's left uncommitted (the unattributed
+            // remainder); on a dry run or conflicts there's nothing settled to read.
+            let working_copy = match &outcome.applied {
+                Some(SaveOutcome::Clean) => Some(working_copy_status_resp(repo)?),
+                _ => None,
+            };
+            Ok(AbsorbWorkingCopyResp {
+                dry_run: req.dry_run,
+                plan,
+                skipped,
+                remaining: outcome.remaining,
+                applied,
                 working_copy,
             })
         })

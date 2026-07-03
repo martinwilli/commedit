@@ -123,6 +123,16 @@ pub struct PartialSelection<'a> {
     pub patches: &'a [(String, String)],
 }
 
+/// One commit to carve out of the uncommitted changes: its message, optional
+/// identity, and the [`PartialSelection`] of the working copy it holds. Consumed
+/// by [`Repo::carve_working_copy`], which chains the entries oldest-first on top
+/// of HEAD and leaves the unselected remainder uncommitted.
+pub struct CarveEntry<'a> {
+    pub message: &'a str,
+    pub identity: Option<&'a Identity>,
+    pub selection: PartialSelection<'a>,
+}
+
 impl Repo {
     /// Snapshot the on-disk working directory into the working-copy commit `@`,
     /// so uncommitted changes to **tracked** files (edits and deletions) become a
@@ -806,6 +816,146 @@ impl Repo {
         )
     }
 
+    /// Carve the uncommitted changes into **several** commits in one transaction,
+    /// each holding its own [`PartialSelection`] of the working copy, stacked
+    /// oldest-first on top of HEAD; whatever no entry selects stays uncommitted.
+    ///
+    /// This is the batch form of [`Self::commit_working_copy_partial`]: every
+    /// entry addresses the *same* `@`-vs-HEAD diff (the one the caller already
+    /// read), so hunk indices are stable across entries — the index-shift hazard
+    /// of committing one-subset-at-a-time (each commit moving HEAD and reshaping
+    /// the remaining diff) doesn't arise. Each commit `Ci` holds HEAD's tree plus
+    /// the cumulative selection of entries `1..=i`, so its own diff is exactly its
+    /// entry's selection; the remainder `@` carries the full on-disk tree so disk
+    /// stays byte-identical. Always lands clean (fresh commits on the tip). Returns
+    /// the save outcome and the new commits' change ids (oldest-first, `C1..Cn`).
+    ///
+    /// A path may be selected by more than one entry only via the `hunks` tier
+    /// with disjoint indices; a whole-file (`paths`) or `patches` selection of a
+    /// path must be unique across the whole carve. Refuses an empty entry list, an
+    /// entry that selects nothing, a clean tree, or a detached/unborn HEAD.
+    pub fn carve_working_copy(
+        &mut self,
+        entries: &[CarveEntry<'_>],
+    ) -> Result<(SaveOutcome, Vec<String>)> {
+        self.require_worktree("carve the working copy")?;
+        crate::repo::catch_jj("carving the working copy", || {
+            self.carve_working_copy_inner(entries)
+        })
+    }
+
+    fn carve_working_copy_inner(
+        &mut self,
+        entries: &[CarveEntry<'_>],
+    ) -> Result<(SaveOutcome, Vec<String>)> {
+        validate_carve(entries)?;
+
+        // Snapshot + fetch HEAD/leaf trees once, and confirm the whole carve
+        // commits something (the cumulative selection over every entry).
+        let full_sel = cumulative_selection(entries, entries.len());
+        let (head, head_tree, full_tree, _t) = self.prepare_partial_commit(&PartialSelection {
+            paths: &full_sel.0,
+            hunks: &full_sel.1,
+            patches: &full_sel.2,
+        })?;
+        let store = self.repo.store().clone();
+
+        // Build each commit's cumulative tree (HEAD + selections 1..=i) and check
+        // every entry adds something over the previous one.
+        let mut trees: Vec<MergedTree> = Vec::with_capacity(entries.len());
+        let mut prev = head_tree.clone();
+        for (i, entry) in entries.iter().enumerate() {
+            let sel = cumulative_selection(entries, i + 1);
+            let ti = self.splice_selection_onto(
+                &head_tree,
+                &full_tree,
+                &store,
+                &PartialSelection {
+                    paths: &sel.0,
+                    hunks: &sel.1,
+                    patches: &sel.2,
+                },
+            )?;
+            if ti.tree_ids() == prev.tree_ids() {
+                bail!(
+                    "carve commit {} ('{}') selects nothing beyond the earlier commits",
+                    i + 1,
+                    entry.message.lines().next().unwrap_or("").trim()
+                );
+            }
+            prev = ti.clone();
+            trees.push(ti);
+        }
+        let cn_tree = trees.last().expect("validated non-empty").clone();
+
+        let name = self.workspace.workspace_name().to_owned();
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.edited_tip();
+        let heads = self.snapshot_heads();
+
+        let mut tx = self.repo.start_transaction();
+        let mut parent = head.clone();
+        let mut change_hexes: Vec<String> = Vec::with_capacity(entries.len());
+        let mut last = None;
+        for (entry, tree) in entries.iter().zip(&trees) {
+            let mut builder = tx
+                .repo_mut()
+                .new_commit(vec![parent.clone()], tree.clone())
+                .set_description(entry.message);
+            if let Some(id) = entry.identity {
+                let author = Signature {
+                    name: id.author_name.clone(),
+                    email: id.author_email.clone(),
+                    timestamp: parse_timestamp(&id.author_time).context("author date")?,
+                };
+                let committer = Signature {
+                    name: id.committer_name.clone(),
+                    email: id.committer_email.clone(),
+                    timestamp: parse_timestamp(&id.committer_time).context("committer date")?,
+                };
+                builder = builder.set_author(author).set_committer(committer);
+            }
+            let created = block_on(builder.write()).context("writing a carve commit")?;
+            parent = created.id().clone();
+            change_hexes.push(created.change_id().hex());
+            last = Some(created);
+        }
+        let last = last.expect("validated non-empty");
+
+        // The remainder — the full on-disk tree as a child of the last commit,
+        // holding whatever no entry selected. When the carve committed the whole
+        // tree, start a fresh empty `@` instead (like commit_working_copy).
+        if full_tree.tree_ids() == cn_tree.tree_ids() {
+            block_on(tx.repo_mut().check_out(name, &last))
+                .context("starting a fresh working copy")?;
+        } else {
+            let remainder = block_on(
+                tx.repo_mut()
+                    .new_commit(vec![last.id().clone()], full_tree.clone())
+                    .write(),
+            )
+            .context("writing the working-copy remainder")?;
+            block_on(tx.repo_mut().edit(name, &remainder))
+                .context("pointing the working copy at the remainder")?;
+        }
+        block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+        self.set_head_bookmark(tx.repo_mut(), last.id().clone());
+
+        let desc = OpDescriptor::new(
+            format!("Carve into {} commit(s)", entries.len()),
+            change_hexes.clone(),
+        );
+        let outcome = self.finish_mutation(
+            tx,
+            "commedit: carve working copy",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )?;
+        Ok((outcome, change_hexes))
+    }
+
     /// Crystallize a single working-copy **entry** (identified by its stable change
     /// id, or the leaf `@` when `change_hex` is `None`) into a real commit on top of
     /// HEAD — committing exactly that entry's slice of the uncommitted changes (its
@@ -1006,15 +1156,38 @@ impl Repo {
             .tree();
 
         // Build the selected tree on top of HEAD from the selection.
-        let mut t_commit = head_tree.clone();
+        let t_commit = self.splice_selection_onto(&head_tree, &full_tree, &store, sel)?;
+
+        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
+        // unmodified path, an empty hunk set, or a patch that changes nothing.
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+        Ok((head, head_tree, full_tree, t_commit))
+    }
+
+    /// Splice a [`PartialSelection`] onto `head_tree`, pulling the selected
+    /// content from `full_tree` (the leaf `@`'s on-disk tree): whole `paths` are
+    /// lifted verbatim; `hunks`/`patches` reconstruct text relative to HEAD (the
+    /// same numbering [`render_diff`] produces). Pure tree-building, no snapshot
+    /// or emptiness check — shared by [`Self::prepare_partial_commit`] and the
+    /// cumulative-tree loop in [`Self::carve_working_copy`].
+    fn splice_selection_onto(
+        &self,
+        head_tree: &MergedTree,
+        full_tree: &MergedTree,
+        store: &Arc<Store>,
+        sel: &PartialSelection<'_>,
+    ) -> Result<MergedTree> {
+        let mut t = head_tree.clone();
         if !sel.paths.is_empty() {
-            t_commit = crate::tree::splice_paths_from_tree(t_commit, &full_tree, sel.paths)?;
+            t = crate::tree::splice_paths_from_tree(t, full_tree, sel.paths)?;
         }
         // The hunks/patches tiers reconstruct text content relative to HEAD; gather
         // them into one whole-file splice (blobs preserve HEAD's exec bit/copy id).
         let mut text_edits: Vec<(String, String)> = Vec::new();
         for (path, indices) in sel.hunks {
-            let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let (old_f, new_f) = self.partial_file_text(head_tree, full_tree, store, path)?;
             let rendered = render_diff(&old_f, &new_f, path, &ContextExpansion::default());
             let mut kept: BTreeSet<usize> = BTreeSet::new();
             for &i in indices {
@@ -1029,21 +1202,15 @@ impl Repo {
             text_edits.push((path.clone(), select_groups(&old_f, &new_f, &kept)));
         }
         for (path, patch) in sel.patches {
-            let (old_f, _new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+            let (old_f, _new_f) = self.partial_file_text(head_tree, full_tree, store, path)?;
             let content = apply_patch(&old_f, patch)
                 .with_context(|| format!("applying the patch for '{path}'"))?;
             text_edits.push((path.clone(), content));
         }
         if !text_edits.is_empty() {
-            t_commit = crate::tree::splice_files_into_tree(t_commit, &store, &text_edits)?;
+            t = crate::tree::splice_files_into_tree(t, store, &text_edits)?;
         }
-
-        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
-        // unmodified path, an empty hunk set, or a patch that changes nothing.
-        if t_commit.tree_ids() == head_tree.tree_ids() {
-            bail!("the selection commits nothing (it matches the branch head)");
-        }
-        Ok((head, head_tree, full_tree, t_commit))
+        Ok(t)
     }
 
     /// Read a path's HEAD-side (`old`) and leaf-side (`new`) UTF-8 text for the
@@ -1740,4 +1907,85 @@ impl Repo {
             .chain_with_file(RepoPath::root(), exclude)
             .context("reading info/exclude")
     }
+}
+
+/// The owned three tiers of a [`PartialSelection`], ready to borrow into one.
+type OwnedSelection = (
+    Vec<String>,
+    Vec<(String, Vec<usize>)>,
+    Vec<(String, String)>,
+);
+
+/// The cumulative selection of the first `n` carve entries, merged into one
+/// [`PartialSelection`]'s owned tiers. Paths and patches are unique across
+/// entries (enforced by [`validate_carve`]) so they concatenate; a path split
+/// across entries' `hunks` tiers has its indices merged. Because every entry
+/// addresses the same `@`-vs-HEAD diff, the merged hunk indices stay valid.
+fn cumulative_selection(entries: &[CarveEntry<'_>], n: usize) -> OwnedSelection {
+    let mut paths: Vec<String> = Vec::new();
+    let mut hunks: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut patches: Vec<(String, String)> = Vec::new();
+    for entry in &entries[..n] {
+        let sel = &entry.selection;
+        paths.extend(sel.paths.iter().cloned());
+        patches.extend(sel.patches.iter().cloned());
+        for (path, indices) in sel.hunks {
+            match hunks.iter_mut().find(|(p, _)| p == path) {
+                Some((_, acc)) => acc.extend(indices.iter().copied()),
+                None => hunks.push((path.clone(), indices.clone())),
+            }
+        }
+    }
+    (paths, hunks, patches)
+}
+
+/// Validate a carve's entries before any work: at least one entry, each entry
+/// selects something, and per path the selections don't overlap — a whole-file
+/// (`paths`) or `patches` selection of a path is unique across the carve, while
+/// the `hunks` tier may split a path across entries only with disjoint indices.
+fn validate_carve(entries: &[CarveEntry<'_>]) -> Result<()> {
+    if entries.is_empty() {
+        bail!("carve needs at least one commit to create");
+    }
+    // A path selected whole or by patch is exclusive; hunk indices accumulate.
+    let mut exclusive: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hunk_indices: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let sel = &entry.selection;
+        if sel.paths.is_empty() && sel.hunks.is_empty() && sel.patches.is_empty() {
+            bail!(
+                "carve commit {} selects no changes; every entry must commit something",
+                i + 1
+            );
+        }
+        for path in sel.paths.iter().chain(sel.patches.iter().map(|(p, _)| p)) {
+            if exclusive.contains(path) || hunk_indices.contains_key(path) {
+                bail!(
+                    "path '{path}' is selected by more than one carve commit; a whole-file \
+                     or patch selection of a path must be unique"
+                );
+            }
+            exclusive.insert(path.clone());
+        }
+        for (path, indices) in sel.hunks {
+            if indices.is_empty() {
+                bail!(
+                    "carve commit {} lists '{path}' in hunks but selects no indices",
+                    i + 1
+                );
+            }
+            if exclusive.contains(path) {
+                bail!("path '{path}' is selected both whole (or by patch) and by hunk; pick one");
+            }
+            let acc = hunk_indices.entry(path.clone()).or_default();
+            for &idx in indices {
+                if acc.contains(&idx) {
+                    bail!("hunk {idx} of '{path}' is selected by more than one carve commit");
+                }
+                acc.push(idx);
+            }
+        }
+    }
+    Ok(())
 }

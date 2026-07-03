@@ -28,7 +28,7 @@ use crate::wrapper::Yaml;
 #[tool_router(router = router_read, vis = "pub")]
 impl CommeditServer {
     #[tool(
-        description = "List the commits of the checked-out branch (the ancestors of HEAD, newest first, like `git log`), with their branch/tag decorations. Returns up to `limit` commits (default 30) from `offset`; when `has_more`, page on with the returned `next_offset`. Each commit always carries sha, change_id and subject; `is_merge` and `refs` appear only when set (a merge, a decorated commit) and are otherwise omitted (absent means a non-merge / no decoration). Use `fields` to pick which verbose fields (message, identity, parents) come with it — omit for all of them, pass a subset (e.g. just the timestamps when re-dating) or `[]` for a header-only overview, then show_commit for any one commit's full message and diff. Merge commits are included but cannot be moved, dropped, split or used as a squash source. Shas/change_ids are abbreviated to the shortest repo-unique prefix (>= 8 chars) — pass them straight back as a commit ref; shas change on every mutation while the change_id is stable, so prefer change ids over re-listing. Set `working_copy: true` to also get the uncommitted-changes status inline (same as working_copy_status), saving a round-trip."
+        description = "List the branch's commits (ancestors of HEAD, newest first, like `git log`) with branch/tag decorations. Returns up to `limit` (default 30) from `offset`; page on with `next_offset` when `has_more`. A lean header-only overview by default (sha, change_id, subject; `is_merge`/`refs` only when set) — pass `fields` for the verbose fields you need (message, identity, parents; e.g. just the timestamps when re-dating), then show_commit for one commit's full message and diff. Merge commits are listed but can't be moved, dropped, split or squashed from. `working_copy: true` also returns the uncommitted-changes status inline, saving a round-trip."
     )]
     pub async fn list_history(
         &self,
@@ -80,7 +80,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Set include_contents to also get each text file's full old/new content."
+        description = "Show one commit's metadata and the files it changes, each as a unified diff. Accepts a history commit, a working-copy entry (the uncommitted diff) or a trashed commit — by sha or change id, full or a unique prefix. Each file's diff is capped at a line limit (a cut file is marked `truncated` with its `total_lines`); pass `paths` to restrict to specific files, or include_contents to also get each text file's full old/new content."
     )]
     pub async fn show_commit(
         &self,
@@ -109,9 +109,11 @@ impl CommeditServer {
             let root = repo.root_commit_id().hex();
             let abbrev = IdAbbrev::new(&repo.repo);
             let include = req.include_contents.unwrap_or(false);
+            let wanted = req.paths.as_ref();
             let files = commit_changes(&repo.repo, &info.id)
                 .map_err(internal)?
                 .iter()
+                .filter(|fc| wanted.is_none_or(|p| p.iter().any(|w| w == &fc.path)))
                 .map(|fc| file_change_dto(fc, include))
                 .collect();
             Ok(ShowCommitResp {
@@ -147,7 +149,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Show the commit graph of the checked-out branch: every commit reachable from HEAD (newest first), each with its parents AND children by change_id — the merge and side-branch structure at a glance, which the newest-first list_history can't convey on its own. This is the standalone, whole-branch read of the same `topology` shape a topology-changing mutation folds into its result. Reach for it to see how merges and side branches connect before reordering, merging out or restoring; list_history stays the source for per-commit detail (messages, identities, diffs, refs)."
+        description = "Show the branch's commit graph: every commit reachable from HEAD (newest first) with its parents AND children by change_id — the merge/side-branch structure a newest-first list_history can't convey. The whole-branch read of the same `topology` shape mutations return. Use it before reordering, merging out or restoring; list_history stays the source for per-commit detail."
     )]
     pub async fn show_graph(
         &self,
@@ -172,7 +174,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Suggest where a fixup/squash/amend commit should be folded. Reads the source commit's leading `fixup!`/`squash!`/`amend!` subject token and returns the matching branch commit(s) as `targets` (pass one straight to squash_commit as `dest`), the `mode` that prefix requests, and any sibling autosquash commits aimed at the same target. Both lists are empty when the source carries no such prefix or nothing matches. The source may be a history or trashed commit and is never modified — this is read-only."
+        description = "Suggest where a `fixup!`/`squash!`/`amend!` commit folds: reads the source's leading autosquash token and returns matching branch commit(s) as `targets` (pass one to squash_commit as `dest`), the `mode` it requests, and sibling autosquash commits aimed at the same target. Empty when the source has no such prefix. Read-only; the source (history or trashed) is never modified. For a fix with no such prefix, use blame_squash_targets instead."
     )]
     pub async fn suggest_squash_targets(
         &self,
@@ -230,7 +232,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Find where a change should be folded by content-blaming the lines it touches — the squash-target finder for the common case where you don't know which commit introduced the code you just fixed. Blames the lines the source removes/modifies against history and returns `candidates`: the branch commits that introduced them, ranked by how many of those lines each owns (`lines`). Pass the top candidate's change_id straight to squash_commit as `dest` — or to squash_working_copy for the default working-copy source. `source` is a history or working-copy commit by sha/change id; omit it to blame the working copy (all uncommitted changes), the default and primary case. `unattributed` counts changed lines tracing to a merge/boundary or an ancestor outside the listed history. Read-only. The content-blame complement to suggest_squash_targets, which instead routes an explicit `fixup!`/`squash!`/`amend!` subject prefix."
+        description = "Find where a change folds by content-blaming the lines it touches — the squash-target finder when you don't know which commit introduced the code you fixed. Ranks the branch commits that own the source's removed/modified lines as `candidates` (by `lines` owned); pass the top change_id to squash_commit as `dest` (or squash_working_copy). `source` is a history/working-copy commit; omit it to blame the whole working copy (the default). `unattributed` counts lines tracing to a merge/boundary. Read-only. To fold the WHOLE working copy across many commits at once, use absorb_working_copy instead."
     )]
     pub async fn blame_squash_targets(
         &self,

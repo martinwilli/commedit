@@ -5,7 +5,7 @@
 mod common;
 
 use commedit_mcp::dto::{
-    CherryPickCommitReq, CommitWorkingCopyReq, ConflictFileEditDto, CreateCommitReq,
+    CherryPickCommitReq, CommitField, CommitWorkingCopyReq, ConflictFileEditDto, CreateCommitReq,
     FileContentDto, IdentityFieldsDto, ListHistoryReq, ReadConflictReq, ReplaceFilesReq,
     ResolveConflictsReq, RevertCommitReq, SaveResultDto,
 };
@@ -60,7 +60,9 @@ async fn history(server: &CommeditServer) -> commedit_mcp::dto::ListHistoryResp 
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            // These tests inspect parent_shas, a verbose field that is opt-in
+            // now that list_history defaults to a header-only overview.
+            fields: Some(vec![CommitField::Parents]),
             working_copy: None,
         }))
         .await

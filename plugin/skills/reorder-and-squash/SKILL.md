@@ -71,6 +71,12 @@ into the answer. It ranks only commits whose lines the change actually edits, so
 a pure addition (new code, nothing modified) has nothing to blame; the reported
 `unattributed` count is lines tracing past a merge or outside the history.
 
+When your uncommitted edits belong across **several** commits, skip the
+one-at-a-time loop entirely: `absorb_working_copy` blames every hunk and folds
+each into its owning commit in a single call. Run it with `dry_run: true` to
+preview the routing (ambiguous hunks stay uncommitted), then apply — it replaces
+a `blame_squash_targets` call plus one `squash_working_copy` per target.
+
 ## Editing an existing merge
 
 You don't only *create* merges — an existing one is editable in place. Fold a
@@ -93,20 +99,10 @@ branch's only commit can't be dropped.
 
 ## When things go sideways
 
-- **A conflicting rewrite is held back in full** — `status: conflicts`, with git
-  history, HEAD and the working tree untouched until it settles, and no other
-  mutation running meanwhile. Resolving it oldest-first, the binary/structural
-  cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
-- **Address commits by `change_id`, not sha** — shas churn on every rewrite,
-  change_ids are stable, so you can chain edits without re-running `list_history`.
-  Each tool also needs a `session` id (the branch short-name) — pass it on every
-  call; editing across branches or worktrees is the `work-in-worktree` skill.
-- **A plain `git commit` on top of HEAD needs no reload** — the session catches up
-  automatically on the next tool call. Reserve `reload_repo(session, …)` for an
-  out-of-band change it can't absorb: a **branch switch**, or history **rewritten**
-  by `git rebase`/`reset`/`commit --amend` (it restarts that session's trash and
-  op-log, so don't run it reflexively).
-- **Safety net & review.** Every landed change is a recorded operation you can
-  walk back, dropped commits stay recoverable, and the session is one inspectable
-  diff — stepping back, reviewing, or recovering is the `review-and-recover`
-  skill. (`discard_working_copy` is the one irreversible action.)
+- A conflicting rewrite is held back in full (`status: conflicts`, git untouched
+  until it settles) — resolving oldest-first, the structural cases and aborting
+  are the `resolve-conflicts` skill.
+- Stepping a landed op back, recovering a dropped commit, or reviewing the whole
+  session as one diff are the `review-and-recover` skill (`discard_working_copy`
+  is the one irreversible action).
+- Editing across branches or worktrees is the `work-in-worktree` skill.

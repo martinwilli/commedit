@@ -55,6 +55,11 @@ reorder or drop it later in one call, and descendants rebase automatically.
    `hunks` / `patches` to fold only part, and `add_paths` to fold in a new file.
    A brand-new (untracked) file is **silently skipped** unless named in
    `add_paths`; in a partial fold it must be in **both** `add_paths` and `paths`.
+   If the leftover changes belong across **several** earlier commits,
+   `absorb_working_copy` blames each hunk and folds them all to their owning
+   commits in one call — run it with `dry_run: true` first to preview the routing
+   (ambiguous hunks stay uncommitted), then apply. It replaces a blame + one
+   `squash_working_copy` per target.
 
 4. **Fixing a commit already in history:**
    - message → `replace_in_message` (surgical) or `edit_message` (whole message)
@@ -71,8 +76,12 @@ reorder or drop it later in one call, and descendants rebase automatically.
    *not yet committed* is the easy, recommended split: commit part of the working
    copy now with the `paths` / `hunks` / `patches` selection on
    `commit_working_copy` (run `show_commit` on the working-copy entry first to read
-   each file's numbered hunks), then commit or fold the rest. That is why eager
-   commits mean you rarely need to split. Splitting a commit *already in history*
+   each file's numbered hunks), then commit or fold the rest. To lay down
+   **several** commits from one dirty tree in a single call, `carve_working_copy`
+   takes an ordered list of `{message, selection}` — every selection reads the
+   same working-copy diff, so hunk indices don't shift between pieces the way they
+   do across repeated `commit_working_copy` calls. That is why eager commits mean
+   you rarely need to split. Splitting a commit *already in history*
    is the hard case — `split_commit` is the only tool for it. Its `files` is the
    whole content to KEEP per changed path: to move a file's change *out* to the
    new commit, pass that file at its PARENT (pre-commit) content (`show_commit`
@@ -84,23 +93,14 @@ reorder or drop it later in one call, and descendants rebase automatically.
 
 ## When things go sideways
 
-- **A conflicting rewrite is held back in full** — `status: conflicts`, with git
-  history, HEAD and the working tree untouched until it settles, and no other
-  mutation running meanwhile. Resolving it oldest-first, the binary/structural
-  cases, and aborting are their own workflow — see the `resolve-conflicts` skill.
-- A plain `git commit` on top of HEAD needs **no** `reload_repo` — the commedit
-  session catches up to it automatically on the next tool call. Reserve `reload_repo`
-  for out-of-band changes it can't absorb in place: a **branch switch**, or history
-  **rewritten** by `git rebase`/`reset`/`commit --amend` (it resets the session's
-  trash and op-log, so don't run it reflexively).
-- **Off-worktree, this loop doesn't apply.** A session over a branch checked out
-  *nowhere* (`open_session` on an unchecked-out branch, `reload_repo`'s `branch`,
-  or launched as `<path> <branch>`) has **no working copy**: no plain `git commit`
-  to crystallize, and the `commit_working_copy` / `squash_working_copy` /
-  `discard_working_copy` tools are refused. You edit the branch's existing commits
-  directly instead. (Different from the `work-in-worktree` skill, where you
-  *create* a worktree and keep a live working copy in it.)
-- **Safety net & review.** Every landed change is a recorded operation you can
-  walk back, dropped commits stay recoverable, and the session is one inspectable
-  diff — stepping back, reviewing, or recovering is the `review-and-recover`
-  skill. (`discard_working_copy` is the one irreversible action.)
+- A conflicting rewrite is held back in full (`status: conflicts`, git untouched
+  until it settles) — resolving oldest-first, the structural cases and aborting
+  are the `resolve-conflicts` skill.
+- Stepping a landed op back, recovering a dropped commit, or reviewing the whole
+  session as one diff are the `review-and-recover` skill (`discard_working_copy`
+  is the one irreversible action).
+- **Off-worktree this loop doesn't apply.** A session over a branch checked out
+  *nowhere* has no working copy, so `commit_working_copy` / `squash_working_copy` /
+  `absorb_working_copy` / `carve_working_copy` / `discard_working_copy` are
+  refused — edit the branch's existing commits directly. (Different from the
+  `work-in-worktree` skill, where you keep a live working copy in a worktree.)

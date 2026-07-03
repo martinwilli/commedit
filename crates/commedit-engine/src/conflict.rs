@@ -261,6 +261,15 @@ impl Repo {
         self.current_head_in_jj()
     }
 
+    /// Every editable branch's tip as jj currently sees it (the post-rewrite,
+    /// not-yet-exported bookmarks), primary first and deduped. The multi-head
+    /// analogue of [`Self::jj_head_commit_id`], for the conflict view: conflict
+    /// detection scans all these heads (see [`Self::collect_conflicts`]), so a UI
+    /// walking only the primary tip cannot reach a conflict on a sibling branch.
+    pub fn jj_editable_heads(&self) -> Vec<CommitId> {
+        self.editable_heads_in_jj()
+    }
+
     /// Commit the rewrite transaction, then either export to git (if the branch
     /// tip's ancestor chain is conflict-free) or hold the rewrite pending while
     /// the conflicts are resolved. Every mutation ends here in place of the old

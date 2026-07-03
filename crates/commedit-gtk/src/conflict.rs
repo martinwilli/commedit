@@ -12,7 +12,7 @@ use std::rc::Rc;
 use commedit_engine::conflict::{ConflictedCommit, SaveOutcome};
 use commedit_engine::diff::{classify_conflict_lines, ConflictLineKind};
 use commedit_engine::graph::compute_graph;
-use commedit_engine::history::history_limited;
+use commedit_engine::history::history_limited_multi;
 use gtk::prelude::*;
 
 use crate::buffer_util::buffer_text;
@@ -331,21 +331,28 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         // GTK row per ancestor and froze the UI on deep repositories.
         let loaded = {
             let r = repo.borrow();
-            match r.jj_head_commit_id() {
-                Some(head) => {
-                    let mut limit = HISTORY_PAGE;
-                    loop {
-                        let (page, has_more) =
-                            history_limited(&r.repo, &head, 0, limit).unwrap_or_default();
-                        let shown: HashSet<String> =
-                            page.iter().map(|c| c.change_id_hex()).collect();
-                        if !has_more || branch_conflicts.iter().all(|ch| shown.contains(ch)) {
-                            break page;
-                        }
-                        limit = limit.saturating_mul(2);
+            // Seed from *every* editable head's jj-pending tip, not just the primary.
+            // A conflict lives on any editable branch (collect_conflicts scans them
+            // all), and one on a sibling branch is unreachable from the primary tip,
+            // so a single-head walk never locates its badge and the loop below keeps
+            // doubling the window until it has loaded the whole ancestry — one GTK row
+            // per ancestor, which froze the UI on a deep repo. The union makes every
+            // badge reachable, so the window stops as soon as it covers them (normally
+            // the first page).
+            let heads = r.jj_editable_heads();
+            if heads.is_empty() {
+                Vec::new()
+            } else {
+                let mut limit = HISTORY_PAGE;
+                loop {
+                    let (page, has_more) =
+                        history_limited_multi(&r.repo, &heads, 0, limit).unwrap_or_default();
+                    let shown: HashSet<String> = page.iter().map(|c| c.change_id_hex()).collect();
+                    if !has_more || branch_conflicts.iter().all(|ch| shown.contains(ch)) {
+                        break page;
                     }
+                    limit = limit.saturating_mul(2);
                 }
-                None => Vec::new(),
             }
         };
         *commits.borrow_mut() = loaded;

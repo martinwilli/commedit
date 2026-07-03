@@ -9,7 +9,7 @@ description = "MCP server frontend for commedit, exposing the history rewrite en
 [dependencies]
 commedit-engine = { path = "../commedit-engine" }
 jj-lib.workspace = true
-rmcp = { version = "2.0", features = ["server", "transport-io"] }
+rmcp = { version = "2.1", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

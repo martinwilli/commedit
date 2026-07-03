@@ -54,11 +54,11 @@ impl DetailFields {
     };
 
     /// Build a selection from a `list_history` request's `fields`: an absent
-    /// list selects everything (full detail), an explicit list selects exactly
-    /// the named fields (so `[]` yields a header-only row).
+    /// list is a header-only overview (no verbose fields — verbose detail is
+    /// opt-in), and an explicit list selects exactly the named fields.
     pub fn from_request(fields: Option<&[CommitField]>) -> Self {
         let Some(fields) = fields else {
-            return Self::ALL;
+            return Self::NONE;
         };
         let mut sel = Self::NONE;
         for f in fields {

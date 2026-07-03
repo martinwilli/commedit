@@ -95,9 +95,9 @@ them straight back rather than echoing full ids.
 
 Bulk & paging: to edit many commits at once (e.g. re-date/reword a range), prefer \
 edit_commits — every edit in ONE atomic transaction and rebase. list_history \
-returns 30 commits and every verbose field by default; page deeper with \
-offset/next_offset (not a huge limit) and pass `fields` for only what you need \
-(`[]` for a header-only overview) to keep responses small.
+returns 30 commits as a lean header-only overview by default; page deeper with \
+offset/next_offset (not a huge limit) and pass `fields` to add the verbose fields \
+(message, identity, parents) you actually need.
 
 Surgical edits: for a small change to a long message or file, prefer \
 replace_in_message / replace_in_file — an exact `old`→`new` substitution (unique \

@@ -108,7 +108,7 @@ async fn list_history_returns_the_branch_commits_with_refs() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::Parents]),
             working_copy: None,
         }))
         .await
@@ -227,13 +227,13 @@ async fn list_history_fields_selects_the_verbose_detail() {
     assert!(d.author_time.is_some() && d.committer_time.is_some());
     assert!(d.description.is_none() && d.author_name.is_none() && d.parent_shas.is_none());
 
-    // Omitting `fields` carries the full detail, including the message body.
+    // Requesting the description carries the message body.
     let full = server
         .list_history(Parameters(ListHistoryReq {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::Description]),
             working_copy: None,
         }))
         .await
@@ -243,10 +243,10 @@ async fn list_history_fields_selects_the_verbose_detail() {
         .detail
         .description
         .as_ref()
-        .expect("full listing has detail");
+        .expect("the requested description is present");
     assert!(
         description.contains("with a long body line"),
-        "full detail carries the message body: {description}"
+        "the description field carries the message body: {description}"
     );
 }
 
@@ -261,7 +261,7 @@ async fn list_history_marks_merges() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::Parents]),
             working_copy: None,
         }))
         .await
@@ -484,7 +484,7 @@ async fn edit_identity_prefills_omitted_fields() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::CommitterTime]),
             working_copy: None,
         }))
         .await
@@ -522,7 +522,7 @@ async fn edit_identity_prefills_omitted_fields() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::CommitterTime]),
             working_copy: None,
         }))
         .await
@@ -601,7 +601,7 @@ async fn edit_commits_batches_message_and_identity_in_one_pass() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::AuthorTime, CommitField::CommitterTime]),
             working_copy: None,
         }))
         .await
@@ -1624,7 +1624,7 @@ async fn a_change_id_chains_mutations_without_relisting() {
             session: sel("main"),
             limit: None,
             offset: None,
-            fields: None,
+            fields: Some(vec![CommitField::AuthorName]),
             working_copy: None,
         }))
         .await

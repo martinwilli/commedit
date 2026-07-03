@@ -9,11 +9,14 @@ use jj_lib::object_id::ObjectId as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 
+use commedit_engine::conflict::SaveOutcome;
+
 use crate::convert::{commit_dto, file_change_dto, DetailFields};
 use crate::dto::{
-    CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq, HunkSelectionDto, OkResp,
-    PatchSelectionDto, SaveResultDto, SessionDiffResp, SessionSel, SquashWorkingCopyReq,
-    SquashWorkingCopyResp, WorkingCopyStatusResp,
+    AbsorbFileStatDto, AbsorbPlanEntryDto, AbsorbSkipDto, AbsorbWorkingCopyReq,
+    AbsorbWorkingCopyResp, CommitWorkingCopyReq, CommitWorkingCopyResp, DiscardWorkingCopyReq,
+    HunkSelectionDto, OkResp, PatchSelectionDto, SaveResultDto, SessionDiffResp, SessionSel,
+    SquashWorkingCopyReq, SquashWorkingCopyResp, WorkingCopyStatusResp,
 };
 use crate::error::{internal, invalid};
 use crate::server::CommeditServer;
@@ -176,6 +179,68 @@ impl CommeditServer {
             Ok(CommitWorkingCopyResp {
                 result,
                 committed,
+                working_copy,
+            })
+        })
+        .await
+        .map(Yaml)
+    }
+
+    #[tool(
+        description = "Fold each uncommitted hunk into the commit that introduced the lines it touches, in one rewrite (like `git absorb`/`jj absorb`) — the fast path for a pile of fixups spread across several ancestors, replacing a blame_squash_targets call plus one squash_working_copy per commit. Only hunks that blame unambiguously to a single commit move; ambiguous, binary or structural ones stay uncommitted (see `remaining` and `skipped`). Pass `dry_run: true` to preview the routing `plan` without changing anything, then call again to apply. `paths` restricts it to those files. Usually lands clean; a fold that can't merge cleanly is held back with `status: conflicts` like any rewrite."
+    )]
+    pub async fn absorb_working_copy(
+        &self,
+        Parameters(req): Parameters<AbsorbWorkingCopyReq>,
+    ) -> Result<Yaml<AbsorbWorkingCopyResp>, ErrorData> {
+        self.with_session(req.session.session.clone(), move |repo, _| {
+            ensure_not_pending(repo)?;
+            ensure_worktree_bound(repo)?;
+            let paths = req.paths.unwrap_or_default();
+            let outcome = repo
+                .absorb_working_copy(&paths, req.dry_run)
+                .map_err(internal)?;
+
+            let plan = outcome
+                .plan
+                .iter()
+                .map(|e| AbsorbPlanEntryDto {
+                    change_id: e.target.change_id_hex(),
+                    sha: e.target.id_hex(),
+                    subject: e.target.subject.clone(),
+                    files: e
+                        .files
+                        .iter()
+                        .map(|f| AbsorbFileStatDto {
+                            path: f.path.clone(),
+                            added: f.added,
+                            removed: f.removed,
+                            hunks: f.hunks,
+                        })
+                        .collect(),
+                })
+                .collect();
+            let skipped = outcome
+                .skipped
+                .iter()
+                .map(|(path, reason)| AbsorbSkipDto {
+                    path: path.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            let applied = outcome.applied.as_ref().map(|o| save_result(repo, o));
+            // On a clean apply, report what's left uncommitted (the unattributed
+            // remainder); on a dry run or conflicts there's nothing settled to read.
+            let working_copy = match &outcome.applied {
+                Some(SaveOutcome::Clean) => Some(working_copy_status_resp(repo)?),
+                _ => None,
+            };
+            Ok(AbsorbWorkingCopyResp {
+                dry_run: req.dry_run,
+                plan,
+                skipped,
+                remaining: outcome.remaining,
+                applied,
                 working_copy,
             })
         })

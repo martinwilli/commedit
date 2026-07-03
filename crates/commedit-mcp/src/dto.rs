@@ -936,6 +936,79 @@ pub struct PatchSelectionDto {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AbsorbWorkingCopyReq {
+    #[serde(flatten)]
+    pub session: SessionSel,
+    /// Restrict the absorb to these files (repo-relative, forward-slash form).
+    /// Omit to consider every changed file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Preview only: return the routing plan (which hunks would fold where, what
+    /// is skipped, what would stay uncommitted) without changing anything.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
+}
+
+/// The result of `absorb_working_copy`, for both the dry-run preview and the
+/// applied rewrite.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbWorkingCopyResp {
+    /// True when this was a preview: nothing was changed.
+    pub dry_run: bool,
+    /// Per destination commit, ancestors-first, the hunks that route into it.
+    /// Empty when nothing could be attributed to a single commit.
+    pub plan: Vec<AbsorbPlanEntryDto>,
+    /// Paths skipped wholesale, each with jj's reason (binary, symlink, a
+    /// conflict, a submodule) — those can't be absorbed as text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<AbsorbSkipDto>,
+    /// Whether any uncommitted change remains after the absorb (an ambiguous or
+    /// unattributable hunk that stays in the working copy).
+    pub remaining: bool,
+    /// The mutation outcome — present only when applied (absent on a dry run, or
+    /// when nothing was attributable so no rewrite ran). `status: conflicts` here
+    /// means the fold couldn't merge cleanly and is held back like any rewrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<SaveResultDto>,
+    /// The uncommitted changes left after a clean apply (the unattributed
+    /// remainder). Present only when applied and clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_copy: Option<WorkingCopyStatusResp>,
+}
+
+/// One destination commit in an absorb plan.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbPlanEntryDto {
+    /// The target commit's stable change id — survives the rewrite, so it stays a
+    /// valid ref after applying.
+    pub change_id: String,
+    /// Its current sha (churns on the rewrite).
+    pub sha: String,
+    pub subject: String,
+    /// The changed files whose hunks route to this target.
+    pub files: Vec<AbsorbFileStatDto>,
+}
+
+/// One file's routed hunks within an [`AbsorbPlanEntryDto`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbFileStatDto {
+    pub path: String,
+    /// Lines the routed hunks add to the target.
+    pub added: usize,
+    /// Lines the routed hunks remove from the target.
+    pub removed: usize,
+    /// Number of contiguous hunks routed here for this file.
+    pub hunks: usize,
+}
+
+/// A path absorb left untouched, with why.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AbsorbSkipDto {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DiscardWorkingCopyReq {
     #[serde(flatten)]
     pub session: SessionSel,

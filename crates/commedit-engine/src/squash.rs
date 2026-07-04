@@ -8,6 +8,8 @@
 //! (`fixup!` / `squash!` / `amend!`) so the UI can recommend drop targets and
 //! compose the merged commit message.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
@@ -616,6 +618,168 @@ impl Repo {
         )
     }
 
+    /// Move a single diff hunk out of `source` and fold it into `dest`, rebasing
+    /// descendants — the "this line belongs in a different commit" fixup at hunk
+    /// granularity. The hunk is addressed by `(path, first_group, last_group)`: the
+    /// inclusive change-group index range of `source`'s parent-vs-commit diff for
+    /// `path`. Group indices come from [`crate::diff::change_groups`] and depend only
+    /// on the old/new content, never on how much context the diff view has expanded
+    /// — unlike a rendered hunk index, which merges adjacent groups once expanded
+    /// context bridges their gap. A dragged visual hunk contributes all of its
+    /// groups, so a range may span what a default render shows as several hunks.
+    /// `message`, when `Some`, replaces `dest`'s message; else `dest`'s is kept (a
+    /// Fixup — the hunk carries no message of its own).
+    ///
+    /// Built on jj's partial-selection [`squash_commits`] like
+    /// [`Self::squash_working_copy_partial_into`]: `source` is rewritten to drop the
+    /// hunk and `dest` gains it, direction-aware so `dest` may sit either above or
+    /// below `source`. Because the net change set is preserved the post-move tip is
+    /// clean even if an interior commit conflicts spuriously — so it exits through
+    /// the same CleanTip auto-resolve as a whole-commit squash; a genuine overlap
+    /// enters the deferred conflict flow. Kept MCP-shaped for a future `move_hunk`
+    /// tool.
+    pub fn squash_hunk_into(
+        &mut self,
+        source: &CommitId,
+        dest: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("moving the hunk", || {
+            self.squash_hunk_into_inner(source, dest, path, first_group, last_group, message, None)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn squash_hunk_into_inner(
+        &mut self,
+        source: &CommitId,
+        dest: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        message: Option<&str>,
+        label: Option<String>,
+    ) -> Result<SaveOutcome> {
+        if source == dest {
+            anyhow::bail!("cannot move a hunk from a commit into itself");
+        }
+        if first_group > last_group {
+            anyhow::bail!(
+                "invalid change-group range: first_group {first_group} > last_group {last_group}"
+            );
+        }
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.edited_tip();
+        let heads = self.snapshot_heads();
+
+        let store = self.repo.store().clone();
+        let source_commit = store.get_commit(source).context("loading source commit")?;
+        let dest_commit = store
+            .get_commit(dest)
+            .context("loading destination commit")?;
+        let source_parent_tree = pollster::block_on(source_commit.parent_tree(self.repo.as_ref()))
+            .context("loading source parent tree")?;
+
+        // Read the source's change for `path` and pull its text on both sides; the
+        // hunk to move is a slice of this parent-vs-commit diff.
+        let changes = crate::diff::commit_changes(&self.repo, source)
+            .context("reading the source commit's changes")?;
+        let change = changes
+            .iter()
+            .find(|c| c.path == path)
+            .with_context(|| format!("the source commit does not modify {path}"))?;
+        let (Some(old), Some(new)) = (change.old_text.as_deref(), change.new_text.as_deref())
+        else {
+            anyhow::bail!("{path} is not an editable text change in the source commit");
+        };
+
+        // Build the selected content straight from the change-group range. Bound the
+        // range against the file's group count (stable across context expansion), so
+        // a stale range is rejected clearly rather than silently selecting nothing.
+        let group_count =
+            crate::diff::render_diff(old, new, path, &crate::diff::ContextExpansion::default())
+                .group_count;
+        if last_group >= group_count {
+            anyhow::bail!(
+                "change-group {last_group} out of range for {path} ({group_count} group(s))"
+            );
+        }
+        let kept: BTreeSet<usize> = (first_group..=last_group).collect();
+        let selected_content = crate::diff::select_groups(old, new, &kept);
+
+        // The selected tree is the source's parent with only this hunk applied, so
+        // its diff from the parent tree is exactly the hunk to move; the remainder
+        // (selected_tree → source.tree) stays in the source.
+        let selected_tree = crate::tree::splice_files_into_tree(
+            source_parent_tree.clone(),
+            &store,
+            &[(path.to_string(), selected_content)],
+        )
+        .context("building the selected hunk tree")?;
+        let sel = CommitWithSelection {
+            commit: source_commit.clone(),
+            parent_tree: source_parent_tree,
+            selected_tree,
+        };
+
+        // The hunk carries no message of its own, so the Fixup default keeps the
+        // destination's; an explicit override replaces it. Preserve the author.
+        let new_desc = match message {
+            Some(m) => m.to_string(),
+            None => dest_commit.description().to_string(),
+        };
+        let dest_author = dest_commit.author().clone();
+        let label = label.unwrap_or_else(|| {
+            format!(
+                "Move a hunk of {} into {}",
+                op_subject(&source_commit),
+                op_subject(&dest_commit)
+            )
+        });
+        let desc = OpDescriptor::new(
+            label,
+            vec![
+                source_commit.change_id().hex(),
+                dest_commit.change_id().hex(),
+            ],
+        );
+
+        let mut tx = self.repo.start_transaction();
+        let squashed = pollster::block_on(squash_commits(
+            tx.repo_mut(),
+            std::slice::from_ref(&sel),
+            &dest_commit,
+            /* keep_emptied = */ false,
+        ))
+        .context("squashing the hunk")?
+        .context("squash produced no commit (empty selection)")?;
+        pollster::block_on(
+            squashed
+                .commit_builder
+                .set_description(new_desc)
+                .set_author(dest_author)
+                .write(),
+        )
+        .context("writing squashed commit")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        // Moving a hunk preserves the net change set, so the post-move tip is clean
+        // even when an interior commit conflicts spuriously — same CleanTip resolve
+        // as a whole-commit squash.
+        self.finish_mutation_auto_resolve(
+            tx,
+            "commedit: move a hunk",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,

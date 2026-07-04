@@ -1,0 +1,87 @@
+//! End-to-end: relocating a single diff hunk between endpoints. Moving one hunk
+//! out of a commit and into another (or into the working copy) rewrites the
+//! source to drop it, folds it into the destination, rebases descendants, and
+//! plain `git` sees the re-attributed, conflict-free history — with the overall
+//! tree content preserved.
+
+mod common;
+
+use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::history::history;
+use commedit_engine::repo::Repo;
+
+/// The commit id of the commit with subject `subject` on the current branch.
+fn id_of(repo: &Repo, subject: &str) -> jj_lib::backend::CommitId {
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    commits
+        .iter()
+        .find(|c| c.subject == subject)
+        .unwrap_or_else(|| panic!("commit {subject:?} present"))
+        .id
+        .clone()
+}
+
+/// A file `f.txt` whose commit "A" edits two well-separated regions (line 1 and
+/// line 9), so its diff renders as two hunks; commit "B" stacks a separate file
+/// `g.txt` above it. Layout (oldest first): base <- A <- B on `main`.
+fn two_hunk_repo(dir: &std::path::Path) {
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n", "base"),
+            ("f.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n", "A"),
+            ("g.txt", "g\n", "B"),
+        ],
+    );
+}
+
+#[test]
+fn moves_the_second_hunk_from_a_commit_into_its_descendant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    two_hunk_repo(dir);
+    // The overall tip tree must be byte-identical afterwards — the change set is
+    // only re-attributed between commits, not altered.
+    let tip_tree_before = common::git(dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let source = id_of(&repo, "A");
+    let dest = id_of(&repo, "B");
+
+    // Change-group 1 is the line-9 region (1→ONE is group 0). Move that group out
+    // of "A" and into its descendant "B".
+    let outcome = repo
+        .squash_hunk_into(&source, &dest, "f.txt", 1, 1, None)
+        .expect("move hunk");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // Still three linear commits; "B" keeps its own message (Fixup default).
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
+
+    // "A" lost the line-9 hunk (line 9 reverts to "9") but kept hunk 0 (ONE).
+    assert_eq!(
+        common::git(dir, &["show", "HEAD~1:f.txt"]),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\n9"
+    );
+    // "B" now carries the line-9 hunk: the tip's f.txt has NINE again.
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:f.txt"]),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE"
+    );
+    // The hunk really was introduced by "B" (it wasn't in "A").
+    let b_patch = common::git(dir, &["show", "HEAD"]);
+    assert!(b_patch.contains("+NINE"), "B introduces NINE: {b_patch}");
+
+    // The overall tip tree is unchanged, and git sees an ordinary clean repo.
+    assert_eq!(
+        common::git(dir, &["rev-parse", "HEAD^{tree}"]),
+        tip_tree_before
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+

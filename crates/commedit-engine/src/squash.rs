@@ -780,6 +780,63 @@ impl Repo {
             heads,
         )
     }
+    /// Carve a single diff hunk out of the history commit `source` and land it as
+    /// an uncommitted change on `target`'s working copy — the inverse direction of
+    /// [`Self::squash_hunk_into`] (commit → working copy rather than commit →
+    /// commit). The hunk is addressed by the same `(path, first_group, last_group)`
+    /// change-group range. The destination is `target`'s leaf `@`, a descendant of
+    /// `source`, so [`squash_commits`]' direction handling drops the hunk from
+    /// `source` and folds it onto `@`, where it surfaces as an on-disk change.
+    /// `source` loses the hunk; the overall content is unchanged (it just moves from
+    /// committed to uncommitted).
+    ///
+    /// A clean move on an *extra* worktree needs an explicit `@`-materialize (the
+    /// shared export tail only re-materializes an extra worktree whose branch tip
+    /// moved, and this can move the `@` alone); the launch worktree is materialized
+    /// unconditionally by the export tail. A conflicting move enters the shared
+    /// deferred-conflict flow. Kept MCP-shaped for a future `move_hunk` tool.
+    pub fn carve_hunk_to_working_copy(
+        &mut self,
+        target: WcTarget,
+        source: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "carve a hunk to the working tree")?;
+        crate::repo::catch_jj("carving the hunk to the working copy", || {
+            // Snapshot before resolving so the leaf id survives squash_hunk_into_inner's
+            // own (now no-op) snapshot — otherwise a churned leaf id would go stale.
+            self.snapshot_wc(&target)?;
+            let dest = self
+                .resolve_wc(&target, None)
+                .context("no working copy to carve the hunk into")?;
+            let source_commit = self
+                .repo
+                .store()
+                .get_commit(source)
+                .context("loading the commit to carve from")?;
+            let label = format!(
+                "Carve a hunk of {} to working copy",
+                op_subject(&source_commit)
+            );
+            let outcome = self.squash_hunk_into_inner(
+                source,
+                &dest,
+                path,
+                first_group,
+                last_group,
+                None,
+                Some(label),
+            )?;
+            // Write a sibling worktree's rebased `@` to its own disk; the launch
+            // path is already materialized by the export tail, so leave it untouched.
+            if matches!(outcome, SaveOutcome::Clean) && matches!(target, WcTarget::Worktree(_)) {
+                self.materialize_wc(&target)?;
+            }
+            Ok(outcome)
+        })
+    }
     #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,

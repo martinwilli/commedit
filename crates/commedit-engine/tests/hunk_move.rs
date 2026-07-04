@@ -9,6 +9,7 @@ mod common;
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
+use commedit_engine::workcopy::WcTarget;
 
 /// The commit id of the commit with subject `subject` on the current branch.
 fn id_of(repo: &Repo, subject: &str) -> jj_lib::backend::CommitId {
@@ -82,6 +83,54 @@ fn moves_the_second_hunk_from_a_commit_into_its_descendant() {
         "refs/heads/main"
     );
     assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn carves_a_hunk_from_a_commit_to_the_launch_working_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // base <- A on `main`, where A edits two well-separated regions of f.txt (two
+    // hunks); A is the tip and `@` sits on top of it.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n", "base"),
+            ("f.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n", "A"),
+        ],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+    let source = id_of(&repo, "A");
+
+    // Carve change-group 1 (the line-9 region) out of "A" onto the launch working
+    // copy.
+    let outcome = repo
+        .carve_hunk_to_working_copy(WcTarget::Launch, &source, "f.txt", 1, 1)
+        .expect("carve hunk");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // The committed tip lost the line-9 hunk (kept hunk 0, ONE)…
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:f.txt"]),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\n9"
+    );
+    // …and it is now an uncommitted change on disk instead.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n"
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M f.txt");
+    // git diff (worktree vs HEAD) shows exactly the carved hunk uncommitted.
+    let diff = common::git(dir, &["diff"]);
+    assert!(diff.contains("+NINE"), "diff adds NINE: {diff}");
+    assert!(
+        diff.lines().any(|l| l == "-9"),
+        "diff reverts line 9: {diff}"
+    );
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
     common::git(dir, &["fsck", "--no-progress"]);
 }
 

@@ -296,6 +296,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // Guards the dropdown↔scroll feedback loop: set while one side programmatically
     // drives the other so the reaction doesn't bounce back.
     let nav_sync: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // One-shot: set around the `refresh()` a content-only Save triggers, so the diff
+    // reload *splices* the new text into the buffer (keeping the SourceView's scroll
+    // anchor) instead of `set_text`-ing it. `set_text` resets the view's internal
+    // first-para mark to the top, and the adjustment is only a mirror of that mark —
+    // GTK re-derives the scroll value from it on the next validation, so poking the
+    // adjustment can't hold. Splicing leaves the mark untouched (see `apply_changes`).
+    let splice_reload: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // Per-file hunk context expansion, keyed by path. Reset when the selected
     // commit changes (see `load_changes`).
     let expansions: Rc<RefCell<HashMap<String, ContextExpansion>>> =
@@ -2231,7 +2238,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let editing = editing.clone();
         let expansions = expansions.clone();
         let render_diff_view = render_diff_view.clone();
+        let rerender_diff_spliced = rerender_diff_spliced.clone();
         let scroll_to_file = scroll_to_file.clone();
+        let splice_reload = splice_reload.clone();
         Rc::new(move |loaded: Vec<FileChange>| {
             // Set the pristine baseline before any render: `set_text` synchronously
             // fires `changed` -> `update_split_sensitivity`, which reads it.
@@ -2248,15 +2257,37 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 file_dropdown.set_model(Some(&StringList::new(&[])));
                 return;
             }
-            // Render the whole change once; the dropdown is now a jump aid.
-            render_diff_view();
+            // Render the whole change once; the dropdown is now a jump aid. A
+            // content Save reloads with `splice_reload` set: splice the new text in
+            // (keeping the scroll anchor) rather than `set_text` (which resets it to
+            // the top). The caller also holds `nav_sync`, so neither branch's
+            // dropdown change bounces back into a scroll.
+            let splice = splice_reload.get();
+            if splice {
+                rerender_diff_spliced();
+            } else {
+                render_diff_view();
+            }
             let labels: Vec<String> = changes.borrow().iter().map(change_label).collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let prev = file_dropdown.selected();
             file_dropdown.set_model(Some(&StringList::new(&refs)));
-            file_dropdown.set_selected(0);
-            // Land at the first file's top (and set current_file) even if
-            // set_selected(0) didn't fire a change notification.
-            scroll_to_file(0);
+            if splice {
+                // The splice kept the viewport where it was, so keep the dropdown on
+                // the same file instead of jumping to the first — and no scroll.
+                let n = refs.len() as u32;
+                let target = if prev == gtk::INVALID_LIST_POSITION || n == 0 {
+                    0
+                } else {
+                    prev.min(n - 1)
+                };
+                file_dropdown.set_selected(target);
+            } else {
+                file_dropdown.set_selected(0);
+                // Land at the first file's top (and set current_file) even if
+                // set_selected(0) didn't fire a change notification.
+                scroll_to_file(0);
+            }
         })
     };
 
@@ -3697,12 +3728,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let commits = commits.clone();
         let changes = changes.clone();
         let orig_changes = orig_changes.clone();
-        let current_file = current_file.clone();
         let message_buffer = message_buffer.clone();
         let file_buffer = file_buffer.clone();
         let file_view = file_view.clone();
-        let file_dropdown = file_dropdown.clone();
         let nav_sync = nav_sync.clone();
+        let splice_reload = splice_reload.clone();
         let selected_change = selected_change.clone();
         let refresh = refresh.clone();
         let show_status = show_status.clone();
@@ -3739,7 +3769,6 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     show_status("That working copy is no longer editable here");
                     return;
                 };
-                let saved_file = current_file.borrow().clone();
                 let saved_cursor = file_buffer.cursor_position();
                 // Flush any pending diff edits into the working copy first — both
                 // paths want the on-disk tree to match the shown diff, whether it's
@@ -3770,15 +3799,17 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let message = buffer_text(&message_buffer);
                 let message = message.trim();
                 if message.is_empty() {
-                    // No message: leave the changes uncommitted. `refresh` rebuilds the
-                    // `@` rows and re-selects this one (its change id is stable across
-                    // the in-place edit), reloading the diff; restore the user's place.
+                    // No message: leave the changes uncommitted. `refresh` rebuilds
+                    // the `@` rows and re-selects this one (its change id is stable
+                    // across the in-place edit), reloading the diff. `splice_reload`
+                    // + `nav_sync` keep it scrolled where it was and the dropdown on
+                    // the same file (see the commit-save path); restore the caret to
+                    // the user's spot.
+                    nav_sync.set(true);
+                    splice_reload.set(true);
                     refresh();
-                    if let Some(path) = saved_file {
-                        if let Some(idx) = changes.borrow().iter().position(|c| c.path == path) {
-                            file_dropdown.set_selected(idx as u32);
-                        }
-                    }
+                    splice_reload.set(false);
+                    nav_sync.set(false);
                     let offset = saved_cursor.min(file_buffer.char_count());
                     file_buffer.place_cursor(&file_buffer.iter_at_offset(offset));
                     return;
@@ -3877,19 +3908,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 return;
             };
 
-            // Remember where the user is so we can restore it after the reload.
-            // The reload re-renders the diff from scratch (context expansions
-            // cleared, edits applied), so the buffer's length and absolute line
-            // numbers change — restoring a saved line/offset overshoots the now
-            // shorter buffer and scrolls to the end. A *fraction* of the
-            // scrollable range survives the re-render; the (uniform, monospace,
-            // unwrapped) line height lets us recompute the post-render offset
-            // arithmetically rather than wait for GTK's deferred layout.
-            let scroll_frac = file_view.vadjustment().map(|v| {
-                let range = (v.upper() - v.page_size()).max(1.0);
-                (v.value() / range).clamp(0.0, 1.0)
-            });
-            let line_height = file_view.iter_location(&file_buffer.start_iter()).height() as f64;
+            // Remember focus so a Save from the diff keeps it. The scroll position
+            // needs no capture: the reload below splices the new diff into the buffer
+            // (`splice_reload`) instead of `set_text`-ing it, so the SourceView's
+            // scroll anchor stays put on its own.
             let file_had_focus = file_view.has_focus();
 
             // Message edit (if changed).
@@ -3969,39 +3991,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
             // Reload, keeping the diff visually where it was. `refresh` re-selects
             // the commit, cascading through `row-selected` -> `load_changes` ->
-            // `render_diff_view`, which `set_text`s the buffer (resetting the scroll
-            // to the top) and calls `scroll_to_file(0)`. We guard the whole reload
-            // with `nav_sync` so that scroll-to-top — and the scroll->dropdown sync —
-            // is suppressed and queues no competing deferred scroll, then re-pin the
-            // scroll ourselves to the fraction captured above.
+            // `apply_changes`. `splice_reload` makes that reload splice the new diff
+            // into the buffer (which keeps the SourceView's scroll anchor) instead of
+            // `set_text` (which would reset it to the top), and `nav_sync` suppresses
+            // the scroll->dropdown sync while it runs. So a save leaves the diff put.
             nav_sync.set(true);
+            splice_reload.set(true);
             refresh();
-            if let (Some(frac), Some(vadj)) = (scroll_frac, file_view.vadjustment()) {
-                let page = vadj.page_size();
-                if line_height > 0.0 && page > 0.0 {
-                    // `set_text` left the adjustment's range stale (layout validates
-                    // on a later frame). Recompute it arithmetically and set the
-                    // offset synchronously, before GTK paints, so the saved fraction
-                    // shows on the next frame instead of a jump-to-top flash; GTK's
-                    // own validation later sets the same values, leaving it put.
-                    let top = file_view.top_margin() as f64;
-                    let bottom = file_view.bottom_margin() as f64;
-                    let height = file_buffer.line_count() as f64 * line_height + top + bottom;
-                    let upper = height.max(page);
-                    let target = (frac * (upper - page)).clamp(0.0, (upper - page).max(0.0));
-                    vadj.set_upper(upper);
-                    vadj.set_value(target);
-                    // Sync the dropdown to the file now at the top of the viewport
-                    // (refresh reset it to the first file), and put the cursor on a
-                    // visible line so grab_focus / validation don't scroll it away.
-                    let top_line = ((target - top) / line_height).max(0.0) as usize;
-                    if let Some(iter) = file_buffer.iter_at_line(top_line as i32) {
-                        file_buffer.place_cursor(&iter);
-                    }
-                    file_dropdown
-                        .set_selected(diff_file_index_at_line(&file_buffer, top_line) as u32);
-                }
-            }
+            splice_reload.set(false);
             nav_sync.set(false);
             if file_had_focus {
                 file_view.grab_focus();

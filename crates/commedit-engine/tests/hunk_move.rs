@@ -134,3 +134,68 @@ fn carves_a_hunk_from_a_commit_to_the_launch_working_copy() {
     common::git(dir, &["fsck", "--no-progress"]);
 }
 
+#[test]
+fn moves_a_working_copy_hunk_into_a_history_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // base <- A <- B on `main`. base commits f.txt; A and B add unrelated files, so
+    // A ("g.txt") is a mid-history commit we can fold a working-copy hunk into while
+    // B rides the rebase on top.
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n", "base"),
+            ("g.txt", "g\n", "A"),
+            ("h.txt", "h\n", "B"),
+        ],
+    );
+    // Two well-separated uncommitted hunks in f.txt: line 1 (1→ONE, group 0) and
+    // line 9 (9→NINE, group 1).
+    std::fs::write(dir.join("f.txt"), "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n").unwrap();
+    let disk_before = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+
+    let mut repo = Repo::open(dir).expect("open");
+    let dest = id_of(&repo, "A");
+
+    // Fold only the line-9 hunk (change-group 1) into "A"; leave line 1 uncommitted.
+    let outcome = repo
+        .squash_working_copy_hunk_into("f.txt", 1, 1, &dest, None)
+        .expect("move working-copy hunk");
+    assert!(matches!(outcome, SaveOutcome::Clean));
+
+    // Topology unchanged; "A" keeps its own message (Fixup default).
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
+
+    // (a) "A" gained the line-9 hunk (NINE) and did NOT get the still-uncommitted
+    // line-1 hunk (line 1 stays "1").
+    assert_eq!(
+        common::git(dir, &["show", "HEAD~1:f.txt"]),
+        "1\n2\n3\n4\n5\n6\n7\n8\nNINE"
+    );
+
+    // (d) the on-disk file is byte-identical before and after the move.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        disk_before
+    );
+
+    // (b) the OTHER hunk (line 1) is still uncommitted, and (c) the moved hunk
+    // (NINE) is no longer uncommitted — the worktree-vs-HEAD diff shows only line 1.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M f.txt");
+    let diff = common::git(dir, &["diff"]);
+    assert!(diff.contains("+ONE"), "diff still adds ONE: {diff}");
+    assert!(
+        diff.lines().any(|l| l == "-1"),
+        "diff reverts line 1: {diff}"
+    );
+    assert!(
+        !diff.contains("NINE"),
+        "the NINE hunk moved out of the working copy: {diff}"
+    );
+
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    common::git(dir, &["fsck", "--no-progress"]);
+}

@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
@@ -526,6 +527,36 @@ impl Repo {
         })
     }
 
+    /// Move a single working-copy diff hunk into the history commit `dest`, leaving
+    /// the rest of the uncommitted changes on disk — the working-copy → commit
+    /// direction of [`Self::squash_hunk_into`], and the hunk-granular partial of
+    /// [`Self::squash_working_copy_partial_into`]. The hunk is addressed by the
+    /// `(path, first_group, last_group)` change-group range of `path`'s `@`-vs-HEAD
+    /// diff, stable across context expansion where a rendered hunk index is not.
+    ///
+    /// Only the selected subset moves from uncommitted to committed-in-`dest`; the
+    /// on-disk file stays byte-identical and the remainder stays uncommitted (the
+    /// throwaway-`C` + full-tree-remainder dance shared with
+    /// [`Self::squash_working_copy_partial_into`]). `message`, when `Some`, becomes
+    /// `dest`'s new message; else `dest`'s is kept (Fixup). Launch worktree only.
+    pub fn squash_working_copy_hunk_into(
+        &mut self,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        self.require_worktree("fold a working-copy hunk into a commit")?;
+        crate::repo::catch_jj("folding a working-copy hunk", || {
+            // Build the selected subset's tree from the change-group range (against
+            // HEAD, like commit_working_copy_partial), then share the transaction
+            // tail with the PartialSelection-based partial squash.
+            let prepared = self.prepare_partial_commit_hunk(path, first_group, last_group)?;
+            self.squash_prepared_working_copy_into(prepared, dest, message)
+        })
+    }
+
     fn squash_working_copy_partial_into_inner(
         &mut self,
         sel: PartialSelection<'_>,
@@ -534,7 +565,26 @@ impl Repo {
     ) -> Result<SaveOutcome> {
         // Snapshot + build the selected subset's tree (`t_commit`) and the full
         // on-disk tree, against HEAD — shared with commit_working_copy_partial.
-        let (head, head_tree, full_tree, t_commit) = self.prepare_partial_commit(&sel)?;
+        let prepared = self.prepare_partial_commit(&sel)?;
+        self.squash_prepared_working_copy_into(prepared, dest, message)
+    }
+
+    /// The shared transaction tail of the partial working-copy squashes: given the
+    /// `(head, head_tree, full_tree, t_commit)` a `prepare_partial_commit*` built,
+    /// stage `t_commit` as a throwaway commit `C` on HEAD, rebuild the leaf `@` to
+    /// hold the full on-disk tree on top of it (so disk stays byte-identical and the
+    /// unselected delta stays uncommitted), then fold `C` into `dest` and rebase
+    /// descendants (including `@`). `message`, when `Some`, replaces `dest`'s
+    /// message; else `dest`'s is kept (Fixup). Shared by
+    /// [`Self::squash_working_copy_partial_into`] and
+    /// [`Self::squash_working_copy_hunk_into`].
+    fn squash_prepared_working_copy_into(
+        &mut self,
+        prepared: (CommitId, MergedTree, MergedTree, MergedTree),
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        let (head, head_tree, full_tree, t_commit) = prepared;
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
@@ -780,6 +830,7 @@ impl Repo {
             heads,
         )
     }
+
     /// Carve a single diff hunk out of the history commit `source` and land it as
     /// an uncommitted change on `target`'s working copy — the inverse direction of
     /// [`Self::squash_hunk_into`] (commit → working copy rather than commit →
@@ -837,6 +888,7 @@ impl Repo {
             Ok(outcome)
         })
     }
+
     #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,

@@ -1130,6 +1130,69 @@ impl Repo {
         &mut self,
         sel: &PartialSelection<'_>,
     ) -> Result<(CommitId, MergedTree, MergedTree, MergedTree)> {
+        let (head, head_tree, full_tree, store) = self.partial_commit_base()?;
+
+        // Build the selected tree on top of HEAD from the selection.
+        let t_commit = self.splice_selection_onto(&head_tree, &full_tree, &store, sel)?;
+
+        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
+        // unmodified path, an empty hunk set, or a patch that changes nothing.
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+        Ok((head, head_tree, full_tree, t_commit))
+    }
+
+    /// Like [`Self::prepare_partial_commit`] but selecting a single file's content
+    /// by change-group *range* rather than a [`PartialSelection`]: reconstruct
+    /// `path` keeping only the change groups in `first_group..=last_group` of its
+    /// `@`-vs-HEAD diff (reverting the rest to HEAD) and splice that onto HEAD.
+    /// Backs [`Self::squash_working_copy_hunk_into`]; the range keys on
+    /// [`crate::diff::change_groups`], stable across context expansion where a
+    /// rendered hunk index is not. Same bail conditions as
+    /// [`Self::prepare_partial_commit`], plus an out-of-range group.
+    pub(crate) fn prepare_partial_commit_hunk(
+        &mut self,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+    ) -> Result<(CommitId, MergedTree, MergedTree, MergedTree)> {
+        if first_group > last_group {
+            bail!(
+                "invalid change-group range: first_group {first_group} > last_group {last_group}"
+            );
+        }
+        let (head, head_tree, full_tree, store) = self.partial_commit_base()?;
+
+        // Reconstruct `path` from its HEAD-side (`old`) and disk-side (`new`) text,
+        // keeping only the selected change groups. Bound the range against the group
+        // count (stable across expansion) so a stale range fails clearly.
+        let (old_f, new_f) = self.partial_file_text(&head_tree, &full_tree, &store, path)?;
+        let group_count =
+            render_diff(&old_f, &new_f, path, &ContextExpansion::default()).group_count;
+        if last_group >= group_count {
+            bail!("change-group {last_group} out of range for '{path}' ({group_count} group(s))");
+        }
+        let kept: BTreeSet<usize> = (first_group..=last_group).collect();
+        let selected = select_groups(&old_f, &new_f, &kept);
+        let t_commit = crate::tree::splice_files_into_tree(
+            head_tree.clone(),
+            &store,
+            &[(path.to_string(), selected)],
+        )?;
+
+        if t_commit.tree_ids() == head_tree.tree_ids() {
+            bail!("the selection commits nothing (it matches the branch head)");
+        }
+        Ok((head, head_tree, full_tree, t_commit))
+    }
+
+    /// The snapshot + tree prologue shared by the partial-commit paths: fold the
+    /// on-disk changes into the leaf `@`, refuse when the tree is clean / HEAD is
+    /// detached or unborn / there is no working copy, and return the branch `head`
+    /// id, HEAD's tree, the leaf `@`'s full on-disk tree, and the store. Each caller
+    /// splices its own selected `t_commit` onto `head_tree` and rejects an empty one.
+    fn partial_commit_base(&mut self) -> Result<(CommitId, MergedTree, MergedTree, Arc<Store>)> {
         // Fold the on-disk changes into the leaf @ first, then refuse if the tree
         // turned out clean (nothing to select).
         self.snapshot_working_copy()?;
@@ -1154,16 +1217,7 @@ impl Repo {
             .get_commit(&head)
             .context("loading the branch head")?
             .tree();
-
-        // Build the selected tree on top of HEAD from the selection.
-        let t_commit = self.splice_selection_onto(&head_tree, &full_tree, &store, sel)?;
-
-        // Bail if the selection reproduces HEAD's tree exactly: a listed-but-
-        // unmodified path, an empty hunk set, or a patch that changes nothing.
-        if t_commit.tree_ids() == head_tree.tree_ids() {
-            bail!("the selection commits nothing (it matches the branch head)");
-        }
-        Ok((head, head_tree, full_tree, t_commit))
+        Ok((head, head_tree, full_tree, store))
     }
 
     /// Splice a [`PartialSelection`] onto `head_tree`, pulling the selected

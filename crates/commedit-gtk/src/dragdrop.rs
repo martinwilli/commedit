@@ -278,6 +278,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     }),
                     // A working-copy entry only folds *onto* a commit — never between.
                     DragOrigin::WorkingCopy => false,
+                    // A hunk likewise only folds onto a row, never into a gap.
+                    DragOrigin::Hunk => false,
                 })
             };
             if !real_move {
@@ -373,6 +375,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 .is_some()
                         })
                     }
+                    // A dragged hunk's target validity is computed in commit 4.
+                    DragOrigin::Hunk => false,
                 })
             });
             if valid {
@@ -1501,6 +1505,8 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     // can't be reordered, so there is nothing to do.
                     false
                 }
+                // The hunk-relocate drop is wired in commit 4.
+                DragOrigin::Hunk => false,
             }
         }
     });
@@ -1880,7 +1886,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
 /// rows are alive for all of them. (Scheduling from `drag-end` rather than the
 /// drop handler matters too: an idle queued mid-gesture can fire between motion
 /// events, i.e. before the drag is over.)
-fn run_post_drag(post_drag: &PostDrag) {
+pub(crate) fn run_post_drag(post_drag: &PostDrag) {
     if let Some(action) = post_drag.borrow_mut().take() {
         glib::idle_add_local_once(action);
     }

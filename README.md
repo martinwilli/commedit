@@ -79,6 +79,16 @@ an interactive-rebase session.
   highlighted in purple — a content-derived "this is where it belongs", stronger
   than the subject match.
 
+- **Relocate a single hunk** — grab a hunk by its `@@` header line in the diff
+  (the line lights up and shows a grab cursor) and drop it onto any commit row, or
+  onto the working-copy `@` row, to move just that hunk there — the "this diff
+  belongs in a different commit" fixup at hunk granularity. Source and destination
+  may each be a commit or the working copy: commit → commit folds it in, commit →
+  `@` carves it back out as an uncommitted change, `@` → commit folds an
+  uncommitted hunk into history. The rest of the diff stays put and descendants
+  rebase. (Grabbing off a `@@` line is ordinary text selection, so the handle
+  never gets in the way.)
+
 - **Edit several branches as one DAG** — the header branch dropdown is a *set* of
   editable branches, not just a view filter. It starts at the branch you opened;
   tick another and it folds into one unified history graph as a real, rewritable

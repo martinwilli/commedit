@@ -82,9 +82,6 @@ pub(crate) enum DragOrigin {
 /// engine moves the same groups the view showed even after a context expand. Held
 /// in [`DragState::drag_hunk`] for the gesture; the GTK payload is only an `i32`
 /// sentinel (mirroring the WC/trash in-process drags).
-// The fields are stashed by the drag source (`main.rs`) and read back by the drop
-// handler, which lands in the next commit — hence dead until then.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct HunkDrag {
     pub(crate) source: HunkSource,
@@ -95,7 +92,6 @@ pub(crate) struct HunkDrag {
 
 /// Where a dragged hunk came from: an existing commit (by stable change id) or a
 /// worktree's uncommitted `@` (by branch short-name + change id).
-#[allow(dead_code)] // read back by the drop handler (next commit)
 #[derive(Clone)]
 pub(crate) enum HunkSource {
     /// A commit's parent-vs-commit diff; the string is the commit's change id hex.
@@ -412,7 +408,6 @@ pub(crate) struct DragState {
     /// The hunk currently being dragged from the diff view (`DragOrigin::Hunk`),
     /// or `None` between hunk drags. Carried here rather than in the payload, which
     /// is only an `i32` sentinel.
-    #[allow(dead_code)] // read by the hunk drop handler (next commit)
     pub(crate) drag_hunk: Rc<RefCell<Option<HunkDrag>>>,
     pub(crate) post_drag: PostDrag,
 }

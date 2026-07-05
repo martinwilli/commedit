@@ -15,6 +15,7 @@ use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::history::{CommitInfo, ReorderMove, ReorderSetMove};
 use commedit_engine::repo::Repo;
 use commedit_engine::squash::{parse_squash_mode, SquashMode};
+use commedit_engine::workcopy::WcTarget;
 use commedit_engine::CommitId;
 use gtk::prelude::*;
 use gtk::{
@@ -26,8 +27,8 @@ use crate::dnd::{DraggedCommit, DraggedCommits};
 use crate::lanebranch::{BranchTip, LaneBranches};
 use crate::rows::{lane_color, populate_trash};
 use crate::state::{
-    row_commit_gap, row_commit_index, Callbacks, Data, DisplayRow, DragOrigin, DragState,
-    PendingTrashOp, PostDrag, Widgets,
+    row_commit_gap, row_commit_index, Callbacks, Data, DisplayRow, DragOrigin, DragState, HunkDrag,
+    HunkSource, PendingTrashOp, PostDrag, Widgets,
 };
 
 /// Build the lane→branch map for the currently displayed `commits` from the
@@ -79,6 +80,57 @@ fn line_commits(mv: &ReorderMove) -> &[CommitId] {
     }
 }
 
+/// The `CommitInfo` of the worktree `@` matching `branch` short-name and `change`
+/// id (hex) in the display list — the source of a working-copy hunk drag, for its
+/// reachability check. `None` once that `@` is no longer shown.
+fn wc_entry_info<'a>(
+    display: &'a [DisplayRow],
+    branch: &str,
+    change: &str,
+) -> Option<&'a CommitInfo> {
+    display.iter().find_map(|r| match r {
+        DisplayRow::Wc { branch: b, entry }
+            if b.as_str() == branch && entry.info.change_id_hex() == change =>
+        {
+            Some(&entry.info)
+        }
+        _ => None,
+    })
+}
+
+/// Whether dropping the dragged hunk onto display row `di` would relocate it — the
+/// squash-target validity for a `DragOrigin::Hunk` drag. A commit destination (`di`
+/// maps to a commit) takes a commit source whose change id differs and stays
+/// reachable (`plan_squash_multi`), or a working-copy source reachable like the
+/// whole-`@` fold (`plan_squash_restore`). An `@` destination takes only a commit
+/// source (commit → working-copy carve); a working-copy source onto any `@` is a
+/// no-op. A missing hunk (no live drag) is never valid.
+fn hunk_target_ok(
+    repo: &Repo,
+    commits: &[CommitInfo],
+    display: &[DisplayRow],
+    di: usize,
+    hunk: Option<&HunkDrag>,
+) -> bool {
+    let Some(hunk) = hunk else {
+        return false;
+    };
+    match row_commit_index(display, di) {
+        Some(dest_ci) => match &hunk.source {
+            HunkSource::Commit(change) => commits
+                .iter()
+                .position(|c| c.change_id_hex() == *change)
+                .is_some_and(|src_ci| {
+                    src_ci != dest_ci && repo.plan_squash_multi(commits, src_ci, dest_ci).is_some()
+                }),
+            HunkSource::WorkingCopy { branch, change } => wc_entry_info(display, branch, change)
+                .is_some_and(|info| repo.plan_squash_restore(commits, info, dest_ci).is_some()),
+        },
+        // An `@` destination: only a commit → working-copy carve.
+        None => matches!(hunk.source, HunkSource::Commit(_)),
+    }
+}
+
 /// Install the drag-and-drop controllers on the history, trash and working-copy
 /// lists. See the module docs.
 pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
@@ -113,6 +165,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     let drag_set = drag.drag_set.clone();
     let drop_gap = drag.drop_gap.clone();
     let drop_onto = drag.drop_onto.clone();
+    let drag_hunk = drag.drag_hunk.clone();
     let post_drag = drag.post_drag.clone();
     let refresh = cb.refresh.clone();
     let show_status = cb.show_status.clone();
@@ -320,6 +373,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let drag_from = drag_from.clone();
         let drag_set = drag_set.clone();
         let drag_origin = drag_origin.clone();
+        let drag_hunk = drag_hunk.clone();
         let drop_onto = drop_onto.clone();
         let trashed = trashed.clone();
         // `di` is a *display* row index (the hovered row); `drop_onto` stores it.
@@ -332,20 +386,32 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     r.remove_css_class("squash-drop-target");
                 }
             }
-            // The target must be a real commit (a working-copy `@` row is never a
-            // squash target); map the hovered display row to its commit index.
-            let target_ci = row_commit_index(&display.borrow(), di);
-            // A history drag squashes one commit onto another; a trash drag squashes
-            // the trashed commit onto the commit at `di`; a working-copy drag folds
-            // that uncommitted `@` into it (a fixup).
-            let valid = target_ci.is_some_and(|ci| {
-                drag_from.get().is_some_and(|from| match drag_origin.get() {
+            // A hunk drag may relocate onto an `@` row too (carve into the working
+            // copy), so it validates on its own; every other drag only ever targets a
+            // real commit. Computed flatly (a labeled block) to keep the nesting
+            // shallow: a history drag squashes one commit (or the whole selection)
+            // onto the target, a trash drag the trashed commit, a working-copy drag
+            // that uncommitted `@` (a fixup) — all across the editable DAG (`_multi`).
+            let valid = 'valid: {
+                if drag_origin.get() == DragOrigin::Hunk {
+                    break 'valid hunk_target_ok(
+                        &repo.borrow(),
+                        &commits.borrow(),
+                        &display.borrow(),
+                        di,
+                        drag_hunk.borrow().as_ref(),
+                    );
+                }
+                let (Some(from), Some(ci)) =
+                    (drag_from.get(), row_commit_index(&display.borrow(), di))
+                else {
+                    break 'valid false;
+                };
+                match drag_origin.get() {
                     DragOrigin::History => {
                         let set = drag_set.borrow();
                         let commits = commits.borrow();
                         let display = display.borrow();
-                        // Validate across the whole editable DAG (`_multi`), so a
-                        // squash onto another branch's commit lights up too.
                         if set.len() > 1 {
                             // Every selected commit must fold onto the target, and the
                             // target must not be one of them (compared in display space).
@@ -375,10 +441,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                                 .is_some()
                         })
                     }
-                    // A dragged hunk's target validity is computed in commit 4.
+                    // Handled at the top of the block.
                     DragOrigin::Hunk => false,
-                })
-            });
+                }
+            };
             if valid {
                 if let Some(r) = list.row_at_index(di as i32) {
                     r.add_css_class("squash-drop-target");
@@ -425,14 +491,18 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 show_gap(y);
                 return;
             }
-            // A working-copy entry can only be folded *onto* a commit (fixup), so
-            // the whole row is a squash target and no reorder gap ever opens.
-            let wc_drag = drag_origin.get() == DragOrigin::WorkingCopy;
+            // A working-copy entry folds *onto* a commit (fixup) and a dragged hunk
+            // relocates *onto* a commit or `@` row, so for both the whole row is a
+            // drop target and no reorder gap ever opens.
+            let onto_only = matches!(
+                drag_origin.get(),
+                DragOrigin::WorkingCopy | DragOrigin::Hunk
+            );
             let Some(row) = list.row_at_y(y as i32) else {
                 // Above the first / below the last row: a pure reorder gap (none
-                // for a working-copy drag).
+                // for an onto-only drag).
                 clear_squash_target();
-                if wc_drag {
+                if onto_only {
                     clear_gap();
                 } else {
                     show_gap(y);
@@ -444,9 +514,9 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             if drop_gap.get() == Some(li) {
                 return;
             }
-            if wc_drag {
-                // No placeholder is ever inserted for a working-copy drag, so the
-                // list index is the commit index.
+            if onto_only {
+                // No placeholder is ever inserted for an onto-only drag, so the
+                // list index is the display index.
                 clear_gap();
                 set_squash_target(li);
                 return;
@@ -739,6 +809,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let foreign_drag = foreign_drag.clone();
         let foreign_sha = foreign_sha.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
+        let drag_hunk = drag_hunk.clone();
         move |_target, value, _x, y| {
             // History drags (including from another commedit window) arrive as a
             // text payload; trash and working-copy drags as an i32 row index.
@@ -1505,7 +1576,145 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                     // can't be reordered, so there is nothing to do.
                     false
                 }
-                // The hunk-relocate drop is wired in commit 4.
+                DragOrigin::Hunk if onto.is_some() => {
+                    // A hunk grabbed by its `@@` line, dropped onto a commit row or an
+                    // `@` row. Resolve the destination and dispatch by direction:
+                    // commit→commit squash, commit→`@` carve, `@`→commit fold. The
+                    // hunk (source, path, change-group range) rides in `drag_hunk`.
+                    let onto = onto.unwrap();
+                    let repo = repo.clone();
+                    let commits = commits.clone();
+                    let display = display.clone();
+                    let refresh = refresh.clone();
+                    let show_status = show_status.clone();
+                    let enter_conflict_mode = enter_conflict_mode.clone();
+                    let selected_change = selected_change.clone();
+                    let drag_hunk = drag_hunk.clone();
+                    *post_drag.borrow_mut() = Some(Box::new(move || {
+                        let Some(hunk) = drag_hunk.borrow().clone() else {
+                            return;
+                        };
+                        let HunkDrag {
+                            source,
+                            path,
+                            first_group,
+                            last_group,
+                        } = hunk;
+                        // The dropped-on row: a commit (its stable change id kept for
+                        // re-selection) or a worktree `@` (its branch short-name).
+                        enum Dest {
+                            Commit(CommitId, String),
+                            Wc(String),
+                        }
+                        let dest = {
+                            let c = commits.borrow();
+                            let disp = display.borrow();
+                            match row_commit_index(&disp, onto) {
+                                Some(ci) => match c.get(ci) {
+                                    Some(info) => {
+                                        Dest::Commit(info.id.clone(), info.change_id_hex())
+                                    }
+                                    None => return,
+                                },
+                                None => match disp.get(onto) {
+                                    Some(DisplayRow::Wc { branch, .. }) => Dest::Wc(branch.clone()),
+                                    _ => return,
+                                },
+                            }
+                        };
+                        // Resolve a commit source's change id to its (churning) commit
+                        // id fresh from the current list.
+                        let src_commit = |change: &str| -> Option<CommitId> {
+                            commits
+                                .borrow()
+                                .iter()
+                                .find(|c| c.change_id_hex() == change)
+                                .map(|c| c.id.clone())
+                        };
+                        let outcome = match (&source, &dest) {
+                            (HunkSource::Commit(src_change), Dest::Commit(dst_id, _)) => {
+                                let Some(src_id) = src_commit(src_change) else {
+                                    return;
+                                };
+                                if src_id == *dst_id {
+                                    return; // squashing a commit into itself
+                                }
+                                repo.borrow_mut().squash_hunk_into(
+                                    &src_id,
+                                    dst_id,
+                                    &path,
+                                    first_group,
+                                    last_group,
+                                    None,
+                                )
+                            }
+                            (HunkSource::Commit(src_change), Dest::Wc(branch)) => {
+                                let Some(src_id) = src_commit(src_change) else {
+                                    return;
+                                };
+                                let Some(target) = repo.borrow().wc_target_for_branch(branch)
+                                else {
+                                    show_status("That working copy has no worktree to carve into");
+                                    return;
+                                };
+                                repo.borrow_mut().carve_hunk_to_working_copy(
+                                    target,
+                                    &src_id,
+                                    &path,
+                                    first_group,
+                                    last_group,
+                                )
+                            }
+                            (HunkSource::WorkingCopy { branch, .. }, Dest::Commit(dst_id, _)) => {
+                                // The engine's working-copy hunk fold runs on the launch
+                                // `@` only; a sibling worktree's `@` as a source isn't
+                                // supported yet, so say so rather than fold the wrong `@`.
+                                let launch = matches!(
+                                    repo.borrow().wc_target_for_branch(branch),
+                                    Some(WcTarget::Launch)
+                                );
+                                if !launch {
+                                    show_status(
+                                        "Moving a hunk from a sibling worktree into a commit \
+                                         isn't supported yet",
+                                    );
+                                    return;
+                                }
+                                repo.borrow_mut().squash_working_copy_hunk_into(
+                                    &path,
+                                    first_group,
+                                    last_group,
+                                    dst_id,
+                                    None,
+                                )
+                            }
+                            // Working copy → working copy: nothing to move.
+                            (HunkSource::WorkingCopy { .. }, Dest::Wc(_)) => return,
+                        };
+                        // On a clean move re-select the surviving source commit (its
+                        // change id is stable across the rewrite); a working-copy source
+                        // has no commit id of its own, so fall back to the destination.
+                        let select = match (&source, &dest) {
+                            (HunkSource::Commit(src_change), _) => Some(src_change.clone()),
+                            (HunkSource::WorkingCopy { .. }, Dest::Commit(_, dst_change)) => {
+                                Some(dst_change.clone())
+                            }
+                            _ => None,
+                        };
+                        match outcome {
+                            Ok(SaveOutcome::Clean) => {
+                                if let Some(change) = select {
+                                    *selected_change.borrow_mut() = Some(change);
+                                }
+                                refresh();
+                            }
+                            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+                            Err(err) => show_status(&format!("Moving the hunk failed: {err}")),
+                        }
+                    }));
+                    true
+                }
+                // Dropped off any valid target row: nothing to do.
                 DragOrigin::Hunk => false,
             }
         }

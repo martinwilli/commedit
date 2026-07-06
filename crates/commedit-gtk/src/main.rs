@@ -658,7 +658,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 Some(data) => {
                     let text = buffer_text(&file_buffer);
                     let nums = linenums::diff_line_numbers(&text);
-                    blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data)
+                    let mut cells =
+                        blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data);
+                    blame_col::annotate_absorb_headers(&mut cells, &text);
+                    cells
                 }
                 None => Vec::new(),
             };

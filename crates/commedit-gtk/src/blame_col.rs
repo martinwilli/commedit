@@ -54,6 +54,9 @@ pub(crate) struct BlameCell {
     pub change_id_hex: String,
     /// Author / date / subject, shown as the cell's tooltip.
     pub tooltip: String,
+    /// Whether this cell is a hunk's *absorb target* (drawn purple + italic on
+    /// the `@@` header line) rather than a factual per-line origin (dim gray).
+    pub absorb: bool,
 }
 
 impl BlameCell {
@@ -67,6 +70,17 @@ impl BlameCell {
                 "{}\n{} · {}",
                 info.subject, info.author_name, info.author_time
             ),
+            absorb: false,
+        }
+    }
+
+    /// Clone this origin cell as a hunk's absorb target, so the `@@` header line
+    /// draws it purple + italic (the natural squash destination) rather than as a
+    /// factual dim per-line origin.
+    fn as_absorb(&self) -> Self {
+        Self {
+            absorb: true,
+            ..self.clone()
         }
     }
 }
@@ -84,6 +98,12 @@ fn hover_color() -> gdk::RGBA {
 /// 0.38)`, `main.rs`), so the hash reads as "drop here".
 fn drop_color() -> gdk::RGBA {
     gdk::RGBA::new(0.878, 0.106, 0.141, 0.38)
+}
+/// The `squash-blame` purple used for a hunk's absorb target on the `@@` header
+/// line (`rgba(145, 65, 172, …)`, matching the drag-highlight), so the suggested
+/// squash destination reads distinctly from the factual dim per-line origins.
+fn absorb_color() -> gdk::RGBA {
+    gdk::RGBA::new(0.569, 0.255, 0.675, 1.0)
 }
 
 mod imp {
@@ -181,9 +201,12 @@ mod imp {
             let hovered = self.hover.get() == line as i32;
             let is_drop = self.drop_line.get() == line as i32;
             // Draw the text darker when hovered or targeted by a drop, so it stays
-            // legible against the red drop fill.
+            // legible against the red drop fill; an absorb target reads purple at
+            // rest but yields that to the hover/drop interaction color.
             let color = if hovered || is_drop {
                 hover_color()
+            } else if cell.absorb {
+                absorb_color()
             } else {
                 dim_color()
             };
@@ -198,13 +221,19 @@ mod imp {
                 snapshot.append_color(&drop_color(), &rect);
                 snapshot.pop();
             }
-            // Hovered cells read as clickable: underline the hash (a hyperlink
-            // affordance, paired with the pointer cursor from `setup_hover`).
-            if hovered {
+            // Hovered cells read as clickable (underline, a hyperlink affordance
+            // paired with the pointer cursor from `setup_hover`); an absorb target
+            // reads as a suggestion (italic). Both share one `AttrList`.
+            if hovered || cell.absorb {
                 let attrs = gtk::pango::AttrList::new();
-                attrs.insert(gtk::pango::AttrInt::new_underline(
-                    gtk::pango::Underline::Single,
-                ));
+                if hovered {
+                    attrs.insert(gtk::pango::AttrInt::new_underline(
+                        gtk::pango::Underline::Single,
+                    ));
+                }
+                if cell.absorb {
+                    attrs.insert(gtk::pango::AttrInt::new_style(gtk::pango::Style::Italic));
+                }
                 layout.set_attributes(Some(&attrs));
             }
             snapshot.save();
@@ -424,6 +453,55 @@ fn diff_old_refs(
     out
 }
 
+/// The absorb target of the hunk headed by `text`'s `@@` line at `header_line`:
+/// the origin all its removed (`-`) lines unanimously blame to, if any. Scans
+/// from `header_line + 1` to the next `@@`/`diff --git` header; over lines that
+/// start with `-` (a removed line, *not* the `---` file header) it reads the
+/// blame `cells[j]`. If there is at least one such line, every one has a cell,
+/// and they all share one `change_id_hex`, that origin is the target (returned
+/// via [`BlameCell::as_absorb`]); a pure-insertion hunk (no `-` lines) or split
+/// origins yield `None`. Context / `+` lines don't affect the decision.
+pub(crate) fn absorb_origin_for_header(
+    cells: &[Option<BlameCell>],
+    text: &str,
+    header_line: usize,
+) -> Option<BlameCell> {
+    let mut origin: Option<&BlameCell> = None;
+    for (j, line) in text.split('\n').enumerate().skip(header_line + 1) {
+        if line.starts_with("@@") || line.starts_with("diff --git ") {
+            break;
+        }
+        // A removed line — but `---` is the old-file header, not a `-` line.
+        if line.starts_with('-') && !line.starts_with("---") {
+            let cell = cells.get(j)?.as_ref()?;
+            match origin {
+                None => origin = Some(cell),
+                Some(prev) if prev.change_id_hex != cell.change_id_hex => return None,
+                Some(_) => {}
+            }
+        }
+    }
+    origin.map(BlameCell::as_absorb)
+}
+
+/// Annotate each `@@` header line of `text` with its hunk's absorb target (via
+/// [`absorb_origin_for_header`]), overwriting that line's `cells` slot. All the
+/// header results are computed first, then assigned, so no immutable borrow of
+/// `cells` is held while it is mutated.
+pub(crate) fn annotate_absorb_headers(cells: &mut [Option<BlameCell>], text: &str) {
+    let annotations: Vec<(usize, Option<BlameCell>)> = text
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("@@"))
+        .map(|(i, _)| (i, absorb_origin_for_header(cells, text, i)))
+        .collect();
+    for (i, cell) in annotations {
+        if let Some(slot) = cells.get_mut(i) {
+            *slot = cell;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +562,82 @@ diff --git a/x b/x
         // Empty blame map -> no cells resolve.
         let cells = blame_cells(text, &files, &nums, &HashMap::new());
         assert_eq!(cells, vec![None, None, None]);
+    }
+
+    /// An origin cell for a given `change_id` hex (short = the first 8 chars).
+    fn origin(hex: &str) -> BlameCell {
+        BlameCell {
+            short: hex.chars().take(8).collect(),
+            change_id_hex: hex.to_string(),
+            tooltip: String::new(),
+            absorb: false,
+        }
+    }
+
+    #[test]
+    fn absorb_header_takes_unanimous_removed_origin() {
+        // Both `-` lines blame to the same origin: the `@@` line is annotated with
+        // that origin, marked absorb; context / `+` lines are ignored.
+        let text = "\
+diff --git a/x b/x
+@@ -1,2 +1,2 @@
+ keep
+-was
+-old
++now";
+        let mut cells = vec![
+            None,               // diff --git
+            None,               // @@
+            Some(origin("ff")), // " keep" (context, ignored)
+            Some(origin("aa")), // "-was"
+            Some(origin("aa")), // "-old"
+            None,               // "+now"
+        ];
+        annotate_absorb_headers(&mut cells, text);
+        assert_eq!(
+            cells[1],
+            Some(BlameCell {
+                short: "aa".to_string(),
+                change_id_hex: "aa".to_string(),
+                tooltip: String::new(),
+                absorb: true,
+            })
+        );
+    }
+
+    #[test]
+    fn absorb_header_none_on_split_removed_origins() {
+        // The `-` lines blame to different origins: no confident target.
+        let text = "\
+diff --git a/x b/x
+@@ -1,2 +1,2 @@
+-was
+-old
++now";
+        let cells = vec![
+            None,               // diff --git
+            None,               // @@
+            Some(origin("aa")), // "-was"
+            Some(origin("bb")), // "-old"
+            None,               // "+now"
+        ];
+        assert_eq!(absorb_origin_for_header(&cells, text, 1), None);
+    }
+
+    #[test]
+    fn absorb_header_none_on_pure_insertion() {
+        // A hunk with no `-` lines (only additions) has no absorb target.
+        let text = "\
+diff --git a/x b/x
+@@ -0,0 +1,2 @@
++new1
++new2";
+        let cells = vec![
+            None, // diff --git
+            None, // @@
+            None, // "+new1"
+            None, // "+new2"
+        ];
+        assert_eq!(absorb_origin_for_header(&cells, text, 1), None);
     }
 }

@@ -89,7 +89,10 @@ an interactive-rebase session.
   onto the working-copy `@` row, to move just that hunk there — the "this diff
   belongs in a different commit" fixup at hunk granularity. You can also drop it
   onto a hash in the blame column to send it straight into that origin commit,
-  without hunting for the row in the history list. Source and destination
+  without hunting for the row in the history list. Grabbing a hunk pre-highlights
+  the commit it would naturally absorb into (the one all its removed lines blame
+  to) in purple, so you can see where it belongs before you drop — and the `@@`
+  line annotates that same target in the blame gutter. Source and destination
   may each be a commit or the working copy: commit → commit folds it in, commit →
   `@` carves it back out as an uncommitted change, `@` → commit folds an
   uncommitted hunk into history. The rest of the diff stays put and descendants

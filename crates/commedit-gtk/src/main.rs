@@ -339,6 +339,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // None between hunk drags. Carried out-of-band (the payload is only an i32
     // sentinel); read by the history list's drop handler (`DragOrigin::Hunk`).
     let drag_hunk: Rc<RefCell<Option<HunkDrag>>> = Rc::new(RefCell::new(None));
+    // The buffer line of the dragged hunk's `@@` header, stashed alongside
+    // `drag_hunk` in the drag source's `connect_prepare` and read at `drag-begin`
+    // to find the hunk's natural absorb target. -1 between hunk drags.
+    let drag_hunk_line: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
     // A drop handler rewrites history and rebuilds both lists, which destroys the
     // ListBoxRow widgets. Doing that while the drag is still in flight frees a row
     // GTK still holds as the drop-crossing target, crashing the next pointer event
@@ -1479,6 +1483,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let selected_wc_change = selected_wc_change.clone();
         let drag_origin = drag_origin.clone();
         let drag_hunk = drag_hunk.clone();
+        let drag_hunk_line = drag_hunk_line.clone();
         let over_gutter = over_gutter.clone();
         move |_source, x, y| {
             // Offered only in the editable single-commit / single-`@` diff. The
@@ -1508,6 +1513,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 first_group,
                 last_group,
             });
+            // `line` is the hunk's `@@` header (hunk_target returned Some), which
+            // drag-begin needs to locate the hunk's absorb target.
+            drag_hunk_line.set(line as i32);
             drag_origin.set(DragOrigin::Hunk);
             // In-process only: the drop handler reads the hunk from `drag_hunk`, not
             // this value. An i32 sentinel keeps the history list's DropTarget
@@ -1515,9 +1523,74 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             Some(gdk::ContentProvider::for_value(&(-1i32).to_value()))
         }
     });
+    hunk_drag_source.connect_drag_begin({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
+        let list = list.clone();
+        let blame_on = blame_on.clone();
+        let blame_selection = blame_selection.clone();
+        let blame_data = blame_data.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        let drag_hunk = drag_hunk.clone();
+        let drag_hunk_line = drag_hunk_line.clone();
+        move |_source, _drag| {
+            // Pre-highlight the commit this hunk would naturally absorb into — the
+            // origin every removed line blames to — so its row lights up (purple)
+            // the moment the drag begins, even with the blame gutter off.
+            let Some(hunk) = drag_hunk.borrow().as_ref().cloned() else {
+                return;
+            };
+            // Reuse the gutter's live blame cache when it has it; otherwise blame
+            // just this hunk's file (the scoped walk), so the hint works gutter-off.
+            let cached = if blame_on.get() {
+                blame_data.borrow().clone()
+            } else {
+                None
+            };
+            let map = match cached {
+                Some(map) => map,
+                None => match repo
+                    .borrow()
+                    .blame_old_side_path(&blame_selection.borrow(), &hunk.path)
+                {
+                    Ok(Some(fb)) => HashMap::from([(hunk.path.clone(), fb)]),
+                    // Nothing to blame (root/binary/error) ⇒ no highlight.
+                    _ => return,
+                },
+            };
+            if map.is_empty() {
+                return;
+            }
+            let text = buffer_text(&file_buffer);
+            let nums = linenums::diff_line_numbers(&text);
+            let cells = blame_col::blame_cells(&text, &combined_files.borrow(), &nums, &map);
+            let Some(absorb) =
+                blame_col::absorb_origin_for_header(&cells, &text, drag_hunk_line.get() as usize)
+            else {
+                return;
+            };
+            // Light the target's row if it is in the loaded window; an offscreen
+            // target simply gets no highlight (no paging on drag).
+            if let Some(row) = commits
+                .borrow()
+                .iter()
+                .position(|c| c.change_id_hex() == absorb.change_id_hex)
+                .and_then(|ci| commit_rows.borrow().get(ci).copied())
+                .and_then(|di| list.row_at_index(di as i32))
+            {
+                row.add_css_class("squash-blame");
+            }
+        }
+    });
     hunk_drag_source.connect_drag_end({
         let post_drag = post_drag.clone();
+        let list = list.clone();
         move |_source, _drag, _delete| {
+            // Clear the absorb-target pre-highlight painted at drag-begin, whether
+            // the drop landed or was cancelled.
+            dragdrop::clear_squash_highlights(&list);
             // The drop staged its rewrite into `post_drag`; run it now that the
             // gesture (and GTK's DnD bookkeeping) is fully torn down — same discipline
             // as the history/trash drag sources.

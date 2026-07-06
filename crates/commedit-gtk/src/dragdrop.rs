@@ -806,13 +806,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             drag_set.borrow_mut().clear();
             clear_gap();
             // populate_rows won't touch our highlight classes, so strip them here.
-            let mut i = 0;
-            while let Some(r) = list.row_at_index(i) {
-                r.remove_css_class("squash-recommended");
-                r.remove_css_class("squash-sibling");
-                r.remove_css_class("squash-blame");
-                i += 1;
-            }
+            clear_squash_highlights(&list);
             clear_squash_target();
             run_post_drag(&post_drag);
         }
@@ -1861,13 +1855,7 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
             clear_gap();
             // The trash drag highlights history rows too (green/yellow recs, red
             // target); strip them here, as populate_rows leaves them alone.
-            let mut i = 0;
-            while let Some(r) = list.row_at_index(i) {
-                r.remove_css_class("squash-recommended");
-                r.remove_css_class("squash-sibling");
-                r.remove_css_class("squash-blame");
-                i += 1;
-            }
+            clear_squash_highlights(&list);
             clear_squash_target();
             run_post_drag(&post_drag);
         }
@@ -2285,6 +2273,20 @@ fn clear_row_target(list: &ListBox, hi: &Cell<i32>) {
 pub(crate) fn run_post_drag(post_drag: &PostDrag) {
     if let Some(action) = post_drag.borrow_mut().take() {
         glib::idle_add_local_once(action);
+    }
+}
+
+/// Strip every squash-hint highlight class off all history rows. The drag-begin
+/// handlers paint these (green `squash-recommended`, yellow `squash-sibling`,
+/// purple `squash-blame`) and `populate_rows` leaves them alone, so each drag
+/// source clears them here at `drag-end`.
+pub(crate) fn clear_squash_highlights(list: &ListBox) {
+    let mut i = 0;
+    while let Some(r) = list.row_at_index(i) {
+        r.remove_css_class("squash-recommended");
+        r.remove_css_class("squash-sibling");
+        r.remove_css_class("squash-blame");
+        i += 1;
     }
 }
 

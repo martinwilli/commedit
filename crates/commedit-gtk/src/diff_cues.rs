@@ -2,8 +2,11 @@
 //!
 //! [`GutterColumn`] is a `sourceview5::GutterRenderer` subclass that draws **one
 //! gutter column**, showing per line *either* a right-aligned line number *or* a
-//! centered, clickable cue glyph — the two never coincide (cue lines, such as a
-//! `@@` header or a conflict marker, carry no number). The file gutter holds two
+//! centered, clickable cue glyph. On an *unnumbered* line (a `@@` header, a
+//! `diff --git` separator, a conflict marker) the two never coincide, so a cue
+//! there draws always. A cue on a *numbered* line — the ✄ split button on an
+//! eligible context line — is **hover-reveal**: at rest the number shows, and
+//! only the hovered line trades it for the button. The file gutter holds two
 //! of them (old|new / ours|theirs); each is fed a per-line number map (it picks
 //! its own slot) plus a per-line cue map, so the action buttons sit at the same
 //! level as the line numbers instead of in extra columns.
@@ -31,6 +34,11 @@ use crate::linenums::{DiffLineNo, NumColumn};
 
 /// The revert glyph (matches the old "⤺ revert" pill).
 const REVERT_GLYPH: &str = "\u{293a}";
+
+/// The split-hunk glyph. `\u{2704}` (✄, white scissors) rather than `\u{2702}`
+/// (✂), which many fonts render as a colour emoji that wouldn't take the accent
+/// tint the other cue glyphs get.
+const SPLIT_GLYPH: &str = "\u{2704}";
 
 /// Horizontal padding around a cue glyph, in pixels.
 const CUE_XPAD: i32 = 6;
@@ -64,6 +72,12 @@ pub(crate) fn revert_color() -> gdk::RGBA {
     gdk::RGBA::parse("#9a6700").expect("valid colour")
 }
 
+/// Accent for the split-hunk cue (purple), distinct from expand-blue and
+/// revert-amber.
+fn split_color() -> gdk::RGBA {
+    gdk::RGBA::parse("#8250df").expect("valid colour")
+}
+
 /// How much larger than the view's body font a cue glyph is drawn — a button
 /// reads as a control, not as text, so it is bumped up a notch.
 const CUE_SCALE: f64 = 1.08;
@@ -95,8 +109,10 @@ mod imp {
         /// Per-buffer-line numbers, indexed by line; this column draws its own
         /// (old or new) slot. Refreshed wholesale on every buffer change.
         pub(super) numbers: RefCell<Vec<DiffLineNo>>,
-        /// Per-buffer-line cues; `None` where the line carries no button. A cue
-        /// line never also carries a number, so a cue takes precedence when drawn.
+        /// Per-buffer-line cues; `None` where the line carries no button. A cue on
+        /// an unnumbered line (a `@@`/`diff --git` header) always wins; a cue on a
+        /// numbered line (the split button on a context line) is hover-reveal —
+        /// only the hovered line draws it, the rest show their number.
         pub(super) cues: RefCell<Vec<Option<GutterCue>>>,
         /// Which number slot this column draws.
         pub(super) column: Cell<NumColumn>,
@@ -153,23 +169,25 @@ mod imp {
         }
 
         fn snapshot_line(&self, snapshot: &gtk::Snapshot, lines: &GutterLines, line: u32) {
-            // A cue line carries no number, so a present cue wins outright.
+            // This column's own number for the line, if any.
+            let value = self.numbers.borrow().get(line as usize).and_then(|entry| {
+                match self.column.get() {
+                    NumColumn::Old => entry.old,
+                    NumColumn::New => entry.new,
+                }
+            });
+            // A cue on an unnumbered line (a `@@`/`diff --git` header) draws always;
+            // a cue on a numbered line (a context-line split button) is hover-reveal
+            // — at rest the number shows, only the hovered line trades it in.
             if let Some(Some(cue)) = self.cues.borrow().get(line as usize) {
-                self.snapshot_cue(snapshot, lines, line, cue);
-                return;
+                if value.is_none() || self.hover.get() == line as i32 {
+                    self.snapshot_cue(snapshot, lines, line, cue);
+                    return;
+                }
             }
-            let nums = self.numbers.borrow();
-            let Some(entry) = nums.get(line as usize) else {
-                return;
-            };
-            let value = match self.column.get() {
-                NumColumn::Old => entry.old,
-                NumColumn::New => entry.new,
-            };
-            let Some(value) = value else {
-                return;
-            };
-            self.snapshot_number(snapshot, lines, line, value);
+            if let Some(value) = value {
+                self.snapshot_number(snapshot, lines, line, value);
+            }
         }
     }
 
@@ -489,8 +507,9 @@ pub(crate) fn file_target(text: &str, files: &[CombinedFile], line: usize) -> Op
 /// context line becomes the new second hunk's leading context; net one line is
 /// added (the inserted `@@` header). Positions are re-derived from the live
 /// `text` so an interactive edit that shifted lines can't misplace the cut.
-// Wired to a gutter split button in a follow-up commit; only tests use it here.
-#[allow(dead_code)]
+///
+/// Backs the gutter ✄ split button (see [`diff_cue_cells`]), which re-validates
+/// here on click and no-ops on `None`.
 pub(crate) fn split_hunk_at(
     text: &str,
     files: &[CombinedFile],
@@ -649,9 +668,12 @@ pub(crate) fn split_hunk_at(
 
 /// The two per-line gutter columns for the diff buffer `text`: expandable `@@`
 /// headers get an `↕`/`↑`/`↓` cell (column 0), revertable hunks and files a `⤺`
-/// cell (column 1). Paired in document order with `hunks`/`files` (robust to
-/// interactive line shifts); `changes` supplies revert eligibility and
-/// `read_only` suppresses the (edit-implying) revert cues.
+/// cell (column 1). Column 0 additionally carries a ✄ split cue on every context
+/// line eligible for [`split_hunk_at`] (one strictly between two change groups of
+/// its hunk) — hover-revealed by the renderer since those lines are numbered.
+/// Paired in document order with `hunks`/`files` (robust to interactive line
+/// shifts); `changes` supplies revert eligibility and `read_only` suppresses the
+/// (edit-implying) revert and split cues.
 pub(crate) fn diff_cue_cells(
     text: &str,
     files: &[CombinedFile],
@@ -666,8 +688,17 @@ pub(crate) fn diff_cue_cells(
     let flat = flatten_hunks(files);
     let mut hunk_k = 0;
     let mut file_k = 0;
+    // Split-eligible context lines, tracked in one pass: once a change has been
+    // seen in the current hunk, buffer any following context lines as `pending`; a
+    // later change line confirms them (they separate two groups) and flushes them
+    // to eligible. A hunk/file boundary or EOF drops whatever is still pending —
+    // that's leading/trailing context, which can't split.
+    let mut seen_change = false;
+    let mut pending: Vec<usize> = Vec::new();
     for (i, l) in text.split('\n').enumerate() {
         if is_hunk_header(l) {
+            pending.clear();
+            seen_change = false;
             if let Some((f, h)) = flat.get(hunk_k) {
                 let glyph = match (h.can_expand_up, h.can_expand_down) {
                     (true, true) => Some("\u{2195}"),  // ↕
@@ -692,6 +723,8 @@ pub(crate) fn diff_cue_cells(
             }
             hunk_k += 1;
         } else if is_file_sep(l) {
+            pending.clear();
+            seen_change = false;
             if let Some(f) = files.get(file_k) {
                 if !read_only && change_for(&f.path).is_some_and(revert_file_ok) {
                     revert[i] = Some(GutterCue {
@@ -702,6 +735,27 @@ pub(crate) fn diff_cue_cells(
                 }
             }
             file_k += 1;
+        } else if !read_only {
+            // A content line inside a hunk (a split enables an edit/move, so gated
+            // like the revert cues on `!read_only`).
+            match line_sides(l) {
+                // Context line: a split candidate once a change precedes it.
+                (true, true) if seen_change => pending.push(i),
+                (true, true) => {}
+                // Change line: the pending context now separates two groups.
+                (o, n) if o != n => {
+                    for p in pending.drain(..) {
+                        expand[p] = Some(GutterCue {
+                            glyph: SPLIT_GLYPH.to_string(),
+                            tooltip: "Split hunk".to_string(),
+                            color: split_color(),
+                        });
+                    }
+                    seen_change = true;
+                }
+                // Neutral (`\ No newline`, meta): leaves the current run intact.
+                _ => {}
+            }
         }
     }
     (expand, revert)

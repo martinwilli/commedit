@@ -1336,6 +1336,26 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             nav_sync.set(false);
         })
     };
+    // Split the hunk enclosing context `line` into two and re-render in place, so
+    // each half becomes its own draggable / revertable / expandable hunk. Backs the
+    // gutter ✄ button; `split_hunk_at` re-validates and no-ops on an ineligible
+    // line, and the split is ephemeral — a full re-render (Save, file switch, …)
+    // re-merges the halves. `splice=true` keeps the scroll put and updates
+    // `combined_files` in step with the text.
+    let apply_split: Rc<dyn Fn(usize)> = {
+        let apply_diff_text = apply_diff_text.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        Rc::new(move |line: usize| {
+            let text = buffer_text(&file_buffer);
+            // Bind before calling `apply_diff_text` (which borrows `combined_files`
+            // mutably), so the read borrow is released first.
+            let split = diff_cues::split_hunk_at(&text, &combined_files.borrow(), line);
+            if let Some((new_text, new_files)) = split {
+                apply_diff_text(new_text, Vec::new(), new_files, true);
+            }
+        })
+    };
     // Bind the two gutter columns' click handlers. A column means different things
     // per pane mode, so each dispatches on it. col_old: diff → widen this hunk's
     // context. col_new: diff → drop this hunk's or file's change; conflict → resolve
@@ -1347,6 +1367,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let apply_diff_cue = apply_diff_cue.clone();
+        let apply_split = apply_split.clone();
         let conflict_expand_cell = conflict_expand_cell.clone();
         Rc::new(move |line: u32| {
             if pane_mode.borrow().is_conflict() {
@@ -1358,13 +1379,18 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 return;
             }
             let text = buffer_text(&file_buffer);
-            let Some((first, last, path)) =
-                diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize)
-            else {
-                return;
-            };
-            let apply = apply_diff_cue.clone();
-            glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
+            // Bind (owned) before deferring so the `combined_files` borrow is short.
+            let target = diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize);
+            if let Some((first, last, path)) = target {
+                // A `@@` header: widen this hunk's context.
+                let apply = apply_diff_cue.clone();
+                glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
+            } else {
+                // A context line: split its hunk in two (`apply_split` re-checks
+                // eligibility via `split_hunk_at` and no-ops otherwise).
+                let apply_split = apply_split.clone();
+                glib::idle_add_local_once(move || apply_split(line as usize));
+            }
         })
     });
     col_new.set_on_activate({
@@ -4703,6 +4729,31 @@ mod tests {
             revert.iter().all(Option::is_none),
             "no revert cues when read-only"
         );
+    }
+
+    #[test]
+    fn split_cue_matches_split_hunk_at_acceptance() {
+        // Two edits close enough to share one hunk, separated by context: the ✄
+        // split cue (col_old, tooltip "Split hunk") must land on exactly the lines
+        // split_hunk_at() accepts — inter-group context, never leading/trailing.
+        let old: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        let new = old.replace("l3\n", "L3\n").replace("l6\n", "L6\n");
+        let changes = vec![modified("f", &old, &new)];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (expand, _revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let mut split_lines = 0;
+        for (i, cue) in expand.iter().enumerate() {
+            let splittable = diff_cues::split_hunk_at(&text, &files, i).is_some();
+            let has_split_cue = cue.as_ref().map(|c| c.tooltip.as_str()) == Some("Split hunk");
+            assert_eq!(
+                splittable,
+                has_split_cue,
+                "line {i}: {:?}",
+                text.lines().nth(i)
+            );
+            split_lines += splittable as usize;
+        }
+        assert!(split_lines >= 1, "at least one eligible split line");
     }
 
     #[test]

@@ -647,18 +647,22 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let col_blame = col_blame.clone();
         Rc::new(move || {
             if !blame_on.get() {
-                col_blame.set_content(&[]);
+                col_blame.set_content(&[], false);
                 return;
             }
+            // Blame is on: keep the column visible even when there's nothing to
+            // annotate (no selection, or a diff with no old side), so the toggle
+            // always has a visible effect. Empty cells + `shown` reserve a strip.
             let data = blame_data.borrow();
-            let Some(data) = data.as_ref() else {
-                col_blame.set_content(&[]);
-                return;
+            let cells = match data.as_ref() {
+                Some(data) => {
+                    let text = buffer_text(&file_buffer);
+                    let nums = linenums::diff_line_numbers(&text);
+                    blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data)
+                }
+                None => Vec::new(),
             };
-            let text = buffer_text(&file_buffer);
-            let nums = linenums::diff_line_numbers(&text);
-            let cells = blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data);
-            col_blame.set_content(&cells);
+            col_blame.set_content(&cells, true);
         })
     };
 
@@ -684,7 +688,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let (elision, resolve) = conflict_cue_cells(&text);
                 col_old.set_content(&nums, &elision);
                 col_new.set_content(&nums, &resolve);
-                col_blame.set_content(&[]); // no blame while resolving conflicts
+                col_blame.set_content(&[], false); // no blame while resolving conflicts
             } else {
                 let nums = linenums::diff_line_numbers(&text);
                 let (exp, rev) = diff_cues::diff_cue_cells(

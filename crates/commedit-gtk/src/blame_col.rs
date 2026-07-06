@@ -242,9 +242,13 @@ impl BlameColumn {
         *self.imp().on_activate.borrow_mut() = Some(f);
     }
 
-    /// Replace the per-line cells, resize to fit the widest hash (zero — a
-    /// collapsed column — when empty), and repaint.
-    pub(crate) fn set_content(&self, cells: &[Option<BlameCell>]) {
+    /// Replace the per-line cells, resize, and repaint. `shown` is whether blame
+    /// is toggled on: when off the column collapses to zero width; when on it
+    /// keeps at least a hash's worth of width even with nothing to annotate, so
+    /// toggling it always slides the gutter in — a diff with no old side (e.g. a
+    /// commit that only adds files) then shows an empty gutter rather than
+    /// silently staying collapsed.
+    pub(crate) fn set_content(&self, cells: &[Option<BlameCell>], shown: bool) {
         let imp = self.imp();
         let view = self.view();
         let text_w = cells
@@ -253,7 +257,14 @@ impl BlameColumn {
             .map(|c| view.create_pango_layout(Some(&c.short)).pixel_size().0)
             .max()
             .unwrap_or(0);
-        let width = if text_w == 0 { 0 } else { text_w + 2 * XPAD };
+        let width = if shown {
+            // A full 8-char hash's width, so an empty-but-shown gutter matches the
+            // width it has once it carries hashes (no jump as you navigate).
+            let placeholder = view.create_pango_layout(Some("00000000")).pixel_size().0;
+            text_w.max(placeholder) + 2 * XPAD
+        } else {
+            0
+        };
         *imp.cells.borrow_mut() = cells.to_vec();
         imp.width_px.set(width);
         self.queue_resize();

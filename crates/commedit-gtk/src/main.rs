@@ -2595,7 +2595,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // multi-selections, so at most one `@` is ever selected; if one is, it
             // wins (mutually exclusive with a history selection, as the old separate
             // working-copy list was).
-            let (commit_infos, wc): (Vec<CommitInfo>, Option<(String, String)>) = {
+            let (commit_infos, wc): (Vec<CommitInfo>, Option<(String, String, CommitId)>) = {
                 let display = display.borrow();
                 let commits = commits.borrow();
                 let mut selected: Vec<usize> = list
@@ -2617,7 +2617,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                             }
                         }
                         Some(DisplayRow::Wc { branch, entry }) if wc.is_none() => {
-                            wc = Some((branch.clone(), entry.info.change_id_hex()));
+                            wc = Some((
+                                branch.clone(),
+                                entry.info.change_id_hex(),
+                                entry.info.id.clone(),
+                            ));
                         }
                         _ => {}
                     }
@@ -2630,7 +2634,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // Save with no message edits the `@` in place, with a message commits it
             // on that worktree's tip (see the `save` closure). Conflict mode never
             // selects `@` rows, so this can't collide with it.
-            if let Some((branch, change)) = wc {
+            if let Some((branch, change, wc_id)) = wc {
                 viewing_wc.set(true);
                 *selected_wc_branch.borrow_mut() = Some(branch);
                 *selected_wc_change.borrow_mut() = Some(change);
@@ -2647,7 +2651,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 }
                 save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
                 diff_read_only.set(false);
-                recompute_blame(); // selection cleared above: drop any stale blame
+                // Blame the working-copy diff like any commit: its old side is the
+                // branch tip, so annotate each context/removed line with the commit
+                // that last touched it (the `@`'s own commit id, resolved above).
+                *blame_selection.borrow_mut() = vec![wc_id];
+                recompute_blame();
                 load_wc_changes();
                 update_save_sensitivity();
                 return;

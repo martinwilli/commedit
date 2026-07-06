@@ -46,7 +46,8 @@ an interactive-rebase session.
   each context and removed line, in a gutter *left* of the line numbers, with the
   commit that last touched it in the *old* (pre-image) file. It's a true `git
   blame`-style walk, computed in-process via jujutsu's annotator and only while
-  expanded (it's the one expensive view). Hovering a hash highlights that commit's
+  expanded (it's the one expensive view). It annotates a selected commit or the
+  uncommitted working-copy diff alike. Hovering a hash highlights that commit's
   row in the history list, if it's shown; the hash reads as a hyperlink (pointer
   cursor plus underline), and clicking it opens that origin commit in the diff
   view (paging older history in when the origin sits below what's loaded). The

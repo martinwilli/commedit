@@ -8,7 +8,9 @@
 //! column via the persistent sidebar handle left of the gutter (`main.rs`'s
 //! `blame_strip`). Hovering a cell invokes a late-bound
 //! callback with the originating commit's `change_id` hex, so the caller can
-//! highlight that commit's row in the history list.
+//! highlight that commit's row in the history list; the cell reads as a
+//! hyperlink (pointer cursor + underline) and clicking it fires a second
+//! late-bound callback so the caller can open that origin commit.
 //!
 //! The line→origin mapping ([`blame_cells`] via the pure [`diff_old_refs`]) is
 //! GTK-free and inline-tested; only the rendering and hover plumbing touch GTK.
@@ -37,6 +39,10 @@ const XPAD: i32 = 4;
 /// A hover callback, invoked with the hovered cell's `change_id` hex (or `None`
 /// when the pointer leaves a blamed line).
 pub(crate) type HoverFn = Rc<dyn Fn(Option<&str>)>;
+
+/// An activation (click) callback, invoked with the clicked cell's `change_id`
+/// hex so the caller can open that origin commit.
+pub(crate) type ActivateFn = Rc<dyn Fn(&str)>;
 
 /// One blame cell: what to draw, plus the data the hover/highlight needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +97,9 @@ mod imp {
         /// Hover callback, late-bound by the caller once the list it highlights
         /// exists.
         pub(super) on_hover: RefCell<Option<HoverFn>>,
+        /// Activation callback, late-bound like `on_hover`; fired with a clicked
+        /// hash's `change_id` hex so the caller can open its origin commit.
+        pub(super) on_activate: RefCell<Option<ActivateFn>>,
     }
 
     #[glib::object_subclass]
@@ -114,6 +123,35 @@ mod imp {
     }
 
     impl GutterRendererImpl for BlameColumn {
+        fn query_activatable(&self, iter: &gtk::TextIter, _area: &gdk::Rectangle) -> bool {
+            matches!(self.cells.borrow().get(iter.line() as usize), Some(Some(_)))
+        }
+
+        fn activate(
+            &self,
+            iter: &gtk::TextIter,
+            _area: &gdk::Rectangle,
+            _button: u32,
+            _state: gdk::ModifierType,
+            _n_presses: i32,
+        ) {
+            // Take a copy of the change id and drop the borrow *before* firing:
+            // the callback re-selects the row, which refreshes and repaints this
+            // column via `set_content` (a `cells` mut-borrow).
+            let change = self
+                .cells
+                .borrow()
+                .get(iter.line() as usize)
+                .cloned()
+                .flatten()
+                .map(|c| c.change_id_hex);
+            if let Some(change) = change {
+                if let Some(cb) = self.on_activate.borrow().clone() {
+                    cb(&change);
+                }
+            }
+        }
+
         fn snapshot_line(&self, snapshot: &gtk::Snapshot, lines: &GutterLines, line: u32) {
             let cells = self.cells.borrow();
             let Some(Some(cell)) = cells.get(line as usize) else {
@@ -129,11 +167,17 @@ mod imp {
             let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
             let x = (avail - lw - XPAD).max(0) as f32;
             let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
-            let color = if self.hover.get() == line as i32 {
-                hover_color()
-            } else {
-                dim_color()
-            };
+            let hovered = self.hover.get() == line as i32;
+            let color = if hovered { hover_color() } else { dim_color() };
+            // Hovered cells read as clickable: underline the hash (a hyperlink
+            // affordance, paired with the pointer cursor from `setup_hover`).
+            if hovered {
+                let attrs = gtk::pango::AttrList::new();
+                attrs.insert(gtk::pango::AttrInt::new_underline(
+                    gtk::pango::Underline::Single,
+                ));
+                layout.set_attributes(Some(&attrs));
+            }
             snapshot.save();
             snapshot.translate(&gtk::graphene::Point::new(x, y));
             snapshot.append_layout(&layout, &color);
@@ -160,6 +204,12 @@ impl BlameColumn {
     /// exists.
     pub(crate) fn set_on_hover(&self, f: HoverFn) {
         *self.imp().on_hover.borrow_mut() = Some(f);
+    }
+
+    /// Late-bind the activation callback, fired with a clicked hash's `change_id`
+    /// hex. Called once the history list it opens into exists.
+    pub(crate) fn set_on_activate(&self, f: ActivateFn) {
+        *self.imp().on_activate.borrow_mut() = Some(f);
     }
 
     /// Replace the per-line cells, resize to fit the widest hash (zero — a
@@ -229,6 +279,11 @@ impl BlameColumn {
                 let hover_line = if cell.is_some() { line } else { -1 };
                 if hover_line != this.imp().hover.get() {
                     this.imp().hover.set(hover_line);
+                    this.set_cursor_from_name(Some(if hover_line >= 0 {
+                        "pointer"
+                    } else {
+                        "default"
+                    }));
                     this.queue_draw();
                     if let Some(cb) = this.imp().on_hover.borrow().clone() {
                         cb(cell.as_ref().map(|c| c.change_id_hex.as_str()));
@@ -241,6 +296,7 @@ impl BlameColumn {
             move |_| {
                 if this.imp().hover.get() != -1 {
                     this.imp().hover.set(-1);
+                    this.set_cursor_from_name(Some("default"));
                     this.queue_draw();
                     if let Some(cb) = this.imp().on_hover.borrow().clone() {
                         cb(None);

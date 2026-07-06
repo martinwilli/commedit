@@ -47,7 +47,9 @@ an interactive-rebase session.
   commit that last touched it in the *old* (pre-image) file. It's a true `git
   blame`-style walk, computed in-process via jujutsu's annotator and only while
   expanded (it's the one expensive view). Hovering a hash highlights that commit's
-  row in the history list, if it's shown.
+  row in the history list, if it's shown; the hash reads as a hyperlink (pointer
+  cursor plus underline), and clicking it opens that origin commit in the diff
+  view (paging older history in when the origin sits below what's loaded).
 
 - **Revert hunks or files** — every changed file carries a *revert* button in the
   gutter to drop its change from the commit, and every hunk of a modified file one

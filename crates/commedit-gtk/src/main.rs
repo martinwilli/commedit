@@ -3623,6 +3623,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let show_status = show_status.clone();
         let list = list.clone();
         let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
         let trashed = trashed.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
@@ -3914,6 +3915,58 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // the dragged row is dimmed; dropping rebases the commit into that slot via
     // the engine and reloads. The reorder is applied immediately — there is no
     // separate Save step for it.
+
+    // Clicking a blame hash opens its origin commit: select that commit's row
+    // (which cascades through `selected-rows-changed` -> `update_selection_pane`
+    // -> loads the diff) and scroll it into view. A blamed origin is always an
+    // ancestor of the selection, so if it sits below the loaded history page,
+    // page in (bump `history_limit` + `refresh`, the same widening the scroll
+    // `edge_reached` uses) and retry until it appears or the branch runs out.
+    col_blame.set_on_activate({
+        let list = list.clone();
+        let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
+        let refresh = refresh.clone();
+        let history_limit = history_limit.clone();
+        let history_has_more = history_has_more.clone();
+        let show_status = show_status.clone();
+        let selection_sync = selection_sync.clone();
+        let selection_anchor = selection_anchor.clone();
+        let update_selection_pane = update_selection_pane.clone();
+        Rc::new(move |change: &str| {
+            loop {
+                // Scope the borrow so it drops before `refresh`'s mut-borrow.
+                let di = {
+                    commits
+                        .borrow()
+                        .iter()
+                        .position(|c| c.change_id_hex() == change)
+                        .and_then(|ci| commit_rows.borrow().get(ci).copied())
+                };
+                if let Some(di) = di {
+                    // Replace the selection with just this origin commit — the list is
+                    // multi-select, so a bare `select_row` would only add to it. Drive
+                    // it under `selection_sync` and render once, like a plain click.
+                    selection_sync.set(true);
+                    list.unselect_all();
+                    if let Some(row) = list.row_at_index(di as i32) {
+                        list.select_row(Some(&row));
+                        selection_anchor.set(Some(di as i32));
+                        row.grab_focus();
+                    }
+                    selection_sync.set(false);
+                    update_selection_pane();
+                    break;
+                }
+                if !history_has_more.get() {
+                    show_status("That commit isn't in this branch's history");
+                    break;
+                }
+                history_limit.set(history_limit.get() + HISTORY_PAGE);
+                refresh();
+            }
+        })
+    });
 
     dragdrop::wire(&widgets, &data, &drag_state, &callbacks);
     populate_trash(

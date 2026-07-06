@@ -419,6 +419,30 @@ fn is_file_sep(l: &str) -> bool {
     l.starts_with("diff --git ")
 }
 
+/// Which sides `(counts_old, counts_new)` a diff line contributes to, classified
+/// exactly like [`crate::linenums::diff_line_numbers`] so counts derived here stay
+/// consistent with the numbers it reports. A context line counts to both, `+`/`-`
+/// to one, and `@@`/meta/`\ No newline` lines to neither.
+fn line_sides(l: &str) -> (bool, bool) {
+    if l.starts_with("@@")
+        || l.starts_with("diff ")
+        || l.starts_with("--- ")
+        || l.starts_with("+++ ")
+        || l.starts_with("index ")
+        || l.starts_with('\\')
+    {
+        (false, false)
+    } else if l.starts_with('+') {
+        (false, true)
+    } else if l.starts_with('-') {
+        (true, false)
+    } else if l.starts_with(' ') {
+        (true, true)
+    } else {
+        (false, false)
+    }
+}
+
 /// A *hunk* revert is a partial content reversal — meaningful only for a modified
 /// file, where both sides exist as text and the hunk's `-`/`+` groups can drop
 /// back to the old side.
@@ -454,6 +478,173 @@ pub(crate) fn hunk_target(
 pub(crate) fn file_target(text: &str, files: &[CombinedFile], line: usize) -> Option<String> {
     let k = order_of(text, line, is_file_sep)?;
     files.get(k).map(|f| f.path.clone())
+}
+
+/// Split the rendered hunk containing context `line` into two hunks at that line.
+/// Returns the new buffer text and the new combined-files, or `None` when `line`
+/// isn't an eligible split point (not a context line strictly between two change
+/// groups within its hunk). Ephemeral: undone by the next full engine re-render.
+///
+/// `line` is a 0-based buffer line index (into `text.split('\n')`). The split
+/// context line becomes the new second hunk's leading context; net one line is
+/// added (the inserted `@@` header). Positions are re-derived from the live
+/// `text` so an interactive edit that shifted lines can't misplace the cut.
+// Wired to a gutter split button in a follow-up commit; only tests use it here.
+#[allow(dead_code)]
+pub(crate) fn split_hunk_at(
+    text: &str,
+    files: &[CombinedFile],
+    line: usize,
+) -> Option<(String, Vec<CombinedFile>)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    // The split point must land on a context line — never a `@@`/`diff --git`/meta
+    // line, a `+`/`-` change line, or out of range.
+    if line >= lines.len() || !lines[line].starts_with(' ') {
+        return None;
+    }
+    // The enclosing hunk is the last `@@` header before `line`; `k` counts them.
+    let k = lines[..line].iter().filter(|l| is_hunk_header(l)).count();
+    if k == 0 {
+        return None;
+    }
+    // Its live buffer position (not the possibly-stale `HunkInfo::header_line`).
+    let orig_header_line = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_hunk_header(l))
+        .nth(k - 1)
+        .map(|(i, _)| i)?;
+    // Map that flattened hunk index back to its owning file + slot so the metadata
+    // can be rewritten in place.
+    let mut owner = None;
+    let mut flat_i = 0usize;
+    'outer: for (fi, f) in files.iter().enumerate() {
+        for hi in 0..f.hunks.len() {
+            if flat_i == k - 1 {
+                owner = Some((fi, hi));
+                break 'outer;
+            }
+            flat_i += 1;
+        }
+    }
+    let (file_idx, hunk_idx) = owner?;
+    let orig = files[file_idx].hunks[hunk_idx].clone();
+
+    // The hunk's content spans from just past its header to the next `@@`/file
+    // separator, or EOF.
+    let hunk_end = (orig_header_line + 1..lines.len())
+        .find(|&i| is_hunk_header(lines[i]) || is_file_sep(lines[i]))
+        .unwrap_or(lines.len());
+    if line <= orig_header_line || line >= hunk_end {
+        return None;
+    }
+
+    // Walk the content into change groups (maximal runs of `+`/`-`, separated by
+    // context; `\ No newline`/meta lines are neutral and don't break a run).
+    let mut group_ends: Vec<usize> = Vec::new();
+    let mut cur_start: Option<usize> = None;
+    let mut cur_last = 0usize;
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .take(hunk_end)
+        .skip(orig_header_line + 1)
+    {
+        let (o, n) = line_sides(l);
+        if o && n {
+            // Context line: close any open group.
+            if cur_start.take().is_some() {
+                group_ends.push(cur_last);
+            }
+        } else if o != n {
+            // Change line.
+            cur_start.get_or_insert(i);
+            cur_last = i;
+        }
+        // Neutral line: leaves the current group open.
+    }
+    if cur_start.take().is_some() {
+        group_ends.push(cur_last);
+    }
+    // Require a whole change group above the cut and at least one below it.
+    let groups_before = group_ends.iter().filter(|&&e| e < line).count();
+    if groups_before == 0 || groups_before >= group_ends.len() {
+        return None;
+    }
+
+    // Derive both headers' start numbers and counts from the live line numbering,
+    // so they stay correct after interactive edits. `line` is context, so it
+    // carries both an old and a new number (the second hunk's starts).
+    let dln = crate::linenums::diff_line_numbers(text);
+    let ao = dln.get(line).and_then(|d| d.old)?;
+    let an = dln.get(line).and_then(|d| d.new)?;
+    // First hunk: counts up to (not including) the cut. Its start is the cut's
+    // number walked back over those lines (equivalently the original header start).
+    let (mut c1o, mut c1n) = (0u32, 0u32);
+    for l in &lines[orig_header_line + 1..line] {
+        let (o, n) = line_sides(l);
+        c1o += o as u32;
+        c1n += n as u32;
+    }
+    let a = ao.checked_sub(c1o)?;
+    let c = an.checked_sub(c1n)?;
+    // Second hunk: counts from the cut to the hunk end (the cut's context counts).
+    let (mut c2o, mut c2n) = (0u32, 0u32);
+    for l in &lines[line..hunk_end] {
+        let (o, n) = line_sides(l);
+        c2o += o as u32;
+        c2n += n as u32;
+    }
+
+    // Preserve the original header's section-heading suffix (everything past the
+    // closing `@@`, including its leading space) on the first hunk only.
+    let after_first = &lines[orig_header_line][2..];
+    let suffix = after_first
+        .find("@@")
+        .map(|i| &after_first[i + 2..])
+        .unwrap_or("");
+    let h1 = format!("@@ -{a},{c1o} +{c},{c1n} @@{suffix}");
+    let h2 = format!("@@ -{ao},{c2o} +{an},{c2n} @@");
+
+    // New text: rewrite the header to the first hunk's, insert the second hunk's
+    // header just before the cut. Split/join on '\n' preserves trailing-newline.
+    let mut out: Vec<String> = text.split('\n').map(str::to_string).collect();
+    out[orig_header_line] = h1;
+    out.insert(line, h2);
+    let new_text = out.join("\n");
+
+    // New metadata: everything below the inserted line shifts down by one, then the
+    // split hunk is replaced by the two halves.
+    let mut new_files = files.to_vec();
+    for f in new_files.iter_mut().skip(file_idx + 1) {
+        f.start_line += 1;
+        for h in &mut f.hunks {
+            h.header_line += 1;
+        }
+    }
+    let owner_file = &mut new_files[file_idx];
+    for h in owner_file.hunks.iter_mut().skip(hunk_idx + 1) {
+        h.header_line += 1;
+    }
+    let hunk1 = HunkInfo {
+        header_line: orig_header_line,
+        first_group: orig.first_group,
+        last_group: orig.first_group + groups_before - 1,
+        can_expand_up: orig.can_expand_up,
+        can_expand_down: false,
+    };
+    let hunk2 = HunkInfo {
+        header_line: line,
+        first_group: orig.first_group + groups_before,
+        last_group: orig.last_group,
+        can_expand_up: false,
+        can_expand_down: orig.can_expand_down,
+    };
+    owner_file
+        .hunks
+        .splice(hunk_idx..hunk_idx + 1, [hunk1, hunk2]);
+
+    Some((new_text, new_files))
 }
 
 /// The two per-line gutter columns for the diff buffer `text`: expandable `@@`
@@ -514,4 +705,274 @@ pub(crate) fn diff_cue_cells(
         }
     }
     (expand, revert)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `HunkInfo` with both expand flags on, so the split's flag handling
+    /// (up stays on hunk1, down on hunk2) is exercised.
+    fn hunk(header_line: usize, first_group: usize, last_group: usize) -> HunkInfo {
+        HunkInfo {
+            header_line,
+            first_group,
+            last_group,
+            can_expand_up: true,
+            can_expand_down: true,
+        }
+    }
+
+    fn file(path: &str, start_line: usize, hunks: Vec<HunkInfo>) -> CombinedFile {
+        CombinedFile {
+            path: path.to_string(),
+            start_line,
+            editable: true,
+            hunks,
+        }
+    }
+
+    /// The `@@` header lines of a rendered diff, in order.
+    fn headers(text: &str) -> Vec<&str> {
+        text.split('\n').filter(|l| is_hunk_header(l)).collect()
+    }
+
+    #[test]
+    fn split_two_group_hunk_at_separating_context() {
+        // Groups {-a,+A} and {-d,+D}, split at the second context line " c".
+        let text = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,4 +1,4 @@
+-a
++A
+ b
+ c
+-d
++D";
+        let files = vec![file("f", 0, vec![hunk(3, 0, 1)])];
+        // " c" is buffer line 7.
+        let (new_text, new_files) = split_hunk_at(text, &files, 7).unwrap();
+
+        assert_eq!(
+            headers(&new_text),
+            vec!["@@ -1,2 +1,2 @@", "@@ -3,2 +3,2 @@"]
+        );
+        // The inserted header sits just before the (now shifted) split line.
+        let lines: Vec<&str> = new_text.split('\n').collect();
+        assert_eq!(lines[7], "@@ -3,2 +3,2 @@");
+        assert_eq!(lines[8], " c");
+
+        assert_eq!(new_files.len(), 1);
+        let h = &new_files[0].hunks;
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            (h[0].header_line, h[0].first_group, h[0].last_group),
+            (3, 0, 0)
+        );
+        assert_eq!(
+            (h[1].header_line, h[1].first_group, h[1].last_group),
+            (7, 1, 1)
+        );
+        // Expand flags: outer edges keep the original's, the inner edges close off.
+        assert_eq!((h[0].can_expand_up, h[0].can_expand_down), (true, false));
+        assert_eq!((h[1].can_expand_up, h[1].can_expand_down), (false, true));
+        assert_eq!(new_files[0].start_line, 0);
+    }
+
+    #[test]
+    fn split_three_group_hunk_at_first_context() {
+        // Groups {-a,+A}, {-c,+C}, {-e,+E}; split at the first inter-group context
+        // " b" (line 6) -> hunk1 covers 1 group, hunk2 covers 2.
+        let text = "\
+diff --git a/g b/g
+--- a/g
++++ b/g
+@@ -1,5 +1,5 @@
+-a
++A
+ b
+-c
++C
+ d
+-e
++E";
+        let files = vec![file("g", 0, vec![hunk(3, 0, 2)])];
+        let (new_text, new_files) = split_hunk_at(text, &files, 6).unwrap();
+
+        assert_eq!(
+            headers(&new_text),
+            vec!["@@ -1,1 +1,1 @@", "@@ -2,4 +2,4 @@"]
+        );
+        let h = &new_files[0].hunks;
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            (h[0].header_line, h[0].first_group, h[0].last_group),
+            (3, 0, 0)
+        );
+        assert_eq!(
+            (h[1].header_line, h[1].first_group, h[1].last_group),
+            (6, 1, 2)
+        );
+    }
+
+    #[test]
+    fn split_second_file_shifts_only_below() {
+        // Three files; split file b's first hunk. File a is untouched, file b's
+        // later hunk and file c (header + start_line) shift down by the inserted
+        // line.
+        let text = "\
+diff --git a/a b/a
+--- a/a
++++ b/a
+@@ -1,2 +1,2 @@
+-p
++P
+ q
+diff --git a/b b/b
+--- a/b
++++ b/b
+@@ -1,3 +1,3 @@
+-m
++M
+ n
+-o
++O
+@@ -20,2 +20,2 @@
+-r
++R
+ s
+diff --git a/c b/c
+--- a/c
++++ b/c
+@@ -1,2 +1,2 @@
+-z
++Z
+ w";
+        let files = vec![
+            file("a", 0, vec![hunk(3, 0, 0)]),
+            file("b", 7, vec![hunk(10, 0, 1), hunk(16, 2, 2)]),
+            file("c", 20, vec![hunk(23, 0, 0)]),
+        ];
+        // " n" in file b's first hunk is buffer line 13.
+        let (new_text, new_files) = split_hunk_at(text, &files, 13).unwrap();
+
+        assert_eq!(
+            headers(&new_text),
+            vec![
+                "@@ -1,2 +1,2 @@",   // file a, untouched
+                "@@ -1,1 +1,1 @@",   // file b hunk1 (split)
+                "@@ -2,2 +2,2 @@",   // file b hunk2 (split)
+                "@@ -20,2 +20,2 @@", // file b's original second hunk
+                "@@ -1,2 +1,2 @@",   // file c, untouched
+            ],
+        );
+
+        // File a: entirely untouched.
+        assert_eq!(new_files[0].start_line, 0);
+        assert_eq!(new_files[0].hunks[0].header_line, 3);
+
+        // File b: unchanged separator; three hunks now, the original second one
+        // bumped by the inserted line.
+        assert_eq!(new_files[1].start_line, 7);
+        let hb = &new_files[1].hunks;
+        assert_eq!(hb.len(), 3);
+        assert_eq!(
+            (hb[0].header_line, hb[0].first_group, hb[0].last_group),
+            (10, 0, 0)
+        );
+        assert_eq!(
+            (hb[1].header_line, hb[1].first_group, hb[1].last_group),
+            (13, 1, 1)
+        );
+        assert_eq!(
+            (hb[2].header_line, hb[2].first_group, hb[2].last_group),
+            (17, 2, 2)
+        );
+
+        // File c: separator and hunk both shift down by one.
+        assert_eq!(new_files[2].start_line, 21);
+        assert_eq!(new_files[2].hunks[0].header_line, 24);
+    }
+
+    #[test]
+    fn ineligible_split_points_return_none() {
+        // A single-group hunk with leading and trailing context.
+        let text = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,3 +1,3 @@
+ head
+-x
++X
+ tail";
+        let files = vec![file("f", 0, vec![hunk(3, 0, 0)])];
+
+        // On the `@@` header line.
+        assert!(split_hunk_at(text, &files, 3).is_none());
+        // On a change line ('-' then '+').
+        assert!(split_hunk_at(text, &files, 5).is_none());
+        assert!(split_hunk_at(text, &files, 6).is_none());
+        // Leading context (before any change group).
+        assert!(split_hunk_at(text, &files, 4).is_none());
+        // Trailing context (after the only change group).
+        assert!(split_hunk_at(text, &files, 7).is_none());
+        // Out of range.
+        assert!(split_hunk_at(text, &files, 999).is_none());
+    }
+
+    #[test]
+    fn preserves_section_heading_suffix_on_first_hunk() {
+        // The original header carries a `@@ … fn thing()` suffix; only hunk1 keeps
+        // it. Also checks trailing-newline preservation.
+        let text = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,4 +1,4 @@ fn thing()
+-a
++A
+ b
+ c
+-d
++D
+";
+        let files = vec![file("f", 0, vec![hunk(3, 0, 1)])];
+        let (new_text, _) = split_hunk_at(text, &files, 7).unwrap();
+        assert_eq!(
+            headers(&new_text),
+            vec!["@@ -1,2 +1,2 @@ fn thing()", "@@ -3,2 +3,2 @@"],
+        );
+        // The trailing newline survives the round-trip.
+        assert!(new_text.ends_with("+D\n"));
+    }
+
+    #[test]
+    fn neutral_no_newline_line_does_not_split_a_group() {
+        // A `\ No newline at end of file` between the two change lines is neutral:
+        // they stay one group, so the only real split is at the inter-group context.
+        let text = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,4 +1,3 @@
+-a
+\\ No newline at end of file
++A
+ b
+ c
+-d";
+        let files = vec![file("f", 0, vec![hunk(3, 0, 1)])];
+        // " c" at buffer line 8 sits between the {-a,+A} run and {-d} run.
+        let (new_text, new_files) = split_hunk_at(text, &files, 8).unwrap();
+        // hunk1 = a,b old / A,b new; hunk2 = c,d old / c new. The `\` line is not
+        // counted on either side (and doesn't break the {-a,+A} run).
+        assert_eq!(
+            headers(&new_text),
+            vec!["@@ -1,2 +1,2 @@", "@@ -3,2 +3,1 @@"]
+        );
+        assert_eq!(new_files[0].hunks.len(), 2);
+    }
 }

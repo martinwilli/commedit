@@ -3969,6 +3969,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     });
 
     dragdrop::wire(&widgets, &data, &drag_state, &callbacks);
+    // A second hunk drop site: dropping a dragged hunk onto a blame hash squashes
+    // it into that origin commit (see `dragdrop::wire_blame_drop`).
+    dragdrop::wire_blame_drop(&col_blame, &widgets, &data, &drag_state, &callbacks);
     populate_trash(
         &trash_list,
         &trash_scroll,

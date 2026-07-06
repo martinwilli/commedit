@@ -2141,6 +2141,136 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
     trash_box.add_controller(trash_drop);
 }
 
+/// Install a `DropTarget` on the blame gutter column so a hunk grabbed off a
+/// `@@` line can be dropped onto a blame hash to squash it into that origin
+/// commit — "send this change back where it came from" without hunting for the
+/// row in the history list. A second target beside the history list's; both
+/// validate with [`hunk_target_ok`] and dispatch through the shared
+/// [`stage_hunk_into_commit`]. Only a hunk drag ever engages it (a hash always
+/// maps to a real commit, never the working copy). Like the list target it
+/// accepts both the `String` (foreign history) and the `i32` hunk sentinel —
+/// the sentinel is essential, without it no motion/drop fires. The rewrite runs
+/// from the hunk drag source's own `drag-end` (`main.rs` → [`run_post_drag`]),
+/// so this only stages into `post_drag`.
+pub(crate) fn wire_blame_drop(
+    col: &crate::blame_col::BlameColumn,
+    w: &Widgets,
+    d: &Data,
+    drag: &DragState,
+    cb: &Callbacks,
+) {
+    let dt = DropTarget::new(
+        String::static_type(),
+        gdk::DragAction::MOVE | gdk::DragAction::COPY,
+    );
+    dt.set_types(&[String::static_type(), i32::static_type()]);
+    dt.set_preload(true);
+    // The display row of the commit currently lit as the squash target (or -1),
+    // shared across the handlers so a target change clears the previous row.
+    let hi: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
+    dt.connect_motion({
+        let col = col.clone();
+        let d = d.clone();
+        let drag = drag.clone();
+        let list = w.list.clone();
+        let hi = hi.clone();
+        move |_t, _x, y| -> gdk::DragAction {
+            if drag.drag_origin.get() != DragOrigin::Hunk {
+                col.set_drop_line(-1);
+                clear_row_target(&list, &hi);
+                return gdk::DragAction::empty();
+            }
+            let Some((line, change)) = col.change_id_at_widget_y(y) else {
+                col.set_drop_line(-1);
+                clear_row_target(&list, &hi);
+                return gdk::DragAction::empty();
+            };
+            // Map the origin's stable change id to its display row, then reuse the
+            // list's own validity check. Each borrow is scoped tight — the same
+            // RefCells get re-borrowed inside `hunk_target_ok`.
+            let di = {
+                let commits = d.commits.borrow();
+                commits
+                    .iter()
+                    .position(|c| c.change_id_hex() == change)
+                    .and_then(|ci| d.commit_rows.borrow().get(ci).copied())
+            };
+            let valid = di.filter(|&di| {
+                hunk_target_ok(
+                    &d.repo.borrow(),
+                    &d.commits.borrow(),
+                    &d.display.borrow(),
+                    di,
+                    drag.drag_hunk.borrow().as_ref(),
+                )
+            });
+            match valid {
+                Some(di) => {
+                    col.set_drop_line(line);
+                    // Light the target commit's row with the same cue a drop onto the
+                    // history list shows, so it's clear which commit receives the hunk.
+                    if hi.get() != di as i32 {
+                        clear_row_target(&list, &hi);
+                        if let Some(r) = list.row_at_index(di as i32) {
+                            r.add_css_class("squash-drop-target");
+                        }
+                        hi.set(di as i32);
+                    }
+                    gdk::DragAction::MOVE
+                }
+                None => {
+                    col.set_drop_line(-1);
+                    clear_row_target(&list, &hi);
+                    gdk::DragAction::empty()
+                }
+            }
+        }
+    });
+    dt.connect_leave({
+        let col = col.clone();
+        let list = w.list.clone();
+        let hi = hi.clone();
+        move |_t| {
+            col.set_drop_line(-1);
+            clear_row_target(&list, &hi);
+        }
+    });
+    dt.connect_drop({
+        let col = col.clone();
+        let d = d.clone();
+        let drag = drag.clone();
+        let cb = cb.clone();
+        let list = w.list.clone();
+        let hi = hi.clone();
+        move |_t, _val, _x, y| -> bool {
+            col.set_drop_line(-1);
+            clear_row_target(&list, &hi);
+            if drag.drag_origin.get() != DragOrigin::Hunk {
+                return false;
+            }
+            let Some((_, change)) = col.change_id_at_widget_y(y) else {
+                return false;
+            };
+            stage_hunk_into_commit(&d, &drag, &cb, change);
+            true
+        }
+    });
+    col.add_controller(dt);
+}
+
+/// Clear the `squash-drop-target` cue from the row `hi` points at (if any) and
+/// reset `hi` to -1. Used by [`wire_blame_drop`] to move the row highlight as the
+/// hovered blame hash changes.
+fn clear_row_target(list: &ListBox, hi: &Cell<i32>) {
+    let cur = hi.get();
+    if cur >= 0 {
+        if let Some(r) = list.row_at_index(cur) {
+            r.remove_css_class("squash-drop-target");
+        }
+        hi.set(-1);
+    }
+}
+
 /// Run a drop's staged action, scheduled from the drag source's `drag-end`.
 ///
 /// The action rewrites history and rebuilds the list widgets, which unparents

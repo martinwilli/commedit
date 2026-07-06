@@ -79,6 +79,12 @@ fn dim_color() -> gdk::RGBA {
 fn hover_color() -> gdk::RGBA {
     gdk::RGBA::new(0.231, 0.251, 0.283, 1.0)
 }
+/// The squash-red tint painted behind a hash while a valid hunk drop targets it,
+/// matching the history list's `squash-drop-target` styling (`rgba(224, 27, 36,
+/// 0.38)`, `main.rs`), so the hash reads as "drop here".
+fn drop_color() -> gdk::RGBA {
+    gdk::RGBA::new(0.878, 0.106, 0.141, 0.38)
+}
 
 mod imp {
     use super::*;
@@ -91,6 +97,11 @@ mod imp {
         pub(super) cells: RefCell<Vec<Option<BlameCell>>>,
         /// Line currently under the pointer (for the prelight), or -1.
         pub(super) hover: Cell<i32>,
+        /// Line a valid hunk drop currently targets (the drop-target prelight),
+        /// or -1. Driven by the gutter's `DropTarget` during a hunk drag
+        /// (`dragdrop::wire_blame_drop`), painted as a red highlight behind the
+        /// hash — distinct from the hover prelight so both can show at once.
+        pub(super) drop_line: Cell<i32>,
         /// Desired column width, sized to the widest hash (0 when empty, so the
         /// column collapses while blame is off).
         pub(super) width_px: Cell<i32>,
@@ -168,7 +179,25 @@ mod imp {
             let x = (avail - lw - XPAD).max(0) as f32;
             let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
             let hovered = self.hover.get() == line as i32;
-            let color = if hovered { hover_color() } else { dim_color() };
+            let is_drop = self.drop_line.get() == line as i32;
+            // Draw the text darker when hovered or targeted by a drop, so it stays
+            // legible against the red drop fill.
+            let color = if hovered || is_drop {
+                hover_color()
+            } else {
+                dim_color()
+            };
+            // A valid hunk drop targeting this line: fill the cell with the
+            // squash-red tint behind the hash (a rounded highlight matching the
+            // history list's `squash-drop-target`).
+            if is_drop {
+                let rect =
+                    gtk::graphene::Rect::new(0.0, line_y as f32, avail as f32, cell_h as f32);
+                let rrect = gtk::gsk::RoundedRect::from_rect(rect, 5.0);
+                snapshot.push_rounded_clip(&rrect);
+                snapshot.append_color(&drop_color(), &rect);
+                snapshot.pop();
+            }
             // Hovered cells read as clickable: underline the hash (a hyperlink
             // affordance, paired with the pointer cursor from `setup_hover`).
             if hovered {
@@ -196,6 +225,7 @@ impl BlameColumn {
     pub(crate) fn new() -> Self {
         let obj: Self = glib::Object::builder().build();
         obj.imp().hover.set(-1);
+        obj.imp().drop_line.set(-1);
         obj.setup_hover();
         obj
     }
@@ -228,6 +258,26 @@ impl BlameColumn {
         imp.width_px.set(width);
         self.queue_resize();
         self.queue_draw();
+    }
+
+    /// Set the line a valid hunk drop targets (or -1 to clear the prelight),
+    /// repainting only when it actually moves. Driven by the blame gutter's
+    /// `DropTarget` during a hunk drag (`dragdrop::wire_blame_drop`).
+    pub(crate) fn set_drop_line(&self, line: i32) {
+        if self.imp().drop_line.get() != line {
+            self.imp().drop_line.set(line);
+            self.queue_draw();
+        }
+    }
+
+    /// The `(buffer line, origin commit `change_id` hex)` of the blame cell under
+    /// widget-relative `y`, if `y` sits on a blamed line. Returns both because a
+    /// hunk drop needs the line for the prelight (`set_drop_line`) and the change
+    /// id for the squash dispatch — one hit-test, no need to expose the private
+    /// line/cell helpers.
+    pub(crate) fn change_id_at_widget_y(&self, y: f64) -> Option<(i32, String)> {
+        let line = self.line_at_widget_y(y)?;
+        Some((line, self.cell_at(line)?.change_id_hex))
     }
 
     /// The buffer line under widget-relative `y` (the gutter scrolls with the

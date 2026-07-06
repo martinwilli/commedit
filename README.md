@@ -49,7 +49,9 @@ an interactive-rebase session.
   expanded (it's the one expensive view). Hovering a hash highlights that commit's
   row in the history list, if it's shown; the hash reads as a hyperlink (pointer
   cursor plus underline), and clicking it opens that origin commit in the diff
-  view (paging older history in when the origin sits below what's loaded).
+  view (paging older history in when the origin sits below what's loaded). The
+  hashes are drop targets too: drag a hunk onto one to squash it into that origin
+  commit (the hash reddens while a valid drop hovers it).
 
 - **Revert hunks or files** — every changed file carries a *revert* button in the
   gutter to drop its change from the commit, and every hunk of a modified file one
@@ -84,7 +86,9 @@ an interactive-rebase session.
 - **Relocate a single hunk** — grab a hunk by its `@@` header line in the diff
   (the line lights up and shows a grab cursor) and drop it onto any commit row, or
   onto the working-copy `@` row, to move just that hunk there — the "this diff
-  belongs in a different commit" fixup at hunk granularity. Source and destination
+  belongs in a different commit" fixup at hunk granularity. You can also drop it
+  onto a hash in the blame column to send it straight into that origin commit,
+  without hunting for the row in the history list. Source and destination
   may each be a commit or the working copy: commit → commit folds it in, commit →
   `@` carves it back out as an uncommitted change, `@` → commit folds an
   uncommitted hunk into history. The rest of the diff stays put and descendants

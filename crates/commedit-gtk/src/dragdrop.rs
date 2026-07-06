@@ -131,6 +131,104 @@ fn hunk_target_ok(
     }
 }
 
+/// Stage (into `post_drag`) the rewrite that folds the dragged hunk into the
+/// commit whose stable change id is `dest_change`. Shared by the history-list
+/// drop and the blame-gutter drop. Resolves src/dest fresh at drag-end, guards a
+/// self-squash, dispatches commit→commit (`squash_hunk_into`) or `@`→commit
+/// (`squash_working_copy_hunk_into`, launch-only), and handles the outcome. Takes
+/// the state bundles rather than a fistful of loose handles (both to dodge
+/// `clippy::too_many_arguments` and because both call sites already hold them),
+/// cloning out the individual handles the staged closure captures.
+fn stage_hunk_into_commit(d: &Data, drag: &DragState, cb: &Callbacks, dest_change: String) {
+    let repo = d.repo.clone();
+    let commits = d.commits.clone();
+    let selected_change = d.selected_change.clone();
+    let drag_hunk = drag.drag_hunk.clone();
+    let post_drag = drag.post_drag.clone();
+    let refresh = cb.refresh.clone();
+    let show_status = cb.show_status.clone();
+    let enter_conflict_mode = cb.enter_conflict_mode.clone();
+    *post_drag.borrow_mut() = Some(Box::new(move || {
+        let Some(hunk) = drag_hunk.borrow().clone() else {
+            return;
+        };
+        let HunkDrag {
+            source,
+            path,
+            first_group,
+            last_group,
+        } = hunk;
+        // Resolve a change id to its (churning) commit id fresh from the current
+        // list — used for the destination and, for a commit source, the source.
+        let commit_id = |change: &str| -> Option<CommitId> {
+            commits
+                .borrow()
+                .iter()
+                .find(|c| c.change_id_hex() == change)
+                .map(|c| c.id.clone())
+        };
+        let Some(dst_id) = commit_id(&dest_change) else {
+            return;
+        };
+        let outcome = match &source {
+            HunkSource::Commit(src_change) => {
+                let Some(src_id) = commit_id(src_change) else {
+                    return;
+                };
+                if src_id == dst_id {
+                    return; // squashing a commit into itself
+                }
+                repo.borrow_mut().squash_hunk_into(
+                    &src_id,
+                    &dst_id,
+                    &path,
+                    first_group,
+                    last_group,
+                    None,
+                )
+            }
+            HunkSource::WorkingCopy { branch, .. } => {
+                // The engine's working-copy hunk fold runs on the launch `@` only;
+                // a sibling worktree's `@` as a source isn't supported yet, so say
+                // so rather than fold the wrong `@`.
+                let launch = matches!(
+                    repo.borrow().wc_target_for_branch(branch),
+                    Some(WcTarget::Launch)
+                );
+                if !launch {
+                    show_status(
+                        "Moving a hunk from a sibling worktree into a commit \
+                         isn't supported yet",
+                    );
+                    return;
+                }
+                repo.borrow_mut().squash_working_copy_hunk_into(
+                    &path,
+                    first_group,
+                    last_group,
+                    &dst_id,
+                    None,
+                )
+            }
+        };
+        // On a clean move re-select the surviving source commit (its change id is
+        // stable across the rewrite); a working-copy source has no commit id of its
+        // own, so fall back to the destination.
+        let select = match &source {
+            HunkSource::Commit(src_change) => src_change.clone(),
+            HunkSource::WorkingCopy { .. } => dest_change.clone(),
+        };
+        match outcome {
+            Ok(SaveOutcome::Clean) => {
+                *selected_change.borrow_mut() = Some(select);
+                refresh();
+            }
+            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
+            Err(err) => show_status(&format!("Moving the hunk failed: {err}")),
+        }
+    }));
+}
+
 /// Install the drag-and-drop controllers on the history, trash and working-copy
 /// lists. See the module docs.
 pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
@@ -810,6 +908,10 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
         let foreign_sha = foreign_sha.clone();
         let enter_conflict_mode = enter_conflict_mode.clone();
         let drag_hunk = drag_hunk.clone();
+        // The whole bundles, for the shared hunk→commit squash helper.
+        let d = d.clone();
+        let drag = drag.clone();
+        let cb = cb.clone();
         move |_target, value, _x, y| {
             // History drags (including from another commedit window) arrive as a
             // text payload; trash and working-copy drags as an i32 row index.
@@ -1578,140 +1680,95 @@ pub(crate) fn wire(w: &Widgets, d: &Data, drag: &DragState, cb: &Callbacks) {
                 }
                 DragOrigin::Hunk if onto.is_some() => {
                     // A hunk grabbed by its `@@` line, dropped onto a commit row or an
-                    // `@` row. Resolve the destination and dispatch by direction:
-                    // commit→commit squash, commit→`@` carve, `@`→commit fold. The
-                    // hunk (source, path, change-group range) rides in `drag_hunk`.
+                    // `@` row. Resolve the destination now (nothing mutates before
+                    // drag-end): a commit routes to the shared squash helper, a
+                    // worktree `@` carves inline. The hunk (source, path, change-group
+                    // range) rides in `drag_hunk`.
                     let onto = onto.unwrap();
-                    let repo = repo.clone();
-                    let commits = commits.clone();
-                    let display = display.clone();
-                    let refresh = refresh.clone();
-                    let show_status = show_status.clone();
-                    let enter_conflict_mode = enter_conflict_mode.clone();
-                    let selected_change = selected_change.clone();
-                    let drag_hunk = drag_hunk.clone();
-                    *post_drag.borrow_mut() = Some(Box::new(move || {
-                        let Some(hunk) = drag_hunk.borrow().clone() else {
-                            return;
-                        };
-                        let HunkDrag {
-                            source,
-                            path,
-                            first_group,
-                            last_group,
-                        } = hunk;
-                        // The dropped-on row: a commit (its stable change id kept for
-                        // re-selection) or a worktree `@` (its branch short-name).
-                        enum Dest {
-                            Commit(CommitId, String),
-                            Wc(String),
-                        }
-                        let dest = {
-                            let c = commits.borrow();
-                            let disp = display.borrow();
-                            match row_commit_index(&disp, onto) {
-                                Some(ci) => match c.get(ci) {
-                                    Some(info) => {
-                                        Dest::Commit(info.id.clone(), info.change_id_hex())
-                                    }
-                                    None => return,
-                                },
-                                None => match disp.get(onto) {
-                                    Some(DisplayRow::Wc { branch, .. }) => Dest::Wc(branch.clone()),
-                                    _ => return,
-                                },
-                            }
-                        };
-                        // Resolve a commit source's change id to its (churning) commit
-                        // id fresh from the current list.
-                        let src_commit = |change: &str| -> Option<CommitId> {
-                            commits
+                    // The dropped-on row: a commit (by stable change id) or a worktree
+                    // `@` (by branch short-name); anything else is a no-op.
+                    enum HunkDest {
+                        Commit(String),
+                        Wc(String),
+                    }
+                    let dest = {
+                        let disp = display.borrow();
+                        match row_commit_index(&disp, onto) {
+                            Some(ci) => commits
                                 .borrow()
-                                .iter()
-                                .find(|c| c.change_id_hex() == change)
-                                .map(|c| c.id.clone())
-                        };
-                        let outcome = match (&source, &dest) {
-                            (HunkSource::Commit(src_change), Dest::Commit(dst_id, _)) => {
-                                let Some(src_id) = src_commit(src_change) else {
+                                .get(ci)
+                                .map(|info| HunkDest::Commit(info.change_id_hex())),
+                            None => match disp.get(onto) {
+                                Some(DisplayRow::Wc { branch, .. }) => {
+                                    Some(HunkDest::Wc(branch.clone()))
+                                }
+                                _ => None,
+                            },
+                        }
+                    };
+                    match dest {
+                        Some(HunkDest::Commit(change)) => {
+                            stage_hunk_into_commit(&d, &drag, &cb, change)
+                        }
+                        Some(HunkDest::Wc(branch)) => {
+                            // A commit → working-copy carve; a working-copy source onto
+                            // an `@` is a no-op.
+                            let repo = repo.clone();
+                            let commits = commits.clone();
+                            let refresh = refresh.clone();
+                            let show_status = show_status.clone();
+                            let enter_conflict_mode = enter_conflict_mode.clone();
+                            let selected_change = selected_change.clone();
+                            let drag_hunk = drag_hunk.clone();
+                            *post_drag.borrow_mut() = Some(Box::new(move || {
+                                let Some(hunk) = drag_hunk.borrow().clone() else {
                                     return;
                                 };
-                                if src_id == *dst_id {
-                                    return; // squashing a commit into itself
-                                }
-                                repo.borrow_mut().squash_hunk_into(
-                                    &src_id,
-                                    dst_id,
-                                    &path,
+                                let HunkDrag {
+                                    source,
+                                    path,
                                     first_group,
                                     last_group,
-                                    None,
-                                )
-                            }
-                            (HunkSource::Commit(src_change), Dest::Wc(branch)) => {
-                                let Some(src_id) = src_commit(src_change) else {
+                                } = hunk;
+                                let HunkSource::Commit(src_change) = source else {
+                                    return; // working copy → working copy: nothing to move
+                                };
+                                let Some(src_id) = commits
+                                    .borrow()
+                                    .iter()
+                                    .find(|c| c.change_id_hex() == src_change)
+                                    .map(|c| c.id.clone())
+                                else {
                                     return;
                                 };
-                                let Some(target) = repo.borrow().wc_target_for_branch(branch)
+                                let Some(target) = repo.borrow().wc_target_for_branch(&branch)
                                 else {
                                     show_status("That working copy has no worktree to carve into");
                                     return;
                                 };
-                                repo.borrow_mut().carve_hunk_to_working_copy(
+                                let outcome = repo.borrow_mut().carve_hunk_to_working_copy(
                                     target,
                                     &src_id,
                                     &path,
                                     first_group,
                                     last_group,
-                                )
-                            }
-                            (HunkSource::WorkingCopy { branch, .. }, Dest::Commit(dst_id, _)) => {
-                                // The engine's working-copy hunk fold runs on the launch
-                                // `@` only; a sibling worktree's `@` as a source isn't
-                                // supported yet, so say so rather than fold the wrong `@`.
-                                let launch = matches!(
-                                    repo.borrow().wc_target_for_branch(branch),
-                                    Some(WcTarget::Launch)
                                 );
-                                if !launch {
-                                    show_status(
-                                        "Moving a hunk from a sibling worktree into a commit \
-                                         isn't supported yet",
-                                    );
-                                    return;
+                                match outcome {
+                                    Ok(SaveOutcome::Clean) => {
+                                        *selected_change.borrow_mut() = Some(src_change);
+                                        refresh();
+                                    }
+                                    Ok(SaveOutcome::Conflicts { commits }) => {
+                                        enter_conflict_mode(commits)
+                                    }
+                                    Err(err) => {
+                                        show_status(&format!("Moving the hunk failed: {err}"))
+                                    }
                                 }
-                                repo.borrow_mut().squash_working_copy_hunk_into(
-                                    &path,
-                                    first_group,
-                                    last_group,
-                                    dst_id,
-                                    None,
-                                )
-                            }
-                            // Working copy → working copy: nothing to move.
-                            (HunkSource::WorkingCopy { .. }, Dest::Wc(_)) => return,
-                        };
-                        // On a clean move re-select the surviving source commit (its
-                        // change id is stable across the rewrite); a working-copy source
-                        // has no commit id of its own, so fall back to the destination.
-                        let select = match (&source, &dest) {
-                            (HunkSource::Commit(src_change), _) => Some(src_change.clone()),
-                            (HunkSource::WorkingCopy { .. }, Dest::Commit(_, dst_change)) => {
-                                Some(dst_change.clone())
-                            }
-                            _ => None,
-                        };
-                        match outcome {
-                            Ok(SaveOutcome::Clean) => {
-                                if let Some(change) = select {
-                                    *selected_change.borrow_mut() = Some(change);
-                                }
-                                refresh();
-                            }
-                            Ok(SaveOutcome::Conflicts { commits }) => enter_conflict_mode(commits),
-                            Err(err) => show_status(&format!("Moving the hunk failed: {err}")),
+                            }));
                         }
-                    }));
+                        None => {}
+                    }
                     true
                 }
                 // Dropped off any valid target row: nothing to do.

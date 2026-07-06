@@ -8,9 +8,12 @@
 //! (`fixup!` / `squash!` / `amend!`) so the UI can recommend drop targets and
 //! compose the merged commit message.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
@@ -524,6 +527,36 @@ impl Repo {
         })
     }
 
+    /// Move a single working-copy diff hunk into the history commit `dest`, leaving
+    /// the rest of the uncommitted changes on disk — the working-copy → commit
+    /// direction of [`Self::squash_hunk_into`], and the hunk-granular partial of
+    /// [`Self::squash_working_copy_partial_into`]. The hunk is addressed by the
+    /// `(path, first_group, last_group)` change-group range of `path`'s `@`-vs-HEAD
+    /// diff, stable across context expansion where a rendered hunk index is not.
+    ///
+    /// Only the selected subset moves from uncommitted to committed-in-`dest`; the
+    /// on-disk file stays byte-identical and the remainder stays uncommitted (the
+    /// throwaway-`C` + full-tree-remainder dance shared with
+    /// [`Self::squash_working_copy_partial_into`]). `message`, when `Some`, becomes
+    /// `dest`'s new message; else `dest`'s is kept (Fixup). Launch worktree only.
+    pub fn squash_working_copy_hunk_into(
+        &mut self,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        self.require_worktree("fold a working-copy hunk into a commit")?;
+        crate::repo::catch_jj("folding a working-copy hunk", || {
+            // Build the selected subset's tree from the change-group range (against
+            // HEAD, like commit_working_copy_partial), then share the transaction
+            // tail with the PartialSelection-based partial squash.
+            let prepared = self.prepare_partial_commit_hunk(path, first_group, last_group)?;
+            self.squash_prepared_working_copy_into(prepared, dest, message)
+        })
+    }
+
     fn squash_working_copy_partial_into_inner(
         &mut self,
         sel: PartialSelection<'_>,
@@ -532,7 +565,26 @@ impl Repo {
     ) -> Result<SaveOutcome> {
         // Snapshot + build the selected subset's tree (`t_commit`) and the full
         // on-disk tree, against HEAD — shared with commit_working_copy_partial.
-        let (head, head_tree, full_tree, t_commit) = self.prepare_partial_commit(&sel)?;
+        let prepared = self.prepare_partial_commit(&sel)?;
+        self.squash_prepared_working_copy_into(prepared, dest, message)
+    }
+
+    /// The shared transaction tail of the partial working-copy squashes: given the
+    /// `(head, head_tree, full_tree, t_commit)` a `prepare_partial_commit*` built,
+    /// stage `t_commit` as a throwaway commit `C` on HEAD, rebuild the leaf `@` to
+    /// hold the full on-disk tree on top of it (so disk stays byte-identical and the
+    /// unselected delta stays uncommitted), then fold `C` into `dest` and rebase
+    /// descendants (including `@`). `message`, when `Some`, replaces `dest`'s
+    /// message; else `dest`'s is kept (Fixup). Shared by
+    /// [`Self::squash_working_copy_partial_into`] and
+    /// [`Self::squash_working_copy_hunk_into`].
+    fn squash_prepared_working_copy_into(
+        &mut self,
+        prepared: (CommitId, MergedTree, MergedTree, MergedTree),
+        dest: &CommitId,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        let (head, head_tree, full_tree, t_commit) = prepared;
 
         let name = self.workspace.workspace_name().to_owned();
         let pre_op = self.repo.operation().clone();
@@ -614,6 +666,227 @@ impl Repo {
             old_head,
             heads,
         )
+    }
+
+    /// Move a single diff hunk out of `source` and fold it into `dest`, rebasing
+    /// descendants — the "this line belongs in a different commit" fixup at hunk
+    /// granularity. The hunk is addressed by `(path, first_group, last_group)`: the
+    /// inclusive change-group index range of `source`'s parent-vs-commit diff for
+    /// `path`. Group indices come from [`crate::diff::change_groups`] and depend only
+    /// on the old/new content, never on how much context the diff view has expanded
+    /// — unlike a rendered hunk index, which merges adjacent groups once expanded
+    /// context bridges their gap. A dragged visual hunk contributes all of its
+    /// groups, so a range may span what a default render shows as several hunks.
+    /// `message`, when `Some`, replaces `dest`'s message; else `dest`'s is kept (a
+    /// Fixup — the hunk carries no message of its own).
+    ///
+    /// Built on jj's partial-selection [`squash_commits`] like
+    /// [`Self::squash_working_copy_partial_into`]: `source` is rewritten to drop the
+    /// hunk and `dest` gains it, direction-aware so `dest` may sit either above or
+    /// below `source`. Because the net change set is preserved the post-move tip is
+    /// clean even if an interior commit conflicts spuriously — so it exits through
+    /// the same CleanTip auto-resolve as a whole-commit squash; a genuine overlap
+    /// enters the deferred conflict flow. Kept MCP-shaped for a future `move_hunk`
+    /// tool.
+    pub fn squash_hunk_into(
+        &mut self,
+        source: &CommitId,
+        dest: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        message: Option<&str>,
+    ) -> Result<SaveOutcome> {
+        crate::repo::catch_jj("moving the hunk", || {
+            self.squash_hunk_into_inner(source, dest, path, first_group, last_group, message, None)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn squash_hunk_into_inner(
+        &mut self,
+        source: &CommitId,
+        dest: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+        message: Option<&str>,
+        label: Option<String>,
+    ) -> Result<SaveOutcome> {
+        if source == dest {
+            anyhow::bail!("cannot move a hunk from a commit into itself");
+        }
+        if first_group > last_group {
+            anyhow::bail!(
+                "invalid change-group range: first_group {first_group} > last_group {last_group}"
+            );
+        }
+        // Capture the on-disk working copy into @ so it rebases with the rewrite.
+        self.snapshot_working_copy()?;
+        let pre_op = self.repo.operation().clone();
+        let old_head = self.edited_tip();
+        let heads = self.snapshot_heads();
+
+        let store = self.repo.store().clone();
+        let source_commit = store.get_commit(source).context("loading source commit")?;
+        let dest_commit = store
+            .get_commit(dest)
+            .context("loading destination commit")?;
+        let source_parent_tree = pollster::block_on(source_commit.parent_tree(self.repo.as_ref()))
+            .context("loading source parent tree")?;
+
+        // Read the source's change for `path` and pull its text on both sides; the
+        // hunk to move is a slice of this parent-vs-commit diff.
+        let changes = crate::diff::commit_changes(&self.repo, source)
+            .context("reading the source commit's changes")?;
+        let change = changes
+            .iter()
+            .find(|c| c.path == path)
+            .with_context(|| format!("the source commit does not modify {path}"))?;
+        let (Some(old), Some(new)) = (change.old_text.as_deref(), change.new_text.as_deref())
+        else {
+            anyhow::bail!("{path} is not an editable text change in the source commit");
+        };
+
+        // Build the selected content straight from the change-group range. Bound the
+        // range against the file's group count (stable across context expansion), so
+        // a stale range is rejected clearly rather than silently selecting nothing.
+        let group_count =
+            crate::diff::render_diff(old, new, path, &crate::diff::ContextExpansion::default())
+                .group_count;
+        if last_group >= group_count {
+            anyhow::bail!(
+                "change-group {last_group} out of range for {path} ({group_count} group(s))"
+            );
+        }
+        let kept: BTreeSet<usize> = (first_group..=last_group).collect();
+        let selected_content = crate::diff::select_groups(old, new, &kept);
+
+        // The selected tree is the source's parent with only this hunk applied, so
+        // its diff from the parent tree is exactly the hunk to move; the remainder
+        // (selected_tree → source.tree) stays in the source.
+        let selected_tree = crate::tree::splice_files_into_tree(
+            source_parent_tree.clone(),
+            &store,
+            &[(path.to_string(), selected_content)],
+        )
+        .context("building the selected hunk tree")?;
+        let sel = CommitWithSelection {
+            commit: source_commit.clone(),
+            parent_tree: source_parent_tree,
+            selected_tree,
+        };
+
+        // The hunk carries no message of its own, so the Fixup default keeps the
+        // destination's; an explicit override replaces it. Preserve the author.
+        let new_desc = match message {
+            Some(m) => m.to_string(),
+            None => dest_commit.description().to_string(),
+        };
+        let dest_author = dest_commit.author().clone();
+        let label = label.unwrap_or_else(|| {
+            format!(
+                "Move a hunk of {} into {}",
+                op_subject(&source_commit),
+                op_subject(&dest_commit)
+            )
+        });
+        let desc = OpDescriptor::new(
+            label,
+            vec![
+                source_commit.change_id().hex(),
+                dest_commit.change_id().hex(),
+            ],
+        );
+
+        let mut tx = self.repo.start_transaction();
+        let squashed = pollster::block_on(squash_commits(
+            tx.repo_mut(),
+            std::slice::from_ref(&sel),
+            &dest_commit,
+            /* keep_emptied = */ false,
+        ))
+        .context("squashing the hunk")?
+        .context("squash produced no commit (empty selection)")?;
+        pollster::block_on(
+            squashed
+                .commit_builder
+                .set_description(new_desc)
+                .set_author(dest_author)
+                .write(),
+        )
+        .context("writing squashed commit")?;
+        pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        // Moving a hunk preserves the net change set, so the post-move tip is clean
+        // even when an interior commit conflicts spuriously — same CleanTip resolve
+        // as a whole-commit squash.
+        self.finish_mutation_auto_resolve(
+            tx,
+            "commedit: move a hunk",
+            desc,
+            pre_op,
+            old_head,
+            heads,
+        )
+    }
+
+    /// Carve a single diff hunk out of the history commit `source` and land it as
+    /// an uncommitted change on `target`'s working copy — the inverse direction of
+    /// [`Self::squash_hunk_into`] (commit → working copy rather than commit →
+    /// commit). The hunk is addressed by the same `(path, first_group, last_group)`
+    /// change-group range. The destination is `target`'s leaf `@`, a descendant of
+    /// `source`, so [`squash_commits`]' direction handling drops the hunk from
+    /// `source` and folds it onto `@`, where it surfaces as an on-disk change.
+    /// `source` loses the hunk; the overall content is unchanged (it just moves from
+    /// committed to uncommitted).
+    ///
+    /// A clean move on an *extra* worktree needs an explicit `@`-materialize (the
+    /// shared export tail only re-materializes an extra worktree whose branch tip
+    /// moved, and this can move the `@` alone); the launch worktree is materialized
+    /// unconditionally by the export tail. A conflicting move enters the shared
+    /// deferred-conflict flow. Kept MCP-shaped for a future `move_hunk` tool.
+    pub fn carve_hunk_to_working_copy(
+        &mut self,
+        target: WcTarget,
+        source: &CommitId,
+        path: &str,
+        first_group: usize,
+        last_group: usize,
+    ) -> Result<SaveOutcome> {
+        self.require_wc_target(&target, "carve a hunk to the working tree")?;
+        crate::repo::catch_jj("carving the hunk to the working copy", || {
+            // Snapshot before resolving so the leaf id survives squash_hunk_into_inner's
+            // own (now no-op) snapshot — otherwise a churned leaf id would go stale.
+            self.snapshot_wc(&target)?;
+            let dest = self
+                .resolve_wc(&target, None)
+                .context("no working copy to carve the hunk into")?;
+            let source_commit = self
+                .repo
+                .store()
+                .get_commit(source)
+                .context("loading the commit to carve from")?;
+            let label = format!(
+                "Carve a hunk of {} to working copy",
+                op_subject(&source_commit)
+            );
+            let outcome = self.squash_hunk_into_inner(
+                source,
+                &dest,
+                path,
+                first_group,
+                last_group,
+                None,
+                Some(label),
+            )?;
+            // Write a sibling worktree's rebased `@` to its own disk; the launch
+            // path is already materialized by the export tail, so leave it untouched.
+            if matches!(outcome, SaveOutcome::Clean) && matches!(target, WcTarget::Worktree(_)) {
+                self.materialize_wc(&target)?;
+            }
+            Ok(outcome)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

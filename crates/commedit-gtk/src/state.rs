@@ -69,6 +69,36 @@ pub(crate) enum DragOrigin {
     /// or onto the trash to discard it. Its branch + entry are read from the
     /// dragged display row (`drag_from` indexes the unified display list).
     WorkingCopy,
+    /// A single diff hunk grabbed by its `@@` header line in the diff view and
+    /// dropped onto a commit row or the working-copy `@` row to relocate it. The
+    /// hunk itself (source, path, change-group range) is carried out-of-band in
+    /// `DragState::drag_hunk`, since the drag payload is only an `i32` sentinel.
+    Hunk,
+}
+
+/// A diff hunk being dragged from the diff view to relocate it into another
+/// commit (or the working copy). Addressed by the expansion-invariant change-group
+/// range `(path, first_group, last_group)` — never a rendered hunk index — so the
+/// engine moves the same groups the view showed even after a context expand. Held
+/// in [`DragState::drag_hunk`] for the gesture; the GTK payload is only an `i32`
+/// sentinel (mirroring the WC/trash in-process drags).
+#[derive(Clone)]
+pub(crate) struct HunkDrag {
+    pub(crate) source: HunkSource,
+    pub(crate) path: String,
+    pub(crate) first_group: usize,
+    pub(crate) last_group: usize,
+}
+
+/// Where a dragged hunk came from: an existing commit (by stable change id) or a
+/// worktree's uncommitted `@` (by branch short-name + change id).
+#[derive(Clone)]
+pub(crate) enum HunkSource {
+    /// A commit's parent-vs-commit diff; the string is the commit's change id hex.
+    Commit(String),
+    /// A worktree's `@`-vs-HEAD diff; `branch` is the worktree's branch short-name
+    /// (`""` on a detached-HEAD launch), `change` the `@`'s stable change id hex.
+    WorkingCopy { branch: String, change: String },
 }
 
 /// One row in the unified history list: either a real commit (by index into the
@@ -375,6 +405,10 @@ pub(crate) struct DragState {
     pub(crate) drag_set: Rc<RefCell<Vec<usize>>>,
     pub(crate) drop_gap: Rc<Cell<Option<usize>>>,
     pub(crate) drop_onto: Rc<Cell<Option<usize>>>,
+    /// The hunk currently being dragged from the diff view (`DragOrigin::Hunk`),
+    /// or `None` between hunk drags. Carried here rather than in the payload, which
+    /// is only an `i32` sentinel.
+    pub(crate) drag_hunk: Rc<RefCell<Option<HunkDrag>>>,
     pub(crate) post_drag: PostDrag,
 }
 

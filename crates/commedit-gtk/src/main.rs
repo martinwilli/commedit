@@ -335,6 +335,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // valid target), or None. Mutually exclusive with `drop_gap`: a row's edges
     // open a reorder gap, its middle marks a squash target.
     let drop_onto: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // The diff hunk grabbed by its `@@` line and dragged from the diff view, or
+    // None between hunk drags. Carried out-of-band (the payload is only an i32
+    // sentinel); read by the history list's drop handler (`DragOrigin::Hunk`).
+    let drag_hunk: Rc<RefCell<Option<HunkDrag>>> = Rc::new(RefCell::new(None));
     // A drop handler rewrites history and rebuilds both lists, which destroys the
     // ListBoxRow widgets. Doing that while the drag is still in flight frees a row
     // GTK still holds as the drop-crossing target, crashing the next pointer event
@@ -1056,6 +1060,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         drag_set: drag_set.clone(),
         drop_gap: drop_gap.clone(),
         drop_onto: drop_onto.clone(),
+        drag_hunk: drag_hunk.clone(),
         post_drag: post_drag.clone(),
     };
 
@@ -1331,6 +1336,26 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             nav_sync.set(false);
         })
     };
+    // Split the hunk enclosing context `line` into two and re-render in place, so
+    // each half becomes its own draggable / revertable / expandable hunk. Backs the
+    // gutter ✄ button; `split_hunk_at` re-validates and no-ops on an ineligible
+    // line, and the split is ephemeral — a full re-render (Save, file switch, …)
+    // re-merges the halves. `splice=true` keeps the scroll put and updates
+    // `combined_files` in step with the text.
+    let apply_split: Rc<dyn Fn(usize)> = {
+        let apply_diff_text = apply_diff_text.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        Rc::new(move |line: usize| {
+            let text = buffer_text(&file_buffer);
+            // Bind before calling `apply_diff_text` (which borrows `combined_files`
+            // mutably), so the read borrow is released first.
+            let split = diff_cues::split_hunk_at(&text, &combined_files.borrow(), line);
+            if let Some((new_text, new_files)) = split {
+                apply_diff_text(new_text, Vec::new(), new_files, true);
+            }
+        })
+    };
     // Bind the two gutter columns' click handlers. A column means different things
     // per pane mode, so each dispatches on it. col_old: diff → widen this hunk's
     // context. col_new: diff → drop this hunk's or file's change; conflict → resolve
@@ -1342,6 +1367,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let combined_files = combined_files.clone();
         let file_buffer = file_buffer.clone();
         let apply_diff_cue = apply_diff_cue.clone();
+        let apply_split = apply_split.clone();
         let conflict_expand_cell = conflict_expand_cell.clone();
         Rc::new(move |line: u32| {
             if pane_mode.borrow().is_conflict() {
@@ -1353,13 +1379,18 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 return;
             }
             let text = buffer_text(&file_buffer);
-            let Some((first, last, path)) =
-                diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize)
-            else {
-                return;
-            };
-            let apply = apply_diff_cue.clone();
-            glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
+            // Bind (owned) before deferring so the `combined_files` borrow is short.
+            let target = diff_cues::hunk_target(&text, &combined_files.borrow(), line as usize);
+            if let Some((first, last, path)) = target {
+                // A `@@` header: widen this hunk's context.
+                let apply = apply_diff_cue.clone();
+                glib::idle_add_local_once(move || apply(DiffCue::Expand(first, last), path));
+            } else {
+                // A context line: split its hunk in two (`apply_split` re-checks
+                // eligibility via `split_hunk_at` and no-ops otherwise).
+                let apply_split = apply_split.clone();
+                glib::idle_add_local_once(move || apply_split(line as usize));
+            }
         })
     });
     col_new.set_on_activate({
@@ -1405,9 +1436,184 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         })
     });
 
-    // Every diff/conflict affordance now lives in the gutter (`GutterColumn`),
-    // which owns its own click handling, pointer cursor and tooltips — so the text
-    // view needs no in-text click gesture or hover-cursor override any more.
+    // The diff/conflict cue *buttons* all live in the gutter (`GutterColumn`), which
+    // owns their click handling, cursor and tooltips. The one in-text affordance is
+    // the `@@` header line as a drag handle: grab it to relocate the whole hunk into
+    // another commit (or the working copy). The gesture is a `DragSource` in the
+    // Capture phase so it gets first look at a press on the view — on a `@@` line it
+    // offers the hunk (a companion press gesture claims the sequence so selection
+    // can't steal it, see below); anywhere else `connect_prepare` returns None and
+    // the press falls through to GtkTextView's own selection drag.
+    // Is a widget-relative x over the left gutter (line numbers + cue buttons)
+    // rather than the text? These Capture-phase handlers claim a press before the
+    // gutter can, so without this they'd swallow the gutter's own expand /
+    // revert-hunk button clicks — which sit on the very same `@@` lines.
+    let over_gutter: Rc<dyn Fn(f64) -> bool> = {
+        let file_view = file_view.clone();
+        Rc::new(move |x: f64| {
+            let gutter =
+                sourceview5::prelude::ViewExt::gutter(&file_view, gtk::TextWindowType::Left);
+            (x as i32) < gutter.width()
+        })
+    };
+
+    let hunk_drag_source = gtk::DragSource::new();
+    hunk_drag_source.set_actions(gdk::DragAction::MOVE);
+    hunk_drag_source.set_propagation_phase(PropagationPhase::Capture);
+    hunk_drag_source.connect_prepare({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let combined_files = combined_files.clone();
+        let diff_read_only = diff_read_only.clone();
+        let pane_mode = pane_mode.clone();
+        let viewing_wc = viewing_wc.clone();
+        let selected_change = selected_change.clone();
+        let selected_wc_branch = selected_wc_branch.clone();
+        let selected_wc_change = selected_wc_change.clone();
+        let drag_origin = drag_origin.clone();
+        let drag_hunk = drag_hunk.clone();
+        let over_gutter = over_gutter.clone();
+        move |_source, x, y| {
+            // Offered only in the editable single-commit / single-`@` diff. The
+            // multi-commit combined view is read-only and its source is ambiguous,
+            // and a conflict snippet buffer isn't a unified diff.
+            if diff_read_only.get() || pane_mode.borrow().is_conflict() || over_gutter(x) {
+                return None;
+            }
+            let (_bx, by) =
+                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let (iter, _) = file_view.line_at_y(by);
+            let line = iter.line() as usize;
+            // Not a `@@` header → return None so normal text selection proceeds.
+            let (first_group, last_group, path) =
+                diff_cues::hunk_target(&buffer_text(&file_buffer), &combined_files.borrow(), line)?;
+            let source = if viewing_wc.get() {
+                HunkSource::WorkingCopy {
+                    branch: selected_wc_branch.borrow().clone().unwrap_or_default(),
+                    change: selected_wc_change.borrow().clone().unwrap_or_default(),
+                }
+            } else {
+                HunkSource::Commit(selected_change.borrow().clone()?)
+            };
+            *drag_hunk.borrow_mut() = Some(HunkDrag {
+                source,
+                path,
+                first_group,
+                last_group,
+            });
+            drag_origin.set(DragOrigin::Hunk);
+            // In-process only: the drop handler reads the hunk from `drag_hunk`, not
+            // this value. An i32 sentinel keeps the history list's DropTarget
+            // (String | i32) willing to receive the drop.
+            Some(gdk::ContentProvider::for_value(&(-1i32).to_value()))
+        }
+    });
+    hunk_drag_source.connect_drag_end({
+        let post_drag = post_drag.clone();
+        move |_source, _drag, _delete| {
+            // The drop staged its rewrite into `post_drag`; run it now that the
+            // gesture (and GTK's DnD bookkeeping) is fully torn down — same discipline
+            // as the history/trash drag sources.
+            dragdrop::run_post_drag(&post_drag);
+        }
+    });
+
+    // A press on a `@@` line must not let GtkTextView start extending a text
+    // selection: a jittery press-and-move would otherwise claim the event sequence
+    // for selection before the drag crosses its motion threshold (drags then only
+    // start if the pointer holds still first). So claim the sequence here in the
+    // Capture phase, denying the Bubble-phase selection gesture — and group this with
+    // the drag source so the claim doesn't also deny our own drag.
+    let hunk_press = gtk::GestureClick::new();
+    hunk_press.set_button(gdk::BUTTON_PRIMARY);
+    hunk_press.set_propagation_phase(PropagationPhase::Capture);
+    hunk_press.connect_pressed({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let combined_files = combined_files.clone();
+        let diff_read_only = diff_read_only.clone();
+        let pane_mode = pane_mode.clone();
+        let over_gutter = over_gutter.clone();
+        move |gesture, _n, x, y| {
+            if diff_read_only.get() || pane_mode.borrow().is_conflict() || over_gutter(x) {
+                return;
+            }
+            let (_bx, by) =
+                file_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let (iter, _) = file_view.line_at_y(by);
+            if diff_cues::hunk_target(
+                &buffer_text(&file_buffer),
+                &combined_files.borrow(),
+                iter.line() as usize,
+            )
+            .is_some()
+            {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+        }
+    });
+    file_view.add_controller(hunk_press.clone());
+    file_view.add_controller(hunk_drag_source.clone());
+    hunk_drag_source.group_with(&hunk_press);
+
+    // Hover feedback for the drag handle: a grab cursor plus a subtle line highlight
+    // whenever the pointer sits over a `@@` header, and only there. Tracks the last
+    // highlighted line so the tag/cursor only change on a line change.
+    let hunk_hover_line: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
+    let hunk_motion = gtk::EventControllerMotion::new();
+    hunk_motion.connect_motion({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let combined_files = combined_files.clone();
+        let diff_read_only = diff_read_only.clone();
+        let pane_mode = pane_mode.clone();
+        let hunk_hover_line = hunk_hover_line.clone();
+        let over_gutter = over_gutter.clone();
+        move |_controller, x, y| {
+            let over = if diff_read_only.get() || pane_mode.borrow().is_conflict() || over_gutter(x)
+            {
+                None
+            } else {
+                let (_bx, by) = file_view.window_to_buffer_coords(
+                    gtk::TextWindowType::Widget,
+                    x as i32,
+                    y as i32,
+                );
+                let (iter, _) = file_view.line_at_y(by);
+                let line = iter.line();
+                diff_cues::hunk_target(
+                    &buffer_text(&file_buffer),
+                    &combined_files.borrow(),
+                    line as usize,
+                )
+                .map(|_| line)
+            };
+            let now = over.unwrap_or(-1);
+            if now == hunk_hover_line.get() {
+                return;
+            }
+            hunk_hover_line.set(now);
+            set_hunk_hover(&file_buffer, over);
+            if over.is_some() {
+                file_view.set_cursor_from_name(Some("grab"));
+            } else {
+                // Off a `@@` line: restore the text I-beam (what GtkTextView shows by
+                // default) rather than clearing to the inherited arrow.
+                file_view.set_cursor_from_name(Some("text"));
+            }
+        }
+    });
+    hunk_motion.connect_leave({
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let hunk_hover_line = hunk_hover_line.clone();
+        move |_controller| {
+            hunk_hover_line.set(-1);
+            set_hunk_hover(&file_buffer, None);
+            file_view.set_cursor(None);
+        }
+    });
+    file_view.add_controller(hunk_motion);
 
     // Jump the (already-rendered) combined diff to the file at dropdown `idx`,
     // pinning its `diff --git` header to the top of the viewport. The whole change
@@ -4523,6 +4729,31 @@ mod tests {
             revert.iter().all(Option::is_none),
             "no revert cues when read-only"
         );
+    }
+
+    #[test]
+    fn split_cue_matches_split_hunk_at_acceptance() {
+        // Two edits close enough to share one hunk, separated by context: the ✄
+        // split cue (col_old, tooltip "Split hunk") must land on exactly the lines
+        // split_hunk_at() accepts — inter-group context, never leading/trailing.
+        let old: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        let new = old.replace("l3\n", "L3\n").replace("l6\n", "L6\n");
+        let changes = vec![modified("f", &old, &new)];
+        let (text, _h, files) = build_diff_buffer_text(&changes, &HashMap::new());
+        let (expand, _revert) = diff_cues::diff_cue_cells(&text, &files, &changes, false);
+        let mut split_lines = 0;
+        for (i, cue) in expand.iter().enumerate() {
+            let splittable = diff_cues::split_hunk_at(&text, &files, i).is_some();
+            let has_split_cue = cue.as_ref().map(|c| c.tooltip.as_str()) == Some("Split hunk");
+            assert_eq!(
+                splittable,
+                has_split_cue,
+                "line {i}: {:?}",
+                text.lines().nth(i)
+            );
+            split_lines += splittable as usize;
+        }
+        assert!(split_lines >= 1, "at least one eligible split line");
     }
 
     #[test]

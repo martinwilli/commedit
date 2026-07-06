@@ -56,6 +56,31 @@ pub(crate) fn install_diff_tags(buffer: &sourceview5::Buffer) {
         t.set_foreground(Some("#cf222e"));
         t.set_weight(700);
     });
+    // Transient hover highlight on a `@@` header line when the pointer sits over
+    // it, cueing that the line is a drag handle for relocating the hunk. A deeper
+    // blue than the resting "hunk" background; added last so its paragraph
+    // background outranks "hunk" (GTK tag priority follows insertion order).
+    add("hunk-hover", &|t| {
+        t.set_paragraph_background(Some("#b6e3ff"))
+    });
+}
+
+/// Move the transient `hunk-hover` highlight onto buffer line `line` (removing it
+/// from everywhere else), or clear it entirely when `None`. Drives the diff view's
+/// "this `@@` line is a drag handle" hover affordance; applying a tag doesn't fire
+/// the buffer's `changed` signal, so it never disturbs the gutter/blame recompute.
+pub(crate) fn set_hunk_hover(buffer: &sourceview5::Buffer, line: Option<i32>) {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    buffer.remove_tag_by_name("hunk-hover", &start, &end);
+    if let Some(li) = line {
+        if let Some(s) = buffer.iter_at_line(li) {
+            let e = buffer
+                .iter_at_line(li + 1)
+                .unwrap_or_else(|| buffer.end_iter());
+            buffer.apply_tag_by_name("hunk-hover", &s, &e);
+        }
+    }
 }
 
 /// Look up (or lazily create and cache, via the buffer's tag table) a foreground

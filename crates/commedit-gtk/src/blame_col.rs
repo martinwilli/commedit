@@ -8,7 +8,9 @@
 //! column via the persistent sidebar handle left of the gutter (`main.rs`'s
 //! `blame_strip`). Hovering a cell invokes a late-bound
 //! callback with the originating commit's `change_id` hex, so the caller can
-//! highlight that commit's row in the history list.
+//! highlight that commit's row in the history list; the cell reads as a
+//! hyperlink (pointer cursor + underline) and clicking it fires a second
+//! late-bound callback so the caller can open that origin commit.
 //!
 //! The line→origin mapping ([`blame_cells`] via the pure [`diff_old_refs`]) is
 //! GTK-free and inline-tested; only the rendering and hover plumbing touch GTK.
@@ -38,6 +40,10 @@ const XPAD: i32 = 4;
 /// when the pointer leaves a blamed line).
 pub(crate) type HoverFn = Rc<dyn Fn(Option<&str>)>;
 
+/// An activation (click) callback, invoked with the clicked cell's `change_id`
+/// hex so the caller can open that origin commit.
+pub(crate) type ActivateFn = Rc<dyn Fn(&str)>;
+
 /// One blame cell: what to draw, plus the data the hover/highlight needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlameCell {
@@ -48,6 +54,9 @@ pub(crate) struct BlameCell {
     pub change_id_hex: String,
     /// Author / date / subject, shown as the cell's tooltip.
     pub tooltip: String,
+    /// Whether this cell is a hunk's *absorb target* (drawn purple + italic on
+    /// the `@@` header line) rather than a factual per-line origin (dim gray).
+    pub absorb: bool,
 }
 
 impl BlameCell {
@@ -61,6 +70,17 @@ impl BlameCell {
                 "{}\n{} · {}",
                 info.subject, info.author_name, info.author_time
             ),
+            absorb: false,
+        }
+    }
+
+    /// Clone this origin cell as a hunk's absorb target, so the `@@` header line
+    /// draws it purple + italic (the natural squash destination) rather than as a
+    /// factual dim per-line origin.
+    fn as_absorb(&self) -> Self {
+        Self {
+            absorb: true,
+            ..self.clone()
         }
     }
 }
@@ -72,6 +92,18 @@ fn dim_color() -> gdk::RGBA {
 }
 fn hover_color() -> gdk::RGBA {
     gdk::RGBA::new(0.231, 0.251, 0.283, 1.0)
+}
+/// The squash-red tint painted behind a hash while a valid hunk drop targets it,
+/// matching the history list's `squash-drop-target` styling (`rgba(224, 27, 36,
+/// 0.38)`, `main.rs`), so the hash reads as "drop here".
+fn drop_color() -> gdk::RGBA {
+    gdk::RGBA::new(0.878, 0.106, 0.141, 0.38)
+}
+/// The `squash-blame` purple used for a hunk's absorb target on the `@@` header
+/// line (`rgba(145, 65, 172, …)`, matching the drag-highlight), so the suggested
+/// squash destination reads distinctly from the factual dim per-line origins.
+fn absorb_color() -> gdk::RGBA {
+    gdk::RGBA::new(0.569, 0.255, 0.675, 1.0)
 }
 
 mod imp {
@@ -85,12 +117,20 @@ mod imp {
         pub(super) cells: RefCell<Vec<Option<BlameCell>>>,
         /// Line currently under the pointer (for the prelight), or -1.
         pub(super) hover: Cell<i32>,
+        /// Line a valid hunk drop currently targets (the drop-target prelight),
+        /// or -1. Driven by the gutter's `DropTarget` during a hunk drag
+        /// (`dragdrop::wire_blame_drop`), painted as a red highlight behind the
+        /// hash — distinct from the hover prelight so both can show at once.
+        pub(super) drop_line: Cell<i32>,
         /// Desired column width, sized to the widest hash (0 when empty, so the
         /// column collapses while blame is off).
         pub(super) width_px: Cell<i32>,
         /// Hover callback, late-bound by the caller once the list it highlights
         /// exists.
         pub(super) on_hover: RefCell<Option<HoverFn>>,
+        /// Activation callback, late-bound like `on_hover`; fired with a clicked
+        /// hash's `change_id` hex so the caller can open its origin commit.
+        pub(super) on_activate: RefCell<Option<ActivateFn>>,
     }
 
     #[glib::object_subclass]
@@ -114,6 +154,35 @@ mod imp {
     }
 
     impl GutterRendererImpl for BlameColumn {
+        fn query_activatable(&self, iter: &gtk::TextIter, _area: &gdk::Rectangle) -> bool {
+            matches!(self.cells.borrow().get(iter.line() as usize), Some(Some(_)))
+        }
+
+        fn activate(
+            &self,
+            iter: &gtk::TextIter,
+            _area: &gdk::Rectangle,
+            _button: u32,
+            _state: gdk::ModifierType,
+            _n_presses: i32,
+        ) {
+            // Take a copy of the change id and drop the borrow *before* firing:
+            // the callback re-selects the row, which refreshes and repaints this
+            // column via `set_content` (a `cells` mut-borrow).
+            let change = self
+                .cells
+                .borrow()
+                .get(iter.line() as usize)
+                .cloned()
+                .flatten()
+                .map(|c| c.change_id_hex);
+            if let Some(change) = change {
+                if let Some(cb) = self.on_activate.borrow().clone() {
+                    cb(&change);
+                }
+            }
+        }
+
         fn snapshot_line(&self, snapshot: &gtk::Snapshot, lines: &GutterLines, line: u32) {
             let cells = self.cells.borrow();
             let Some(Some(cell)) = cells.get(line as usize) else {
@@ -129,11 +198,44 @@ mod imp {
             let (line_y, cell_h) = lines.line_yrange(line, GutterRendererAlignmentMode::Cell);
             let x = (avail - lw - XPAD).max(0) as f32;
             let y = line_y as f32 + ((cell_h - lh) / 2).max(0) as f32;
-            let color = if self.hover.get() == line as i32 {
+            let hovered = self.hover.get() == line as i32;
+            let is_drop = self.drop_line.get() == line as i32;
+            // Draw the text darker when hovered or targeted by a drop, so it stays
+            // legible against the red drop fill; an absorb target reads purple at
+            // rest but yields that to the hover/drop interaction color.
+            let color = if hovered || is_drop {
                 hover_color()
+            } else if cell.absorb {
+                absorb_color()
             } else {
                 dim_color()
             };
+            // A valid hunk drop targeting this line: fill the cell with the
+            // squash-red tint behind the hash (a rounded highlight matching the
+            // history list's `squash-drop-target`).
+            if is_drop {
+                let rect =
+                    gtk::graphene::Rect::new(0.0, line_y as f32, avail as f32, cell_h as f32);
+                let rrect = gtk::gsk::RoundedRect::from_rect(rect, 5.0);
+                snapshot.push_rounded_clip(&rrect);
+                snapshot.append_color(&drop_color(), &rect);
+                snapshot.pop();
+            }
+            // Hovered cells read as clickable (underline, a hyperlink affordance
+            // paired with the pointer cursor from `setup_hover`); an absorb target
+            // reads as a suggestion (italic). Both share one `AttrList`.
+            if hovered || cell.absorb {
+                let attrs = gtk::pango::AttrList::new();
+                if hovered {
+                    attrs.insert(gtk::pango::AttrInt::new_underline(
+                        gtk::pango::Underline::Single,
+                    ));
+                }
+                if cell.absorb {
+                    attrs.insert(gtk::pango::AttrInt::new_style(gtk::pango::Style::Italic));
+                }
+                layout.set_attributes(Some(&attrs));
+            }
             snapshot.save();
             snapshot.translate(&gtk::graphene::Point::new(x, y));
             snapshot.append_layout(&layout, &color);
@@ -152,6 +254,7 @@ impl BlameColumn {
     pub(crate) fn new() -> Self {
         let obj: Self = glib::Object::builder().build();
         obj.imp().hover.set(-1);
+        obj.imp().drop_line.set(-1);
         obj.setup_hover();
         obj
     }
@@ -162,9 +265,19 @@ impl BlameColumn {
         *self.imp().on_hover.borrow_mut() = Some(f);
     }
 
-    /// Replace the per-line cells, resize to fit the widest hash (zero — a
-    /// collapsed column — when empty), and repaint.
-    pub(crate) fn set_content(&self, cells: &[Option<BlameCell>]) {
+    /// Late-bind the activation callback, fired with a clicked hash's `change_id`
+    /// hex. Called once the history list it opens into exists.
+    pub(crate) fn set_on_activate(&self, f: ActivateFn) {
+        *self.imp().on_activate.borrow_mut() = Some(f);
+    }
+
+    /// Replace the per-line cells, resize, and repaint. `shown` is whether blame
+    /// is toggled on: when off the column collapses to zero width; when on it
+    /// keeps at least a hash's worth of width even with nothing to annotate, so
+    /// toggling it always slides the gutter in — a diff with no old side (e.g. a
+    /// commit that only adds files) then shows an empty gutter rather than
+    /// silently staying collapsed.
+    pub(crate) fn set_content(&self, cells: &[Option<BlameCell>], shown: bool) {
         let imp = self.imp();
         let view = self.view();
         let text_w = cells
@@ -173,11 +286,38 @@ impl BlameColumn {
             .map(|c| view.create_pango_layout(Some(&c.short)).pixel_size().0)
             .max()
             .unwrap_or(0);
-        let width = if text_w == 0 { 0 } else { text_w + 2 * XPAD };
+        let width = if shown {
+            // A full 8-char hash's width, so an empty-but-shown gutter matches the
+            // width it has once it carries hashes (no jump as you navigate).
+            let placeholder = view.create_pango_layout(Some("00000000")).pixel_size().0;
+            text_w.max(placeholder) + 2 * XPAD
+        } else {
+            0
+        };
         *imp.cells.borrow_mut() = cells.to_vec();
         imp.width_px.set(width);
         self.queue_resize();
         self.queue_draw();
+    }
+
+    /// Set the line a valid hunk drop targets (or -1 to clear the prelight),
+    /// repainting only when it actually moves. Driven by the blame gutter's
+    /// `DropTarget` during a hunk drag (`dragdrop::wire_blame_drop`).
+    pub(crate) fn set_drop_line(&self, line: i32) {
+        if self.imp().drop_line.get() != line {
+            self.imp().drop_line.set(line);
+            self.queue_draw();
+        }
+    }
+
+    /// The `(buffer line, origin commit `change_id` hex)` of the blame cell under
+    /// widget-relative `y`, if `y` sits on a blamed line. Returns both because a
+    /// hunk drop needs the line for the prelight (`set_drop_line`) and the change
+    /// id for the squash dispatch — one hit-test, no need to expose the private
+    /// line/cell helpers.
+    pub(crate) fn change_id_at_widget_y(&self, y: f64) -> Option<(i32, String)> {
+        let line = self.line_at_widget_y(y)?;
+        Some((line, self.cell_at(line)?.change_id_hex))
     }
 
     /// The buffer line under widget-relative `y` (the gutter scrolls with the
@@ -229,6 +369,11 @@ impl BlameColumn {
                 let hover_line = if cell.is_some() { line } else { -1 };
                 if hover_line != this.imp().hover.get() {
                     this.imp().hover.set(hover_line);
+                    this.set_cursor_from_name(Some(if hover_line >= 0 {
+                        "pointer"
+                    } else {
+                        "default"
+                    }));
                     this.queue_draw();
                     if let Some(cb) = this.imp().on_hover.borrow().clone() {
                         cb(cell.as_ref().map(|c| c.change_id_hex.as_str()));
@@ -241,6 +386,7 @@ impl BlameColumn {
             move |_| {
                 if this.imp().hover.get() != -1 {
                     this.imp().hover.set(-1);
+                    this.set_cursor_from_name(Some("default"));
                     this.queue_draw();
                     if let Some(cb) = this.imp().on_hover.borrow().clone() {
                         cb(None);
@@ -307,6 +453,55 @@ fn diff_old_refs(
     out
 }
 
+/// The absorb target of the hunk headed by `text`'s `@@` line at `header_line`:
+/// the origin all its removed (`-`) lines unanimously blame to, if any. Scans
+/// from `header_line + 1` to the next `@@`/`diff --git` header; over lines that
+/// start with `-` (a removed line, *not* the `---` file header) it reads the
+/// blame `cells[j]`. If there is at least one such line, every one has a cell,
+/// and they all share one `change_id_hex`, that origin is the target (returned
+/// via [`BlameCell::as_absorb`]); a pure-insertion hunk (no `-` lines) or split
+/// origins yield `None`. Context / `+` lines don't affect the decision.
+pub(crate) fn absorb_origin_for_header(
+    cells: &[Option<BlameCell>],
+    text: &str,
+    header_line: usize,
+) -> Option<BlameCell> {
+    let mut origin: Option<&BlameCell> = None;
+    for (j, line) in text.split('\n').enumerate().skip(header_line + 1) {
+        if line.starts_with("@@") || line.starts_with("diff --git ") {
+            break;
+        }
+        // A removed line — but `---` is the old-file header, not a `-` line.
+        if line.starts_with('-') && !line.starts_with("---") {
+            let cell = cells.get(j)?.as_ref()?;
+            match origin {
+                None => origin = Some(cell),
+                Some(prev) if prev.change_id_hex != cell.change_id_hex => return None,
+                Some(_) => {}
+            }
+        }
+    }
+    origin.map(BlameCell::as_absorb)
+}
+
+/// Annotate each `@@` header line of `text` with its hunk's absorb target (via
+/// [`absorb_origin_for_header`]), overwriting that line's `cells` slot. All the
+/// header results are computed first, then assigned, so no immutable borrow of
+/// `cells` is held while it is mutated.
+pub(crate) fn annotate_absorb_headers(cells: &mut [Option<BlameCell>], text: &str) {
+    let annotations: Vec<(usize, Option<BlameCell>)> = text
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("@@"))
+        .map(|(i, _)| (i, absorb_origin_for_header(cells, text, i)))
+        .collect();
+    for (i, cell) in annotations {
+        if let Some(slot) = cells.get_mut(i) {
+            *slot = cell;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +562,82 @@ diff --git a/x b/x
         // Empty blame map -> no cells resolve.
         let cells = blame_cells(text, &files, &nums, &HashMap::new());
         assert_eq!(cells, vec![None, None, None]);
+    }
+
+    /// An origin cell for a given `change_id` hex (short = the first 8 chars).
+    fn origin(hex: &str) -> BlameCell {
+        BlameCell {
+            short: hex.chars().take(8).collect(),
+            change_id_hex: hex.to_string(),
+            tooltip: String::new(),
+            absorb: false,
+        }
+    }
+
+    #[test]
+    fn absorb_header_takes_unanimous_removed_origin() {
+        // Both `-` lines blame to the same origin: the `@@` line is annotated with
+        // that origin, marked absorb; context / `+` lines are ignored.
+        let text = "\
+diff --git a/x b/x
+@@ -1,2 +1,2 @@
+ keep
+-was
+-old
++now";
+        let mut cells = vec![
+            None,               // diff --git
+            None,               // @@
+            Some(origin("ff")), // " keep" (context, ignored)
+            Some(origin("aa")), // "-was"
+            Some(origin("aa")), // "-old"
+            None,               // "+now"
+        ];
+        annotate_absorb_headers(&mut cells, text);
+        assert_eq!(
+            cells[1],
+            Some(BlameCell {
+                short: "aa".to_string(),
+                change_id_hex: "aa".to_string(),
+                tooltip: String::new(),
+                absorb: true,
+            })
+        );
+    }
+
+    #[test]
+    fn absorb_header_none_on_split_removed_origins() {
+        // The `-` lines blame to different origins: no confident target.
+        let text = "\
+diff --git a/x b/x
+@@ -1,2 +1,2 @@
+-was
+-old
++now";
+        let cells = vec![
+            None,               // diff --git
+            None,               // @@
+            Some(origin("aa")), // "-was"
+            Some(origin("bb")), // "-old"
+            None,               // "+now"
+        ];
+        assert_eq!(absorb_origin_for_header(&cells, text, 1), None);
+    }
+
+    #[test]
+    fn absorb_header_none_on_pure_insertion() {
+        // A hunk with no `-` lines (only additions) has no absorb target.
+        let text = "\
+diff --git a/x b/x
+@@ -0,0 +1,2 @@
++new1
++new2";
+        let cells = vec![
+            None, // diff --git
+            None, // @@
+            None, // "+new1"
+            None, // "+new2"
+        ];
+        assert_eq!(absorb_origin_for_header(&cells, text, 1), None);
     }
 }

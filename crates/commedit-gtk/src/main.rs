@@ -339,6 +339,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // None between hunk drags. Carried out-of-band (the payload is only an i32
     // sentinel); read by the history list's drop handler (`DragOrigin::Hunk`).
     let drag_hunk: Rc<RefCell<Option<HunkDrag>>> = Rc::new(RefCell::new(None));
+    // The buffer line of the dragged hunk's `@@` header, stashed alongside
+    // `drag_hunk` in the drag source's `connect_prepare` and read at `drag-begin`
+    // to find the hunk's natural absorb target. -1 between hunk drags.
+    let drag_hunk_line: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
     // A drop handler rewrites history and rebuilds both lists, which destroys the
     // ListBoxRow widgets. Doing that while the drag is still in flight frees a row
     // GTK still holds as the drop-crossing target, crashing the next pointer event
@@ -647,18 +651,25 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let col_blame = col_blame.clone();
         Rc::new(move || {
             if !blame_on.get() {
-                col_blame.set_content(&[]);
+                col_blame.set_content(&[], false);
                 return;
             }
+            // Blame is on: keep the column visible even when there's nothing to
+            // annotate (no selection, or a diff with no old side), so the toggle
+            // always has a visible effect. Empty cells + `shown` reserve a strip.
             let data = blame_data.borrow();
-            let Some(data) = data.as_ref() else {
-                col_blame.set_content(&[]);
-                return;
+            let cells = match data.as_ref() {
+                Some(data) => {
+                    let text = buffer_text(&file_buffer);
+                    let nums = linenums::diff_line_numbers(&text);
+                    let mut cells =
+                        blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data);
+                    blame_col::annotate_absorb_headers(&mut cells, &text);
+                    cells
+                }
+                None => Vec::new(),
             };
-            let text = buffer_text(&file_buffer);
-            let nums = linenums::diff_line_numbers(&text);
-            let cells = blame_col::blame_cells(&text, &combined_files.borrow(), &nums, data);
-            col_blame.set_content(&cells);
+            col_blame.set_content(&cells, true);
         })
     };
 
@@ -684,7 +695,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 let (elision, resolve) = conflict_cue_cells(&text);
                 col_old.set_content(&nums, &elision);
                 col_new.set_content(&nums, &resolve);
-                col_blame.set_content(&[]); // no blame while resolving conflicts
+                col_blame.set_content(&[], false); // no blame while resolving conflicts
             } else {
                 let nums = linenums::diff_line_numbers(&text);
                 let (exp, rev) = diff_cues::diff_cue_cells(
@@ -1472,6 +1483,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let selected_wc_change = selected_wc_change.clone();
         let drag_origin = drag_origin.clone();
         let drag_hunk = drag_hunk.clone();
+        let drag_hunk_line = drag_hunk_line.clone();
         let over_gutter = over_gutter.clone();
         move |_source, x, y| {
             // Offered only in the editable single-commit / single-`@` diff. The
@@ -1501,6 +1513,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 first_group,
                 last_group,
             });
+            // `line` is the hunk's `@@` header (hunk_target returned Some), which
+            // drag-begin needs to locate the hunk's absorb target.
+            drag_hunk_line.set(line as i32);
             drag_origin.set(DragOrigin::Hunk);
             // In-process only: the drop handler reads the hunk from `drag_hunk`, not
             // this value. An i32 sentinel keeps the history list's DropTarget
@@ -1508,9 +1523,74 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             Some(gdk::ContentProvider::for_value(&(-1i32).to_value()))
         }
     });
+    hunk_drag_source.connect_drag_begin({
+        let repo = repo.clone();
+        let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
+        let list = list.clone();
+        let blame_on = blame_on.clone();
+        let blame_selection = blame_selection.clone();
+        let blame_data = blame_data.clone();
+        let combined_files = combined_files.clone();
+        let file_buffer = file_buffer.clone();
+        let drag_hunk = drag_hunk.clone();
+        let drag_hunk_line = drag_hunk_line.clone();
+        move |_source, _drag| {
+            // Pre-highlight the commit this hunk would naturally absorb into — the
+            // origin every removed line blames to — so its row lights up (purple)
+            // the moment the drag begins, even with the blame gutter off.
+            let Some(hunk) = drag_hunk.borrow().as_ref().cloned() else {
+                return;
+            };
+            // Reuse the gutter's live blame cache when it has it; otherwise blame
+            // just this hunk's file (the scoped walk), so the hint works gutter-off.
+            let cached = if blame_on.get() {
+                blame_data.borrow().clone()
+            } else {
+                None
+            };
+            let map = match cached {
+                Some(map) => map,
+                None => match repo
+                    .borrow()
+                    .blame_old_side_path(&blame_selection.borrow(), &hunk.path)
+                {
+                    Ok(Some(fb)) => HashMap::from([(hunk.path.clone(), fb)]),
+                    // Nothing to blame (root/binary/error) ⇒ no highlight.
+                    _ => return,
+                },
+            };
+            if map.is_empty() {
+                return;
+            }
+            let text = buffer_text(&file_buffer);
+            let nums = linenums::diff_line_numbers(&text);
+            let cells = blame_col::blame_cells(&text, &combined_files.borrow(), &nums, &map);
+            let Some(absorb) =
+                blame_col::absorb_origin_for_header(&cells, &text, drag_hunk_line.get() as usize)
+            else {
+                return;
+            };
+            // Light the target's row if it is in the loaded window; an offscreen
+            // target simply gets no highlight (no paging on drag).
+            if let Some(row) = commits
+                .borrow()
+                .iter()
+                .position(|c| c.change_id_hex() == absorb.change_id_hex)
+                .and_then(|ci| commit_rows.borrow().get(ci).copied())
+                .and_then(|di| list.row_at_index(di as i32))
+            {
+                row.add_css_class("squash-blame");
+            }
+        }
+    });
     hunk_drag_source.connect_drag_end({
         let post_drag = post_drag.clone();
+        let list = list.clone();
         move |_source, _drag, _delete| {
+            // Clear the absorb-target pre-highlight painted at drag-begin, whether
+            // the drop landed or was cancelled.
+            dragdrop::clear_squash_highlights(&list);
             // The drop staged its rewrite into `post_drag`; run it now that the
             // gesture (and GTK's DnD bookkeeping) is fully torn down — same discipline
             // as the history/trash drag sources.
@@ -2591,7 +2671,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // multi-selections, so at most one `@` is ever selected; if one is, it
             // wins (mutually exclusive with a history selection, as the old separate
             // working-copy list was).
-            let (commit_infos, wc): (Vec<CommitInfo>, Option<(String, String)>) = {
+            let (commit_infos, wc): (Vec<CommitInfo>, Option<(String, String, CommitId)>) = {
                 let display = display.borrow();
                 let commits = commits.borrow();
                 let mut selected: Vec<usize> = list
@@ -2613,7 +2693,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                             }
                         }
                         Some(DisplayRow::Wc { branch, entry }) if wc.is_none() => {
-                            wc = Some((branch.clone(), entry.info.change_id_hex()));
+                            wc = Some((
+                                branch.clone(),
+                                entry.info.change_id_hex(),
+                                entry.info.id.clone(),
+                            ));
                         }
                         _ => {}
                     }
@@ -2626,7 +2710,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // Save with no message edits the `@` in place, with a message commits it
             // on that worktree's tip (see the `save` closure). Conflict mode never
             // selects `@` rows, so this can't collide with it.
-            if let Some((branch, change)) = wc {
+            if let Some((branch, change, wc_id)) = wc {
                 viewing_wc.set(true);
                 *selected_wc_branch.borrow_mut() = Some(branch);
                 *selected_wc_change.borrow_mut() = Some(change);
@@ -2643,7 +2727,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 }
                 save_button.set_tooltip_text(Some(SAVE_HINT_WORKCOPY));
                 diff_read_only.set(false);
-                recompute_blame(); // selection cleared above: drop any stale blame
+                // Blame the working-copy diff like any commit: its old side is the
+                // branch tip, so annotate each context/removed line with the commit
+                // that last touched it (the `@`'s own commit id, resolved above).
+                *blame_selection.borrow_mut() = vec![wc_id];
+                recompute_blame();
                 load_wc_changes();
                 update_save_sensitivity();
                 return;
@@ -3623,6 +3711,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let show_status = show_status.clone();
         let list = list.clone();
         let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
         let trashed = trashed.clone();
         let pending_trash_op = pending_trash_op.clone();
         let trash_list = trash_list.clone();
@@ -3915,7 +4004,62 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // the engine and reloads. The reorder is applied immediately — there is no
     // separate Save step for it.
 
+    // Clicking a blame hash opens its origin commit: select that commit's row
+    // (which cascades through `selected-rows-changed` -> `update_selection_pane`
+    // -> loads the diff) and scroll it into view. A blamed origin is always an
+    // ancestor of the selection, so if it sits below the loaded history page,
+    // page in (bump `history_limit` + `refresh`, the same widening the scroll
+    // `edge_reached` uses) and retry until it appears or the branch runs out.
+    col_blame.set_on_activate({
+        let list = list.clone();
+        let commits = commits.clone();
+        let commit_rows = commit_rows.clone();
+        let refresh = refresh.clone();
+        let history_limit = history_limit.clone();
+        let history_has_more = history_has_more.clone();
+        let show_status = show_status.clone();
+        let selection_sync = selection_sync.clone();
+        let selection_anchor = selection_anchor.clone();
+        let update_selection_pane = update_selection_pane.clone();
+        Rc::new(move |change: &str| {
+            loop {
+                // Scope the borrow so it drops before `refresh`'s mut-borrow.
+                let di = {
+                    commits
+                        .borrow()
+                        .iter()
+                        .position(|c| c.change_id_hex() == change)
+                        .and_then(|ci| commit_rows.borrow().get(ci).copied())
+                };
+                if let Some(di) = di {
+                    // Replace the selection with just this origin commit — the list is
+                    // multi-select, so a bare `select_row` would only add to it. Drive
+                    // it under `selection_sync` and render once, like a plain click.
+                    selection_sync.set(true);
+                    list.unselect_all();
+                    if let Some(row) = list.row_at_index(di as i32) {
+                        list.select_row(Some(&row));
+                        selection_anchor.set(Some(di as i32));
+                        row.grab_focus();
+                    }
+                    selection_sync.set(false);
+                    update_selection_pane();
+                    break;
+                }
+                if !history_has_more.get() {
+                    show_status("That commit isn't in this branch's history");
+                    break;
+                }
+                history_limit.set(history_limit.get() + HISTORY_PAGE);
+                refresh();
+            }
+        })
+    });
+
     dragdrop::wire(&widgets, &data, &drag_state, &callbacks);
+    // A second hunk drop site: dropping a dragged hunk onto a blame hash squashes
+    // it into that origin commit (see `dragdrop::wire_blame_drop`).
+    dragdrop::wire_blame_drop(&col_blame, &widgets, &data, &drag_state, &callbacks);
     populate_trash(
         &trash_list,
         &trash_scroll,

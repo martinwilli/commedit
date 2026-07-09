@@ -21,6 +21,7 @@
 //! line is attributed.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use similar::{DiffOp, TextDiff};
@@ -29,9 +30,11 @@ use jj_lib::annotate::FileAnnotator;
 use jj_lib::backend::CommitId;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
+use jj_lib::revset::{
+    ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension,
+};
 
-use crate::diff::{combined_changes, commit_changes};
+use crate::diff::{combined_changes, commit_changes, FileChange};
 use crate::history::CommitInfo;
 use crate::repo::Repo;
 
@@ -62,6 +65,10 @@ pub struct BlameOrigins {
     pub unattributed: usize,
 }
 
+/// The base commit, annotation domain, and changed-file set that
+/// [`Repo::blame_prologue`] resolves for both old-side blames.
+type BlamePrologue = (CommitId, Arc<ResolvedRevsetExpression>, Vec<FileChange>);
+
 impl Repo {
     /// Blame the *old* (pre-image) side of the diff for `commit_ids`.
     ///
@@ -73,9 +80,50 @@ impl Repo {
     /// introduced it. Added/binary files (no old side) are skipped, as is a
     /// selection whose combined diff conflicts.
     pub fn blame_old_side(&self, commit_ids: &[CommitId]) -> Result<Vec<FileBlame>> {
+        let Some((start_id, domain, changes)) = self.blame_prologue(commit_ids)? else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        for fc in &changes {
+            if let Some(fb) = self.annotate_file(&start_id, &domain, fc)? {
+                result.push(fb);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Blame the old side of just one file `path` in the diff for `commit_ids`,
+    /// the file-scoped form of [`Self::blame_old_side`] — same base / domain,
+    /// but only the one file is walked. `path` is the internal forward-slash
+    /// form matching [`crate::diff::FileChange::path`]. Returns `Ok(None)` when
+    /// there is nothing to blame (an empty / root selection, a conflicting
+    /// combined diff), or `path` is not a changed file with a text old side.
+    /// Backs the GTK hunk-absorb hint, which only needs the dragged hunk's file
+    /// rather than the whole diff.
+    pub fn blame_old_side_path(
+        &self,
+        commit_ids: &[CommitId],
+        path: &str,
+    ) -> Result<Option<FileBlame>> {
+        let Some((start_id, domain, changes)) = self.blame_prologue(commit_ids)? else {
+            return Ok(None);
+        };
+        let Some(fc) = changes.iter().find(|fc| fc.path == path) else {
+            return Ok(None);
+        };
+        self.annotate_file(&start_id, &domain, fc)
+    }
+
+    /// Shared setup for both old-side blames: the base commit whose file content
+    /// the walk starts from (the oldest commit's first parent), the annotation
+    /// domain (that base's whole ancestry, narrowed per file by the annotator),
+    /// and the diff's changed-file set. `Ok(None)` when there is nothing to
+    /// blame — an empty selection, a root commit (empty old side), or a
+    /// conflicting combined diff with no coherent old side.
+    fn blame_prologue(&self, commit_ids: &[CommitId]) -> Result<Option<BlamePrologue>> {
         let store = self.repo.store().clone();
         let Some(first_id) = commit_ids.first() else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let oldest = store
             .get_commit(first_id)
@@ -84,14 +132,14 @@ impl Repo {
         // no parent (its parent is the virtual root) has an empty old side, so
         // there is nothing to blame.
         let Some(start_id) = oldest.parent_ids().first().cloned() else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         // The pre-image text + changed-file set, reused from the diff path so the
         // blamed files match exactly what the buffer shows. A conflicting
         // combination has no coherent old side.
         let Some(changes) = combined_changes(&self.repo, commit_ids)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         // Domain for every file's walk: the base commit and all its ancestors
@@ -104,52 +152,60 @@ impl Repo {
             .resolve_user_expression(&*self.repo, &symbol_resolver)
             .context("resolving blame domain")?;
 
-        let mut result = Vec::new();
-        for fc in &changes {
-            if fc.is_binary {
-                continue;
-            }
-            let Some(old_text) = fc.old_text.as_deref() else {
-                continue; // added file: no old side
-            };
-            let repo_path = RepoPathBuf::from_internal_string(&fc.path).context("invalid path")?;
-            let mut annotator =
-                FileAnnotator::with_file_content(&start_id, &repo_path, old_text.to_owned());
-            pollster::block_on(annotator.compute(&*self.repo, &domain))
-                .with_context(|| format!("blaming {}", fc.path))?;
+        Ok(Some((start_id, domain, changes)))
+    }
 
-            // Per old-file line, the originating commit (or `None` at a boundary),
-            // deduped into `origins`.
-            let annotation = annotator.to_annotation();
-            let mut origins: Vec<CommitInfo> = Vec::new();
-            let mut index_of: HashMap<CommitId, usize> = HashMap::new();
-            let mut lines: Vec<Option<usize>> = Vec::new();
-            for (origin, _line) in annotation.lines() {
-                match origin {
-                    Ok(id) => {
-                        let idx = match index_of.get(id) {
-                            Some(&i) => i,
-                            None => {
-                                let commit =
-                                    store.get_commit(id).context("loading blame origin")?;
-                                let i = origins.len();
-                                origins.push(CommitInfo::from_commit(&commit));
-                                index_of.insert(id.clone(), i);
-                                i
-                            }
-                        };
-                        lines.push(Some(idx));
-                    }
-                    Err(_boundary) => lines.push(None),
-                }
-            }
-            result.push(FileBlame {
-                path: fc.path.clone(),
-                origins,
-                lines,
-            });
+    /// Blame the old side of one changed file, deduping its per-line origins into
+    /// a [`FileBlame`]. `Ok(None)` when the file has no text old side to blame (a
+    /// binary file, or an added file with no pre-image).
+    fn annotate_file(
+        &self,
+        start_id: &CommitId,
+        domain: &Arc<ResolvedRevsetExpression>,
+        fc: &FileChange,
+    ) -> Result<Option<FileBlame>> {
+        if fc.is_binary {
+            return Ok(None);
         }
-        Ok(result)
+        let Some(old_text) = fc.old_text.as_deref() else {
+            return Ok(None); // added file: no old side
+        };
+        let repo_path = RepoPathBuf::from_internal_string(&fc.path).context("invalid path")?;
+        let mut annotator =
+            FileAnnotator::with_file_content(start_id, &repo_path, old_text.to_owned());
+        pollster::block_on(annotator.compute(&*self.repo, domain))
+            .with_context(|| format!("blaming {}", fc.path))?;
+
+        // Per old-file line, the originating commit (or `None` at a boundary),
+        // deduped into `origins`.
+        let store = self.repo.store();
+        let annotation = annotator.to_annotation();
+        let mut origins: Vec<CommitInfo> = Vec::new();
+        let mut index_of: HashMap<CommitId, usize> = HashMap::new();
+        let mut lines: Vec<Option<usize>> = Vec::new();
+        for (origin, _line) in annotation.lines() {
+            match origin {
+                Ok(id) => {
+                    let idx = match index_of.get(id) {
+                        Some(&i) => i,
+                        None => {
+                            let commit = store.get_commit(id).context("loading blame origin")?;
+                            let i = origins.len();
+                            origins.push(CommitInfo::from_commit(&commit));
+                            index_of.insert(id.clone(), i);
+                            i
+                        }
+                    };
+                    lines.push(Some(idx));
+                }
+                Err(_boundary) => lines.push(None),
+            }
+        }
+        Ok(Some(FileBlame {
+            path: fc.path.clone(),
+            origins,
+            lines,
+        }))
     }
 
     /// The display index of the single commit every line removed by the commit at

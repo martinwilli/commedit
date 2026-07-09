@@ -46,8 +46,13 @@ an interactive-rebase session.
   each context and removed line, in a gutter *left* of the line numbers, with the
   commit that last touched it in the *old* (pre-image) file. It's a true `git
   blame`-style walk, computed in-process via jujutsu's annotator and only while
-  expanded (it's the one expensive view). Hovering a hash highlights that commit's
-  row in the history list, if it's shown.
+  expanded (it's the one expensive view). It annotates a selected commit or the
+  uncommitted working-copy diff alike. Hovering a hash highlights that commit's
+  row in the history list, if it's shown; the hash reads as a hyperlink (pointer
+  cursor plus underline), and clicking it opens that origin commit in the diff
+  view (paging older history in when the origin sits below what's loaded). The
+  hashes are drop targets too: drag a hunk onto one to squash it into that origin
+  commit (the hash reddens while a valid drop hovers it).
 
 - **Revert hunks or files** — every changed file carries a *revert* button in the
   gutter to drop its change from the commit, and every hunk of a modified file one
@@ -82,7 +87,12 @@ an interactive-rebase session.
 - **Relocate a single hunk** — grab a hunk by its `@@` header line in the diff
   (the line lights up and shows a grab cursor) and drop it onto any commit row, or
   onto the working-copy `@` row, to move just that hunk there — the "this diff
-  belongs in a different commit" fixup at hunk granularity. Source and destination
+  belongs in a different commit" fixup at hunk granularity. You can also drop it
+  onto a hash in the blame column to send it straight into that origin commit,
+  without hunting for the row in the history list. Grabbing a hunk pre-highlights
+  the commit it would naturally absorb into (the one all its removed lines blame
+  to) in purple, so you can see where it belongs before you drop — and the `@@`
+  line annotates that same target in the blame gutter. Source and destination
   may each be a commit or the working copy: commit → commit folds it in, commit →
   `@` carves it back out as an uncommitted change, `@` → commit folds an
   uncommitted hunk into history. The rest of the diff stays put and descendants

@@ -169,6 +169,48 @@ fn old_side_blame_attributes_each_line_to_its_origin() {
 }
 
 #[test]
+fn old_side_blame_path_scopes_to_one_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Same fixture as the whole-diff test: A intro 1-3, B appends 4-5, C rewrites
+    // line 2. C's diff only touches file.txt, so other.txt is not in it.
+    common::init_repo(
+        dir,
+        &[
+            ("file.txt", "1\n2\n3\n", "A"),
+            ("other.txt", "x\n", "A2"),
+            ("file.txt", "1\n2\n3\n4\n5\n", "B"),
+            ("file.txt", "1\nTWO\n3\n4\n5\n", "C"),
+        ],
+    );
+    let repo = Repo::open(dir).expect("open");
+    let commits = commit_list(&repo);
+    let c = &commits[index_of(&commits, "C")];
+
+    // The scoped blame of file.txt must match the file.txt entry of the full one.
+    let full = repo
+        .blame_old_side(std::slice::from_ref(&c.id))
+        .expect("blame");
+    let full_file = full
+        .iter()
+        .find(|b| b.path == "file.txt")
+        .expect("file.txt blamed");
+    let scoped = repo
+        .blame_old_side_path(std::slice::from_ref(&c.id), "file.txt")
+        .expect("scoped blame")
+        .expect("file.txt has an old side");
+    assert_eq!(scoped.lines, full_file.lines);
+
+    // other.txt is not in C's diff, so there is nothing to blame there.
+    assert!(
+        repo.blame_old_side_path(std::slice::from_ref(&c.id), "other.txt")
+            .expect("scoped blame")
+            .is_none(),
+        "other.txt is not in C's diff"
+    );
+}
+
+#[test]
 fn nothing_to_blame_on_a_root_commits_old_side() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

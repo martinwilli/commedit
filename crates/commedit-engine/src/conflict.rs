@@ -160,6 +160,73 @@ pub struct ConflictedFile {
     pub num_sides: usize,
 }
 
+impl ConflictedFile {
+    /// Trim the materialized conflict text down to just its conflict hunks, each
+    /// with up to `context` lines of surrounding context, collapsing every elided
+    /// run into a single `[... N lines omitted ...]` sentinel. This is what makes
+    /// *inspection* cheap: a large file with a small conflict no longer costs its
+    /// whole length on every read.
+    ///
+    /// Every kept region is a verbatim slice of [`Self::text`], so an `old` a
+    /// caller lifts out of a window still matches uniquely when
+    /// [`Repo::resolve_conflicts_ext`] applies its `Patch` against the full text.
+    /// The sentinel lines are display-only — they are not part of the file and
+    /// must never appear in a patch `old` or a full-content resolution. A file
+    /// with no conflict markers (should not happen for a conflicted path) is
+    /// returned unchanged.
+    pub fn windowed(&self, context: usize) -> String {
+        let lines: Vec<&str> = self.text.split_inclusive('\n').collect();
+        let marker_run = |line: &str, ch: char| {
+            let body = line.strip_suffix('\n').unwrap_or(line);
+            body.chars().take_while(|&c| c == ch).count() >= self.marker_len
+        };
+        // A hunk spans a `<<<` open line through its matching `>>>` close line.
+        let mut hunk = vec![false; lines.len()];
+        let mut in_hunk = false;
+        for (i, line) in lines.iter().enumerate() {
+            if marker_run(line, '<') {
+                in_hunk = true;
+            }
+            hunk[i] = in_hunk;
+            if marker_run(line, '>') {
+                in_hunk = false;
+            }
+        }
+        if !hunk.iter().any(|&h| h) {
+            return self.text.clone();
+        }
+        // Grow every hunk region by `context` lines on each side.
+        let mut keep = hunk.clone();
+        for (i, &h) in hunk.iter().enumerate() {
+            if h {
+                let lo = i.saturating_sub(context);
+                let hi = (i + context).min(lines.len() - 1);
+                keep[lo..=hi].fill(true);
+            }
+        }
+        // Emit kept lines verbatim; collapse each dropped run into one sentinel.
+        let mut out = String::new();
+        let mut dropped = 0usize;
+        let flush = |out: &mut String, dropped: &mut usize| {
+            if *dropped > 0 {
+                let noun = if *dropped == 1 { "line" } else { "lines" };
+                out.push_str(&format!("[... {dropped} {noun} omitted ...]\n"));
+                *dropped = 0;
+            }
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if keep[i] {
+                flush(&mut out, &mut dropped);
+                out.push_str(line);
+            } else {
+                dropped += 1;
+            }
+        }
+        flush(&mut out, &mut dropped);
+        out
+    }
+}
+
 /// One `old`→`new` text edit applied to a conflicted file's materialized
 /// conflict-marker text — the surgical way to resolve a conflict, mirroring how
 /// [`crate::tree::StrReplace`] edits a plain file. Pathless on purpose: the path
@@ -1689,7 +1756,68 @@ fn simplify_label(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::simplify_marker_labels;
+    use super::{simplify_marker_labels, ConflictedFile};
+
+    fn conflicted(text: &str) -> ConflictedFile {
+        ConflictedFile {
+            text: text.to_string(),
+            marker_len: 7,
+            num_sides: 2,
+        }
+    }
+
+    #[test]
+    fn windows_a_hunk_with_context_and_sentinels() {
+        let file = conflicted(
+            "line 1\nline 2\nline 3\nline 4\nline 5\n\
+             <<<<<<< aaa\nours\n=======\ntheirs\n>>>>>>> bbb\n\
+             line 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+        let expected = "\
+[... 3 lines omitted ...]
+line 4
+line 5
+<<<<<<< aaa
+ours
+=======
+theirs
+>>>>>>> bbb
+line 6
+line 7
+[... 3 lines omitted ...]
+";
+        assert_eq!(file.windowed(2), expected);
+    }
+
+    #[test]
+    fn windowing_keeps_verbatim_slices_so_a_hunk_still_matches_the_full_text() {
+        let file =
+            conflicted("a\nb\nc\nd\ne\n<<<<<<< x\nours\n=======\ntheirs\n>>>>>>> y\nf\ng\nh\n");
+        let block = "<<<<<<< x\nours\n=======\ntheirs\n>>>>>>> y\n";
+        // The window still contains the conflict block byte-for-byte, so an `old`
+        // lifted from it matches uniquely against the untrimmed text.
+        assert!(file.windowed(1).contains(block));
+        assert_eq!(file.text.matches(block).count(), 1);
+    }
+
+    #[test]
+    fn windowing_leaves_marker_free_text_untouched() {
+        let file = conflicted("just\nplain\nlines\n");
+        assert_eq!(file.windowed(3), file.text);
+    }
+
+    #[test]
+    fn windowing_coalesces_adjacent_hunks_without_a_sentinel_between() {
+        let file = conflicted(
+            "top\n<<<<<<< a\no1\n=======\nt1\n>>>>>>> b\nmid\n\
+             <<<<<<< c\no2\n=======\nt2\n>>>>>>> d\nbot\n",
+        );
+        // With context 1 the two hunks' windows meet over "mid", so no sentinel
+        // is emitted between them (only the single-line head/tail stay whole).
+        let out = file.windowed(1);
+        assert!(!out.contains("omitted"), "unexpected sentinel: {out}");
+        assert_eq!(out, file.text);
+    }
 
     #[test]
     fn simplifies_jj_marker_labels() {

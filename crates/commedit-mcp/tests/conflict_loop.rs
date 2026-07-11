@@ -5,8 +5,8 @@
 mod common;
 
 use commedit_mcp::dto::{
-    ConflictFileEditDto, DropCommitReq, EditMessageReq, FileContentDto, ListHistoryReq,
-    ReadConflictReq, ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
+    ConflictFileEditDto, ConflictPatchEditDto, DropCommitReq, EditMessageReq, FileContentDto,
+    ListHistoryReq, ReadConflictReq, ReplaceFilesReq, ResolveConflictsReq, SaveResultDto,
 };
 use commedit_mcp::server::CommeditServer;
 use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
@@ -137,6 +137,7 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
                     path: path.path.clone(),
                     text: Some("1\nR\n3\n".into()),
                     marker_len: Some(file.marker_len),
+                    edits: None,
                     delete: None,
                 }],
             }))
@@ -405,6 +406,7 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
                 path: oldest.files[0].path.clone(),
                 text: Some("1\nB\n3\n".into()),
                 marker_len: Some(file.marker_len),
+                edits: None,
                 delete: None,
             }],
         }))
@@ -490,6 +492,7 @@ async fn conflicts_resolve_by_sha_or_prefix() {
                     path: oldest.files[0].path.clone(),
                     text: Some("1\nR\n3\n".into()),
                     marker_len: Some(file.marker_len),
+                    edits: None,
                     delete: None,
                 }],
             }))
@@ -509,4 +512,203 @@ async fn conflicts_resolve_by_sha_or_prefix() {
             .pending
     );
     assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
+}
+
+/// Resolve a conflict with a surgical `edits` patch against the marker text —
+/// the small old→new alternative to resending the whole resolved file.
+#[tokio::test]
+async fn a_conflict_resolves_via_edits_patching_the_marker_text() {
+    let dir = TempDir::new().unwrap();
+    conflicting_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let mut result = conflicting_edit(&server).await;
+    let mut steps = 0;
+    while let SaveResultDto::Conflicts { commits, .. } = result {
+        let oldest = &commits[0];
+        let path = oldest.files[0].path.clone();
+
+        let resp = server
+            .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
+                commit: oldest.change_id.clone(),
+                path: Some(path.clone()),
+                paths: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        let text = resp.files[0].text.clone();
+        assert!(text.contains("<<<<<<<"), "markers present: {text}");
+
+        // Patch only the `<<<<<<< … >>>>>>>` block — not the whole file — down
+        // to the chosen line. The untouched context ("1" / "3") is never resent.
+        let start = text.find("<<<<<<<").expect("start marker");
+        let gt = text.find(">>>>>>>").expect("end marker");
+        let end = text[gt..]
+            .find('\n')
+            .map(|i| gt + i + 1)
+            .expect("newline after end marker");
+        let block = text[start..end].to_string();
+
+        result = server
+            .resolve_conflicts(Parameters(ResolveConflictsReq {
+                session: sel("main"),
+                commit: oldest.change_id.clone(),
+                files: vec![ConflictFileEditDto {
+                    path,
+                    text: None,
+                    marker_len: None,
+                    edits: Some(vec![ConflictPatchEditDto {
+                        old: block,
+                        new: "R\n".into(),
+                        replace_all: None,
+                    }]),
+                    delete: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+
+    // Clean: the patched resolution reached git, markers gone.
+    assert!(
+        matches!(result, SaveResultDto::Clean { .. }),
+        "the edits resolution should settle clean"
+    );
+    assert!(
+        !server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:f.txt"]), "1\nX\n3");
+    assert_eq!(git(dir.path(), &["show", "HEAD:f.txt"]), "1\nR\n3");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+}
+
+/// The `edits` path surfaces a bad patch (absent / ambiguous / empty `old`) and
+/// a mode conflict as `invalid` caller errors, leaving the rewrite still
+/// pending so the caller can just retry with a fixed edit.
+#[tokio::test]
+async fn resolve_conflicts_rejects_bad_patch_and_mode_conflicts() {
+    let dir = TempDir::new().unwrap();
+    conflicting_repo(dir.path());
+    let server = open_server(dir.path());
+
+    let result = conflicting_edit(&server).await;
+    let SaveResultDto::Conflicts { commits, .. } = result else {
+        panic!("expected conflicts");
+    };
+    let oldest = &commits[0];
+    let change = oldest.change_id.clone();
+    let path = oldest.files[0].path.clone();
+
+    // Build a single-edit `edits` request against the shared pending commit.
+    let req = |edits: Vec<ConflictPatchEditDto>| {
+        Parameters(ResolveConflictsReq {
+            session: sel("main"),
+            commit: change.clone(),
+            files: vec![ConflictFileEditDto {
+                path: path.clone(),
+                text: None,
+                marker_len: None,
+                edits: Some(edits),
+                delete: None,
+            }],
+        })
+    };
+
+    // `old` absent → NotFound, surfaced as invalid with a closest-match hint.
+    let err = expect_err(
+        server
+            .resolve_conflicts(req(vec![ConflictPatchEditDto {
+                old: "this text is nowhere in the conflict\n".into(),
+                new: "x".into(),
+                replace_all: None,
+            }]))
+            .await,
+    );
+    assert!(
+        err.message.contains("not found") && err.message.contains("closest"),
+        "not-found error with hint: {}",
+        err.message
+    );
+
+    // `old` matching many times (a bare newline) → Ambiguous.
+    let err = expect_err(
+        server
+            .resolve_conflicts(req(vec![ConflictPatchEditDto {
+                old: "\n".into(),
+                new: "x".into(),
+                replace_all: None,
+            }]))
+            .await,
+    );
+    assert!(
+        err.message.contains("matched") && err.message.contains("times"),
+        "ambiguous error names the count: {}",
+        err.message
+    );
+
+    // An empty `old` is rejected at the boundary (mirrors replace_in_file).
+    let err = expect_err(
+        server
+            .resolve_conflicts(req(vec![ConflictPatchEditDto {
+                old: String::new(),
+                new: "x".into(),
+                replace_all: None,
+            }]))
+            .await,
+    );
+    assert!(err.message.contains("empty"), "empty old: {}", err.message);
+
+    // An empty `edits` vec is a no-op mode — rejected.
+    let err = expect_err(server.resolve_conflicts(req(Vec::new())).await);
+    assert!(
+        err.message.contains("empty"),
+        "empty edits: {}",
+        err.message
+    );
+
+    // Two modes at once (full text and edits) is a caller mistake.
+    let err = expect_err(
+        server
+            .resolve_conflicts(Parameters(ResolveConflictsReq {
+                session: sel("main"),
+                commit: change.clone(),
+                files: vec![ConflictFileEditDto {
+                    path: path.clone(),
+                    text: Some("1\nR\n3\n".into()),
+                    marker_len: Some(2),
+                    edits: Some(vec![ConflictPatchEditDto {
+                        old: "1".into(),
+                        new: "2".into(),
+                        replace_all: None,
+                    }]),
+                    delete: None,
+                }],
+            }))
+            .await,
+    );
+    assert!(
+        err.message.contains("exactly one"),
+        "mode conflict: {}",
+        err.message
+    );
+
+    // None of the rejects touched git or cleared the pending rewrite.
+    assert!(
+        server
+            .pending_status(Parameters(sel("main")))
+            .await
+            .unwrap()
+            .0
+            .pending
+    );
 }

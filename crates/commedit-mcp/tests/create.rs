@@ -365,6 +365,7 @@ async fn a_modify_delete_conflict_resolves_by_deleting_the_file() {
                 path: oldest.files[0].path.clone(),
                 text: None,
                 marker_len: None,
+                edits: None,
                 delete: Some(true),
             }],
         }))
@@ -659,6 +660,7 @@ async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
                 path: oldest.files[0].path.clone(),
                 text: Some("feature\n".into()),
                 marker_len: Some(file.marker_len),
+                edits: None,
                 delete: None,
             }],
         }))

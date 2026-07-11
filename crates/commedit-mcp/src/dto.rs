@@ -1120,24 +1120,50 @@ pub struct ConflictFileContentDto {
     pub num_sides: usize,
 }
 
-/// One resolved file for `resolve_conflicts` — either edited content, or a
-/// deletion.
+/// One resolved file for `resolve_conflicts`. Pick exactly one of three
+/// mutually-exclusive modes: full resolved content (`text` + `marker_len`),
+/// targeted patch edits against the conflict-marker text (`edits`), or a
+/// deletion (`delete`).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ConflictFileEditDto {
     /// The conflicted path being resolved.
     pub path: String,
     /// The file's complete resolved content, all conflict markers removed.
-    /// Required unless `delete` is true.
+    /// Required to resolve with full content unless `delete` or `edits` is
+    /// given.
     pub text: Option<String>,
     /// The `marker_len` `read_conflict` returned for this file. Required
-    /// alongside `text`; omit when deleting.
+    /// alongside `text`; omit for `edits` (a fresh one is derived) or `delete`.
     pub marker_len: Option<usize>,
+    /// Resolve by patching the conflict-marker text `read_conflict` returned:
+    /// each edit finds `old` and substitutes `new` (see `ConflictPatchEditDto`),
+    /// composed in order. Cheaper than resending the whole file and can't
+    /// corrupt untouched content — prefer it over `text` for anything but a
+    /// tiny file. Mutually exclusive with `text` and `delete`.
+    pub edits: Option<Vec<ConflictPatchEditDto>>,
     /// Resolve by deleting the path instead of supplying content — the way to
     /// settle a modify/delete conflict (e.g. a revert that should remove a
     /// file). Works for structural (resolvable=false) conflicts too, so it is
-    /// also the text route's escape hatch besides abort_rewrite. When true,
-    /// text/marker_len are ignored.
+    /// also the text route's escape hatch besides abort_rewrite. Mutually
+    /// exclusive with `text` and `edits`.
     pub delete: Option<bool>,
+}
+
+/// One targeted `old`→`new` edit applied to a conflicted file's materialized
+/// conflict-marker text (what `read_conflict` returned). Pathless on purpose:
+/// the path is the outer `ConflictFileEditDto.path`, so repeating it per edit
+/// would be redundant.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ConflictPatchEditDto {
+    /// The exact text to find in the conflict-marked content — typically the
+    /// whole `<<<<<<< … ======= … >>>>>>>` block, replaced with the chosen
+    /// resolution. Must occur exactly once unless `replace_all` is set —
+    /// include enough surrounding text to make it unique.
+    pub old: String,
+    /// The text to substitute in.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

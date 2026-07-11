@@ -32,14 +32,34 @@ or want to confirm a hold exists.
 
 Work the **oldest conflicted commit first** and climb:
 
-1. For each conflicted file in that commit, `read_conflict` returns its content
-   with the conflict regions marked (both sides present).
-2. Edit it down to the content you want — **remove every conflict marker**,
-   keeping the reconciled result.
-3. Submit it with `resolve_conflicts`, keyed by the commit's **`change_id`**
-   (stable across the rewrite — shas are not). As with every commedit tool, pass
-   the `session` id on the call.
+1. For each conflicted file in that commit, `read_conflict` returns its `text`
+   with the conflict regions marked (`<<<<<<< … ======= … >>>>>>>`, both sides
+   present) plus a `marker_len`.
+2. Decide the reconciled result for each marked region.
+3. Hand it back with `resolve_conflicts`, keyed by the commit's **`change_id`**
+   (stable across the rewrite — shas are not) and the `session` id. Per file,
+   pick exactly one of three modes:
+   - **`edits` — the default.** A list of targeted `{old, new}` patches applied
+     to the exact `text` `read_conflict` returned (each `old` must match once,
+     unless `replace_all`). The idiomatic move is a *single* edit whose `old` is
+     the whole `<<<<<<< … >>>>>>>` block and whose `new` is the chosen resolved
+     lines — the untouched context around it is never restated. Reach for this
+     on anything but a tiny file: it sends only the delta (far cheaper in
+     tokens) and **cannot corrupt content it never touches**. You never retype
+     the file, so there is no way to silently mistranscribe the parts you
+     weren't even changing.
+   - **`text`.** The complete resolved file with every marker removed, echoing
+     its `marker_len`. Reserve it for a genuinely tiny file, where resending the
+     whole thing costs about the same as a patch. (It's also the mode the GTK
+     app uses.)
+   - **`delete: true`.** Drop the file — how a modify/delete conflict settles
+     (see below).
 4. Re-check `pending_status` and repeat on the next-oldest until it's empty.
+
+A region only resolves once its markers are gone: an `edit` (or `text`) that
+leaves a `<<<<<<<`/`=======`/`>>>>>>>` behind keeps the file conflicted. A patch
+whose `old` doesn't match (or matches ambiguously) comes back as an error with a
+hint — fix the edit and resubmit; nothing was applied.
 
 Fixing the earliest conflict often **auto-clears its descendants**: a child's
 conflict is frequently just the parent's unresolved change cascading down, so
@@ -56,8 +76,8 @@ Some conflicts can't be reconciled by editing text:
 
 - **Binary files**, or **structural** clashes (a file modified on one side and
   deleted on the other, mode changes) — there are no markers to remove. Resolve
-  by choosing a side, including a **`Delete`** resolution to drop the file, via
-  `resolve_conflicts`.
+  by choosing a side, including `delete: true` in `resolve_conflicts` to drop
+  the file.
 - A **split chain** or a genuinely overlapping edit may have no mechanical answer
   at all. Then the only escape is `abort_rewrite`, which discards the held
   rewrite and returns the repo to its exact pre-mutation state — clean, nothing

@@ -33,6 +33,7 @@ use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
 
 use crate::repo::Repo;
+use crate::tree::{replace_checked, ReplaceError};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
@@ -159,12 +160,106 @@ pub struct ConflictedFile {
     pub num_sides: usize,
 }
 
+impl ConflictedFile {
+    /// Trim the materialized conflict text down to just its conflict hunks, each
+    /// with up to `context` lines of surrounding context, collapsing every elided
+    /// run into a single `[... N lines omitted ...]` sentinel. This is what makes
+    /// *inspection* cheap: a large file with a small conflict no longer costs its
+    /// whole length on every read.
+    ///
+    /// Every kept region is a verbatim slice of [`Self::text`], so an `old` a
+    /// caller lifts out of a window still matches uniquely when
+    /// [`Repo::resolve_conflicts_ext`] applies its `Patch` against the full text.
+    /// The sentinel lines are display-only — they are not part of the file and
+    /// must never appear in a patch `old` or a full-content resolution. A file
+    /// with no conflict markers (should not happen for a conflicted path) is
+    /// returned unchanged.
+    pub fn windowed(&self, context: usize) -> String {
+        let lines: Vec<&str> = self.text.split_inclusive('\n').collect();
+        let marker_run = |line: &str, ch: char| {
+            let body = line.strip_suffix('\n').unwrap_or(line);
+            body.chars().take_while(|&c| c == ch).count() >= self.marker_len
+        };
+        // A hunk spans a `<<<` open line through its matching `>>>` close line.
+        let mut hunk = vec![false; lines.len()];
+        let mut in_hunk = false;
+        for (i, line) in lines.iter().enumerate() {
+            if marker_run(line, '<') {
+                in_hunk = true;
+            }
+            hunk[i] = in_hunk;
+            if marker_run(line, '>') {
+                in_hunk = false;
+            }
+        }
+        if !hunk.iter().any(|&h| h) {
+            return self.text.clone();
+        }
+        // Grow every hunk region by `context` lines on each side.
+        let mut keep = hunk.clone();
+        for (i, &h) in hunk.iter().enumerate() {
+            if h {
+                let lo = i.saturating_sub(context);
+                let hi = (i + context).min(lines.len() - 1);
+                keep[lo..=hi].fill(true);
+            }
+        }
+        // Emit kept lines verbatim; collapse each dropped run into one sentinel.
+        let mut out = String::new();
+        let mut dropped = 0usize;
+        let flush = |out: &mut String, dropped: &mut usize| {
+            if *dropped > 0 {
+                let noun = if *dropped == 1 { "line" } else { "lines" };
+                out.push_str(&format!("[... {dropped} {noun} omitted ...]\n"));
+                *dropped = 0;
+            }
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if keep[i] {
+                flush(&mut out, &mut dropped);
+                out.push_str(line);
+            } else {
+                dropped += 1;
+            }
+        }
+        flush(&mut out, &mut dropped);
+        out
+    }
+}
+
+/// One `old`→`new` text edit applied to a conflicted file's materialized
+/// conflict-marker text — the surgical way to resolve a conflict, mirroring how
+/// [`crate::tree::StrReplace`] edits a plain file. Pathless on purpose: the path
+/// is the outer key in [`Repo::resolve_conflicts_ext`], so repeating it per edit
+/// would be redundant.
+#[derive(Debug, Clone)]
+pub struct ConflictEdit {
+    /// The exact text to find in the conflict-marked content — typically the
+    /// `<<<<<<< … ======= … >>>>>>>` block that [`Repo::read_conflict`] rendered,
+    /// but any unique substring works.
+    pub old: String,
+    /// The text to substitute in (the chosen resolution for that region).
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub all: bool,
+}
+
 /// How to resolve one conflicted path in [`Repo::resolve_conflicts_ext`].
 #[derive(Debug, Clone)]
 pub enum FileResolution {
     /// Replace the path with resolved file content — all conflict markers
     /// removed, `marker_len` echoing what [`Repo::read_conflict`] reported.
     Content { text: String, marker_len: usize },
+    /// Apply targeted `old`→`new` edits to the materialized conflict-marker text
+    /// (the same text [`Repo::read_conflict`] returns), instead of resending the
+    /// whole file. Each edit is validated against exact context match (unique
+    /// unless [`ConflictEdit::all`]) and composed in order; a missing or ambiguous
+    /// `old` surfaces a downcastable [`crate::tree::ReplaceError`]. Editing away
+    /// every marker resolves the file clean; markers left behind stay conflicted,
+    /// exactly like [`Self::Content`]. The engine re-materializes the conflict to
+    /// obtain a fresh `marker_len` for the current shape, so the caller never
+    /// echoes one back.
+    Patch { edits: Vec<ConflictEdit> },
     /// Remove the path from the commit. Resolves a modify/delete conflict (or
     /// any other conflict kind, structural included) by deleting the file —
     /// the one resolution that plain content cannot express.
@@ -484,6 +579,58 @@ impl Repo {
                         })
                     })
                 }
+                FileResolution::Patch { edits } => {
+                    let Some(file_ids) = value.to_file_merge() else {
+                        continue; // structural conflict — not text-resolvable, leave it
+                    };
+                    let exec = value
+                        .to_executable_merge()
+                        .as_ref()
+                        .and_then(resolve_file_executable)
+                        .unwrap_or(false);
+
+                    // Re-materialize the conflict to get exactly the text the agent
+                    // saw *and* a fresh marker_len for this shape — never a
+                    // hardcoded one, or marker-lookalike content would be mangled.
+                    let cf = self.materialize_conflict_file(&commit, path)?;
+                    let mut current = cf.text;
+                    // Fold the edits in order; each reads the previous one's output,
+                    // like replace_in_files composes several edits to one file.
+                    for edit in edits {
+                        current = replace_checked(&current, &edit.old, &edit.new, edit.all)
+                            .map_err(|count| {
+                                let path = path.as_internal_file_string().to_string();
+                                if count == 0 {
+                                    ReplaceError::NotFound {
+                                        hint: crate::diff::closest_match_hint(&current, &edit.old),
+                                        path,
+                                    }
+                                } else {
+                                    ReplaceError::Ambiguous { path, count }
+                                }
+                            })?;
+                    }
+
+                    // Feed the patched text through the same parse tail as Content,
+                    // with the fresh marker_len: markers left behind stay conflicted,
+                    // a fully replaced block resolves clean.
+                    let new_ids = block_on(update_from_content(
+                        &file_ids,
+                        &store,
+                        path,
+                        current.as_bytes(),
+                        cf.marker_len,
+                    ))
+                    .context("parsing resolved content")?;
+
+                    new_ids.map(|oid| {
+                        oid.as_ref().map(|id| TreeValue::File {
+                            id: id.clone(),
+                            executable: exec,
+                            copy_id: CopyId::placeholder(),
+                        })
+                    })
+                }
             };
             entries.push((path.to_owned(), merged_value));
         }
@@ -776,9 +923,30 @@ impl Repo {
     /// to Git-style 2-way conflict-marker text, for display in the editor.
     pub fn read_conflict(&self, change_hex: &str, path: &str) -> Result<ConflictedFile> {
         let path: &RepoPath = RepoPath::from_internal_string(path).context("invalid path")?;
-        let store = self.repo.store();
         let commit_id = self.resolve_change_on_chain(change_hex)?;
-        let commit = store.get_commit(&commit_id).context("loading commit")?;
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&commit_id)
+            .context("loading commit")?;
+        self.materialize_conflict_file(&commit, path)
+    }
+
+    /// Materialize one conflicted file of `commit` to Git-style 2-way
+    /// conflict-marker text, choosing a *fresh* `marker_len` for the current
+    /// conflict's shape. Shared by [`Self::read_conflict`] (what the editor / agent
+    /// sees) and the [`FileResolution::Patch`] arm of [`Self::resolve_conflicts_inner`],
+    /// so a patch is applied against exactly the text — and validated against the
+    /// same marker length — that was read. The chosen `marker_len` always exceeds
+    /// any marker-char run in the file content, which is the sole reason
+    /// marker-lookalike content survives the round-trip; the patch arm must thread
+    /// this value (not a hardcoded one) back through `update_from_content`.
+    fn materialize_conflict_file(
+        &self,
+        commit: &Commit,
+        path: &RepoPath,
+    ) -> Result<ConflictedFile> {
+        let store = self.repo.store();
         let tree = commit.tree();
         let value = block_on(tree.path_value(path)).context("reading conflicted path")?;
         let mat = block_on(materialize_tree_value(store, path, value, tree.labels()))
@@ -1588,7 +1756,68 @@ fn simplify_label(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::simplify_marker_labels;
+    use super::{simplify_marker_labels, ConflictedFile};
+
+    fn conflicted(text: &str) -> ConflictedFile {
+        ConflictedFile {
+            text: text.to_string(),
+            marker_len: 7,
+            num_sides: 2,
+        }
+    }
+
+    #[test]
+    fn windows_a_hunk_with_context_and_sentinels() {
+        let file = conflicted(
+            "line 1\nline 2\nline 3\nline 4\nline 5\n\
+             <<<<<<< aaa\nours\n=======\ntheirs\n>>>>>>> bbb\n\
+             line 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+        let expected = "\
+[... 3 lines omitted ...]
+line 4
+line 5
+<<<<<<< aaa
+ours
+=======
+theirs
+>>>>>>> bbb
+line 6
+line 7
+[... 3 lines omitted ...]
+";
+        assert_eq!(file.windowed(2), expected);
+    }
+
+    #[test]
+    fn windowing_keeps_verbatim_slices_so_a_hunk_still_matches_the_full_text() {
+        let file =
+            conflicted("a\nb\nc\nd\ne\n<<<<<<< x\nours\n=======\ntheirs\n>>>>>>> y\nf\ng\nh\n");
+        let block = "<<<<<<< x\nours\n=======\ntheirs\n>>>>>>> y\n";
+        // The window still contains the conflict block byte-for-byte, so an `old`
+        // lifted from it matches uniquely against the untrimmed text.
+        assert!(file.windowed(1).contains(block));
+        assert_eq!(file.text.matches(block).count(), 1);
+    }
+
+    #[test]
+    fn windowing_leaves_marker_free_text_untouched() {
+        let file = conflicted("just\nplain\nlines\n");
+        assert_eq!(file.windowed(3), file.text);
+    }
+
+    #[test]
+    fn windowing_coalesces_adjacent_hunks_without_a_sentinel_between() {
+        let file = conflicted(
+            "top\n<<<<<<< a\no1\n=======\nt1\n>>>>>>> b\nmid\n\
+             <<<<<<< c\no2\n=======\nt2\n>>>>>>> d\nbot\n",
+        );
+        // With context 1 the two hunks' windows meet over "mid", so no sentinel
+        // is emitted between them (only the single-line head/tail stay whole).
+        let out = file.windowed(1);
+        assert!(!out.contains("omitted"), "unexpected sentinel: {out}");
+        assert_eq!(out, file.text);
+    }
 
     #[test]
     fn simplifies_jj_marker_labels() {

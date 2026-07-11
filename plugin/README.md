@@ -66,7 +66,9 @@ subagent** (below). They load on the matching intent, or invoke one explicitly
   anywhere in the graph, revert a commit, or cherry-pick one from another branch.
 - **`resolve-conflicts`** — when a rewrite's rebase conflicts, commedit holds it
   back *in full* (nothing conflicted ever reaches git); resolve the deferred
-  conflicts file-by-file, oldest commit first, or abort.
+  conflicts file-by-file, oldest commit first — by a targeted patch of the
+  conflict markers (cheap, never retypes the file) or the whole resolved file —
+  or abort.
 - **`review-and-recover`** — lean on the session safety net: review everything
   the session changed as one diff, undo or jump back through recorded operations,
   recover a dropped commit, or orient yourself in the branch graph.

@@ -518,3 +518,165 @@ fn abort_leaves_a_single_op_head() {
         heads.len()
     );
 }
+
+/// §1 round-trip guard: read_conflict → resolve must carry multibyte UTF-8
+/// (emoji, umlaut, CJK) through byte-for-byte. The reported 🚢→🚀 swap, if it
+/// lived in the tool, would surface here; the path is a strict `String::from_utf8`
+/// plus line copies, so this pins the round-trip clean and blames the reported
+/// corruption on the upstream whole-file retype, not read_conflict.
+#[test]
+fn conflict_read_resolve_preserves_multibyte_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A context line carrying the multibyte codepoints, unchanged across
+    // base/A/B, plus a middle line A and B both edit so the reorder can't commute.
+    let ctx = "Schöne Grüße 🚢 你好世界";
+    let base = format!("{ctx}\n2\n3\n");
+    let a = format!("{ctx}\nA\n3\n");
+    let b = format!("{ctx}\nB\n3\n");
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", base.as_str(), "base"),
+            ("f.txt", a.as_str(), "A"),
+            ("f.txt", b.as_str(), "B"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+
+    let resolved = format!("{ctx}\nR\n3\n");
+    let mut steps = 0;
+    let mut checked = false;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let change_hex = oldest.change_id_hex();
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        let file = repo
+            .read_conflict(&change_hex, &path)
+            .expect("read conflict");
+        if !checked {
+            // The multibyte context survives materialization verbatim — no swap.
+            assert!(
+                file.text.contains('🚢'),
+                "materialized text keeps 🚢: {}",
+                file.text
+            );
+            assert!(
+                !file.text.contains('🚀'),
+                "no 🚢→🚀 corruption: {}",
+                file.text
+            );
+            assert!(
+                file.text.contains(ctx),
+                "the whole multibyte line survives: {}",
+                file.text
+            );
+            checked = true;
+        }
+        outcome = repo
+            .resolve_conflict(&change_hex, &path, &resolved, file.marker_len)
+            .expect("resolve");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(checked, "at least one conflict was read");
+    assert!(!repo.is_pending());
+
+    // The committed blob is byte-identical to the intended resolution (git trims
+    // the trailing newline, so compare against the trimmed form).
+    let expected = format!("{ctx}\nR\n3");
+    assert_eq!(common::git(dir, &["show", "HEAD:f.txt"]), expected);
+}
+
+/// Marker-hazard guard: content lines that *look* like conflict markers — a
+/// setext `=======` underline and a deep `>>>>>>> …` blockquote — must survive
+/// read_conflict → resolve verbatim. jj's choose_materialized_conflict_marker_len
+/// inflates the marker length past any marker-char run in the file's sides, so
+/// strip_base_sections/simplify_marker_labels never mistake these 7-char content
+/// runs for real markers even though they classify position-blind. This pins that
+/// guarantee (and, with the marker_len assertions, records *why* it holds).
+#[test]
+fn conflict_read_resolve_preserves_marker_like_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Marker-like lines bracket the conflicting middle line as unchanged context,
+    // so they land in the materialized output outside the real conflict markers.
+    let setext = "======="; // 7 '=' — a setext-style heading underline
+    let quote = ">>>>>>> quoted text"; // 7 '>' — a deep blockquote line
+    let make = |mid: &str| format!("# Title\n{setext}\n{mid}\n{quote}\nend\n");
+    let base = make("2");
+    let a = make("A");
+    let b = make("B");
+    common::init_repo(
+        dir,
+        &[
+            ("doc.md", base.as_str(), "base"),
+            ("doc.md", a.as_str(), "A"),
+            ("doc.md", b.as_str(), "B"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+
+    let resolved = make("R");
+    let mut steps = 0;
+    let mut seen_marker_len = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let change_hex = oldest.change_id_hex();
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        let file = repo
+            .read_conflict(&change_hex, &path)
+            .expect("read conflict");
+        seen_marker_len = seen_marker_len.max(file.marker_len);
+        // jj inflated the marker length past the 7-char content runs, which is the
+        // reason the position-blind classifier can't touch these lines.
+        assert!(
+            file.marker_len > 7,
+            "marker_len inflated past content runs: {}",
+            file.marker_len
+        );
+        // The marker-like content lines appear verbatim, bounded by newlines so
+        // the assertion can't accidentally match the (longer) real marker lines.
+        assert!(
+            file.text.contains(&format!("\n{setext}\n")),
+            "setext underline survives read: {}",
+            file.text
+        );
+        assert!(
+            file.text.contains(&format!("\n{quote}\n")),
+            "blockquote line survives read: {}",
+            file.text
+        );
+        outcome = repo
+            .resolve_conflict(&change_hex, &path, &resolved, file.marker_len)
+            .expect("resolve");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending());
+    assert!(
+        seen_marker_len >= 11,
+        "7-char content runs force marker_len 7+4: {seen_marker_len}"
+    );
+
+    // The committed blob keeps the marker-like content lines byte-for-byte.
+    let expected = make("R");
+    let expected = expected.strip_suffix('\n').unwrap();
+    assert_eq!(common::git(dir, &["show", "HEAD:doc.md"]), expected);
+}

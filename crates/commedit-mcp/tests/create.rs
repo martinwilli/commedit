@@ -647,6 +647,8 @@ async fn a_cherry_pick_that_overlaps_conflicts_and_resolves() {
             commit: oldest.change_id.clone(),
             path: Some(oldest.files[0].path.clone()),
             paths: None,
+            context_lines: None,
+            full: None,
         }))
         .await
         .unwrap()

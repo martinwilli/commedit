@@ -1098,6 +1098,16 @@ pub struct ReadConflictReq {
     /// Omit `path` and `paths` both to read every resolvable file at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
+    /// Lines of surrounding context to keep around each conflict hunk in the
+    /// windowed `text` (default 3). Ignored when `full` is set. Widen it if you
+    /// need more of the file to craft a unique `old` for a patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<usize>,
+    /// Return the entire file instead of the windowed view. Set this when you
+    /// intend to resolve by resending the whole `text` (rather than `edits`), or
+    /// when you genuinely need to see all of the file. Default false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1111,8 +1121,13 @@ pub struct ReadConflictResp {
 pub struct ConflictFileContentDto {
     /// The conflicted path.
     pub path: String,
-    /// The file with git-style conflict markers (`<<<<<<<`/`=======`/
-    /// `>>>>>>>`). Resolve by producing the file without any markers.
+    /// The conflict content, with git-style markers (`<<<<<<<`/`=======`/
+    /// `>>>>>>>`). By default this is *windowed*: only the conflict hunks plus a
+    /// few lines of context, with each elided run shown as a `[... N lines
+    /// omitted ...]` sentinel (display-only — never put a sentinel in a patch
+    /// `old` or a full-content resolution). Pass `full: true` to get the whole
+    /// file. Resolve by patching this text with `edits`, or by resending the
+    /// full resolved `text` (read with `full: true` first).
     pub text: String,
     /// Echo this back to `resolve_conflicts` for this file.
     pub marker_len: usize,

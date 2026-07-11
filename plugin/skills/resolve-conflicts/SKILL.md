@@ -34,7 +34,12 @@ Work the **oldest conflicted commit first** and climb:
 
 1. For each conflicted file in that commit, `read_conflict` returns its `text`
    with the conflict regions marked (`<<<<<<< … ======= … >>>>>>>`, both sides
-   present) plus a `marker_len`.
+   present) plus a `marker_len`. By default `text` is **windowed** — just the
+   conflict hunks plus a few lines of context, with far runs collapsed into
+   `[... N lines omitted ...]` sentinels — so inspecting a small conflict in a
+   big file stays cheap. Widen with `context_lines`, or pass `full: true` for
+   the whole file (needed only if you'll resolve by resending the entire `text`).
+   The sentinels are display-only: never put one inside a patch `old`.
 2. Decide the reconciled result for each marked region.
 3. Hand it back with `resolve_conflicts`, keyed by the commit's **`change_id`**
    (stable across the rewrite — shas are not) and the `session` id. Per file,

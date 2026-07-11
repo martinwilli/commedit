@@ -275,7 +275,8 @@ message, identity or file contents; split, reorder, drop, restore or squash
 commits; create, revert or cherry-pick commits and introduce merges; and fold
 uncommitted changes in or commit them — addressing commits by sha or jj's stable
 change id, with descendants rebased automatically, conflicted rewrites held back
-from git until they resolve — file by file, by a targeted patch against the
+from git until they resolve — file by file, reading just the conflict hunks (or
+the whole file on request) and writing back a targeted patch against the
 conflict markers or the whole resolved file — or abort, and every step undoable.
 Alongside the tools the plugin ships skills that teach the agent *when* to reach
 for these workflows and a `commedit-operator` subagent that drives them.

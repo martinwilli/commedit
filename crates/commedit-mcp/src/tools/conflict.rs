@@ -44,7 +44,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Read conflicted files of a pending rewrite, each materialized with git-style conflict markers. Pass a single `path`, several `paths`, or omit both to read every resolvable file of the commit in one call. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants. The response is files: [{ path, text, marker_len, num_sides }] (a stable schema): `text` carries the git-style conflict markers, `num_sides` is the number of conflicting sides (normally 2). To resolve, hand the file back to resolve_conflicts either as `edits` (old→new patches against this exact `text` — preferred) or as the full resolved `text` echoing its `marker_len`."
+        description = "Read conflicted files of a pending rewrite, each materialized with git-style conflict markers. Pass a single `path`, several `paths`, or omit both to read every resolvable file of the commit in one call. Address the commit by change id or sha (full or a unique prefix); prefer the change id — shas churn on every resolution step. Resolve commits oldest-first — fixing the earliest often auto-clears its descendants. The response is files: [{ path, text, marker_len, num_sides }] (a stable schema): `num_sides` is the number of conflicting sides (normally 2). By default `text` is WINDOWED — only the conflict hunks plus `context_lines` (default 3) of surrounding context, with elided runs shown as `[... N lines omitted ...]` sentinels — so a small conflict in a large file stays cheap to read. The sentinels are display-only: never include one in a patch `old`. Pass `full: true` for the entire file (do this if you'll resolve by resending the whole `text`). To resolve, hand the file back to resolve_conflicts either as `edits` (old→new patches against this exact `text` — preferred, and works on the windowed view) or as the full resolved `text` echoing its `marker_len`."
     )]
     pub async fn read_conflict(
         &self,
@@ -96,9 +96,17 @@ impl CommeditServer {
                     )));
                 }
                 let file = repo.read_conflict(&change_hex, &path).map_err(internal)?;
+                // Window to the conflict hunks by default; the full file only on
+                // request. Inspecting a small conflict in a large file shouldn't
+                // cost the whole file on every round.
+                let text = if req.full.unwrap_or(false) {
+                    file.text
+                } else {
+                    file.windowed(req.context_lines.unwrap_or(3))
+                };
                 files.push(ConflictFileContentDto {
                     path,
-                    text: file.text,
+                    text,
                     marker_len: file.marker_len,
                     num_sides: file.num_sides,
                 });

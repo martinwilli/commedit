@@ -114,6 +114,8 @@ async fn a_conflicting_edit_is_held_back_then_resolved_oldest_first() {
                 commit: oldest.change_id.clone(),
                 path: Some(path.path.clone()),
                 paths: None,
+                context_lines: None,
+                full: None,
             }))
             .await
             .unwrap()
@@ -184,6 +186,8 @@ async fn read_conflict_validates_change_and_path() {
                 commit: "00".into(),
                 path: Some("f.txt".into()),
                 paths: None,
+                context_lines: None,
+                full: None,
             }))
             .await,
     );
@@ -205,6 +209,8 @@ async fn read_conflict_validates_change_and_path() {
                 commit: commits[0].change_id.clone(),
                 path: Some("nope.txt".into()),
                 paths: None,
+                context_lines: None,
+                full: None,
             }))
             .await,
     );
@@ -274,6 +280,8 @@ async fn read_conflict_reads_every_file_in_one_call() {
             commit: oldest.change_id.clone(),
             path: None,
             paths: None,
+            context_lines: None,
+            full: None,
         }))
         .await
         .unwrap()
@@ -393,6 +401,8 @@ async fn a_conflicted_drop_lands_in_the_trash_only_after_settling_clean() {
             commit: oldest.change_id.clone(),
             path: Some(oldest.files[0].path.clone()),
             paths: None,
+            context_lines: None,
+            full: None,
         }))
         .await
         .unwrap()
@@ -479,6 +489,8 @@ async fn conflicts_resolve_by_sha_or_prefix() {
                 commit: oldest.sha.clone(),
                 path: Some(oldest.files[0].path.clone()),
                 paths: None,
+                context_lines: None,
+                full: None,
             }))
             .await
             .unwrap()
@@ -534,6 +546,8 @@ async fn a_conflict_resolves_via_edits_patching_the_marker_text() {
                 commit: oldest.change_id.clone(),
                 path: Some(path.clone()),
                 paths: None,
+                context_lines: None,
+                full: None,
             }))
             .await
             .unwrap()
@@ -711,4 +725,168 @@ async fn resolve_conflicts_rejects_bad_patch_and_mode_conflicts() {
             .0
             .pending
     );
+}
+
+/// A large file whose only contested line is `mid`, sandwiched between 20
+/// padding lines on each side.
+fn big_file(mid: &str) -> String {
+    let mut s = String::new();
+    for i in 1..=20 {
+        s.push_str(&format!("pad {i:02}\n"));
+    }
+    s.push_str(mid);
+    s.push('\n');
+    for i in 21..=40 {
+        s.push_str(&format!("pad {i:02}\n"));
+    }
+    s
+}
+
+/// Slice out the `<<<<<<< … >>>>>>>` block (verbatim, through the end of the
+/// close-marker line) so it can serve as a patch `old`.
+fn conflict_block(text: &str) -> String {
+    let start = text.find("<<<<<<<").expect("open marker");
+    let close = text[start..].find(">>>>>>>").expect("close marker") + start;
+    let end = text[close..]
+        .find('\n')
+        .map(|n| close + n + 1)
+        .unwrap_or(text.len());
+    text[start..end].to_string()
+}
+
+#[tokio::test]
+async fn read_conflict_windows_to_the_hunk_and_patches_from_the_window() {
+    let dir = TempDir::new().unwrap();
+    // base <- A <- B, all editing the one contested line of a 41-line file.
+    init_repo(
+        dir.path(),
+        &[
+            ("big.txt", big_file("2").as_str(), "base"),
+            ("big.txt", big_file("A").as_str(), "A"),
+            ("big.txt", big_file("B").as_str(), "B"),
+        ],
+    );
+    let server = open_server(dir.path());
+
+    // Rewrite A's content so B's rebase conflicts on the contested line.
+    let history = server
+        .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
+            limit: None,
+            offset: None,
+            fields: None,
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let a = history.commits.iter().find(|c| c.subject == "A").unwrap();
+    let mut result = server
+        .replace_files(Parameters(ReplaceFilesReq {
+            session: sel("main"),
+            commit: a.sha.clone(),
+            files: vec![FileContentDto {
+                path: "big.txt".into(),
+                content: big_file("X"),
+            }],
+            delete_paths: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    // Resolve oldest-first (B's rebase and the working copy that rides it both
+    // conflict). On the first round, prove the read is windowed and that a patch
+    // lifted from that window still resolves against the untrimmed content.
+    let mut steps = 0;
+    let mut checked_window = false;
+    while let SaveResultDto::Conflicts { commits, .. } = result {
+        let change = commits[0].change_id.clone();
+
+        // Default read is windowed: the hunk with a little context, far padding
+        // collapsed into sentinels — not the whole 41-line file.
+        let windowed = server
+            .read_conflict(Parameters(ReadConflictReq {
+                session: sel("main"),
+                commit: change.clone(),
+                path: Some("big.txt".into()),
+                paths: None,
+                context_lines: None,
+                full: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .files
+            .remove(0);
+        assert!(windowed.text.contains("<<<<<<<") && windowed.text.contains(">>>>>>>"));
+
+        if !checked_window {
+            assert!(
+                windowed.text.contains("omitted"),
+                "elision sentinel present: {}",
+                windowed.text
+            );
+            assert!(
+                !windowed.text.contains("pad 01"),
+                "far padding is trimmed: {}",
+                windowed.text
+            );
+            assert!(
+                windowed.text.lines().count() < 15,
+                "windowed to the hunk, got {} lines",
+                windowed.text.lines().count()
+            );
+            // full: true returns the entire file, no sentinels.
+            let full = server
+                .read_conflict(Parameters(ReadConflictReq {
+                    session: sel("main"),
+                    commit: change.clone(),
+                    path: Some("big.txt".into()),
+                    paths: None,
+                    context_lines: None,
+                    full: Some(true),
+                }))
+                .await
+                .unwrap()
+                .0
+                .files
+                .remove(0);
+            assert!(!full.text.contains("omitted"), "full view has no sentinel");
+            assert!(full.text.contains("pad 01") && full.text.contains("pad 40"));
+            checked_window = true;
+        }
+
+        // Resolve with a patch whose `old` is lifted straight from the WINDOWED
+        // view — it still matches uniquely against the untrimmed content.
+        result = server
+            .resolve_conflicts(Parameters(ResolveConflictsReq {
+                session: sel("main"),
+                commit: change,
+                files: vec![ConflictFileEditDto {
+                    path: "big.txt".into(),
+                    text: None,
+                    marker_len: None,
+                    edits: Some(vec![ConflictPatchEditDto {
+                        old: conflict_block(&windowed.text),
+                        new: "MID\n".into(),
+                        replace_all: None,
+                    }]),
+                    delete: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+
+    let shown = git(dir.path(), &["show", "HEAD:big.txt"]);
+    assert!(
+        shown.contains("\nMID\n"),
+        "contested line resolved: {shown}"
+    );
+    assert!(shown.starts_with("pad 01\n") && shown.trim_end().ends_with("pad 40"));
+    assert!(!shown.contains("<<<<<<<"), "no markers left behind");
+    assert_eq!(git_log_subjects(dir.path()), ["B", "A", "base"]);
 }

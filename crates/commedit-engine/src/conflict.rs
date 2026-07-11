@@ -33,6 +33,7 @@ use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
 
 use crate::repo::Repo;
+use crate::tree::{replace_checked, ReplaceError};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
@@ -159,12 +160,39 @@ pub struct ConflictedFile {
     pub num_sides: usize,
 }
 
+/// One `old`→`new` text edit applied to a conflicted file's materialized
+/// conflict-marker text — the surgical way to resolve a conflict, mirroring how
+/// [`crate::tree::StrReplace`] edits a plain file. Pathless on purpose: the path
+/// is the outer key in [`Repo::resolve_conflicts_ext`], so repeating it per edit
+/// would be redundant.
+#[derive(Debug, Clone)]
+pub struct ConflictEdit {
+    /// The exact text to find in the conflict-marked content — typically the
+    /// `<<<<<<< … ======= … >>>>>>>` block that [`Repo::read_conflict`] rendered,
+    /// but any unique substring works.
+    pub old: String,
+    /// The text to substitute in (the chosen resolution for that region).
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub all: bool,
+}
+
 /// How to resolve one conflicted path in [`Repo::resolve_conflicts_ext`].
 #[derive(Debug, Clone)]
 pub enum FileResolution {
     /// Replace the path with resolved file content — all conflict markers
     /// removed, `marker_len` echoing what [`Repo::read_conflict`] reported.
     Content { text: String, marker_len: usize },
+    /// Apply targeted `old`→`new` edits to the materialized conflict-marker text
+    /// (the same text [`Repo::read_conflict`] returns), instead of resending the
+    /// whole file. Each edit is validated against exact context match (unique
+    /// unless [`ConflictEdit::all`]) and composed in order; a missing or ambiguous
+    /// `old` surfaces a downcastable [`crate::tree::ReplaceError`]. Editing away
+    /// every marker resolves the file clean; markers left behind stay conflicted,
+    /// exactly like [`Self::Content`]. The engine re-materializes the conflict to
+    /// obtain a fresh `marker_len` for the current shape, so the caller never
+    /// echoes one back.
+    Patch { edits: Vec<ConflictEdit> },
     /// Remove the path from the commit. Resolves a modify/delete conflict (or
     /// any other conflict kind, structural included) by deleting the file —
     /// the one resolution that plain content cannot express.
@@ -484,6 +512,58 @@ impl Repo {
                         })
                     })
                 }
+                FileResolution::Patch { edits } => {
+                    let Some(file_ids) = value.to_file_merge() else {
+                        continue; // structural conflict — not text-resolvable, leave it
+                    };
+                    let exec = value
+                        .to_executable_merge()
+                        .as_ref()
+                        .and_then(resolve_file_executable)
+                        .unwrap_or(false);
+
+                    // Re-materialize the conflict to get exactly the text the agent
+                    // saw *and* a fresh marker_len for this shape — never a
+                    // hardcoded one, or marker-lookalike content would be mangled.
+                    let cf = self.materialize_conflict_file(&commit, path)?;
+                    let mut current = cf.text;
+                    // Fold the edits in order; each reads the previous one's output,
+                    // like replace_in_files composes several edits to one file.
+                    for edit in edits {
+                        current = replace_checked(&current, &edit.old, &edit.new, edit.all)
+                            .map_err(|count| {
+                                let path = path.as_internal_file_string().to_string();
+                                if count == 0 {
+                                    ReplaceError::NotFound {
+                                        hint: crate::diff::closest_match_hint(&current, &edit.old),
+                                        path,
+                                    }
+                                } else {
+                                    ReplaceError::Ambiguous { path, count }
+                                }
+                            })?;
+                    }
+
+                    // Feed the patched text through the same parse tail as Content,
+                    // with the fresh marker_len: markers left behind stay conflicted,
+                    // a fully replaced block resolves clean.
+                    let new_ids = block_on(update_from_content(
+                        &file_ids,
+                        &store,
+                        path,
+                        current.as_bytes(),
+                        cf.marker_len,
+                    ))
+                    .context("parsing resolved content")?;
+
+                    new_ids.map(|oid| {
+                        oid.as_ref().map(|id| TreeValue::File {
+                            id: id.clone(),
+                            executable: exec,
+                            copy_id: CopyId::placeholder(),
+                        })
+                    })
+                }
             };
             entries.push((path.to_owned(), merged_value));
         }
@@ -776,9 +856,30 @@ impl Repo {
     /// to Git-style 2-way conflict-marker text, for display in the editor.
     pub fn read_conflict(&self, change_hex: &str, path: &str) -> Result<ConflictedFile> {
         let path: &RepoPath = RepoPath::from_internal_string(path).context("invalid path")?;
-        let store = self.repo.store();
         let commit_id = self.resolve_change_on_chain(change_hex)?;
-        let commit = store.get_commit(&commit_id).context("loading commit")?;
+        let commit = self
+            .repo
+            .store()
+            .get_commit(&commit_id)
+            .context("loading commit")?;
+        self.materialize_conflict_file(&commit, path)
+    }
+
+    /// Materialize one conflicted file of `commit` to Git-style 2-way
+    /// conflict-marker text, choosing a *fresh* `marker_len` for the current
+    /// conflict's shape. Shared by [`Self::read_conflict`] (what the editor / agent
+    /// sees) and the [`FileResolution::Patch`] arm of [`Self::resolve_conflicts_inner`],
+    /// so a patch is applied against exactly the text — and validated against the
+    /// same marker length — that was read. The chosen `marker_len` always exceeds
+    /// any marker-char run in the file content, which is the sole reason
+    /// marker-lookalike content survives the round-trip; the patch arm must thread
+    /// this value (not a hardcoded one) back through `update_from_content`.
+    fn materialize_conflict_file(
+        &self,
+        commit: &Commit,
+        path: &RepoPath,
+    ) -> Result<ConflictedFile> {
+        let store = self.repo.store();
         let tree = commit.tree();
         let value = block_on(tree.path_value(path)).context("reading conflicted path")?;
         let mat = block_on(materialize_tree_value(store, path, value, tree.labels()))

@@ -4,9 +4,10 @@
 
 mod common;
 
-use commedit_engine::conflict::SaveOutcome;
+use commedit_engine::conflict::{ConflictEdit, FileResolution, SaveOutcome};
 use commedit_engine::history::history;
 use commedit_engine::repo::Repo;
+use commedit_engine::tree::ReplaceError;
 
 #[test]
 fn a_history_rewrite_detects_and_resolves_conflicts_across_the_whole_wc_chain() {
@@ -86,6 +87,44 @@ fn conflicting_repo(dir: &std::path::Path) {
             ("f.txt", "1\nB\n3\n", "B"),
         ],
     );
+}
+
+/// Extract the full conflict block from materialized marker text: from the first
+/// `<<<<<<<` line through the trailing newline of the `>>>>>>>` line. Both are
+/// found by their 7-char prefix — which the real (possibly longer) marker starts
+/// with — and it's safe in these tests because no *earlier* content run of the
+/// same marker char reaches 7 (jj inflates the real marker past any content run).
+fn conflict_block(text: &str) -> &str {
+    let start = text.find("<<<<<<<").expect("opening marker");
+    let close = start + text[start..].find(">>>>>>>").expect("closing marker");
+    let end = text[close..]
+        .find('\n')
+        .map(|n| close + n + 1)
+        .unwrap_or(text.len());
+    &text[start..end]
+}
+
+/// Resolve `path` on the commit with change id `change_hex` by patching the
+/// materialized conflict text: replace the whole conflict block with `new`,
+/// leaving every surrounding line byte-identical — the surgical counterpart to
+/// resolving with a whole rewritten file.
+fn resolve_by_patch(repo: &mut Repo, change_hex: &str, path: &str, new: &str) -> SaveOutcome {
+    let file = repo.read_conflict(change_hex, path).expect("read conflict");
+    let old = conflict_block(&file.text).to_string();
+    repo.resolve_conflicts_ext(
+        change_hex,
+        &[(
+            path.to_string(),
+            FileResolution::Patch {
+                edits: vec![ConflictEdit {
+                    old,
+                    new: new.to_string(),
+                    all: false,
+                }],
+            },
+        )],
+    )
+    .expect("resolve by patch")
 }
 
 /// Plan and perform "drag A (display row 1) to the top".
@@ -679,4 +718,179 @@ fn conflict_read_resolve_preserves_marker_like_content() {
     let expected = make("R");
     let expected = expected.strip_suffix('\n').unwrap();
     assert_eq!(common::git(dir, &["show", "HEAD:doc.md"]), expected);
+}
+
+/// §2 happy path: a conflict is resolved with a small `old`→`new` patch against
+/// the materialized marker text (replace just the conflict block), not a whole
+/// rewritten file. The surrounding context lines are never resent yet come out
+/// byte-identical, and plain `git` sees the reordered, conflict-free history.
+#[test]
+fn patch_resolves_conflict_with_a_small_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Context lines bracket the conflicting middle line; a whole-file resolution
+    // would have to resend all of them, a patch touches only the middle.
+    let make = |mid: &str| format!("a\nb\nc\n{mid}\nx\ny\nz\n");
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", make("2").as_str(), "base"),
+            ("f.txt", make("A").as_str(), "A"),
+            ("f.txt", make("B").as_str(), "B"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+
+    let mut steps = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        // Replace the whole conflict block with the single resolved line "R".
+        outcome = resolve_by_patch(&mut repo, &oldest.change_id_hex(), &path, "R\n");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending());
+
+    // The reorder landed and the resolved blob is exactly context + "R", proving
+    // the untouched lines round-tripped through the patch byte-for-byte.
+    assert_eq!(common::git_log_subjects(dir), vec!["A", "B", "base"]);
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:f.txt"]),
+        make("R").strip_suffix('\n').unwrap()
+    );
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+/// A patch whose `old` is absent (or ambiguous) in the conflict text fails
+/// exactly like `replace_in_file`: it returns a downcastable [`ReplaceError`], the
+/// pending resolution is untouched, and git stays frozen. This is what lets the
+/// MCP layer report a bad patch as a caller error rather than an internal one.
+#[test]
+fn patch_resolution_reports_not_found_and_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // "dup" appears twice as context, so it is an ambiguous match target; "nope"
+    // is nowhere in the file, so it is a not-found target.
+    let make = |mid: &str| format!("dup\n1\n{mid}\ndup\n3\n");
+    common::init_repo(
+        dir,
+        &[
+            ("f.txt", make("2").as_str(), "base"),
+            ("f.txt", make("A").as_str(), "A"),
+            ("f.txt", make("B").as_str(), "B"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let outcome = reorder_a_to_top(&mut repo);
+    let SaveOutcome::Conflicts { commits } = outcome else {
+        panic!("expected a conflict");
+    };
+    let oldest = &commits[0];
+    let change_hex = oldest.change_id_hex();
+    let path = oldest
+        .files
+        .iter()
+        .find(|f| f.resolvable)
+        .expect("a resolvable file")
+        .path_str();
+    // read_conflict succeeds — the miss is purely about the patch's `old`.
+    repo.read_conflict(&change_hex, &path)
+        .expect("read conflict");
+
+    let patch = |old: &str| {
+        vec![(
+            path.clone(),
+            FileResolution::Patch {
+                edits: vec![ConflictEdit {
+                    old: old.to_string(),
+                    new: "whatever".to_string(),
+                    all: false,
+                }],
+            },
+        )]
+    };
+
+    // Absent `old` → NotFound, carrying the path and a hint.
+    let err = repo
+        .resolve_conflicts_ext(&change_hex, &patch("nope-not-in-conflict\n"))
+        .expect_err("absent old must error");
+    match err.downcast_ref::<ReplaceError>() {
+        Some(ReplaceError::NotFound { path: p, .. }) => assert_eq!(p, &path),
+        other => panic!("expected ReplaceError::NotFound, got {other:?} / {err:#}"),
+    }
+
+    // Duplicated `old` → Ambiguous with the occurrence count.
+    let err = repo
+        .resolve_conflicts_ext(&change_hex, &patch("dup\n"))
+        .expect_err("ambiguous old must error");
+    match err.downcast_ref::<ReplaceError>() {
+        Some(ReplaceError::Ambiguous { count, .. }) => assert_eq!(*count, 2),
+        other => panic!("expected ReplaceError::Ambiguous, got {other:?} / {err:#}"),
+    }
+
+    // A failed patch never touches the held rewrite: still pending, git frozen.
+    assert!(
+        repo.is_pending(),
+        "failed patch must leave the resolution pending"
+    );
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A", "base"]);
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "");
+}
+
+/// The marker-lookalike guard, but resolved via a *patch*: content lines that look
+/// like conflict markers (a setext `=======`, a deep `>>>>>>>` blockquote) survive
+/// a patch resolution verbatim. The patch replaces only the real conflict block,
+/// which jj marks with an inflated marker length, so the 7-char content runs are
+/// never in the block the edit touches.
+#[test]
+fn patch_resolution_preserves_marker_like_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let setext = "======="; // 7 '=' — a setext-style heading underline
+    let quote = ">>>>>>> quoted text"; // 7 '>' — a deep blockquote line
+    let make = |mid: &str| format!("# Title\n{setext}\n{mid}\n{quote}\nend\n");
+    common::init_repo(
+        dir,
+        &[
+            ("doc.md", make("2").as_str(), "base"),
+            ("doc.md", make("A").as_str(), "A"),
+            ("doc.md", make("B").as_str(), "B"),
+        ],
+    );
+
+    let mut repo = Repo::open(dir).expect("open");
+    let mut outcome = reorder_a_to_top(&mut repo);
+    assert!(matches!(outcome, SaveOutcome::Conflicts { .. }));
+
+    let mut steps = 0;
+    while let SaveOutcome::Conflicts { commits } = outcome {
+        let oldest = commits.into_iter().next().expect("a conflicted commit");
+        let path = oldest
+            .files
+            .iter()
+            .find(|f| f.resolvable)
+            .expect("a resolvable file")
+            .path_str();
+        outcome = resolve_by_patch(&mut repo, &oldest.change_id_hex(), &path, "R\n");
+        steps += 1;
+        assert!(steps < 10, "resolution should converge");
+    }
+    assert!(!repo.is_pending());
+
+    // The marker-like content lines outside the conflict block are byte-for-byte.
+    assert_eq!(
+        common::git(dir, &["show", "HEAD:doc.md"]),
+        make("R").strip_suffix('\n').unwrap()
+    );
 }

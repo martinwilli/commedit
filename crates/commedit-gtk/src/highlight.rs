@@ -15,6 +15,17 @@ use syntect::parsing::SyntaxSet;
 use crate::conflict::conflict_header_path;
 use crate::state::{CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE};
 
+/// Skip syntect coloring and intra-line emphasis on any diff line longer than
+/// this many bytes. Pango lays out even a ~1 MB line in ~130 ms and scales
+/// linearly, so the raw text renders fine; what freezes the UI is syntect's
+/// regex pass over the line plus the char-offset span mapping in
+/// [`apply_code_spans`] / [`apply_cols`], both super-linear in line length. So
+/// a single minified line (a bundled `*.min.js` and the like) otherwise hangs
+/// the diff view. Past the cap the line still gets its background tag and shows
+/// as plain monospace text, the way vim's `synmaxcol` or VS Code's per-line
+/// tokenizer limit bail out. Well above any hand-written source line.
+const MAX_HIGHLIGHT_LINE_LEN: usize = 10_000;
+
 /// Create the static, named tags used for diff line backgrounds and intra-line
 /// emphasis (idempotent). Per-syntax foreground tags are created lazily in
 /// [`fg_tag`]. Colors follow GitHub's light diff palette.
@@ -159,6 +170,13 @@ pub(crate) fn highlight_diff(
             _ => {}
         }
 
+        // Degenerate long line (minified bundle, huge data row): the background
+        // tag above is enough; skip the super-linear syntect + span-mapping work
+        // that would otherwise freeze the view. See MAX_HIGHLIGHT_LINE_LEN.
+        if raw.len() > MAX_HIGHLIGHT_LINE_LEN {
+            continue;
+        }
+
         let prefix = if raw.is_empty() { 0 } else { 1 };
         let code = &raw[prefix..];
         let owned = format!("{code}\n");
@@ -233,6 +251,11 @@ pub(crate) fn highlight_diff_line(
     match kind {
         DiffLineKind::Hunk | DiffLineKind::Meta | DiffLineKind::Header => return,
         _ => {}
+    }
+    // Same cap as the full pass: don't run syntect / span mapping on a
+    // degenerate long line. See MAX_HIGHLIGHT_LINE_LEN.
+    if raw.len() > MAX_HIGHLIGHT_LINE_LEN {
+        return;
     }
 
     let syntax = path

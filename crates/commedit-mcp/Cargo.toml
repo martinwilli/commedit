@@ -2,6 +2,7 @@
 name = "commedit-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "MCP server frontend for commedit, exposing the history rewrite engine to AI agents"

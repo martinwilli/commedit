@@ -173,6 +173,52 @@ claude plugin install commedit@commedit-local   # then restart Claude Code
 Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
 and ask the agent to list or edit history.
 
+## Permissions in auto mode
+
+To Claude Code's [`auto` permission mode](https://code.claude.com/docs/en/permission-modes)
+rewriting git history is a *destructive* action, so its classifier will prompt
+(or block) on commedit's mutations — even though rewriting history in place is the
+whole point here. To stop that, tell Claude Code to trust the `commedit` server's
+tools. A plugin **can't** grant this itself: permission grants are honoured only
+from *your* settings or your org's managed settings, never from installed code (by
+design — otherwise any plugin could self-approve). So add one of the following
+once.
+
+**Simplest — pre-approve the tools.** A `permissions.allow` rule resolves *before*
+the classifier, so this auto-approves every commedit tool, in every permission
+mode. Add it to your `~/.claude/settings.json` (note the plugin-namespaced prefix
+`mcp__plugin_commedit_commedit__` — not a bare `mcp__commedit__`):
+
+```json
+{ "permissions": { "allow": ["mcp__plugin_commedit_commedit__*"] } }
+```
+
+**Surgical — keep the classifier, clear just the false positive.** An
+[`autoMode.allow`](https://code.claude.com/docs/en/auto-mode-config) prose rule
+lets the classifier keep judging commedit for *other* risks and only stops it from
+treating local history rewriting as destructive. Keep `"$defaults"` first, or you
+replace the entire built-in allow list. Note `autoMode` is read **only** from
+`~/.claude/settings.json` or managed settings — *not* a repo's
+`.claude/settings.json`:
+
+```json
+{
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "Local git history rewriting via the commedit MCP server is routine and reversible, not destructive: its tools (prefixed mcp__plugin_commedit_commedit__) rewrite the checked-out branch's history in place and auto-rebase descendants, but only ever touch LOCAL history — never a remote, never a force-push, never remote history. The repo stays a plain attached-HEAD git repo throughout, conflicted trees are never exported, every edit is a reversible op-log operation (undo/redo/jump) with dropped commits kept in a restorable trash, and a rebase that conflicts freezes the whole rewrite without writing anything to git rather than leaving a broken tree."
+    ]
+  }
+}
+```
+
+**For a team or org.** Push either rule to everyone through [managed
+settings](https://code.claude.com/docs/en/server-managed-settings) instead of
+having each member configure it. The `autoMode.allow` form fits best there — it
+blesses commedit without blanket-approving its tools.
+
+Either way the change takes effect on your next Claude Code session.
+
 ## Developing locally
 
 A source checkout has **no binaries** in `bin/` — the release workflow injects

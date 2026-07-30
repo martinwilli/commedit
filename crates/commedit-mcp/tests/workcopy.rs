@@ -10,6 +10,7 @@ use commedit_mcp::dto::{
     SquashWorkingCopyReq,
 };
 use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
+use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -121,6 +122,7 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
                 hunks: None,
                 patches: None,
                 add_paths: None,
+                dry_run: false,
             }))
             .await,
     );
@@ -141,11 +143,12 @@ async fn squash_working_copy_folds_the_dirt_into_a_commit() {
             hunks: None,
             patches: None,
             add_paths: None,
+            dry_run: false,
         }))
         .await
         .unwrap()
         .0;
-    assert!(matches!(result.result, SaveResultDto::Clean { .. }));
+    assert!(matches!(result.result, Some(SaveResultDto::Clean { .. })));
 
     // The message is kept (fixup), the content landed, the tree is clean.
     assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
@@ -298,11 +301,12 @@ async fn squash_working_copy_accepts_a_change_id_prefix() {
             hunks: None,
             patches: None,
             add_paths: None,
+            dry_run: false,
         }))
         .await
         .unwrap()
         .0;
-    assert!(matches!(result.result, SaveResultDto::Clean { .. }));
+    assert!(matches!(result.result, Some(SaveResultDto::Clean { .. })));
 
     assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "1\nfolded");
     assert!(
@@ -510,11 +514,12 @@ async fn squash_working_copy_partial_reports_the_remainder() {
             hunks: None,
             patches: None,
             add_paths: None,
+            dry_run: false,
         }))
         .await
         .unwrap()
         .0;
-    assert!(matches!(resp.result, SaveResultDto::Clean { .. }));
+    assert!(matches!(resp.result, Some(SaveResultDto::Clean { .. })));
 
     let wc = resp.working_copy.expect("remainder reported");
     assert!(
@@ -522,6 +527,154 @@ async fn squash_working_copy_partial_reports_the_remainder() {
         "b.txt remains uncommitted after the partial fold"
     );
     assert_eq!(wc.entries[0].files, vec!["b.txt".to_string()]);
+}
+
+/// The change id of the commit at `row` of the newest-first history.
+async fn change_id_at(server: &commedit_mcp::server::CommeditServer, row: usize) -> String {
+    server
+        .list_history(Parameters(ListHistoryReq {
+            session: sel("main"),
+            limit: None,
+            offset: None,
+            fields: None,
+            working_copy: None,
+        }))
+        .await
+        .unwrap()
+        .0
+        .commits[row]
+        .change_id
+        .clone()
+}
+
+#[tokio::test]
+async fn squash_working_copy_dry_run_previews_the_destination_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    init_repo(
+        dir.path(),
+        &[("a.txt", "a\n", "first"), ("b.txt", "b\n", "second")],
+    );
+    let server = open_server(dir.path());
+
+    std::fs::write(dir.path().join("a.txt"), "a\nedit-a\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b\nedit-b\n").unwrap();
+    let first = change_id_at(&server, 1).await;
+
+    let preview = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
+            dest: first.clone(),
+            message: None,
+            paths: Some(vec!["a.txt".into()]),
+            hunks: None,
+            patches: None,
+            add_paths: None,
+            dry_run: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+
+    // A preview reports what "first" would gain and that b.txt would stay behind,
+    // and applies nothing.
+    assert!(preview.dry_run);
+    assert!(preview.result.is_none(), "nothing was applied");
+    assert_eq!(preview.remaining, Some(true), "b.txt would stay");
+    assert!(preview.working_copy.is_none());
+    let changes = preview.dest_changes.clone().expect("destination echoed");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].path, "a.txt");
+    let diff = changes[0].diff.as_deref().expect("a text diff");
+    assert!(diff.contains("+edit-a"), "unexpected diff:\n{diff}");
+
+    // The preview response is serializable — the outcome is flattened in, so the
+    // absent one must simply leave `status` out rather than break the wire form.
+    let text = commedit_mcp::wrapper::Yaml(preview)
+        .into_call_tool_result()
+        .expect("into result")
+        .content[0]
+        .as_text()
+        .expect("text content")
+        .text
+        .clone();
+    let parsed: serde_json::Value = serde_yaml::from_str(&text).expect("valid YAML");
+    assert_eq!(parsed["dry_run"], true);
+    assert!(parsed.get("status").is_none(), "no status on a preview");
+
+    // Git and the working copy are untouched.
+    assert_eq!(git_log_subjects(dir.path()), ["second", "first"]);
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "a");
+    assert_eq!(
+        git(dir.path(), &["status", "--porcelain"]),
+        "M a.txt\n M b.txt"
+    );
+
+    // Applying for real lands exactly what the preview promised.
+    let applied = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
+            dest: first,
+            message: None,
+            paths: Some(vec!["a.txt".into()]),
+            hunks: None,
+            patches: None,
+            add_paths: None,
+            dry_run: false,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(!applied.dry_run);
+    assert!(matches!(applied.result, Some(SaveResultDto::Clean { .. })));
+    assert!(
+        applied.dest_changes.is_none(),
+        "no echo for a whole-file fold"
+    );
+    assert_eq!(
+        applied.remaining, None,
+        "working_copy reports the remainder"
+    );
+    assert_eq!(git(dir.path(), &["show", "HEAD~1:a.txt"]), "a\nedit-a");
+}
+
+#[tokio::test]
+async fn squash_working_copy_patches_tier_echoes_what_the_destination_got() {
+    let dir = TempDir::new().unwrap();
+    // "first" writes two lines; "second" appends a third. A patch deleting that
+    // third line matches the tip but describes nothing "first" contains.
+    init_repo(dir.path(), &[("f.txt", "one\ntwo\n", "first")]);
+    std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+    git(dir.path(), &["commit", "-am", "second"]);
+    let server = open_server(dir.path());
+
+    std::fs::write(dir.path().join("f.txt"), "one\ntwo\n").unwrap();
+    let first = change_id_at(&server, 1).await;
+    let resp = server
+        .squash_working_copy(Parameters(SquashWorkingCopyReq {
+            session: sel("main"),
+            dest: first,
+            message: None,
+            paths: None,
+            hunks: None,
+            patches: Some(vec![PatchSelectionDto {
+                path: "f.txt".into(),
+                patch: "@@ -2,2 +2,1 @@\n two\n-three\n".into(),
+            }]),
+            add_paths: None,
+            dry_run: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+
+    // The fold reports no error — the 3-way merge sees both sides agreeing the
+    // line is gone — yet "first" gains nothing. An empty echo is the tell that a
+    // `clean` patches-tier fold landed nothing.
+    let changes = resp.dest_changes.expect("destination echoed");
+    assert!(
+        changes.is_empty(),
+        "the patch contributes nothing to 'first': {changes:?}"
+    );
 }
 
 #[tokio::test]
@@ -749,11 +902,12 @@ async fn squash_working_copy_can_reword_and_fold_partially() {
             hunks: None,
             patches: None,
             add_paths: None,
+            dry_run: false,
         }))
         .await
         .unwrap()
         .0;
-    assert!(matches!(result.result, SaveResultDto::Clean { .. }));
+    assert!(matches!(result.result, Some(SaveResultDto::Clean { .. })));
 
     // "first" gained a.txt's change and the new message; b.txt stays uncommitted.
     assert_eq!(
@@ -898,11 +1052,12 @@ async fn squash_working_copy_add_paths_folds_a_new_file_into_a_commit() {
             hunks: None,
             patches: None,
             add_paths: Some(vec!["c.txt".into()]),
+            dry_run: false,
         }))
         .await
         .unwrap()
         .0;
-    assert!(matches!(result.result, SaveResultDto::Clean { .. }));
+    assert!(matches!(result.result, Some(SaveResultDto::Clean { .. })));
 
     // The new file folded into "first" (HEAD~1) and the tree is clean again.
     assert_eq!(git(dir.path(), &["show", "HEAD~1:c.txt"]), "new");

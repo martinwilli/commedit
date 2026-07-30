@@ -842,13 +842,20 @@ pub struct SquashWorkingCopyReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<HunkSelectionDto>>,
     /// `patches`: a unified-diff patch applied to the file's HEAD content, to
-    /// split finer than a whole hunk. Text files only.
+    /// split finer than a whole hunk. Text files only. This tier is 3-way merged
+    /// into the destination rather than replayed there — read `dest_changes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<PatchSelectionDto>>,
     /// `add_paths`: brand-new untracked files to fold in (naming begins tracking
     /// past `.gitignore`); also list them under `paths` for a partial fold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_paths: Option<Vec<String>>,
+    /// Preview only: build the fold, report `dest_changes` and `remaining`, then
+    /// throw it away — history, HEAD and the worktree are untouched. Naming an
+    /// untracked file in `add_paths` still begins tracking it (the preview needs
+    /// its content), which is jj-side only and invisible to git.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -905,14 +912,34 @@ pub struct CommitWorkingCopyResp {
 }
 
 /// The result of `squash_working_copy`. The mutation outcome (including its
-/// `topology` slice) is flattened to the top level; the remaining working copy
-/// rides alongside.
+/// `topology` slice) is flattened to the top level; the destination echo and the
+/// remaining working copy ride alongside.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SquashWorkingCopyResp {
+    /// True when this was a preview: nothing was changed.
+    #[serde(skip_serializing_if = "is_false")]
+    pub dry_run: bool,
     /// The mutation outcome, flattened in: `status`, `head_sha` and (on a clean
-    /// fold) the `topology` slice showing the destination after the fold.
-    #[serde(flatten)]
-    pub result: SaveResultDto,
+    /// fold) the `topology` slice showing the destination after the fold. Absent
+    /// on a dry run — nothing was applied.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub result: Option<SaveResultDto>,
+    /// What the fold actually put into the destination: its own tree before the
+    /// fold vs after it, per file. Present on every dry run, and on a real fold
+    /// that used the `patches` tier.
+    ///
+    /// Worth reading, because the fold 3-way merges the selection into the
+    /// destination instead of replaying it there: a hand-built patch matches the
+    /// content at HEAD, and where a *descendant* commit reworded those lines the
+    /// merge silently drops the parts that don't match the destination — still
+    /// reporting `clean`. An empty list on a fold you expected to land something
+    /// means it landed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest_changes: Option<Vec<FileChangeDto>>,
+    /// Whether anything would be left uncommitted after the fold. Dry run only;
+    /// a real fold reports the remainder itself in `working_copy`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<bool>,
     /// The uncommitted changes that remain after the fold: clean for a whole fold,
     /// the unselected remainder for a partial one. Present on a clean fold.
     #[serde(skip_serializing_if = "Option::is_none")]

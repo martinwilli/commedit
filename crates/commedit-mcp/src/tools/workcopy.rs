@@ -64,7 +64,7 @@ impl CommeditServer {
     }
 
     #[tool(
-        description = "Fold the uncommitted changes into a commit as a fixup (the destination's message is kept; pass `message` to reword it in the same call). Pass `paths`/`hunks`/`patches` to fold only PART of the changes, leaving the rest uncommitted; omit all three to fold everything. Only already-tracked files are folded — an untracked file needs `add_paths` (see the field docs). A clean fold returns the `topology` slice and the remaining `working_copy` (the unselected remainder for a partial fold); an overlap with the commit conflicts like any rewrite."
+        description = "Fold the uncommitted changes into a commit as a fixup (the destination's message is kept; pass `message` to reword it in the same call). Pass `paths`/`hunks`/`patches` to fold only PART of the changes, leaving the rest uncommitted; omit all three to fold everything. Only already-tracked files are folded — an untracked file needs `add_paths` (see the field docs). A clean fold returns the `topology` slice and the remaining `working_copy` (the unselected remainder for a partial fold); an overlap with the commit conflicts like any rewrite. Pass `dry_run: true` to preview the fold — `dest_changes` (what the destination would really gain) and `remaining`, nothing written — then call again to apply. A real `patches`-tier fold echoes `dest_changes` too: that tier is 3-way merged into the destination rather than replayed there, so a patch built against HEAD can land only partly and still report `clean`. Check it."
     )]
     pub async fn squash_working_copy(
         &self,
@@ -81,6 +81,7 @@ impl CommeditServer {
                 hunks,
                 patches,
                 add_paths,
+                dry_run,
             } = req;
             // Track any named new files before checking for changes, so folding a
             // brand-new file alone (no tracked edits) isn't seen as a clean tree.
@@ -97,6 +98,10 @@ impl CommeditServer {
 
             // A partial fold is requested when any selection tier is present.
             let partial = paths.is_some() || hunks.is_some() || patches.is_some();
+            // The `patches` tier is the one whose result can differ from its
+            // intent (it is merged into the destination, not replayed there), so
+            // it gets the destination echo even on a real fold.
+            let echo_dest = dry_run || patches.as_ref().is_some_and(|p| !p.is_empty());
             let outcome = if partial {
                 let (paths, hunks, patches) = parse_partial_selection(paths, hunks, patches)?;
                 let sel = PartialSelection {
@@ -104,13 +109,37 @@ impl CommeditServer {
                     hunks: &hunks,
                     patches: &patches,
                 };
-                repo.squash_working_copy_partial_into(sel, &dest_id, message.as_deref())
-                    .map_err(internal)?
+                repo.squash_working_copy_partial_into_ext(
+                    sel,
+                    &dest_id,
+                    message.as_deref(),
+                    dry_run,
+                )
+                .map_err(internal)?
             } else {
-                repo.squash_working_copy_into(None, &dest_id, message.as_deref())
+                repo.squash_working_copy_into_ext(None, &dest_id, message.as_deref(), dry_run)
                     .map_err(internal)?
             };
-            let result = save_result_topo(repo, &outcome, &pre, &anchors)?;
+            let dest_changes = echo_dest.then(|| {
+                outcome
+                    .dest_changes
+                    .iter()
+                    .map(|fc| file_change_dto(fc, false))
+                    .collect()
+            });
+
+            let Some(applied) = outcome.applied else {
+                // A dry run wrote nothing, so there is no outcome and no settled
+                // working copy to read — just the preview.
+                return Ok(SquashWorkingCopyResp {
+                    dry_run: true,
+                    result: None,
+                    dest_changes,
+                    remaining: Some(outcome.remaining),
+                    working_copy: None,
+                });
+            };
+            let result = save_result_topo(repo, &applied, &pre, &anchors)?;
             // On a clean fold, report what's left uncommitted (clean for a whole
             // fold, the unselected remainder for a partial one); on conflicts the
             // working copy is held with the rewrite, so there's nothing to report.
@@ -119,7 +148,10 @@ impl CommeditServer {
                 SaveResultDto::Conflicts { .. } => None,
             };
             Ok(SquashWorkingCopyResp {
-                result,
+                dry_run: false,
+                result: Some(result),
+                dest_changes,
+                remaining: None,
                 working_copy,
             })
         })

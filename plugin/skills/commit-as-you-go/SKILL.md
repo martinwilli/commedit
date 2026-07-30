@@ -55,6 +55,13 @@ reorder or drop it later in one call, and descendants rebase automatically.
    `hunks` / `patches` to fold only part, and `add_paths` to fold in a new file.
    A brand-new (untracked) file is **silently skipped** unless named in
    `add_paths`; in a partial fold it must be in **both** `add_paths` and `paths`.
+   **`patches` is the tier where `clean` does not mean `correct`.** You write that
+   patch against the content at **HEAD**, but the fold 3-way merges it into the
+   destination — so a `-` or context line a *descendant* commit reworded silently
+   doesn't match there, gets dropped, and the call still returns `clean`. Read the
+   `dest_changes` the response echoes back for that tier: it is the destination's
+   own before/after, and an empty one means the fold landed **nothing**. Use
+   `dry_run: true` to see it before committing to the fold.
    If the leftover changes belong across **several** earlier commits,
    `absorb_working_copy` blames each hunk and folds them all to their owning
    commits in one call — run it with `dry_run: true` first to preview the routing

@@ -292,6 +292,14 @@ uncommitted hunk to the commit that owns its lines and folds them all in one
 rewrite (like `git absorb` / `jj absorb`), leaving ambiguous hunks in the working
 copy — with a `dry_run` that returns the routing plan to preview first.
 
+`squash_working_copy` has a `dry_run` too, and reports `dest_changes`: the
+destination commit's own tree before the fold vs after it. That matters for its
+`patches` tier — a hand-written unified diff, the way to fold *less* than a whole
+hunk. The patch is written against the content at HEAD, but the fold 3-way merges
+it into the destination, so where a descendant reworded the lines it touches, the
+parts that don't match are quietly dropped and the fold still reports clean.
+`dest_changes` says what actually arrived; an empty one means nothing did.
+
 One server hosts several **independent editing sessions** over the one repository
 it serves — one per branch — so an agent can edit several branches at once, and in
 parallel. Every tool names the session it acts on by id (the branch's short name);

@@ -25,6 +25,7 @@ The MCP server is **multi-tenant**: one server hosts several independent editing
 - **DTO boundary** — `dto.rs`/`convert.rs`: no jj-lib types cross the MCP boundary; engine types are converted to plain serializable DTOs. Results are YAML-wrapped in `wrapper.rs`.
 - **Tools** live in `tools/{read,mutate,workcopy,conflict,ops}.rs` (`tools/mod.rs` ties them together); the router and `#[tool]` dispatch are in `server.rs`. `error.rs` is the shared error type.
 - The MCP surface is a **superset of the GTK app** — it exposes everything the UI can do plus the `PartialSelection`-based partial commit/squash that has no GTK counterpart.
+- **`squash_working_copy` previews and echoes.** `dry_run` builds the fold and throws it away; `dest_changes` reports the destination's tree before vs after, on every dry run and on any real fold that used the `patches` tier (the one tier whose result can differ from its intent — see the engine guide's *A fold is a 3-way merge*). Because the mutation outcome is `#[serde(flatten)]`ed into `SquashWorkingCopyResp`, it is an `Option` that simply omits `status` on a preview; `tests/workcopy.rs` asserts that wire form.
 
 ## Tests
 

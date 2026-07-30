@@ -17,8 +17,10 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::{squash_commits, CommitWithSelection};
+use jj_lib::transaction::Transaction;
 
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
+use crate::diff::{tree_changes, FileChange};
 use crate::history::{branch_commits, branch_commits_multi, CommitInfo};
 use crate::repo::Repo;
 use crate::workcopy::{PartialSelection, WcTarget};
@@ -43,6 +45,38 @@ const PREFIXES: [(&str, SquashMode); 3] = [
     ("squash!", SquashMode::Squash),
     ("amend!", SquashMode::Amend),
 ];
+
+/// A squash's outcome plus what it actually put into the destination.
+///
+/// The extra detail matters because a squash is not a literal replay of the
+/// source's diff onto the destination: jj 3-way merges the source's change into
+/// the destination's *own* tree. A selection built against HEAD — a
+/// `patches`-tier sub-hunk especially — can therefore land differently in a
+/// destination whose content a descendant later reworded, and the merge swallows
+/// the mismatch silently. `dest_changes` is what really landed there.
+#[derive(Debug, Clone)]
+pub struct SquashOutcome {
+    /// The mutation outcome, or `None` on a dry run — nothing was written.
+    pub applied: Option<SaveOutcome>,
+    /// The destination commit's own tree, before the squash vs after it: the
+    /// change the fold contributed there, per file. Read as the squash wrote
+    /// it, before descendants rebase — final for a working-copy fold, whose
+    /// destination is always an ancestor of the source.
+    pub dest_changes: Vec<FileChange>,
+    /// Whether the launch `@` still differs from its parent afterwards, i.e.
+    /// anything is left uncommitted (the unselected remainder of a partial
+    /// fold).
+    pub remaining: bool,
+}
+
+impl SquashOutcome {
+    /// The [`SaveOutcome`] of a squash that was applied — every `dry_run: false`
+    /// call produces one, so the wrappers that predate the preview unwrap here.
+    fn into_applied(self) -> SaveOutcome {
+        self.applied
+            .expect("a squash with dry_run: false always produces an outcome")
+    }
+}
 
 /// Rows to highlight while dragging a prefixed commit, as indices into the
 /// (newest-first) display list.
@@ -355,8 +389,17 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit", || {
-            self.squash_into_inner(vec![source.clone()], dest, mode, message, false, None)
+            self.squash_into_inner(
+                vec![source.clone()],
+                dest,
+                mode,
+                message,
+                false,
+                None,
+                false,
+            )
         })
+        .map(SquashOutcome::into_applied)
     }
 
     /// Fold a *set* of sources into one destination in a single transaction — the
@@ -374,8 +417,9 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commits", || {
-            self.squash_into_inner(sources, dest, mode, message, false, None)
+            self.squash_into_inner(sources, dest, mode, message, false, None, false)
         })
+        .map(SquashOutcome::into_applied)
     }
 
     /// Like [`Self::squash_into`], but `source` is a *trashed* commit — an orphan
@@ -391,8 +435,9 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
         crate::repo::catch_jj("squashing the commit from trash", || {
-            self.squash_into_inner(vec![source.clone()], dest, mode, message, true, None)
+            self.squash_into_inner(vec![source.clone()], dest, mode, message, true, None, false)
         })
+        .map(SquashOutcome::into_applied)
     }
 
     /// Fold a working-copy entry (identified by its stable change id, or the leaf
@@ -426,6 +471,37 @@ impl Repo {
         dest: &CommitId,
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
+        self.squash_working_copy_fold_at(target, change_hex, dest, message, false)
+            .map(SquashOutcome::into_applied)
+    }
+
+    /// [`Self::squash_working_copy_into`] with a preview: `dry_run` builds the
+    /// whole rewrite and reads its effect off the transaction, then throws the
+    /// transaction away, so nothing is written. Either way the returned
+    /// [`SquashOutcome`] carries `dest_changes` — what the fold landed in the
+    /// destination — which a bare [`SaveOutcome`] cannot show. Launch worktree
+    /// only, like the partial fold.
+    pub fn squash_working_copy_into_ext(
+        &mut self,
+        change_hex: Option<&str>,
+        dest: &CommitId,
+        message: Option<&str>,
+        dry_run: bool,
+    ) -> Result<SquashOutcome> {
+        self.squash_working_copy_fold_at(WcTarget::Launch, change_hex, dest, message, dry_run)
+    }
+
+    /// Shared body of the whole-`@` folds: resolve `target`'s entry and squash it
+    /// into `dest` as a Fixup. Mirrors [`Self::squash_into`]'s `catch_jj` wrapper,
+    /// so the two entry points above stay byte-identical to the old inline form.
+    fn squash_working_copy_fold_at(
+        &mut self,
+        target: WcTarget,
+        change_hex: Option<&str>,
+        dest: &CommitId,
+        message: Option<&str>,
+        dry_run: bool,
+    ) -> Result<SquashOutcome> {
         self.require_wc_target(&target, "fold the working copy into a commit")?;
         // Snapshot before resolving so the resolved id survives squash_into's own
         // (now no-op) snapshot — otherwise a churned leaf id would go stale.
@@ -433,7 +509,17 @@ impl Repo {
         let source = self
             .resolve_wc(&target, change_hex)
             .context("no working-copy entry to fold")?;
-        self.squash_into(&source, dest, SquashMode::Fixup, message)
+        crate::repo::catch_jj("squashing the commit", || {
+            self.squash_into_inner(
+                vec![source.clone()],
+                dest,
+                SquashMode::Fixup,
+                message,
+                false,
+                None,
+                dry_run,
+            )
+        })
     }
 
     /// Apply a *trashed* (orphan) commit's changes onto the working copy as
@@ -480,14 +566,17 @@ impl Repo {
                 .get_commit(source)
                 .context("loading the commit to restore")?;
             let label = format!("Restore {} to working copy", op_subject(&source_commit));
-            let outcome = self.squash_into_inner(
-                vec![source.clone()],
-                &dest,
-                SquashMode::Fixup,
-                None,
-                true,
-                Some(label),
-            )?;
+            let outcome = self
+                .squash_into_inner(
+                    vec![source.clone()],
+                    &dest,
+                    SquashMode::Fixup,
+                    None,
+                    true,
+                    Some(label),
+                    false,
+                )
+                .map(SquashOutcome::into_applied)?;
             // Write a sibling worktree's rebased `@` to its own disk: the export
             // tail only re-materializes an extra worktree whose *tip* moved, and a
             // restore moves the `@` alone. The launch path is already materialized
@@ -521,9 +610,33 @@ impl Repo {
         dest: &CommitId,
         message: Option<&str>,
     ) -> Result<SaveOutcome> {
+        self.squash_working_copy_partial_into_ext(sel, dest, message, false)
+            .map(SquashOutcome::into_applied)
+    }
+
+    /// [`Self::squash_working_copy_partial_into`] with a preview: `dry_run` builds
+    /// the whole rewrite and reads its effect off the transaction, then throws the
+    /// transaction away, so nothing is written. Either way the returned
+    /// [`SquashOutcome`] carries `dest_changes` — the destination's own tree
+    /// before vs after the fold.
+    ///
+    /// That echo is the point of this entry: the selection is spliced onto HEAD
+    /// and then 3-way merged into `dest`, so a `patches`-tier patch whose context
+    /// or `-` lines a *descendant* commit reworded lands only partly in `dest`,
+    /// and the merge reports no error. `dest_changes` shows what arrived.
+    pub fn squash_working_copy_partial_into_ext(
+        &mut self,
+        sel: PartialSelection<'_>,
+        dest: &CommitId,
+        message: Option<&str>,
+        dry_run: bool,
+    ) -> Result<SquashOutcome> {
         self.require_worktree("fold part of the working copy into a commit")?;
         crate::repo::catch_jj("folding part of the working copy", || {
-            self.squash_working_copy_partial_into_inner(sel, dest, message)
+            // Snapshot + build the selected subset's tree (`t_commit`) and the full
+            // on-disk tree, against HEAD — shared with commit_working_copy_partial.
+            let prepared = self.prepare_partial_commit(&sel)?;
+            self.squash_prepared_working_copy_into(prepared, dest, message, dry_run)
         })
     }
 
@@ -553,20 +666,9 @@ impl Repo {
             // HEAD, like commit_working_copy_partial), then share the transaction
             // tail with the PartialSelection-based partial squash.
             let prepared = self.prepare_partial_commit_hunk(path, first_group, last_group)?;
-            self.squash_prepared_working_copy_into(prepared, dest, message)
+            self.squash_prepared_working_copy_into(prepared, dest, message, false)
         })
-    }
-
-    fn squash_working_copy_partial_into_inner(
-        &mut self,
-        sel: PartialSelection<'_>,
-        dest: &CommitId,
-        message: Option<&str>,
-    ) -> Result<SaveOutcome> {
-        // Snapshot + build the selected subset's tree (`t_commit`) and the full
-        // on-disk tree, against HEAD — shared with commit_working_copy_partial.
-        let prepared = self.prepare_partial_commit(&sel)?;
-        self.squash_prepared_working_copy_into(prepared, dest, message)
+        .map(SquashOutcome::into_applied)
     }
 
     /// The shared transaction tail of the partial working-copy squashes: given the
@@ -583,7 +685,8 @@ impl Repo {
         prepared: (CommitId, MergedTree, MergedTree, MergedTree),
         dest: &CommitId,
         message: Option<&str>,
-    ) -> Result<SaveOutcome> {
+        dry_run: bool,
+    ) -> Result<SquashOutcome> {
         let (head, head_tree, full_tree, t_commit) = prepared;
 
         let name = self.workspace.workspace_name().to_owned();
@@ -602,6 +705,7 @@ impl Repo {
             None => dest_commit.description().to_string(),
         };
         let dest_author = dest_commit.author().clone();
+        let dest_before = dest_commit.tree();
         let desc = OpDescriptor::new(
             format!("Squash working copy into {}", op_subject(&dest_commit)),
             vec![dest_commit.change_id().hex()],
@@ -645,7 +749,7 @@ impl Repo {
         ))
         .context("squashing commits")?
         .context("squash produced no commit (empty selection)")?;
-        pollster::block_on(
+        let new_dest = pollster::block_on(
             squashed
                 .commit_builder
                 .set_description(new_desc)
@@ -653,19 +757,65 @@ impl Repo {
                 .write(),
         )
         .context("writing squashed commit")?;
+        let dest_after = new_dest.tree();
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        let (dest_changes, remaining) = self.fold_effect(&tx, &dest_before, &dest_after)?;
+        if dry_run {
+            // Drop the transaction: jj is only mutated on commit, so nothing lands.
+            drop(tx);
+            return Ok(SquashOutcome {
+                applied: None,
+                dest_changes,
+                remaining,
+            });
+        }
 
         // The subset is preserved as a net change, so the post-squash tip is clean
         // even if an interior commit conflicts spuriously — same CleanTip resolve
         // as a whole-working-copy fold / reorder.
-        self.finish_mutation_auto_resolve(
+        let applied = self.finish_mutation_auto_resolve(
             tx,
             "commedit: squash working copy (partial)",
             desc,
             pre_op,
             old_head,
             heads,
-        )
+        )?;
+        Ok(SquashOutcome {
+            applied: Some(applied),
+            dest_changes,
+            remaining,
+        })
+    }
+
+    /// Read a squash's effect off its transaction *before* it is committed, so a
+    /// dry run reports exactly what an apply would land: the destination's own
+    /// tree before vs after, and whether the rebased launch `@` still differs
+    /// from its parent (anything left uncommitted). See [`SquashOutcome`] for why
+    /// the destination echo is not just the source's diff.
+    fn fold_effect(
+        &self,
+        tx: &Transaction,
+        dest_before: &MergedTree,
+        dest_after: &MergedTree,
+    ) -> Result<(Vec<FileChange>, bool)> {
+        let dest_changes = tree_changes(&self.repo.store().clone(), dest_before, dest_after)?;
+        let wc = tx
+            .repo()
+            .view()
+            .get_wc_commit_id(self.workspace.workspace_name())
+            .cloned()
+            .and_then(|id| tx.repo().store().get_commit(&id).ok());
+        let remaining = match wc {
+            Some(wc) => {
+                let parent_tree =
+                    pollster::block_on(wc.parent_tree(tx.repo())).context("reading @'s parent")?;
+                wc.tree().tree_ids_and_labels() != parent_tree.tree_ids_and_labels()
+            }
+            None => false,
+        };
+        Ok((dest_changes, remaining))
     }
 
     /// Move a single diff hunk out of `source` and fold it into `dest`, rebasing
@@ -890,6 +1040,7 @@ impl Repo {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn squash_into_inner(
         &mut self,
         sources: Vec<CommitId>,
@@ -898,7 +1049,8 @@ impl Repo {
         message: Option<&str>,
         source_is_orphan: bool,
         label: Option<String>,
-    ) -> Result<SaveOutcome> {
+        dry_run: bool,
+    ) -> Result<SquashOutcome> {
         if sources.is_empty() {
             anyhow::bail!("no commits to squash");
         }
@@ -944,6 +1096,7 @@ impl Repo {
             None => compose_squash_message_multi(mode, dest_commit.description(), &source_descs),
         };
         let dest_author = dest_commit.author().clone();
+        let dest_before = dest_commit.tree();
         let label = label.unwrap_or_else(|| {
             if let [only] = source_commits.as_slice() {
                 format!(
@@ -989,7 +1142,7 @@ impl Repo {
 
         // Preserve the destination's author; leaving the committer unset lets
         // jj re-stamp it (otherwise `rewrite_commit` would do so anyway).
-        pollster::block_on(
+        let new_dest = pollster::block_on(
             squashed
                 .commit_builder
                 .set_description(new_desc)
@@ -997,20 +1150,37 @@ impl Repo {
                 .write(),
         )
         .context("writing squashed commit")?;
+        let dest_after = new_dest.tree();
 
         pollster::block_on(tx.repo_mut().rebase_descendants()).context("rebasing descendants")?;
+
+        let (dest_changes, remaining) = self.fold_effect(&tx, &dest_before, &dest_after)?;
+        if dry_run {
+            // Drop the transaction: jj is only mutated on commit, so nothing lands.
+            drop(tx);
+            return Ok(SquashOutcome {
+                applied: None,
+                dest_changes,
+                remaining,
+            });
+        }
 
         // A squash preserves the net change set, so the post-squash tip is clean
         // and identical to the original even when an interior commit conflicts
         // spuriously — opt into the same CleanTip auto-resolution as a reorder.
-        self.finish_mutation_auto_resolve(
+        let applied = self.finish_mutation_auto_resolve(
             tx,
             "commedit: squash commit",
             desc,
             pre_op,
             old_head,
             heads,
-        )
+        )?;
+        Ok(SquashOutcome {
+            applied: Some(applied),
+            dest_changes,
+            remaining,
+        })
     }
 }
 

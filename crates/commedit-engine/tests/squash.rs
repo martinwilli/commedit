@@ -483,6 +483,103 @@ fn partial_fold_lands_a_subset_and_keeps_the_rest_uncommitted() {
 }
 
 #[test]
+fn a_dry_run_fold_previews_the_destination_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "A"), ("b.txt", "b\n", "B")]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    std::fs::write(dir.join("a.txt"), "a\nAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\nBB\n").unwrap();
+    let dest = id_of(&repo, "A");
+    let paths = vec!["a.txt".to_string()];
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
+    let preview = repo
+        .squash_working_copy_partial_into_ext(sel, &dest, None, true)
+        .expect("dry run");
+
+    // The preview shows what "A" would gain and that b.txt would stay behind.
+    assert!(preview.applied.is_none(), "a dry run applies nothing");
+    assert!(preview.remaining, "b.txt would stay uncommitted");
+    let paths_touched: Vec<&str> = preview
+        .dest_changes
+        .iter()
+        .map(|fc| fc.path.as_str())
+        .collect();
+    assert_eq!(paths_touched, vec!["a.txt"]);
+    assert_eq!(preview.dest_changes[0].old_text.as_deref(), Some("a\n"));
+    assert_eq!(preview.dest_changes[0].new_text.as_deref(), Some("a\nAA\n"));
+
+    // Nothing was written: git still sees the original history and both edits are
+    // still uncommitted on disk.
+    assert_eq!(common::git_log_subjects(dir), vec!["B", "A"]);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "a");
+    assert_eq!(
+        common::git(dir, &["status", "--porcelain"]),
+        "M a.txt\n M b.txt",
+        "both edits still unstaged (the leading blank is git's staged column)"
+    );
+    assert!(!repo.is_pending());
+
+    // Applying for real lands exactly what the preview promised.
+    let sel = PartialSelection {
+        paths: &paths,
+        hunks: &[],
+        patches: &[],
+    };
+    let applied = repo
+        .squash_working_copy_partial_into_ext(sel, &dest, None, false)
+        .expect("apply");
+    assert!(matches!(applied.applied, Some(SaveOutcome::Clean)));
+    assert_eq!(applied.dest_changes.len(), 1);
+    assert_eq!(applied.dest_changes[0].path, "a.txt");
+    assert!(applied.remaining);
+    assert_eq!(common::git(dir, &["show", "HEAD~1:a.txt"]), "a\nAA");
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn the_destination_echo_exposes_a_patch_the_merge_swallowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // "base" writes two lines; "later" appends a third. A patch that deletes that
+    // third line matches the *tip* but describes nothing "base" contains.
+    common::init_repo(dir, &[("f.txt", "one\ntwo\n", "base")]);
+    std::fs::write(dir.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+    common::git(dir, &["commit", "-am", "later"]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+    let dest = id_of(&repo, "base");
+    let patches = vec![(
+        "f.txt".to_string(),
+        "@@ -2,2 +2,1 @@\n two\n-three\n".to_string(),
+    )];
+    let sel = PartialSelection {
+        paths: &[],
+        hunks: &[],
+        patches: &patches,
+    };
+    let preview = repo
+        .squash_working_copy_partial_into_ext(sel, &dest, None, true)
+        .expect("dry run");
+
+    // The fold reports no error — the 3-way merge sees both sides agreeing that
+    // the line is gone — yet "base" gains nothing at all. An empty `dest_changes`
+    // on a fold you expected to land something is the tell.
+    assert!(
+        preview.dest_changes.is_empty(),
+        "the patch contributes nothing to 'base': {:?}",
+        preview.dest_changes
+    );
+    assert_eq!(common::git_log_subjects(dir), vec!["later", "base"]);
+}
+
+#[test]
 fn partial_fold_by_hunk_index_folds_one_hunk() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

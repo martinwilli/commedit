@@ -1782,6 +1782,22 @@ impl Repo {
             .collect()
     }
 
+    /// The change ids (hex) of every editable worktree's `@` chain, in the order
+    /// [`Self::all_worktree_chain_ids`] lists them — an `@` with no diff of its
+    /// own included, unlike [`Self::worktree_chain_entries`].
+    ///
+    /// That difference is the point: a clean `@` still *inherits* the rewritten
+    /// tip's conflicted tree, so [`Repo::collect_conflicts`] reports it while
+    /// there is nothing in it to resolve. A caller telling working-copy conflicts
+    /// apart from branch ones must therefore key on this, not on the entries.
+    pub fn worktree_chain_change_ids(&self) -> Vec<String> {
+        self.all_worktree_chain_ids()
+            .iter()
+            .filter_map(|id| self.repo.store().get_commit(id).ok())
+            .map(|c| c.change_id().hex())
+            .collect()
+    }
+
     /// Resolve a working-copy entry's stable change id to its *current* commit id
     /// within the chain. Commit ids churn (the leaf's on every snapshot), so the
     /// UI hands edits/splits/squashes a change id and we resolve it here, after

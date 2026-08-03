@@ -894,3 +894,52 @@ fn patch_resolution_preserves_marker_like_content() {
         make("R").strip_suffix('\n').unwrap()
     );
 }
+
+/// A *clean* working copy still inherits the conflict its rebased parent picked
+/// up, so it is reported among the conflicted commits while having no diff — and
+/// therefore no `worktree_chain_entries()` row — of its own. Only
+/// `worktree_chain_change_ids()` names it, which is how the GTK conflict view
+/// tells such a badge apart from a real branch conflict.
+#[test]
+fn a_clean_working_copy_conflict_is_named_by_change_id_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A and B both rewrite f.txt's middle line, so rewriting A's conflicts B.
+    common::init_repo(
+        dir,
+        &[("f.txt", "1\n2\n3\n", "A"), ("f.txt", "1\nB\n3\n", "B")],
+    );
+    let mut repo = Repo::open(dir).expect("open");
+    assert!(
+        repo.worktree_chain_entries().is_empty(),
+        "the worktree is clean, so there are no entries to start with"
+    );
+
+    let a = history(&repo.repo, &repo.head_commit_id().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|c| c.subject == "A")
+        .unwrap()
+        .id;
+    let outcome = repo
+        .rewrite_file(&a, "f.txt", "1\nREWRITTEN\n3\n")
+        .expect("rewrite");
+
+    let SaveOutcome::Conflicts { commits } = outcome else {
+        panic!("expected the rewrite to conflict B");
+    };
+    let wc: Vec<_> = commits
+        .iter()
+        .filter(|c| c.subject == "Uncommitted changes")
+        .collect();
+    assert_eq!(wc.len(), 1, "the clean @ inherits B's conflict");
+
+    // Still no entry — the `@` changes no file of its own ...
+    assert!(repo.worktree_chain_entries().is_empty());
+    // ... but its change id is listed, so the badge is attributable.
+    assert!(
+        repo.worktree_chain_change_ids()
+            .contains(&wc[0].change_id_hex()),
+        "the conflicted @ must be named among the worktree chain change ids"
+    );
+}

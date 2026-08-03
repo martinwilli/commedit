@@ -21,7 +21,7 @@ use crate::rows::{populate_history, populate_trash};
 use crate::state::{
     first_commit_row, Callbacks, ConflictCtx, Data, DisplayRow, PaneMode, PendingTrashOp,
     RestoreToWorktreeCallback, Side, Widgets, CONFLICT_ELISION_LINE, CONFLICT_STRUCTURAL_NOTICE,
-    HISTORY_PAGE, SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
+    CONFLICT_WINDOW_MAX, HISTORY_PAGE, SAVE_HINT_CONFLICT, SAVE_HINT_DIFF,
 };
 
 /// The header line introducing one file's section in the combined conflict view,
@@ -358,6 +358,13 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
                         history_limited_multi(&r.repo, &heads, 0, limit).unwrap_or_default();
                     let shown: HashSet<String> = page.iter().map(|c| c.change_id_hex()).collect();
                     if !has_more || branch_conflicts.iter().all(|ch| shown.contains(ch)) {
+                        break page;
+                    }
+                    // A badge we can't locate at all must not cost the whole
+                    // ancestry: stop at the ceiling and render what we have. The
+                    // commit simply gets no row, the same graceful degradation the
+                    // engine's spurious auto-resolve falls back to.
+                    if limit >= CONFLICT_WINDOW_MAX {
                         break page;
                     }
                     limit = limit.saturating_mul(2);

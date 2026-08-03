@@ -24,6 +24,13 @@ pub(crate) const APP_ID: &str = "net.willi.commedit";
 /// `history_scroll` edge handler), so opening a deep repo stays cheap.
 pub(crate) const HISTORY_PAGE: usize = 64;
 
+/// Ceiling on the window the conflict view grows to reach a conflicted commit
+/// (see `conflict::build_refresh_conflict`). Conflicts live on the rewritten
+/// range near the tip, so the first page normally covers them; this only bounds
+/// the search for a badge we can't locate at all, which would otherwise page in
+/// a deep repo's entire ancestry — one row per commit — and freeze the UI.
+pub(crate) const CONFLICT_WINDOW_MAX: usize = HISTORY_PAGE * 16;
+
 /// A reference-counted, re-entrant "render the current diff" callback. Boxed so
 /// the embedded expand-context buttons can hold and invoke it after they widen a
 /// hunk (the renderer rebuilds the buffer and the buttons themselves).

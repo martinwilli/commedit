@@ -316,8 +316,17 @@ pub(crate) fn build_refresh_conflict(w: &Widgets, d: &Data) -> Rc<dyn Fn()> {
         // worktree's `@`) and the change ids they cover, so the history walk below
         // can exclude them from what it must reach — and a conflicted *sibling* `@`
         // is reachable as an inline row, not just the launch one's.
+        //
+        // The exclusion keys on the chain's change ids, not on the entries: a
+        // *clean* `@` inherits the rewritten tip's conflict, so it carries a badge
+        // while having no entry (and no row) of its own. Left in, that badge sits on
+        // no editable head's ancestry and the window loop below never covers it.
         let wc_chain = repo.borrow().worktree_chain_entries();
-        let wc_changes: HashSet<String> = wc_chain.iter().map(|e| e.info.change_id_hex()).collect();
+        let wc_changes: HashSet<String> = repo
+            .borrow()
+            .worktree_chain_change_ids()
+            .into_iter()
+            .collect();
         let branch_conflicts: Vec<String> = badges
             .iter()
             .filter(|ch| !wc_changes.contains(*ch))

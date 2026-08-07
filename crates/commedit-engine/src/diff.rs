@@ -142,13 +142,30 @@ pub fn combined_changes(
     tree_changes(&store, &base, &acc).map(Some)
 }
 
+/// Split `text` into lines the way git does — and the way [`apply_patch`] reads
+/// a patch back: a line ends at `\n`, and at nothing else.
+///
+/// Every line diff in the engine goes through this plus
+/// [`TextDiff::from_slices`], never `TextDiff::from_lines`. `similar`'s own
+/// tokenizer additionally treats a **bare `\r`** as a line terminator, so on a
+/// file carrying one (classic-Mac endings, captured terminal output) it yields
+/// more lines than this does. The `DiffOp` indices would then be indices into a
+/// sequence we don't have: every segment past the `\r` picks up the wrong text,
+/// and once the drift runs off the end, an out-of-bounds panic. Feeding
+/// `from_slices` the tokens we ourselves index makes that desync unrepresentable.
+pub(crate) fn split_lines(text: &str) -> Vec<&str> {
+    text.lines().collect()
+}
+
 /// Render a standard unified diff of `old` → `new` with `@@` hunk headers and
 /// the usual context (3 lines). Inputs are newline-normalized. The result is
 /// meant to be edited and fed back to [`apply_patch`].
 pub fn unified_diff(old: &str, new: &str, path: &str) -> String {
     let old = ensure_trailing_newline(old);
     let new = ensure_trailing_newline(new);
-    let diff = TextDiff::from_lines(old.as_ref(), new.as_ref());
+    let old_lines = split_lines(old.as_ref());
+    let new_lines = split_lines(new.as_ref());
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
     let mut formatter = diff.unified_diff();
     formatter
         .context_radius(DEFAULT_CONTEXT)
@@ -261,6 +278,10 @@ struct Seg<'a> {
 /// Flatten a line-level diff's ops into one sequence of segments, tracking each
 /// line's old/new index and its text. Shared by [`render_diff`] and
 /// [`revert_groups`] so both see identical segmentation and change grouping.
+///
+/// `ops` must index into `old_lines`/`new_lines` themselves — i.e. come from a
+/// `TextDiff::from_slices(old_lines, new_lines)`, never from a `from_lines` over
+/// the original text, which tokenizes differently (see [`split_lines`]).
 fn diff_segments<'a>(old_lines: &[&'a str], new_lines: &[&'a str], ops: &[DiffOp]) -> Vec<Seg<'a>> {
     let mut segs: Vec<Seg> = Vec::new();
     for op in ops {
@@ -365,9 +386,9 @@ fn change_groups(segs: &[Seg]) -> Vec<(usize, usize)> {
 fn reconstruct_groups(old: &str, new: &str, keep_new: impl Fn(usize) -> bool) -> String {
     let old_n = ensure_trailing_newline(old);
     let new_n = ensure_trailing_newline(new);
-    let old_lines: Vec<&str> = old_n.lines().collect();
-    let new_lines: Vec<&str> = new_n.lines().collect();
-    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+    let old_lines = split_lines(old_n.as_ref());
+    let new_lines = split_lines(new_n.as_ref());
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
 
     let segs = diff_segments(&old_lines, &new_lines, diff.ops());
     let groups = change_groups(&segs);
@@ -433,9 +454,9 @@ pub fn select_groups(old: &str, new: &str, kept: &BTreeSet<usize>) -> String {
 pub fn render_diff(old: &str, new: &str, path: &str, exp: &ContextExpansion) -> RenderedDiff {
     let old_n = ensure_trailing_newline(old);
     let new_n = ensure_trailing_newline(new);
-    let old_lines: Vec<&str> = old_n.lines().collect();
-    let new_lines: Vec<&str> = new_n.lines().collect();
-    let diff = TextDiff::from_lines(old_n.as_ref(), new_n.as_ref());
+    let old_lines = split_lines(old_n.as_ref());
+    let new_lines = split_lines(new_n.as_ref());
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
 
     // Flatten the line ops into segments and find the change groups (both shared
     // with `revert_groups` so they agree on grouping).
@@ -1393,6 +1414,50 @@ mod tests {
         let (old, new) = two_change_file();
         let rendered = render_diff(&old, &new, "f", &ContextExpansion::default());
         assert_eq!(rendered.text, unified_diff(&old, &new, "f"));
+    }
+
+    /// A bare `\r` is content, not a line break — git only splits on `\n`, and so
+    /// must we. `similar`'s own line tokenizer splits on it, which used to shift
+    /// every op index past the `\r` and eventually panic out of bounds.
+    #[test]
+    fn a_bare_carriage_return_is_not_a_line_break() {
+        // The CR sits early enough that the drift ran off the end of the file.
+        let old = "a\nb\nc\n";
+        let new = "a\nb\nX\rY\nc\nd\ne\nf\ng\n";
+
+        let rendered = render_diff(old, new, "f", &ContextExpansion::default());
+        assert_eq!(rendered.text, unified_diff(old, new, "f"));
+        assert!(
+            rendered.text.contains("+X\rY\n"),
+            "the CR line stays one line, verbatim: {:?}",
+            rendered.text
+        );
+        // The rendered patch must still reverse-apply, i.e. the segments carry the
+        // text they claim to.
+        assert_eq!(apply_patch(old, &rendered.text).unwrap(), new);
+
+        // Reverting every group reconstructs `old`; reverting none reconstructs `new`.
+        let last = rendered.group_count - 1;
+        assert_eq!(revert_groups(old, new, 0, last), old);
+        assert_eq!(select_groups(old, new, &(0..=last).collect()), new);
+    }
+
+    /// The same desync, but with the CR on the *old* side, and long enough to
+    /// misattribute text rather than run off the end.
+    #[test]
+    fn a_carriage_return_on_the_old_side_keeps_segments_aligned() {
+        let old = "one\ntwo\rSTILL_TWO\nthree\nfour\nfive\n";
+        let new = "one\ntwo\rSTILL_TWO\nthree\nFOUR\nfive\n";
+
+        let rendered = render_diff(old, new, "f", &ContextExpansion::default());
+        assert!(rendered.text.contains("-four\n") && rendered.text.contains("+FOUR\n"));
+        assert!(
+            !rendered.text.contains("-two\r") && !rendered.text.contains("-STILL_TWO"),
+            "the unchanged CR line must not be dragged into the hunk: {:?}",
+            rendered.text
+        );
+        assert_eq!(apply_patch(old, &rendered.text).unwrap(), new);
+        assert_eq!(revert_groups(old, new, 0, rendered.group_count - 1), old);
     }
 
     #[test]

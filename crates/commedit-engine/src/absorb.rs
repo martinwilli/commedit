@@ -37,7 +37,7 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::{RevsetExpression, SymbolResolver, SymbolResolverExtension};
 
 use crate::conflict::{OpDescriptor, SaveOutcome};
-use crate::diff::tree_changes;
+use crate::diff::{split_lines, tree_changes};
 use crate::history::CommitInfo;
 use crate::repo::Repo;
 
@@ -91,7 +91,8 @@ pub struct AbsorbOutcome {
 /// Count the lines added/removed and the number of contiguous hunks between two
 /// file versions (a contiguous delete-then-insert run counts as one hunk).
 fn diff_stat(old: &str, new: &str) -> (usize, usize, usize) {
-    let diff = TextDiff::from_lines(old, new);
+    let (old_lines, new_lines) = (split_lines(old), split_lines(new));
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
     let (mut added, mut removed, mut hunks) = (0, 0, 0);
     let mut in_hunk = false;
     for change in diff.iter_all_changes() {

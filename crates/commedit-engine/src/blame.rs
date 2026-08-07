@@ -34,7 +34,7 @@ use jj_lib::revset::{
     ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension,
 };
 
-use crate::diff::{combined_changes, commit_changes, FileChange};
+use crate::diff::{combined_changes, commit_changes, split_lines, FileChange};
 use crate::history::CommitInfo;
 use crate::repo::Repo;
 
@@ -406,7 +406,8 @@ impl Repo {
 /// The old-side line indices `old` → `new` removes: the `-` lines of the diff,
 /// i.e. the old side of every `Delete` and `Replace` op.
 fn removed_old_indices(old: &str, new: &str) -> Vec<usize> {
-    let diff = TextDiff::from_lines(old, new);
+    let (old_lines, new_lines) = (split_lines(old), split_lines(new));
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
     let mut out = Vec::new();
     for op in diff.ops() {
         if let DiffOp::Delete {
@@ -428,7 +429,8 @@ fn removed_old_indices(old: &str, new: &str) -> Vec<usize> {
 /// returned; a line the commit added or rewrote (`Insert`/`Replace`) is dropped
 /// and flips `introduced` to true. Returns `(introduced, remapped)`.
 fn step_through(old: &str, new: &str, tracked: &[usize]) -> (bool, Vec<usize>) {
-    let diff = TextDiff::from_lines(old, new);
+    let (old_lines, new_lines) = (split_lines(old), split_lines(new));
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
     let ops = diff.ops();
     let mut remapped = Vec::with_capacity(tracked.len());
     let mut introduced = false;

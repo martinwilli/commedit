@@ -29,6 +29,8 @@
 
 use similar::{DiffOp, TextDiff};
 
+use crate::diff::split_lines;
+
 /// Replay the change `base → theirs` onto `ours`, trusting `ours` for context.
 ///
 /// Returns the reconstructed text, or `None` when an edit `theirs` makes overlaps
@@ -43,9 +45,9 @@ use similar::{DiffOp, TextDiff};
 /// tip-equality gate rejects the rare case where that matters, falling back to
 /// manual resolution.
 pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
-    let base_lines: Vec<&str> = base.lines().collect();
-    let ours_lines: Vec<&str> = ours.lines().collect();
-    let theirs_lines: Vec<&str> = theirs.lines().collect();
+    let base_lines = split_lines(base);
+    let ours_lines = split_lines(ours);
+    let theirs_lines = split_lines(theirs);
 
     // How `ours` changed each base line, indexed by base line:
     //   `Some(j)` — unchanged, sitting at `ours` line `j` (an Equal region);
@@ -59,7 +61,7 @@ pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
     // position; a deleted or rewritten one anchors at where it sat, so an
     // insertion lands at the right spot even when `ours` changed the anchor line.
     let mut anchor: Vec<usize> = vec![ours_lines.len(); base_lines.len() + 1];
-    for op in TextDiff::from_lines(base, ours).ops() {
+    for op in TextDiff::from_slices(&base_lines, &ours_lines).ops() {
         match *op {
             DiffOp::Equal {
                 old_index,
@@ -118,7 +120,7 @@ pub fn replay_change(base: &str, ours: &str, theirs: &str) -> Option<String> {
         Some(())
     };
 
-    for op in TextDiff::from_lines(base, theirs).ops() {
+    for op in TextDiff::from_slices(&base_lines, &theirs_lines).ops() {
         match *op {
             DiffOp::Equal { .. } => {}
             DiffOp::Insert {
@@ -187,6 +189,19 @@ mod tests {
         // bottom commit's tree (base = C1, theirs = C1's parent, ours = tip).
         let got = replay_change("foo\nbar\n", "foo\nbar\nbaz\n", "foo\n");
         assert_eq!(got.as_deref(), Some("foo\nbaz\n"));
+    }
+
+    /// A bare `\r` is content, not a line break. `similar`'s own tokenizer splits
+    /// on it, which used to hand out op indices past the end of the `.lines()`
+    /// vectors this indexes, panicking mid-rewrite in the spurious auto-resolve.
+    #[test]
+    fn a_bare_carriage_return_is_not_a_line_break() {
+        let got = replay_change(
+            "foo\nb\rar\n",
+            "foo\n",
+            "foo\nb\rar\nbaz\nqux\nquux\ncorge\n",
+        );
+        assert_eq!(got.as_deref(), Some("foo\nbaz\nqux\nquux\ncorge\n"));
     }
 
     #[test]

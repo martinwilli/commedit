@@ -92,6 +92,8 @@ Three pure, GTK-free modules:
 - `patch_edit.rs` — maps raw edit gestures onto structurally-valid `EditPlan`s (only `+` lines freely editable; context lines split into `-orig`/`+edited` pairs). `MoveLine` reorders `+` line(s) over their neighbour — valid because `+` lines are invisible to the old-file projection, so context/`-` anchors keep their order; `move_block_range` is shared with the GTK key handler for its selection-follow.
 - `tabwidth.rs` — `TabWidthResolver` reads `.editorconfig`, `.vscode/settings.json`, `.clang-format` to pick display tab width per file.
 
+**One line-splitting rule: `diff::split_lines`.** A line ends at `\n` and at nothing else, matching git and `apply_patch`. Never call `TextDiff::from_lines` — `similar`'s tokenizer also splits on a **bare `\r`**, so on a file carrying one it returns `DiffOp` indices into a sequence we don't have: segments past the `\r` pick up the wrong text, and the drift eventually panics out of bounds (a hard abort when it crosses a GTK signal trampoline). Always `TextDiff::from_slices` over `split_lines` output, so the ops index the very tokens we hold — `diff.rs`, `replay.rs`, `blame.rs` and `absorb.rs` all do. Caveat, pre-existing and separate: `split_lines` inherits `str::lines()`'s trailing-`\r` strip, so a **CRLF** file round-trips through `apply_patch` / `revert_groups` as LF.
+
 ## CLI (`cli.rs`)
 
 `parse_repo_and_branch` parses both binaries' `[PATH] [BRANCH]` argument form: a lone arg is a path if it's an existing directory, else a branch in `.`.

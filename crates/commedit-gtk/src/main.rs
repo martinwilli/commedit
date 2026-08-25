@@ -1865,7 +1865,9 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     .borrow()
                     .iter()
                     .find(|c| c.change_id_hex() == change_id)
-                    .is_some_and(|c| buffer_text(&message_buffer) != c.description);
+                    .is_some_and(|c| {
+                        message_differs(&buffer_text(&message_buffer), &c.description)
+                    });
                 let new_identity = read_identity(&identity_fields);
                 let identity_dirty = original_identity.borrow().as_ref() != Some(&new_identity);
                 message_dirty || identity_dirty || has_file_edits()
@@ -2750,7 +2752,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             // regardless of how many rows are selected; never the multi view.
             if pane_mode.borrow().is_conflict() {
                 if let Some(info) = infos.first() {
-                    message_buffer.set_text(&info.description);
+                    message_buffer.set_text(message_for_editor(&info.description));
                     load_conflict_files(info);
                 }
                 return;
@@ -2781,7 +2783,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                     for f in identity_fields.iter() {
                         f.set_sensitive(true);
                     }
-                    message_buffer.set_text(&info.description);
+                    message_buffer.set_text(message_for_editor(&info.description));
                     set_identity_fields(&identity_fields, info);
                     *original_identity.borrow_mut() = Some(read_identity(&identity_fields));
                     diff_read_only.set(false);
@@ -4266,7 +4268,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
             // Message edit (if changed).
             let new_message = buffer_text(&message_buffer);
-            if new_message != original_message {
+            if message_differs(&new_message, &original_message) {
                 // Bind in its own statement so the `RefMut` is dropped before the
                 // match arms run — `enter_conflict_mode` re-borrows `repo`.
                 let outcome = repo.borrow_mut().rewrite_message(&commit_id, &new_message);

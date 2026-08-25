@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use commedit_engine::diff::{ChangeKind, FileChange};
+use commedit_engine::message::cleanup_message;
 use commedit_engine::patch_edit::{Cursor, PatchEdit, Selection};
 use gtk::prelude::*;
 
@@ -14,6 +15,24 @@ pub(crate) fn buffer_text(buffer: &sourceview5::Buffer) -> String {
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), false)
         .to_string()
+}
+
+/// A commit message as the editor shows it: the stored description without its
+/// trailing newline. Every message the engine writes ends in exactly one (see
+/// `commedit_engine::message::cleanup_message`), which the text view would
+/// render as an empty last line — noise the user deletes, only for the next
+/// save to put it back.
+pub(crate) fn message_for_editor(description: &str) -> &str {
+    description.trim_end_matches('\n')
+}
+
+/// Whether the editor text `edited` differs in substance from the stored
+/// `description`. Both sides are cleaned first, so neither the newline dropped
+/// for display nor whitespace the save would strip anyway counts as an edit:
+/// selecting a commit leaves Save inert, and an identity-only save doesn't
+/// quietly rewrite an old message that merely predates the cleanup.
+pub(crate) fn message_differs(edited: &str, description: &str) -> bool {
+    cleanup_message(edited) != cleanup_message(description)
 }
 
 /// The text of buffer `line` (without its trailing newline).
@@ -127,4 +146,26 @@ pub(crate) fn splice_buffer_text(buffer: &sourceview5::Buffer, new_text: &str) {
     let mut at = buffer.iter_at_offset(head as i32);
     buffer.insert(&mut at, &middle);
     buffer.end_user_action();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{message_differs, message_for_editor};
+
+    #[test]
+    fn a_loaded_message_reads_as_unchanged() {
+        // What the editor shows for a git-made message (final newline dropped)
+        // must not count as an edit, or selecting a commit would arm Save.
+        let stored = "subject\n\nbody\n";
+        assert!(!message_differs(message_for_editor(stored), stored));
+        // Same for a message written before the cleanup landed: no final
+        // newline at all, so an identity-only save leaves it alone.
+        let legacy = "subject\n\nbody";
+        assert!(!message_differs(message_for_editor(legacy), legacy));
+    }
+
+    #[test]
+    fn a_real_edit_still_reads_as_changed() {
+        assert!(message_differs("subject, edited", "subject\n"));
+    }
 }

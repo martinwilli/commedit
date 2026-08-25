@@ -21,6 +21,7 @@ use crate::history::{
     plan_reorder_set_candidates, plan_restore_candidates, CommitInfo, ReorderCandidate,
     ReorderSetCandidate,
 };
+use crate::message::cleanup_message;
 use crate::repo::Repo;
 
 /// The author and committer identity of a commit, as edited in the UI. Names and
@@ -71,7 +72,7 @@ impl Repo {
         pollster::block_on(
             tx.repo_mut()
                 .rewrite_commit(&commit)
-                .set_description(message)
+                .set_description(cleanup_message(message))
                 .write(),
         )
         .context("writing rewritten commit")?;
@@ -265,7 +266,7 @@ impl Repo {
                 .rewrite_commit(&p.commit)
                 .set_parents(new_parents);
             if let Some(message) = &p.message {
-                builder = builder.set_description(message);
+                builder = builder.set_description(cleanup_message(message));
             }
             if let Some((author, committer)) = &p.signatures {
                 builder = builder

@@ -92,6 +92,31 @@ fn rewrites_middle_commit_message_visible_to_git() {
 }
 
 #[test]
+fn message_lands_in_the_shape_git_writes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    common::init_repo(dir, &[("a.txt", "a\n", "first")]);
+
+    let mut repo = Repo::open(dir).expect("open");
+    let target = repo.head_commit_id().expect("head");
+
+    // Straight out of a text buffer: no final newline, trailing whitespace, and
+    // blank lines top and bottom.
+    repo.rewrite_message(&target, "  \nsubject   \n\n\nbody  \t\n\n")
+        .expect("rewrite message");
+
+    // The brackets make the message's own trailing newline visible — `%B` alone
+    // would lose it to the helper's trim. Note the interior blank run stays:
+    // git's `strip` would collapse it, we don't.
+    assert_eq!(
+        common::git(dir, &["show", "-s", "--format=[%B]", "main"]),
+        "[subject\n\n\nbody\n]"
+    );
+    assert_eq!(common::git_log_subjects(dir), vec!["subject"]);
+    common::git(dir, &["fsck", "--no-progress"]);
+}
+
+#[test]
 fn rewrites_author_and_committer_identity_visible_to_git() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

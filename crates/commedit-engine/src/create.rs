@@ -27,6 +27,7 @@ use jj_lib::rewrite::{
 
 use crate::conflict::{OpDescriptor, SaveOutcome, SpuriousResolve};
 use crate::history::{format_timestamp, parse_timestamp};
+use crate::message::cleanup_message;
 use crate::repo::Repo;
 use crate::rewrite::Identity;
 use crate::tree::{splice_edits_into_tree, FileEdit};
@@ -346,7 +347,7 @@ impl Repo {
         let mut builder = tx
             .repo_mut()
             .new_commit(new_parent_ids.clone(), tree)
-            .set_description(message);
+            .set_description(cleanup_message(message));
         if let Some(id) = identity {
             let author = Signature {
                 name: id.author_name.clone(),

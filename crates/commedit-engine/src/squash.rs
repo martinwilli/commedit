@@ -22,6 +22,7 @@ use jj_lib::transaction::Transaction;
 use crate::conflict::{op_subject, OpDescriptor, SaveOutcome};
 use crate::diff::{tree_changes, FileChange};
 use crate::history::{branch_commits, branch_commits_multi, CommitInfo};
+use crate::message::cleanup_message;
 use crate::repo::Repo;
 use crate::workcopy::{PartialSelection, WcTarget};
 
@@ -752,7 +753,7 @@ impl Repo {
         let new_dest = pollster::block_on(
             squashed
                 .commit_builder
-                .set_description(new_desc)
+                .set_description(cleanup_message(&new_desc))
                 .set_author(dest_author)
                 .write(),
         )
@@ -961,7 +962,7 @@ impl Repo {
         pollster::block_on(
             squashed
                 .commit_builder
-                .set_description(new_desc)
+                .set_description(cleanup_message(&new_desc))
                 .set_author(dest_author)
                 .write(),
         )
@@ -1145,7 +1146,7 @@ impl Repo {
         let new_dest = pollster::block_on(
             squashed
                 .commit_builder
-                .set_description(new_desc)
+                .set_description(cleanup_message(&new_desc))
                 .set_author(dest_author)
                 .write(),
         )

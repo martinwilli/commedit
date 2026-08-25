@@ -42,6 +42,7 @@ use jj_lib::working_copy::{CheckoutStats, SnapshotOptions};
 use crate::conflict::{OpDescriptor, SaveOutcome};
 use crate::diff::{apply_patch, render_diff, select_groups, ContextExpansion};
 use crate::history::parse_timestamp;
+use crate::message::cleanup_message;
 use crate::repo::Repo;
 use crate::rewrite::Identity;
 
@@ -681,7 +682,7 @@ impl Repo {
         let mut builder = tx
             .repo_mut()
             .new_commit(vec![head.clone()], tree)
-            .set_description(message);
+            .set_description(cleanup_message(message));
         if let Some(id) = identity {
             let author = Signature {
                 name: id.author_name.clone(),
@@ -766,7 +767,7 @@ impl Repo {
         let mut builder = tx
             .repo_mut()
             .new_commit(vec![head.clone()], t_commit)
-            .set_description(message);
+            .set_description(cleanup_message(message));
         if let Some(id) = identity {
             let author = Signature {
                 name: id.author_name.clone(),
@@ -901,7 +902,7 @@ impl Repo {
             let mut builder = tx
                 .repo_mut()
                 .new_commit(vec![parent.clone()], tree.clone())
-                .set_description(entry.message);
+                .set_description(cleanup_message(entry.message));
             if let Some(id) = entry.identity {
                 let author = Signature {
                     name: id.author_name.clone(),
@@ -1061,7 +1062,7 @@ impl Repo {
         let mut builder = tx
             .repo_mut()
             .new_commit(vec![head.clone()], t_commit.clone())
-            .set_description(message);
+            .set_description(cleanup_message(message));
         if let Some(id) = identity {
             let author = Signature {
                 name: id.author_name.clone(),

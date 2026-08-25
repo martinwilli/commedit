@@ -30,7 +30,7 @@ cargo run -p commedit-gtk -- /path/to/repo feature  # edit an off-worktree branc
 - `identity.rs` — author/committer identity/date fields and conversions.
 - `spelling.rs` — libspelling glue for the message editor; pins language to keep enchant's personal dictionary stable across sessions.
 - `window_state.rs` — persists window geometry (size, maximized, pane positions) across sessions.
-- `buffer_util.rs` — buffer/selection/text helpers.
+- `buffer_util.rs` — buffer/selection/text helpers, plus the commit-message shape pair `message_for_editor` / `message_differs` (the editor shows a description without its engine-written closing newline, and dirtiness compares both sides cleaned).
 
 ## Cross-instance commit dragging
 
@@ -53,4 +53,4 @@ The engine computes the history and the planners (`crates/commedit-engine/CLAUDE
 
 ## Tests
 
-The pure modules carry inline `#[cfg(test)]` units (`lanebranch.rs`, `dnd.rs`, `msglint.rs`, `search.rs`, `linenums.rs`, `blame_col.rs`, the `state.rs` index helpers); there is **no `tests/` dir**. The live app is exercised end-to-end via the dogfood tournament — see `dogfood/CLAUDE.md`.
+The pure modules carry inline `#[cfg(test)]` units (`lanebranch.rs`, `dnd.rs`, `msglint.rs`, `search.rs`, `linenums.rs`, `blame_col.rs`, the `state.rs` index helpers, the `buffer_util.rs` message helpers); there is **no `tests/` dir**. The live app is exercised end-to-end via the dogfood tournament — see `dogfood/CLAUDE.md`.

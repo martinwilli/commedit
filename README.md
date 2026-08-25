@@ -195,6 +195,13 @@ an interactive-rebase session.
   calls remain (a missing prefix, an over-long summary), to jump to the message and
   edit it yourself.
 
+- **Messages land the way git writes them** — on save, a message gets git's own
+  cleanup: trailing whitespace off every line, no leading or trailing blank lines,
+  and a single closing newline, so a commit rewritten here carries a message shaped
+  exactly like one `git commit` would have written. What git strips only because of
+  its editor template is kept: a `#1234` line is your text, and a run of blank lines
+  is your formatting.
+
 - **Spell-check the message as you type** — the commit-message editor underlines
   misspelled words; right-click one for correction suggestions or to add it to your
   dictionary. It uses your system's spell checker (GNOME libspelling over enchant),

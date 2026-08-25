@@ -48,6 +48,7 @@ Key operations and their source files:
 - Split: `split.rs` (the `set_rewritten_commit` trick makes descendants follow the split child)
 - Surgical text replace: `tree.rs` (`replace_in_files`)
 - Working-copy commit/fold: `workcopy.rs`
+- Message cleanup: `message.rs` (`cleanup_message`) — jj-lib writes a description verbatim, so every write path (`rewrite.rs`, `create.rs`, `split.rs`, `workcopy.rs`, `squash.rs`) runs the message through it first: trailing whitespace off each line, leading/trailing blank lines dropped, exactly one closing newline, which is what `git commit`'s own `--cleanup` guarantees and what messages written straight from a text buffer otherwise lack. Git's comment-stripping and blank-run collapsing are deliberately *not* mirrored (no comment template here, and blank runs are the author's formatting)
 
 ## Working-copy preservation (`workcopy.rs`)
 
@@ -100,7 +101,7 @@ Three pure, GTK-free modules:
 
 ## Module inventory
 
-`blame.rs` · `cli.rs` · `conflict.rs` · `create.rs` · `diff.rs` · `graph.rs` · `history.rs` · `index_cache.rs` · `lib.rs` · `patch_edit.rs` · `replay.rs` · `repo.rs` · `rewrite.rs` · `split.rs` · `squash.rs` · `tabwidth.rs` · `transparency.rs` · `tree.rs` · `workcopy.rs`. `default_config.toml` is embedded (see *Conventions*).
+`blame.rs` · `cli.rs` · `conflict.rs` · `create.rs` · `diff.rs` · `graph.rs` · `history.rs` · `index_cache.rs` · `lib.rs` · `message.rs` · `patch_edit.rs` · `replay.rs` · `repo.rs` · `rewrite.rs` · `split.rs` · `squash.rs` · `tabwidth.rs` · `transparency.rs` · `tree.rs` · `workcopy.rs`. `default_config.toml` is embedded (see *Conventions*).
 
 ## Tests
 

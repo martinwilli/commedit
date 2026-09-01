@@ -29,7 +29,8 @@ cargo run -p commedit-gtk -- /path/to/repo feature  # edit an off-worktree branc
 - `highlight.rs` — TextTag palette and syntect syntax colouring.
 - `identity.rs` — author/committer identity/date fields and conversions.
 - `spelling.rs` — libspelling glue for the message editor; pins language to keep enchant's personal dictionary stable across sessions.
-- `window_state.rs` — persists window geometry (size, maximized, pane positions) across sessions.
+- `fontsize.rs` — the header text-size dropdown's levels (50–200% of the theme font) and the CSS applying one: a single `font-size` **percentage** rule on the `window` node, which every widget below inherits (100% carries no rule at all, leaving the theme's own size untouched). Also `after_restyle`, the deferral the diff pane needs before re-measuring: reloading a `CssProvider` does not restyle synchronously, and the new font metrics are readable neither from an idle callback nor from the *first* frame tick (the frame the restyle is scheduled in) — only from the second. `main.rs`'s `apply_font_scale` swaps the stylesheet and then re-runs the two things that *measure* the font instead of inheriting it: the diff view's Pango tab stops (`apply_tab_width`) and the gutter columns' cached pixel widths (`refresh_gutters`, factored out of the `file_buffer` `changed` handler for exactly this).
+- `window_state.rs` — persists window geometry (size, maximized, pane positions) and the text-size level across sessions.
 - `buffer_util.rs` — buffer/selection/text helpers, plus the commit-message shape pair `message_for_editor` / `message_differs` (the editor shows a description without its engine-written closing newline, and dirtiness compares both sides cleaned).
 
 ## Cross-instance commit dragging

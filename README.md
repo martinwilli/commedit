@@ -202,6 +202,13 @@ an interactive-rebase session.
   its editor template is kept: a `#1234` line is your text, and a run of blank lines
   is your formatting.
 
+- **Scale the text for a projector** — the text-size dropdown in the header (beside
+  the *Compare* toggle) scales every bit of text in the window at once — the commit
+  list, the message editor, the diff and its gutters — from 50% to 200% of your
+  desktop's font size. Handy when showing a repository's history on a projector,
+  where the desktop default reads far too small. The level is remembered for the
+  next launch.
+
 - **Spell-check the message as you type** — the commit-message editor underlines
   misspelled words; right-click one for correction suggestions or to add it to your
   dictionary. It uses your system's spell checker (GNOME libspelling over enchant),

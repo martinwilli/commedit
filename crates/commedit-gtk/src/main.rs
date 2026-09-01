@@ -55,6 +55,7 @@ use crate::conflict::*;
 mod diff_cues;
 mod dnd;
 mod dragdrop;
+mod fontsize;
 mod lanebranch;
 mod linenums;
 mod msglint;
@@ -72,6 +73,10 @@ type ApplyDiffText = Rc<dyn Fn(String, Vec<HunkInfo>, Vec<CombinedFile>, bool)>;
 
 /// Sets the diff view's tab width for the file path now at the top of the view.
 type ApplyTabWidth = Rc<dyn Fn(Option<&str>)>;
+
+/// Refills the diff pane's gutter columns (line numbers, cues, blame) from the
+/// given buffer's current text.
+type RefreshGutters = Rc<dyn Fn(&sourceview5::Buffer)>;
 
 /// The index (in `changes`/dropdown order) of the file whose `diff --git`
 /// separator is the last one at or before buffer `line` — i.e. the file the
@@ -361,6 +366,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // commits the changes on HEAD (see the `save` closure).
     let viewing_wc: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
+    // The text-size stylesheet, kept in a provider of its own so the header's
+    // dropdown can swap it wholesale (one `font-size` rule the whole window
+    // inherits — see `fontsize`). Empty until a level other than 100% is picked.
+    let zoom_css = gtk::CssProvider::new();
+
     // Styling for drag-and-drop reordering: the insertion gap placeholder and the
     // dimmed row being dragged. Installed once for the display.
     if let Some(display) = gdk::Display::default() {
@@ -405,6 +415,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         gtk::style_context_add_provider_for_display(
             &display,
             &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &zoom_css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
@@ -673,7 +688,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         })
     };
 
-    file_buffer.connect_changed({
+    // Refill the gutter columns from the buffer's current text. Driven by the
+    // buffer's `changed` below, and re-run on a text-size change: `set_content`
+    // caches a *pixel* width it measures through the view's font, so the columns
+    // keep the old width until something feeds them again. Takes the buffer as an
+    // argument rather than capturing it — the handler holding this closure hangs
+    // off that same buffer, and a captured clone would make the pair a cycle.
+    let refresh_gutters: RefreshGutters = {
         let pane_mode = pane_mode.clone();
         let col_old = col_old.clone();
         let col_new = col_new.clone();
@@ -683,7 +704,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let changes = changes.clone();
         let diff_read_only = diff_read_only.clone();
         let refresh_blame_column = refresh_blame_column.clone();
-        move |buffer| {
+        Rc::new(move |buffer: &sourceview5::Buffer| {
             let text = buffer_text(buffer);
             // Conflict snippets (`<<<`/`>>>`) aren't a unified diff: the columns show
             // each side's line numbers (ours | theirs), with the elision "expand"
@@ -708,7 +729,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 col_new.set_content(&nums, &rev);
                 refresh_blame_column();
             }
-        }
+        })
+    };
+    file_buffer.connect_changed({
+        let refresh_gutters = refresh_gutters.clone();
+        move |buffer| refresh_gutters(buffer)
     });
     // Set while we mutate the diff buffer ourselves (loading a file, or applying
     // a structured edit) so the firewall signal handlers below let it through
@@ -976,13 +1001,23 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     let branch_popover = Popover::new();
     branch_popover.set_child(Some(&branch_scroll));
     branch_menu.set_popover(Some(&branch_popover));
+    // A text-size chooser at the right of the header: pick a percentage of the
+    // theme's font and every widget in the window scales with it — the app is
+    // regularly shown on a projector, where the desktop's own font size reads far
+    // too small. A view option like "Compare" beside it, so it sits on the same
+    // side. Wired below, once the refreshers a size change has to re-run exist.
+    let font_dropdown = DropDown::from_strings(&fontsize::LABELS);
+    font_dropdown.set_selected(fontsize::index_of(fontsize::DEFAULT_PCT));
+    font_dropdown.set_tooltip_text(Some("Text size — scale all text in the window"));
     header.pack_start(&reload_button);
     header.pack_start(&branch_menu);
     header.pack_start(&search_entry);
     // pack_end fills right-to-left, so packing the history button first leaves
-    // "Compare" to its left: [ Compare ][ ↺ ].
+    // "Compare" to its left, and the text size left of that:
+    // [ 100% ][ Compare ][ ↺ ].
     header.pack_end(&history_button);
     header.pack_end(&compare_button);
+    header.pack_end(&font_dropdown);
 
     // Title with the repository folder name, e.g. "Commit editor - commedit".
     let folder = repo
@@ -1743,6 +1778,35 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
             file_view.set_tabs(&tabs);
         })
     };
+
+    // Apply a text-size level: swap the zoom stylesheet, which the whole window
+    // inherits, then re-run the two things in the diff pane that *measure* the
+    // font instead of inheriting it — the Pango tab stops just above and the
+    // gutter columns' cached widths. Both read the metrics off `file_view`, which
+    // only carries the new font once GTK has restyled, hence `after_restyle`.
+    let apply_font_scale: Rc<dyn Fn(u32)> = {
+        let zoom_css = zoom_css.clone();
+        let file_view = file_view.clone();
+        let file_buffer = file_buffer.clone();
+        let current_file = current_file.clone();
+        let apply_tab_width = apply_tab_width.clone();
+        let refresh_gutters = refresh_gutters.clone();
+        Rc::new(move |pct: u32| {
+            zoom_css.load_from_data(&fontsize::css(pct));
+            let file_buffer = file_buffer.clone();
+            let current_file = current_file.clone();
+            let apply_tab_width = apply_tab_width.clone();
+            let refresh_gutters = refresh_gutters.clone();
+            fontsize::after_restyle(&file_view, move || {
+                apply_tab_width(current_file.borrow().as_deref());
+                refresh_gutters(&file_buffer);
+            });
+        })
+    };
+    font_dropdown.connect_selected_notify({
+        let apply_font_scale = apply_font_scale.clone();
+        move |dropdown| apply_font_scale(fontsize::level_at(dropdown.selected()))
+    });
 
     let scroll_to_file: Rc<dyn Fn(usize)> = {
         let combined_files = combined_files.clone();

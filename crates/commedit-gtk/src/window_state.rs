@@ -1,9 +1,9 @@
 //! Persist the window geometry across sessions, mirroring `spelling.rs`: a tiny
 //! hand-rolled `key=value` file under the user config dir
 //! (`~/.config/commedit/window.conf`), read with `std::fs` — no serde, no
-//! GSettings schema. We remember the window size, its maximized state, and the
-//! two paned divider positions (the commit-list width and the message-pane
-//! height), and restore them on the next launch.
+//! GSettings schema. We remember the window size, its maximized state, the two
+//! paned divider positions (the commit-list width and the message-pane height)
+//! and the text-size level, and restore them on the next launch.
 //!
 //! We deliberately do **not** store the window *position*. GTK4 removed the
 //! position-setting APIs, and under Wayland a client cannot read or set its own
@@ -30,6 +30,8 @@ pub struct WindowState {
     pub list_width: i32,
     /// Vertical divider position — the commit-message (top-right pane) height.
     pub message_height: i32,
+    /// Text-size level in percent of the theme font (see `fontsize`).
+    pub font_pct: u32,
 }
 
 impl Default for WindowState {
@@ -40,6 +42,7 @@ impl Default for WindowState {
             maximized: false,
             list_width: 480,
             message_height: 200,
+            font_pct: crate::fontsize::DEFAULT_PCT,
         }
     }
 }
@@ -85,6 +88,13 @@ impl WindowState {
                 "maximized" => s.maximized = value == "true",
                 "list_width" => set_positive(&mut s.list_width, value),
                 "message_height" => set_positive(&mut s.message_height, value),
+                // A level we don't offer (a hand-edited file) is not rejected here:
+                // the dropdown maps anything unknown back to 100%.
+                "font_pct" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        s.font_pct = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -94,8 +104,13 @@ impl WindowState {
     /// Render the geometry as the config file's `key=value` text. Pure (no I/O).
     fn to_text(&self) -> String {
         format!(
-            "width={}\nheight={}\nmaximized={}\nlist_width={}\nmessage_height={}\n",
-            self.width, self.height, self.maximized, self.list_width, self.message_height,
+            "width={}\nheight={}\nmaximized={}\nlist_width={}\nmessage_height={}\nfont_pct={}\n",
+            self.width,
+            self.height,
+            self.maximized,
+            self.list_width,
+            self.message_height,
+            self.font_pct,
         )
     }
 }
@@ -122,6 +137,7 @@ mod tests {
             maximized: true,
             list_width: 321,
             message_height: 89,
+            font_pct: 150,
         };
         let back = WindowState::from_text(&s.to_text());
         assert_eq!(back.width, 1234);
@@ -129,6 +145,7 @@ mod tests {
         assert!(back.maximized);
         assert_eq!(back.list_width, 321);
         assert_eq!(back.message_height, 89);
+        assert_eq!(back.font_pct, 150);
     }
 
     #[test]
@@ -141,13 +158,14 @@ mod tests {
         assert_eq!(s.list_width, d.list_width);
         assert_eq!(s.message_height, d.message_height);
         assert_eq!(s.maximized, d.maximized);
+        assert_eq!(s.font_pct, d.font_pct);
     }
 
     #[test]
     fn garbage_and_non_positive_values_are_ignored() {
         let d = WindowState::default();
         let s = WindowState::from_text(
-            "width=oops\nheight=0\nlist_width=-5\nmessage_height=\nnonsense\n=42\n",
+            "width=oops\nheight=0\nlist_width=-5\nmessage_height=\nfont_pct=big\nnonsense\n=42\n",
         );
         assert_eq!(s.width, d.width);
         assert_eq!(s.height, d.height);

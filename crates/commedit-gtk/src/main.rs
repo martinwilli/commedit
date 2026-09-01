@@ -1007,7 +1007,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // too small. A view option like "Compare" beside it, so it sits on the same
     // side. Wired below, once the refreshers a size change has to re-run exist.
     let font_dropdown = DropDown::from_strings(&fontsize::LABELS);
-    font_dropdown.set_selected(fontsize::index_of(fontsize::DEFAULT_PCT));
+    font_dropdown.set_selected(fontsize::index_of(win_state.font_pct));
     font_dropdown.set_tooltip_text(Some("Text size — scale all text in the window"));
     header.pack_start(&reload_button);
     header.pack_start(&branch_menu);
@@ -1807,6 +1807,11 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let apply_font_scale = apply_font_scale.clone();
         move |dropdown| apply_font_scale(fontsize::level_at(dropdown.selected()))
     });
+    // Put the level remembered from the last session into effect. The dropdown
+    // already shows it, but nothing has applied it yet — and the diff rendered
+    // during the initial selection below is measured from the unscaled font, so
+    // this also re-runs the tab stops and gutter widths once the style lands.
+    apply_font_scale(win_state.font_pct);
 
     let scroll_to_file: Rc<dyn Fn(usize)> = {
         let combined_files = combined_files.clone();
@@ -4651,11 +4656,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
     // Remember the window geometry across sessions: on close, persist the size
     // (`default_size` reports the un-maximized size to restore to), the maximized
-    // state, and the two divider positions (commit-list width, message-pane
-    // height). Position is deliberately not stored — GTK4/Wayland can't restore it.
+    // state, the two divider positions (commit-list width, message-pane height)
+    // and the text-size level. Position is deliberately not stored — GTK4/Wayland
+    // can't restore it.
     {
         let paned = paned.clone();
         let right_paned = right_paned.clone();
+        let font_dropdown = font_dropdown.clone();
         let repo = repo.clone();
         window.connect_close_request(move |window| {
             let (width, height) = window.default_size();
@@ -4665,6 +4672,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 maximized: window.is_maximized(),
                 list_width: paned.position(),
                 message_height: right_paned.position(),
+                font_pct: fontsize::level_at(font_dropdown.selected()),
             }
             .save();
             // Persist the session's jj index to the cache so the next launch primes

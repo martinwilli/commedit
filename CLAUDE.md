@@ -33,7 +33,7 @@ Three crates, split so the rewrite logic carries no GTK dependency and is unit-t
 - **`commedit-gtk`** — the UI (binary `commedit`). Depends on the engine. → [`crates/commedit-gtk/CLAUDE.md`](crates/commedit-gtk/CLAUDE.md)
 - **`commedit-mcp`** — MCP stdio server over the engine (binary `commedit-mcp`); a lib + thin bin. The MCP surface is a superset of the GTK app. → [`crates/commedit-mcp/CLAUDE.md`](crates/commedit-mcp/CLAUDE.md)
 
-Beyond the crates, [`plugin/`](plugin/CLAUDE.md) bundles `commedit-mcp` as a Claude Code plugin and [`dogfood/`](dogfood/CLAUDE.md) is the teacher↔student tournament that stress-tests the MCP surface and bundled agent/skills — each has its own `CLAUDE.md`.
+Beyond the crates, [`plugin/`](plugin/CLAUDE.md) bundles `commedit-mcp` as a Claude Code plugin (distributed through the marketplace each release deploys to GitHub Pages) and [`dogfood/`](dogfood/CLAUDE.md) is the teacher↔student tournament that stress-tests the MCP surface and bundled agent/skills — each has its own `CLAUDE.md`.
 
 ### Two cross-cutting invariants
 

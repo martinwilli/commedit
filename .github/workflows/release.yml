@@ -12,7 +12,9 @@
 # The MCP server (and thus the plugin) only needs `git` on PATH.
 #
 # Push a tag like `v0.1.0` to cut a GitHub Release; or run manually via the
-# Actions tab to just produce downloadable build artifacts.
+# Actions tab to just produce downloadable build artifacts. The maintainer side
+# of that — version bump, signed tag, release notes, verification, and the
+# repository settings this workflow depends on — is in RELEASING.md.
 #
 # The build/plugin jobs only upload workflow artifacts; a final `release` job
 # gathers them and publishes the release in one shot. It does so the way

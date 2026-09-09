@@ -20,6 +20,16 @@
 # it, then flip it to published. A published immutable release is locked, so
 # the old approach (each matrix job appending its own asset to an
 # already-published release) cannot work — only the draft is still writable.
+#
+# A tagged run also publishes the marketplace users register (see the
+# "Installing" section of plugin/README.md): the `plugin` job writes a
+# `marketplace.json` pinning this tag's zip by URL and digest, and the `pages`
+# job serves it at https://martinwilli.github.io/commedit/marketplace.json.
+# It has to be Pages: Claude Code CLONES any `https://github.com/…` URL as a
+# git repo instead of fetching it as a manifest, so the release asset itself
+# cannot be registered. The zip stays on the release and is fetched from there
+# by digest. The two jobs are independent — a Pages deploy that fails (Pages
+# not enabled for the repo, say) still leaves the release published.
 name: release
 
 on:
@@ -143,6 +153,40 @@ jobs:
           name: commedit-plugin.zip
           path: commedit-plugin.zip
 
+      # The catalog users register. Its one entry has an `archive` source, the
+      # only kind that works for a marketplace served as a bare JSON file: a
+      # relative `./plugin` source would never resolve, because Claude Code
+      # downloads just this file and nothing around it.
+      #
+      # The entry's metadata is the (already tag-stamped) plugin.json verbatim,
+      # so the version it advertises is the one the zip really contains —
+      # plugin.json always wins over a marketplace entry's `version`, and a
+      # divergence would silently mask ours. That version is also the update
+      # signal: bumping the tag is what offers installed users the new zip.
+      - name: Assemble marketplace.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/commedit-plugin.zip"
+          jq -n --slurpfile p plugin/.claude-plugin/plugin.json \
+             --arg url "$url" \
+             --arg sha256 "$(sha256sum commedit-plugin.zip | cut -d' ' -f1)" '
+            $p[0] as $m
+            | { "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+                name: "commedit",
+                description: "The comm(ed)it Claude Code plugin, published from each GitHub release.",
+                owner: { name: $m.author.name, email: $m.author.email, url: $m.homepage },
+                plugins: [ ($m | del(.["$schema"]))
+                           + { source: { source: "archive", url: $url, sha256: $sha256 } } ] }' \
+            > marketplace.json
+          cat marketplace.json
+
+      - name: Upload marketplace artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: marketplace.json
+          path: marketplace.json
+
   # Publish the release once, with every asset, via GitHub's immutable-release
   # flow: a draft is the only writable state, so we attach all assets to a
   # draft and then flip it to published (which locks it). Only on a tag.
@@ -152,9 +196,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      # Pull every uploaded artifact flat into dist/. The bare MCP binaries
-      # land here too but are filtered out below — only tarballs + the plugin
-      # zip get attached, matching what the release carried before.
+      # Pull every uploaded artifact flat into dist/. The bare MCP binaries and
+      # marketplace.json land here too but are filtered out below — only
+      # tarballs + the plugin zip get attached, matching what the release
+      # carried before (a marketplace.json asset would only mislead: nobody can
+      # register it from github.com).
       - name: Download release assets
         uses: actions/download-artifact@v7
         with:
@@ -184,3 +230,39 @@ jobs:
           gh api --method PATCH \
             "/repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
             -F draft=false
+
+  # Serve the marketplace catalog over HTTPS, from the same tag that produced
+  # the zip it pins. Needs no checkout — the manifest arrives as an artifact —
+  # and the site holds nothing else, so each deploy simply replaces it.
+  #
+  # `permissions` here REPLACES the workflow-wide `contents: write` for this
+  # job, and deploy-pages authenticates with an OIDC token, hence `id-token`.
+  # Pages must be enabled once for the repo with "GitHub Actions" as the source
+  # (Settings > Pages): configure-pages' `enablement` input would do it, but
+  # only with a PAT, not the workflow's own token.
+  pages:
+    name: deploy marketplace
+    needs: plugin
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download marketplace manifest
+        uses: actions/download-artifact@v7
+        with:
+          name: marketplace.json
+          path: _site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@v5

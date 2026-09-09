@@ -117,6 +117,8 @@ plain-git tasks.
 
 - **`git`** on your `PATH` — the server drives the git CLI for working-copy and
   `HEAD` bookkeeping.
+- **Claude Code 2.1.224** or later — the release that learned to install a plugin
+  from a zip archive, which is how the marketplace below ships it.
 
 No GTK or other runtime libraries are needed (that's only for the desktop app).
 
@@ -133,45 +135,46 @@ Windows build.
 
 ## Installing
 
-**From your organisation.** If an admin uploaded the plugin to your claude.ai
-team settings, it appears in members' `/plugin` list and installs per your org's
-policy — none of the steps below are needed.
-
-**For yourself.** Download `commedit-plugin.zip` from the [latest
-release](https://github.com/martinwilli/commedit/releases) and unpack it into a
-directory of its own:
+Register the comm(ed)it marketplace, then install the plugin from it:
 
 ```sh
-unzip commedit-plugin.zip -d ~/.local/share/commedit/plugin
+claude plugin marketplace add https://martinwilli.github.io/commedit/marketplace.json
+claude plugin install commedit@commedit
 ```
 
-Then either load it for a single session, or install it persistently.
+Restart Claude Code afterwards: an install from your shell never reaches an
+already-running session. Doing it from inside one instead — `/plugin marketplace
+add …`, then `/plugin install …` — either activates the plugin right away or
+tells you to run `/reload-plugins`. Either way, confirm the `commedit` tools are
+listed under `/plugin`, open a repo, and ask the agent to list or edit history.
 
-*Single session* — point Claude Code at the unpacked plugin as you launch it:
+That marketplace is published by each [GitHub
+release](https://github.com/martinwilli/commedit/releases): its manifest points
+at that release's `commedit-plugin.zip` and pins it by SHA-256 digest, so the
+install pulls one archive with a prebuilt server for every supported platform,
+verifies it against the digest, and unpacks it into Claude Code's plugin cache.
+Nothing to compile, and nothing to install beyond `git` on your `PATH`.
+
+### Upgrading
+
+Third-party marketplaces don't auto-update by default, so a new release reaches
+you when you ask for it:
 
 ```sh
-claude --plugin-dir ~/.local/share/commedit/plugin /path/to/your/repo
+claude plugin marketplace update commedit
+claude plugin update commedit@commedit   # then restart Claude Code
 ```
 
-*Persistently, across all sessions* — Claude Code installs plugins from a
-marketplace, so register a one-plugin local marketplace pointing at what you
-unpacked, then install from it:
+Run the refresh first, so the update sees the new release at all. To have Claude
+Code do both for you at startup instead, enable auto-update for the marketplace
+in `/plugin` (select the marketplace, then **Enable auto-update**).
+
+### Uninstalling
 
 ```sh
-mkdir -p ~/.local/share/commedit/.claude-plugin
-cat > ~/.local/share/commedit/.claude-plugin/marketplace.json <<'JSON'
-{
-  "name": "commedit-local",
-  "owner": { "name": "you" },
-  "plugins": [{ "name": "commedit", "source": "./plugin" }]
-}
-JSON
-claude plugin marketplace add ~/.local/share/commedit
-claude plugin install commedit@commedit-local   # then restart Claude Code
+claude plugin uninstall commedit@commedit
+claude plugin marketplace remove commedit
 ```
-
-Either way, confirm the `commedit` tools are listed under `/plugin`, open a repo,
-and ask the agent to list or edit history.
 
 ## Permissions in auto mode
 

@@ -322,15 +322,24 @@ out in a worktree opens worktree-bound there (with a live working copy); a branc
 checked out nowhere opens off-worktree (only its ref moves). The launch branch is
 just the first session.
 
-The plugin is self-contained: each [GitHub release](../../releases) attaches
-`commedit-plugin.zip`, which bundles a prebuilt server for every supported
-target (Linux x86-64, Linux AArch64, macOS Apple Silicon) plus a launcher that
-picks the right one — nothing to compile, and the only requirement is `git` on
-your `PATH` (the GTK runtime libraries are needed only for the desktop app).
+Install it by registering the comm(ed)it marketplace:
+
+```sh
+claude plugin marketplace add https://martinwilli.github.io/commedit/marketplace.json
+claude plugin install commedit@commedit
+```
+
+The marketplace is published by each [GitHub release](../../releases) and pins
+that release's `commedit-plugin.zip` by SHA-256 digest — a self-contained
+archive bundling a prebuilt server for every supported target (Linux x86-64,
+Linux AArch64, macOS Apple Silicon) plus a launcher that picks the right one.
+Nothing to compile, and the only requirement is `git` on your `PATH` (the GTK
+runtime libraries are needed only for the desktop app).
 
 See [`plugin/README.md`](plugin/README.md) for the full list of what the agent
-can do, the bundled skills and `commedit-operator` subagent, and how to install
-the plugin.
+can do, the bundled skills and `commedit-operator` subagent, how to upgrade, and
+the `auto`-mode rule that keeps rewriting local history from being classified as
+destructive.
 
 ## How it works
 

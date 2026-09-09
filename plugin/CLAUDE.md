@@ -13,6 +13,7 @@ dogfooding from inside Claude Code.
 - `hooks/` — `hooks.json` + `on-worktree-enter.sh` (reminds the agent to retarget on worktree entry).
 - `bin/launch.sh` — runtime launcher; picks `commedit-mcp-<os>-<arch>`. The binaries themselves are git-ignored and injected by the release workflow (a source checkout has none).
 - `.mcp.json` — declares the `commedit` MCP server. `.claude-plugin/plugin.json` is the manifest (note its `version`, below).
+- **No `marketplace.json` is tracked here.** The release workflow generates it per tag from `plugin.json` plus the zip's digest and deploys it to GitHub Pages, where users register it (`https://martinwilli.github.io/commedit/marketplace.json`). It has to be Pages: Claude Code *clones* any `https://github.com/…` URL as a git repo instead of fetching it as a manifest, so the release asset can't serve as the marketplace. Details in the header comment of `.github/workflows/release.yml`.
 
 ## Rebuild gotchas (dogfooding)
 

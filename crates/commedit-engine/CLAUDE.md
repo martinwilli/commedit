@@ -89,7 +89,7 @@ Every clean mutation records a session op. A working-copy-direct edit records vi
 ## Structured diff editing
 
 Three pure, GTK-free modules:
-- `diff.rs` — render unified diffs (`render_diff`), apply patches (`apply_patch`), classify lines, `revert_groups`/`select_groups` for hunk-level revert and partial commit selection.
+- `diff.rs` — render unified diffs (`render_diff`), apply patches (`apply_patch`), classify lines, `revert_groups`/`select_groups` for hunk-level revert and partial commit selection. `review_order` moves a header ahead of its same-directory, same-stem source (and likewise `.mli`/`.ads`/`.pyi`/… interfaces); it's presentation only, so the GTK views apply it and `tree_changes` keeps jj's path order for every other consumer (MCP included).
 - `patch_edit.rs` — maps raw edit gestures onto structurally-valid `EditPlan`s (only `+` lines freely editable; context lines split into `-orig`/`+edited` pairs). `MoveLine` reorders `+` line(s) over their neighbour — valid because `+` lines are invisible to the old-file projection, so context/`-` anchors keep their order; `move_block_range` is shared with the GTK key handler for its selection-follow.
 - `tabwidth.rs` — `TabWidthResolver` reads `.editorconfig`, `.vscode/settings.json`, `.clang-format` to pick display tab width per file.
 

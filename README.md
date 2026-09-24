@@ -39,7 +39,10 @@ an interactive-rebase session.
   changed words tinted inline, and each hunk has an *expand context* button in the
   gutter to reveal more of the surrounding file. A gutter shows old | new line
   numbers alongside the diff — the original number on removed lines, the resulting
-  number on context and added lines.
+  number on context and added lines. Files come in path order, except that an
+  interface reads first: a header right before its source (`foo.h`, then
+  `foo.c`), likewise an OCaml `.mli`, an Ada spec or a Python stub before its
+  implementation.
 
 - **Blame the old side** — click the slim handle at the left edge of the diff
   (a triangle, ▸, collapsed by default) to slide open a blame column annotating

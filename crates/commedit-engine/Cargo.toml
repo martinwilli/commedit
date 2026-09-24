@@ -12,7 +12,7 @@ jj-lib.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-pollster = "0.4"
+pollster = "1"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 similar = "3"
@@ -23,4 +23,4 @@ sha2 = "0.11"
 
 [dev-dependencies]
 jj-lib.workspace = true
-pollster = "0.4"
+pollster = "1"

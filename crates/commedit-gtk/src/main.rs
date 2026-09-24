@@ -11,8 +11,8 @@ use commedit_engine::blame::FileBlame;
 use commedit_engine::conflict::SaveOutcome;
 use commedit_engine::diff::{
     apply_patch, combined_changes, commit_changes, reconstruct_conflict_file, render_commit_diff,
-    render_conflict_snippets, revert_groups, split_combined_patch, CombinedFile, ContextExpansion,
-    FileChange, HunkInfo,
+    render_conflict_snippets, revert_groups, review_order, split_combined_patch, CombinedFile,
+    ContextExpansion, FileChange, HunkInfo,
 };
 use commedit_engine::graph::{compute_graph, GraphLayout};
 use commedit_engine::history::{history, history_limited, CommitInfo};
@@ -2598,7 +2598,10 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let rerender_diff_spliced = rerender_diff_spliced.clone();
         let scroll_to_file = scroll_to_file.clone();
         let splice_reload = splice_reload.clone();
-        Rc::new(move |loaded: Vec<FileChange>| {
+        Rc::new(move |mut loaded: Vec<FileChange>| {
+            // Headers ahead of their sources; the dropdown, the buffer and every
+            // by-order pairing with `combined_files` follow this one order.
+            review_order(&mut loaded);
             // Set the pristine baseline before any render: `set_text` synchronously
             // fires `changed` -> `update_split_sensitivity`, which reads it.
             *orig_changes.borrow_mut() = loaded.clone();
@@ -3727,7 +3730,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         let theme = theme.clone();
         let show_status = show_status.clone();
         Rc::new(move || {
-            let changes = match repo.borrow_mut().session_changes() {
+            let mut changes = match repo.borrow_mut().session_changes() {
                 Ok(changes) => changes,
                 Err(err) => {
                     show_status(&format!("Compare failed: {err}"));
@@ -3738,6 +3741,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 compare_buffer.set_text("No content changes since the session started.");
                 return;
             }
+            review_order(&mut changes);
             // Default context, no expand cues: the compare view is read-only, so
             // the diff pane's hunk-expansion wiring deliberately doesn't apply.
             let combined = render_commit_diff(&changes, &HashMap::new());

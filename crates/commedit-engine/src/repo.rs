@@ -556,7 +556,8 @@ impl Repo {
         state_dir: &Path,
         edited: &EditableSet,
     ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
-        use jj_lib::repo::{RepoLoader, StoreFactories};
+        use jj_lib::default_backend_factories::default_backend_factories;
+        use jj_lib::repo::RepoLoader;
 
         let repo_dir = state_dir.join("repo"); // primed by the caller
         let wc_state = state_dir.join("working_copy");
@@ -574,7 +575,7 @@ impl Repo {
         .context("setting up the session git dir")?;
 
         let loader =
-            RepoLoader::init_from_file_system(settings, &repo_dir, &StoreFactories::default())
+            RepoLoader::init_from_file_system(settings, &repo_dir, &default_backend_factories())
                 .context("loading the primed jj repo")?;
         let repo = pollster::block_on(loader.load_at_head())
             .context("loading the primed jj repo at head")?;
@@ -1149,7 +1150,11 @@ impl Repo {
                 return Some(id.hex());
             }
         }
-        self.repo.view().git_head().as_normal().map(|id| id.hex())
+        self.repo
+            .view()
+            .git_head(WorkspaceName::DEFAULT)
+            .as_normal()
+            .map(|id| id.hex())
     }
 
     /// The tip jj exported for the bookmark `short` (a branch short-name) into its
@@ -1253,7 +1258,7 @@ impl Repo {
     /// upstream trap where jj merges the local and remote refs into one
     /// *conflicted* bookmark it can't export (still defended by
     /// [`Self::ensure_branch_exportable`]). On a detached HEAD the filter matches
-    /// nothing, so only `import_head` runs — there is no branch to edit anyway.
+    /// nothing, so only the HEAD import runs — there is no branch to edit anyway.
     /// `record_synthetic_predecessors: false` keeps imported commits free of
     /// jj-only predecessor metadata.
     fn import_git(&mut self) -> Result<()> {
@@ -1263,7 +1268,15 @@ impl Repo {
             .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
             .collect();
         let mut tx = self.repo.start_transaction();
-        pollster::block_on(git::import_head(tx.repo_mut())).context("importing git HEAD")?;
+        // HEAD comes from the session git dir (the backend's own repo), as seeded
+        // by `seed_session_head`. `git::import_head` would instead open a repo at
+        // a workdir, i.e. the user's `.git`, which shares no common dir with ours.
+        let head = pollster::block_on(git::import_head_commit(tx.repo_mut()))
+            .context("importing git HEAD")?;
+        tx.repo_mut().set_git_head_target(
+            WorkspaceName::DEFAULT,
+            RefTarget::resolved(head.map(|c| c.id().clone())),
+        );
         let options = GitImportOptions {
             abandon_unreachable_commits: false,
             record_synthetic_predecessors: false,

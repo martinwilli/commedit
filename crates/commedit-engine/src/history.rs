@@ -236,9 +236,7 @@ impl<'a> IdAbbrev<'a> {
         match self.repo {
             None => full,
             Some(repo) => {
-                let n = repo
-                    .index()
-                    .shortest_unique_commit_id_prefix_len(id)
+                let n = pollster::block_on(repo.index().shortest_unique_commit_id_prefix_len(id))
                     .unwrap_or(full.len())
                     .max(Self::MIN)
                     .min(full.len());
@@ -254,8 +252,7 @@ impl<'a> IdAbbrev<'a> {
         match self.repo {
             None => full,
             Some(repo) => {
-                let n = repo
-                    .shortest_unique_change_id_prefix_len(id)
+                let n = pollster::block_on(repo.shortest_unique_change_id_prefix_len(id))
                     .unwrap_or(full.len())
                     .max(Self::MIN)
                     .min(full.len());

@@ -227,8 +227,7 @@ impl Repo {
         for i in 0..ids.len() {
             for j in 0..ids.len() {
                 if i != j
-                    && index
-                        .is_ancestor(&ids[j], &ids[i])
+                    && pollster::block_on(index.is_ancestor(&ids[j], &ids[i]))
                         .context("checking commit ancestry")?
                 {
                     anc_count[i] += 1;
@@ -602,8 +601,7 @@ impl Repo {
         for i in 0..ids.len() {
             for j in 0..ids.len() {
                 if i != j
-                    && index
-                        .is_ancestor(&ids[j], &ids[i])
+                    && pollster::block_on(index.is_ancestor(&ids[j], &ids[i]))
                         .context("checking commit ancestry")?
                 {
                     anc_count[i] += 1;

@@ -27,10 +27,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use jj_lib::backend::{CommitId, Signature, TreeValue};
+use jj_lib::backend::{CommitId, MergedTreeValue, Signature, TreeValue};
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher};
-use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;

@@ -16,14 +16,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
-use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
+use jj_lib::backend::{
+    ChangeId, CommitId, CopyId, MergedTreeValue, MergedTreeValueExt as _, TreeValue,
+};
 use jj_lib::commit::Commit;
 use jj_lib::conflicts::{
     choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
     materialize_tree_value, resolve_file_executable, update_from_content, ConflictMarkerStyle,
     ConflictMaterializeOptions, MaterializedTreeValue,
 };
-use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;

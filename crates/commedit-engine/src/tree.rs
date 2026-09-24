@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use jj_lib::backend::{CommitId, CopyId, TreeValue};
+use jj_lib::backend::{CommitId, CopyId, MergedTreeValue, TreeValue};
 use jj_lib::matchers::FilesMatcher;
-use jj_lib::merge::{Merge, MergedTreeValue};
+use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;

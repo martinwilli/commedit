@@ -12,6 +12,7 @@ use commedit_mcp::dto::{
 use common::{expect_err, git, git_log_subjects, init_repo, open_server, sel};
 use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResponse;
 use tempfile::TempDir;
 
 /// Build a `commit_working_copy` request with the default identity, spelling out
@@ -589,10 +590,13 @@ async fn squash_working_copy_dry_run_previews_the_destination_and_writes_nothing
 
     // The preview response is serializable — the outcome is flattened in, so the
     // absent one must simply leave `status` out rather than break the wire form.
-    let text = commedit_mcp::wrapper::Yaml(preview)
+    let CallToolResponse::Complete(result) = commedit_mcp::wrapper::Yaml(preview)
         .into_call_tool_result()
         .expect("into result")
-        .content[0]
+    else {
+        panic!("expected a completed tool result");
+    };
+    let text = result.content[0]
         .as_text()
         .expect("text content")
         .text

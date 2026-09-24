@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 
 use rmcp::handler::server::tool::IntoCallToolResult;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -27,7 +27,7 @@ impl<T: JsonSchema> JsonSchema for Yaml<T> {
 }
 
 impl<T: Serialize + JsonSchema> IntoCallToolResult for Yaml<T> {
-    fn into_call_tool_result(self) -> Result<CallToolResult, ErrorData> {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, ErrorData> {
         let value = serde_yaml::to_value(&self.0).map_err(|e| {
             ErrorData::internal_error(format!("serializing YAML content: {e}"), None)
         })?;
@@ -36,7 +36,7 @@ impl<T: Serialize + JsonSchema> IntoCallToolResult for Yaml<T> {
         })?;
         // No `structured_content`: a client that receives it surfaces the JSON
         // and hides this text block, defeating the readable YAML rendering.
-        Ok(CallToolResult::success(vec![ContentBlock::text(yaml)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(yaml)]).into())
     }
 }
 
@@ -74,13 +74,21 @@ mod tests {
     use super::*;
     use crate::dto::SaveResultDto;
 
+    /// The completed tool result, the only kind `Yaml` ever produces.
+    fn complete(response: CallToolResponse) -> CallToolResult {
+        match response {
+            CallToolResponse::Complete(result) => result,
+            _ => panic!("expected a completed tool result"),
+        }
+    }
+
     #[test]
     fn the_result_is_a_single_yaml_block_with_no_structured_content() {
         let dto = SaveResultDto::Clean {
             head_sha: Some("abc123".into()),
             topology: None,
         };
-        let result = Yaml(dto).into_call_tool_result().expect("into result");
+        let result = complete(Yaml(dto).into_call_tool_result().expect("into result"));
 
         // No machine-readable JSON half: a client would surface it and hide the
         // YAML, so the result is the YAML text block alone.
@@ -102,12 +110,14 @@ mod tests {
             clean: String,
             blobby: String,
         }
-        let result = Yaml(Probe {
-            clean: "fn main() {\n    ok\n}".to_string(),
-            blobby: "fn main() {\n\tok\n}".to_string(),
-        })
-        .into_call_tool_result()
-        .expect("into result");
+        let result = complete(
+            Yaml(Probe {
+                clean: "fn main() {\n    ok\n}".to_string(),
+                blobby: "fn main() {\n\tok\n}".to_string(),
+            })
+            .into_call_tool_result()
+            .expect("into result"),
+        );
 
         let text = &result.content[0].as_text().expect("text content").text;
         // The tab-free field stays a readable literal block scalar...

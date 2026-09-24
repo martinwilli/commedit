@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use commedit_engine::repo::Repo;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool_handler, ServerHandler};
 
 use crate::session::SessionRegistry;
@@ -122,8 +122,8 @@ newlines.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CommeditServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("commedit", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }

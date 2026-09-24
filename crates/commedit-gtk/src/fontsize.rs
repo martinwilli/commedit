@@ -14,10 +14,10 @@ use gtk::glib;
 use gtk::prelude::*;
 
 /// The offered levels, in percent of the theme's own font size.
-pub(crate) const LEVELS: [u32; 6] = [50, 75, 100, 125, 150, 200];
+pub(crate) const LEVELS: [u32; 8] = [50, 75, 90, 100, 110, 125, 150, 200];
 
 /// The dropdown's labels — one per [`LEVELS`] entry, same order.
-pub(crate) const LABELS: [&str; 6] = ["50%", "75%", "100%", "125%", "150%", "200%"];
+pub(crate) const LABELS: [&str; 8] = ["50%", "75%", "90%", "100%", "110%", "125%", "150%", "200%"];
 
 /// The unscaled level: where a fresh install starts, and the fallback for a level
 /// we don't offer (a hand-edited config file).

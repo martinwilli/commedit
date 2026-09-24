@@ -142,6 +142,86 @@ pub fn combined_changes(
     tree_changes(&store, &base, &acc).map(Some)
 }
 
+/// Extensions of a file declaring what its same-stem sibling implements: C/C++
+/// and CUDA headers, OCaml/F# interfaces, Ada specs, Python stubs, D interfaces,
+/// Vala bindings, (System)Verilog and Erlang headers. Matched case-insensitively.
+/// Pairs the alphabet already orders (`.h`/`.m`, `.pxd`/`.pyx`) need no entry.
+const INTERFACE_EXTS: &[&str] = &[
+    "h", "hh", "hpp", "hxx", "h++", "cuh", "mli", "fsi", "ads", "pyi", "di", "vapi", "svh", "vh",
+    "hrl",
+];
+
+/// Extensions of inline / template bodies a header includes: read after the
+/// header, but ahead of the implementation.
+const INLINE_EXTS: &[&str] = &["inl", "ipp", "tpp", "tcc", "txx"];
+
+/// Where a file reads within its same-stem group, see [`review_order`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PairRank {
+    Interface,
+    Inline,
+    Other,
+}
+
+/// The directory-plus-stem a file pairs on, and its rank within that pair, or
+/// `None` for a name without an extension (`Makefile`, `.gitignore`).
+fn pair_key(path: &str) -> Option<(&str, PairRank)> {
+    let name = path.rfind('/').map_or(0, |i| i + 1);
+    let dot = name + path[name..].rfind('.').filter(|&d| d > 0)?;
+    let ext = &path[dot + 1..];
+    let is = |exts: &[&str]| exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
+    let rank = if is(INTERFACE_EXTS) {
+        PairRank::Interface
+    } else if is(INLINE_EXTS) {
+        PairRank::Inline
+    } else {
+        PairRank::Other
+    };
+    Some((&path[..dot], rank))
+}
+
+/// Reorder `changes` for reading: a header comes right before its sibling source
+/// (`foo.h` before `foo.c`, `foo.mli` before `foo.ml`), where jj's path order
+/// mostly puts it last. Only files sharing a directory and a stem with an
+/// interface or inline file move, as a group into the slot of the group's first
+/// member; everything else keeps its place. Presentation only, so the diff views
+/// apply it rather than [`tree_changes`].
+pub fn review_order(changes: &mut Vec<FileChange>) {
+    let order = {
+        let keys: Vec<_> = changes.iter().map(|c| pair_key(&c.path)).collect();
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            if let Some((stem, _)) = key {
+                groups.entry(stem).or_default().push(i);
+            }
+        }
+        let mut order = Vec::with_capacity(keys.len());
+        let mut placed = vec![false; keys.len()];
+        for (i, key) in keys.iter().enumerate() {
+            if placed[i] {
+                continue;
+            }
+            let rank = |j: usize| keys[j].map_or(PairRank::Other, |(_, r)| r);
+            let mut members = match key {
+                Some((stem, _)) => groups[stem].clone(),
+                None => vec![i],
+            };
+            if members.iter().all(|&j| rank(j) == PairRank::Other) {
+                members = vec![i];
+            }
+            // Stable, so equal ranks keep their path order.
+            members.sort_by_key(|&j| rank(j));
+            for j in members {
+                placed[j] = true;
+                order.push(j);
+            }
+        }
+        order
+    };
+    let mut slots: Vec<_> = std::mem::take(changes).into_iter().map(Some).collect();
+    changes.extend(order.into_iter().filter_map(|i| slots[i].take()));
+}
+
 /// Split `text` into lines the way git does — and the way [`apply_patch`] reads
 /// a patch back: a line ends at `\n`, and at nothing else.
 ///
@@ -1391,7 +1471,7 @@ mod tests {
     use super::{
         apply_patch, closest_match_hint, describe_indent, parse_diff_lines,
         reconstruct_conflict_file, render_commit_diff, render_conflict_snippets, render_diff,
-        revert_groups, select_groups, split_combined_patch, unified_diff, ChangeKind,
+        revert_groups, review_order, select_groups, split_combined_patch, unified_diff, ChangeKind,
         ContextExpansion, DiffLineKind, FileChange,
     };
     use std::collections::{BTreeSet, HashMap};
@@ -2042,5 +2122,83 @@ mod tests {
         assert_eq!(describe_indent("    x"), "4 spaces");
         assert_eq!(describe_indent("\t x"), "1 tab + 1 space");
         assert_eq!(describe_indent("x"), "no indentation");
+    }
+
+    /// `paths` (in jj's path order) as [`review_order`] lists them.
+    fn review(paths: &[&str]) -> Vec<String> {
+        let mut changes: Vec<_> = paths.iter().map(|p| modified(p, "a\n", "b\n")).collect();
+        review_order(&mut changes);
+        changes.into_iter().map(|c| c.path).collect()
+    }
+
+    #[test]
+    fn review_order_puts_a_header_before_its_source() {
+        assert_eq!(
+            review(&["Makefile", "src/a.c", "src/a.h", "src/b.c"]),
+            ["Makefile", "src/a.h", "src/a.c", "src/b.c"]
+        );
+    }
+
+    #[test]
+    fn review_order_covers_other_interface_pairs() {
+        assert_eq!(
+            review(&["m.adb", "m.ads", "x.ml", "x.mli", "y.fs", "y.fsi", "z.py", "z.pyi"]),
+            ["m.ads", "m.adb", "x.mli", "x.ml", "y.fsi", "y.fs", "z.pyi", "z.py"]
+        );
+    }
+
+    #[test]
+    fn review_order_reads_inline_bodies_between_header_and_source() {
+        assert_eq!(
+            review(&["t.cpp", "t.hpp", "t.ipp"]),
+            ["t.hpp", "t.ipp", "t.cpp"]
+        );
+    }
+
+    #[test]
+    fn review_order_matches_extensions_case_insensitively() {
+        assert_eq!(review(&["Foo.C", "Foo.H"]), ["Foo.H", "Foo.C"]);
+    }
+
+    #[test]
+    fn review_order_pairs_only_within_a_directory() {
+        let paths = ["include/foo.h", "src/foo.c"];
+        assert_eq!(review(&paths), paths);
+        let paths = ["src/foo.c", "src/sub/foo.h"];
+        assert_eq!(review(&paths), paths);
+    }
+
+    #[test]
+    fn review_order_pairs_on_the_full_stem() {
+        // `foo.pb.h` pairs with `foo.pb.cc`, not with `foo.c`.
+        assert_eq!(
+            review(&["foo.c", "foo.pb.cc", "foo.pb.h"]),
+            ["foo.c", "foo.pb.h", "foo.pb.cc"]
+        );
+    }
+
+    #[test]
+    fn review_order_leaves_unpaired_files_in_place() {
+        // No extension never pairs, not even with a same-named header.
+        let paths = [
+            ".gitignore",
+            "README",
+            "a.h",
+            "b.c",
+            "foo",
+            "foo.h",
+            "z.txt",
+        ];
+        assert_eq!(review(&paths), paths);
+    }
+
+    #[test]
+    fn review_order_moves_a_group_into_its_first_members_slot() {
+        // jj compares by component, so the `foo.d/` directory sorts between the
+        // pair; the group closes up ahead of it.
+        assert_eq!(
+            review(&["foo.c", "foo.d/x.c", "foo.h"]),
+            ["foo.h", "foo.c", "foo.d/x.c"]
+        );
     }
 }

@@ -410,7 +410,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
              outline-offset: -1px; } \
              .blame-strip { min-width: 14px; padding: 0; color: #6e7781; \
              border-right: 1px solid alpha(@theme_fg_color, 0.12); } \
-             .blame-strip:hover { background-color: alpha(@theme_fg_color, 0.08); }",
+             .blame-strip:hover { background-color: alpha(@theme_fg_color, 0.08); } \
+             textview.commit-message > text { background-color: transparent; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -502,6 +503,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     message_view.set_wrap_mode(gtk::WrapMode::WordChar);
     message_view.set_left_margin(8);
     message_view.set_top_margin(8);
+    // A ruler at git's conventional body wrap column. GtkSourceView paints it
+    // beneath the text node, whose opaque style-scheme background would hide
+    // it; the "commit-message" class clears that (see the CSS above), leaving
+    // the identical textview background to show through.
+    message_view.add_css_class("commit-message");
+    message_view.set_show_right_margin(true);
+    message_view.set_right_margin_position(72);
     // Interactive spell checking (red squiggles + right-click suggestions) on
     // the message editor, via libspelling — it adapts to the GtkSourceBuffer.
     spelling::attach(&message_view, &message_buffer);

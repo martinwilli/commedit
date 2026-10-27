@@ -221,7 +221,8 @@ an interactive-rebase session.
   conventional 72 columns, so an overlong body line stands out while you type. Drag
   it to the column your project wraps at (a bubble shows the count as you go), or
   double-click it to put it back at 72. It only grabs where no text reaches it, so a
-  click into a long line still places the caret.
+  click into a long line still places the caret. The column is remembered for the
+  next launch.
 
 ## Keyboard shortcuts
 

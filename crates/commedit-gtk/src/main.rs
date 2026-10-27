@@ -505,14 +505,13 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     message_view.set_wrap_mode(gtk::WrapMode::WordChar);
     message_view.set_left_margin(8);
     message_view.set_top_margin(8);
-    // A ruler at git's conventional body wrap column, draggable to another one
-    // (see `ruler`). GtkSourceView paints it beneath the text node, whose opaque
-    // style-scheme background would hide it; the "commit-message" class clears
-    // that (see the CSS above), leaving the identical textview background to
-    // show through.
+    // A ruler at the body wrap column, draggable from git's conventional one to
+    // another (see `ruler`) and restored with the window state below.
+    // GtkSourceView paints it beneath the text node, whose opaque style-scheme
+    // background would hide it; the "commit-message" class clears that (see the
+    // CSS above), leaving the identical textview background to show through.
     message_view.add_css_class("commit-message");
     message_view.set_show_right_margin(true);
-    message_view.set_right_margin_position(ruler::DEFAULT_COLUMN);
     // Interactive spell checking (red squiggles + right-click suggestions) on
     // the message editor, via libspelling — it adapts to the GtkSourceBuffer.
     spelling::attach(&message_view, &message_buffer);
@@ -897,6 +896,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     // state + the two divider positions), falling back to the built-in defaults
     // on a fresh install. Saved on close-request below.
     let win_state = window_state::WindowState::load();
+    message_view.set_right_margin_position(win_state.ruler_column);
 
     // The file pane carries the Save action bar at its bottom. A Paned lets
     // either child be shrunk below its minimum by default, so dragging this
@@ -4671,13 +4671,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
 
     // Remember the window geometry across sessions: on close, persist the size
     // (`default_size` reports the un-maximized size to restore to), the maximized
-    // state, the two divider positions (commit-list width, message-pane height)
-    // and the text-size level. Position is deliberately not stored — GTK4/Wayland
-    // can't restore it.
+    // state, the two divider positions (commit-list width, message-pane height),
+    // the text-size level and the ruler column. Position is deliberately not
+    // stored — GTK4/Wayland can't restore it.
     {
         let paned = paned.clone();
         let right_paned = right_paned.clone();
         let font_dropdown = font_dropdown.clone();
+        let message_view = message_view.clone();
         let repo = repo.clone();
         window.connect_close_request(move |window| {
             let (width, height) = window.default_size();
@@ -4688,6 +4689,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
                 list_width: paned.position(),
                 message_height: right_paned.position(),
                 font_pct: fontsize::level_at(font_dropdown.selected()),
+                ruler_column: message_view.right_margin_position(),
             }
             .save();
             // Persist the session's jj index to the cache so the next launch primes

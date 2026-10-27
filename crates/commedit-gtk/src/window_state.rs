@@ -2,8 +2,9 @@
 //! hand-rolled `key=value` file under the user config dir
 //! (`~/.config/commedit/window.conf`), read with `std::fs` — no serde, no
 //! GSettings schema. We remember the window size, its maximized state, the two
-//! paned divider positions (the commit-list width and the message-pane height)
-//! and the text-size level, and restore them on the next launch.
+//! paned divider positions (the commit-list width and the message-pane height),
+//! the text-size level and the message ruler's column, and restore them on the
+//! next launch.
 //!
 //! We deliberately do **not** store the window *position*. GTK4 removed the
 //! position-setting APIs, and under Wayland a client cannot read or set its own
@@ -32,6 +33,8 @@ pub struct WindowState {
     pub message_height: i32,
     /// Text-size level in percent of the theme font (see `fontsize`).
     pub font_pct: u32,
+    /// The message editor's ruler column (see `ruler`).
+    pub ruler_column: u32,
 }
 
 impl Default for WindowState {
@@ -43,6 +46,7 @@ impl Default for WindowState {
             list_width: 480,
             message_height: 200,
             font_pct: crate::fontsize::DEFAULT_PCT,
+            ruler_column: crate::ruler::DEFAULT_COLUMN,
         }
     }
 }
@@ -95,6 +99,13 @@ impl WindowState {
                         s.font_pct = v;
                     }
                 }
+                // GtkSourceView refuses a margin position outside 1..=1000 with a
+                // critical warning, so keep the default for one it would refuse.
+                "ruler_column" => {
+                    if let Ok(v @ 1..=1000) = value.parse::<u32>() {
+                        s.ruler_column = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -104,13 +115,15 @@ impl WindowState {
     /// Render the geometry as the config file's `key=value` text. Pure (no I/O).
     fn to_text(&self) -> String {
         format!(
-            "width={}\nheight={}\nmaximized={}\nlist_width={}\nmessage_height={}\nfont_pct={}\n",
+            "width={}\nheight={}\nmaximized={}\nlist_width={}\nmessage_height={}\nfont_pct={}\n\
+             ruler_column={}\n",
             self.width,
             self.height,
             self.maximized,
             self.list_width,
             self.message_height,
             self.font_pct,
+            self.ruler_column,
         )
     }
 }
@@ -138,6 +151,7 @@ mod tests {
             list_width: 321,
             message_height: 89,
             font_pct: 150,
+            ruler_column: 80,
         };
         let back = WindowState::from_text(&s.to_text());
         assert_eq!(back.width, 1234);
@@ -146,6 +160,7 @@ mod tests {
         assert_eq!(back.list_width, 321);
         assert_eq!(back.message_height, 89);
         assert_eq!(back.font_pct, 150);
+        assert_eq!(back.ruler_column, 80);
     }
 
     #[test]
@@ -159,6 +174,7 @@ mod tests {
         assert_eq!(s.message_height, d.message_height);
         assert_eq!(s.maximized, d.maximized);
         assert_eq!(s.font_pct, d.font_pct);
+        assert_eq!(s.ruler_column, d.ruler_column);
     }
 
     #[test]
@@ -171,6 +187,22 @@ mod tests {
         assert_eq!(s.height, d.height);
         assert_eq!(s.list_width, d.list_width);
         assert_eq!(s.message_height, d.message_height);
+    }
+
+    #[test]
+    fn ruler_column_outside_sourceviews_range_is_ignored() {
+        let d = WindowState::default();
+        for text in [
+            "ruler_column=0\n",
+            "ruler_column=1001\n",
+            "ruler_column=-1\n",
+        ] {
+            assert_eq!(WindowState::from_text(text).ruler_column, d.ruler_column);
+        }
+        assert_eq!(
+            WindowState::from_text("ruler_column=1000\n").ruler_column,
+            1000
+        );
     }
 
     #[test]

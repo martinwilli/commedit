@@ -217,6 +217,12 @@ an interactive-rebase session.
   dictionary. It uses your system's spell checker (GNOME libspelling over enchant),
   so it picks up whichever dictionaries you already have installed.
 
+- **A ruler at the wrap column** — the message editor draws a ruler at git's
+  conventional 72 columns, so an overlong body line stands out while you type. Drag
+  it to the column your project wraps at (a bubble shows the count as you go), or
+  double-click it to put it back at 72. It only grabs where no text reaches it, so a
+  click into a long line still places the caret.
+
 ## Keyboard shortcuts
 
 - `Ctrl+F` — focus the commit search box; `Enter` jumps to the next match.

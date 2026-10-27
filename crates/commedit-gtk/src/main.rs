@@ -59,6 +59,7 @@ mod fontsize;
 mod lanebranch;
 mod linenums;
 mod msglint;
+mod ruler;
 mod search;
 mod spelling;
 mod window_state;
@@ -411,7 +412,8 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
              .blame-strip { min-width: 14px; padding: 0; color: #6e7781; \
              border-right: 1px solid alpha(@theme_fg_color, 0.12); } \
              .blame-strip:hover { background-color: alpha(@theme_fg_color, 0.08); } \
-             textview.commit-message > text { background-color: transparent; }",
+             textview.commit-message > text { background-color: transparent; } \
+             label.ruler-hint { padding: 2px 6px; border-radius: 6px; }",
         );
         gtk::style_context_add_provider_for_display(
             &display,
@@ -503,13 +505,14 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
     message_view.set_wrap_mode(gtk::WrapMode::WordChar);
     message_view.set_left_margin(8);
     message_view.set_top_margin(8);
-    // A ruler at git's conventional body wrap column. GtkSourceView paints it
-    // beneath the text node, whose opaque style-scheme background would hide
-    // it; the "commit-message" class clears that (see the CSS above), leaving
-    // the identical textview background to show through.
+    // A ruler at git's conventional body wrap column, draggable to another one
+    // (see `ruler`). GtkSourceView paints it beneath the text node, whose opaque
+    // style-scheme background would hide it; the "commit-message" class clears
+    // that (see the CSS above), leaving the identical textview background to
+    // show through.
     message_view.add_css_class("commit-message");
     message_view.set_show_right_margin(true);
-    message_view.set_right_margin_position(72);
+    message_view.set_right_margin_position(ruler::DEFAULT_COLUMN);
     // Interactive spell checking (red squiggles + right-click suggestions) on
     // the message editor, via libspelling — it adapts to the GtkSourceBuffer.
     spelling::attach(&message_view, &message_buffer);
@@ -558,7 +561,7 @@ fn build_ui(app: &Application, repo_path: PathBuf, branch: Option<String>) {
         .build();
     let message_box = GtkBox::new(Orientation::Vertical, 0);
     message_box.append(&identity_grid);
-    message_box.append(&message_scroll);
+    message_box.append(&ruler::attach(&message_view, &message_scroll));
 
     // The original identity of the selected commit, to detect edits on save.
     let original_identity: Rc<RefCell<Option<Identity>>> = Rc::new(RefCell::new(None));

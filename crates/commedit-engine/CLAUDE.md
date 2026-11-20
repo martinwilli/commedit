@@ -76,6 +76,8 @@ Spurious conflicts from reorder/squash/drop/restore are auto-resolved once by `t
 
 Genuine overlaps, binary/structural changes, or split chains fall back to the manual flow.
 
+**Rename-aware git re-merge.** jj-lib merges purely by path, so a rebase across a file rename comes out as a modify/delete conflict. Whatever the spurious pass leaves conflicted, `settle` hands to `try_git_remerge`, which redoes each conflicted commit oldest-first as `git rebase` would: `git merge-tree` (`gitmerge.rs`, run in the user's worktree so their `merge.*` rename settings apply) of its original parent, new parent and original (`original_commits`, plus `worktree_originals` for each worktree's non-split `@`), every clean result in a tx of its own with the descendants rebased onto it. `remerge_inputs` admits only a *pure rebase*: one parent on both sides and it moved, no root parent, clean inputs, and a tree equal to jj's own rebase merge (`same_merged_content`), since a squash or edit landing on a moved commit would otherwise lose its folded change. A missing or pre-2.40 git sets `git_merge_unavailable` for the session; whatever git can't merge stays for manual resolution.
+
 ## History view (`history.rs`, `graph.rs`)
 
 `history()` walks HEAD's ancestors only (like `git log <current-branch>`); `history_multi(heads, …)` walks the **union** of several branch tips' ancestries for the editable-set DAG. `graph.rs` computes gitk-style lanes (`compute_graph`) and `GraphLayout::boundaries` — the lane edges planning uses to find splice candidates. `change_id` (stable across rewrites) is the stable identity for re-selection after saves.
@@ -101,15 +103,15 @@ Three pure, GTK-free modules:
 
 ## Module inventory
 
-`blame.rs` · `cli.rs` · `conflict.rs` · `create.rs` · `diff.rs` · `graph.rs` · `history.rs` · `index_cache.rs` · `lib.rs` · `message.rs` · `patch_edit.rs` · `replay.rs` · `repo.rs` · `rewrite.rs` · `split.rs` · `squash.rs` · `tabwidth.rs` · `transparency.rs` · `tree.rs` · `workcopy.rs`. `default_config.toml` is embedded (see *Conventions*).
+`blame.rs` · `cli.rs` · `conflict.rs` · `create.rs` · `diff.rs` · `gitmerge.rs` · `graph.rs` · `history.rs` · `index_cache.rs` · `lib.rs` · `message.rs` · `patch_edit.rs` · `replay.rs` · `repo.rs` · `rewrite.rs` · `split.rs` · `squash.rs` · `tabwidth.rs` · `transparency.rs` · `tree.rs` · `workcopy.rs`. `default_config.toml` is embedded (see *Conventions*).
 
 ## Tests
 
-Integration tests build scratch git repos via `tests/common/mod.rs` (`init_repo`, `git`, `git_log_subjects`) and **assert against plain `git`**. Each `tests/*.rs` is its own binary (`cargo test --test <name>`); they use `IndexCache::Disabled` and never touch `~/.cache`. Notable guards: `tests/spurious.rs` (auto-resolve), `tests/sibling_branch.rs` / `tests/multi_branch.rs` / `tests/off_worktree.rs` (editable-set & worktree symmetry), `tests/timetravel.rs` (op-log undo/redo).
+Integration tests build scratch git repos via `tests/common/mod.rs` (`init_repo`, `git`, `git_log_subjects`) and **assert against plain `git`**. Each `tests/*.rs` is its own binary (`cargo test --test <name>`); they use `IndexCache::Disabled` and never touch `~/.cache`. Notable guards: `tests/spurious.rs` (auto-resolve), `tests/rename.rs` (rename-aware git re-merge), `tests/sibling_branch.rs` / `tests/multi_branch.rs` / `tests/off_worktree.rs` (editable-set & worktree symmetry), `tests/timetravel.rs` (op-log undo/redo).
 
 ## Conventions
 
-- The engine never shells out to `git` for rewrites (that's jj-lib); it only uses the `git` CLI in `transparency.rs` for HEAD/worktree bookkeeping jj-lib doesn't expose cleanly.
+- The engine never shells out to `git` for rewrites (that's jj-lib); it only uses the `git` CLI in `transparency.rs` for HEAD/worktree bookkeeping jj-lib doesn't expose cleanly. The one exception is `gitmerge.rs`: the rename-aware re-merge runs `git merge-tree`, since jj-lib has no rename detection and git writes the merged tree straight into the shared object store.
 - `jj-lib`'s backend trait is async but the git backend is synchronous. Drive every async call with `pollster::block_on(...)` — do not introduce a runtime.
 - `default_config.toml` (embedded) supplies jj-lib's baseline settings, since jj-lib ships no defaults of its own.
 - When a change touches engine behavior, consider whether it should also extend `README.md` and this file.

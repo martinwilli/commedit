@@ -149,12 +149,15 @@ an interactive-rebase session.
 
 - **Conflicts never reach your git history** — a reorder, drop or squash is a
   real rebase, so it can conflict. Spurious conflicts (nearby but independent
-  edits) are resolved for you automatically; a genuine one is held back — `git`
-  keeps seeing your original, untouched history — and shown right in the diff pane
-  with standard git conflict markers, a *keep ours / both / theirs* button in the
-  gutter of each marker line, and an ours | theirs line-number gutter. Resolve
-  them file by file; the rewrite reaches git only once the last is cleared, or you
-  abort and leave history exactly as it was.
+  edits) are resolved for you automatically, and a conflicted rebase gets a second
+  try through `git merge-tree`, so a commit (or your uncommitted changes) rebased
+  across a file rename follows it like `git rebase` does (this needs git 2.40 or
+  newer; otherwise it just stays a conflict). A genuine conflict is held back —
+  `git` keeps seeing your original, untouched history — and shown right in the
+  diff pane with standard git conflict markers, a *keep ours / both / theirs*
+  button in the gutter of each marker line, and an ours | theirs line-number
+  gutter. Resolve them file by file; the rewrite reaches git only once the last is
+  cleared, or you abort and leave history exactly as it was.
 
 - **Uncommitted changes are first-class** — whatever you've edited or added on
   disk but not committed appears as a **hollow node on its branch's lane** in the
@@ -244,7 +247,7 @@ your system GTK, so they are not self-contained — you need a few runtime
 dependencies installed first:
 
 - **`git`** on your `PATH` — comm(ed)it drives the git CLI for working-copy and
-  `HEAD` bookkeeping.
+  `HEAD` bookkeeping, and (with git 2.40 or newer) for rename-aware rebases.
 - **GTK 4** (≥ 4.10) and **GtkSourceView 5** (≥ 5.4) shared libraries.
 - **libspelling** (GTK 4 spell-check library) for the message-field spell checker.
   It checks against your system's enchant dictionaries, so also install a dictionary
@@ -423,10 +426,13 @@ launch branch's — is resolved in the diff pane the same way, since detection a
 resolution both span every editable branch and every worktree. *Spurious* conflicts
 — adjacent but independent edits that an ordinary 3-way merge can't place even
 though the combined result is unambiguous — are reconstructed and resolved
-automatically before any of that, so you only ever face conflicts that genuinely
-need a decision. Some conflicts are structural (a directory, symlink or submodule
-rather than text) and can't be resolved in the diff pane; for those, aborting the
-rewrite is the only way out.
+automatically before any of that. jj merges trees purely by path, though, so a
+rebase across a file rename conflicts; every conflicted rebase therefore gets a
+second try through `git merge-tree`, which follows the rename the way `git rebase`
+does (git 2.40 or newer; with an older git it just stays a conflict). So you only
+ever face conflicts that genuinely need a decision. Some conflicts are structural
+(a directory, symlink or submodule rather than text) and can't be resolved in the
+diff pane; for those, aborting the rewrite is the only way out.
 
 Your uncommitted changes ride through every rewrite because jj keeps them in its
 working-copy commit and rebases them forward like any other descendant. The one

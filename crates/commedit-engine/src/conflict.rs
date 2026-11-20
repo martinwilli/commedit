@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt as _;
 use jj_lib::backend::{
     ChangeId, CommitId, CopyId, MergedTreeValue, MergedTreeValueExt as _, TreeValue,
 };
@@ -25,6 +26,7 @@ use jj_lib::conflicts::{
     materialize_tree_value, resolve_file_executable, update_from_content, ConflictMarkerStyle,
     ConflictMaterializeOptions, MaterializedTreeValue,
 };
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
@@ -34,6 +36,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
 
+use crate::gitmerge::GitMerge;
 use crate::repo::Repo;
 use crate::tree::{replace_checked, ReplaceError};
 
@@ -1179,12 +1182,259 @@ impl Repo {
             // The chain was rebuilt clean in jj; settle again to export it.
             return self.settle();
         }
+        // A rebase across a file rename conflicts under jj's path-keyed merge,
+        // where git would carry the change over to the new path. Re-merge such
+        // commits through git before bothering the user.
+        let mut conflicts = conflicts;
+        if self.try_git_remerge()? {
+            conflicts = self.collect_conflicts()?;
+            if conflicts.is_empty() {
+                return self.settle(); // export it
+            }
+        }
         let p = self
             .pending
             .as_mut()
             .expect("settle requires a pending resolution");
         p.conflicts = conflicts.clone();
         Ok(SaveOutcome::Conflicts { commits: conflicts })
+    }
+
+    /// Each editable branch's pre-rewrite tip, by short branch name. The primary's
+    /// is the pending rewrite's authoritative `old_head`; the extras' come from the
+    /// pending pre-rewrite heads map (git was frozen, so it still holds the
+    /// pre-rewrite oids). `None` without a pending rewrite or on a detached HEAD,
+    /// where there is no primary tip to anchor on.
+    fn pre_rewrite_tips(&self) -> Option<HashMap<String, CommitId>> {
+        let p = self.pending.as_ref()?;
+        let orig_primary = CommitId::try_from_hex(p.old_head.as_deref()?)?;
+        let mut pre_tips: HashMap<String, CommitId> = HashMap::new();
+        if let Some(primary) = self.target_branch_name() {
+            pre_tips.insert(primary.to_string(), orig_primary);
+        }
+        // Only *editable* branches are imported into this session's index, so a
+        // non-editable branch in the (all-branches) pending heads map must be
+        // skipped — walking its history for originals would fail "not found in index".
+        let editable: HashSet<String> = self.editable_branches().into_iter().collect();
+        for (full, hex) in &p.heads {
+            let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+            if !editable.contains(short) {
+                continue;
+            }
+            if let Some(id) = CommitId::try_from_hex(hex) {
+                pre_tips.entry(short.to_string()).or_insert(id);
+            }
+        }
+        Some(pre_tips)
+    }
+
+    /// The pre-rewrite commit of every change in each editable head's rewritten
+    /// range, by change id (a shared ancestor appears once), sourced from
+    /// `pre_tips` ([`Self::pre_rewrite_tips`]). These come from the git history the
+    /// rewrite started from, so they are conflict-free. `extra` seeds one more
+    /// commit by its own change id, overriding the walk (a restored orphan, absent
+    /// from the pre-rewrite histories).
+    ///
+    /// The only changes worth an original are the ones in each editable head's
+    /// rewritten range — the near-tip commits [`Self::collect_conflicts`] scans, not
+    /// the whole ancestry. Gather those change ids first, then source each one's
+    /// original from the pre-rewrite tips, walking only deep enough to cover them.
+    /// Walking every pre-tip's full history was O(history) and dominated the cost on
+    /// a deep repo. A change id we don't locate (a rewrite reaching further back
+    /// than the window) just won't be in the map, and the caller bails that change
+    /// to manual resolution — safe.
+    fn original_commits(
+        &self,
+        pre_tips: &HashMap<String, CommitId>,
+        extra: Option<&CommitId>,
+    ) -> Result<HashMap<ChangeId, Commit>> {
+        let store = self.repo.store();
+        let mut needed: HashSet<ChangeId> = HashSet::new();
+        for head in self.editable_heads_in_jj() {
+            for info in self.rewritten_history(&head)? {
+                needed.insert(info.change_id);
+            }
+        }
+        let limit = needed.len() + 64;
+        let mut originals: HashMap<ChangeId, Commit> = HashMap::new();
+        for orig_tip in pre_tips.values() {
+            for info in crate::history::history_limited(&self.repo, orig_tip, 0, limit)?.0 {
+                if !needed.contains(&info.change_id) || originals.contains_key(&info.change_id) {
+                    continue;
+                }
+                let c = store
+                    .get_commit(&info.id)
+                    .context("loading an original commit")?;
+                originals.insert(info.change_id, c);
+            }
+        }
+        if let Some(id) = extra {
+            let c = store
+                .get_commit(id)
+                .context("loading an extra original commit")?;
+            originals.insert(c.change_id().clone(), c);
+        }
+        Ok(originals)
+    }
+
+    /// The pre-rewrite commit of each worktree's `@`, by change id, read from the
+    /// held rewrite's pre-rewrite view: the launch `@` (only when worktree-bound)
+    /// and each extra worktree's. The `@`s ride a rewrite as rebased commits, but
+    /// sit outside the rewritten ranges [`Self::original_commits`] covers. A split
+    /// `@` chain is left out, as in [`Self::try_auto_resolve_spurious`], since only
+    /// its leaf has a pre-rewrite counterpart to match.
+    fn worktree_originals(&self) -> Result<HashMap<ChangeId, Commit>> {
+        let Some(p) = self.pending.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        let pre_view = block_on(p.pre_op.view()).context("reading the pre-rewrite view")?;
+        let mut names = Vec::new();
+        if self.is_worktree_bound() && self.working_copy_chain_ids().len() <= 1 {
+            names.push(self.workspace.workspace_name().to_owned());
+        }
+        for view in &self.extra_worktrees {
+            if self.worktree_chain_ids(view).len() <= 1 {
+                names.push(view.name.clone());
+            }
+        }
+        let mut originals = HashMap::new();
+        for name in &names {
+            if let Some(id) = pre_view.get_wc_commit_id(name) {
+                let c = self
+                    .repo
+                    .store()
+                    .get_commit(id)
+                    .context("loading the original working copy")?;
+                originals.insert(c.change_id().clone(), c);
+            }
+        }
+        Ok(originals)
+    }
+
+    /// Re-merge the conflicted commits of a held rewrite through `git merge-tree`,
+    /// the way `git rebase` would. jj merges trees purely by path, so a commit
+    /// rebased across a file rename comes out as a modify/delete conflict, where
+    /// git's merge-ort carries the change over to the renamed path. Walks the
+    /// conflicts oldest first and merges each eligible commit's original change
+    /// (see [`Self::remerge_inputs`]) onto its current parent, each worktree's
+    /// `@` included ([`Self::worktree_originals`]). A clean result replaces the
+    /// commit's tree in a transaction of its own, rebasing the descendants onto
+    /// it; whatever git can't merge cleanly stays conflicted for manual
+    /// resolution.
+    ///
+    /// Returns whether it healed anything. Each commit gets one git run per call,
+    /// and since the walk restarts from the oldest conflict after every heal, a
+    /// healed commit's parent doesn't move again within the call, so it ends.
+    /// [`GitMerge::Unavailable`] switches the pass off for the session.
+    fn try_git_remerge(&mut self) -> Result<bool> {
+        if self.git_merge_unavailable {
+            return Ok(false);
+        }
+        let Some(pre_tips) = self.pre_rewrite_tips() else {
+            return Ok(false);
+        };
+        let mut originals = self.original_commits(&pre_tips, None)?;
+        for (change_id, c) in self.worktree_originals()? {
+            originals.entry(change_id).or_insert(c);
+        }
+        if originals.is_empty() {
+            return Ok(false);
+        }
+        let store = self.repo.store().clone();
+        let root = self.workspace.workspace_root().to_path_buf();
+        let mut attempted: HashSet<ChangeId> = HashSet::new();
+        let mut healed = false;
+        'scan: loop {
+            for cc in self.collect_conflicts()? {
+                if attempted.contains(&cc.change_id) {
+                    continue;
+                }
+                // No original (a split `@` chain, a change beyond the walk): leave
+                // it alone.
+                let Some(orig) = originals.get(&cc.change_id) else {
+                    continue;
+                };
+                let current = store
+                    .get_commit(&cc.commit_id)
+                    .context("loading a conflicted commit")?;
+                let Some((base, ours)) = self.remerge_inputs(&store, &current, orig)? else {
+                    continue;
+                };
+                attempted.insert(cc.change_id.clone());
+                match crate::gitmerge::git_merge_tree(&root, &base, &ours, orig.id()) {
+                    GitMerge::Clean(tree_id) => {
+                        let mut tx = self.repo.start_transaction();
+                        block_on(
+                            tx.repo_mut()
+                                .rewrite_commit(&current)
+                                .set_tree(MergedTree::resolved(store.clone(), tree_id))
+                                .write(),
+                        )
+                        .context("writing a re-merged commit")?;
+                        block_on(tx.repo_mut().rebase_descendants())
+                            .context("rebasing onto a re-merged commit")?;
+                        self.repo = block_on(tx.commit("commedit: rename-aware re-merge"))
+                            .context("committing a re-merged commit")?;
+                        healed = true;
+                        continue 'scan;
+                    }
+                    GitMerge::Conflicted | GitMerge::Failed => {}
+                    GitMerge::Unavailable => {
+                        self.git_merge_unavailable = true;
+                        return Ok(healed);
+                    }
+                }
+            }
+            return Ok(healed);
+        }
+    }
+
+    /// The `(base, ours)` commits to re-merge the conflicted `current` through git,
+    /// `orig` being its pre-rewrite commit: `orig`'s change replays from its
+    /// original parent (base) onto the current one (ours). That only describes a
+    /// pure rebase, so `None` unless `current` is exactly `orig` moved onto a new
+    /// single parent. Ruled out are a merge on either side, an unchanged parent,
+    /// the root commit as a parent (no git commit, so git can't read it), a
+    /// conflicted input, and a commit that carries more than the rebase (a squash
+    /// or an edit landing on a moved commit), whose own change a re-merge would
+    /// silently drop.
+    fn remerge_inputs(
+        &self,
+        store: &std::sync::Arc<jj_lib::store::Store>,
+        current: &Commit,
+        orig: &Commit,
+    ) -> Result<Option<(CommitId, CommitId)>> {
+        let ([new_parent], [orig_parent]) = (current.parent_ids(), orig.parent_ids()) else {
+            return Ok(None);
+        };
+        let root = store.root_commit_id();
+        if new_parent == orig_parent || new_parent == root || orig_parent == root {
+            return Ok(None);
+        }
+        let new_parent_commit = store
+            .get_commit(new_parent)
+            .context("loading a conflicted commit's parent")?;
+        let orig_parent_commit = store
+            .get_commit(orig_parent)
+            .context("loading an original parent")?;
+        if orig.has_conflict()
+            || orig_parent_commit.has_conflict()
+            || new_parent_commit.has_conflict()
+        {
+            return Ok(None);
+        }
+        // jj's own rebase of `orig` onto the new parent, the merge CommitRewriter
+        // runs. `current` must hold exactly that and nothing else.
+        let rebased = block_on(MergedTree::merge(Merge::from_vec(vec![
+            (new_parent_commit.tree(), "rebase destination".to_string()),
+            (orig_parent_commit.tree(), "original parent".to_string()),
+            (orig.tree(), "original commit".to_string()),
+        ])))
+        .context("re-running the rebase merge")?;
+        if !same_merged_content(&rebased, &current.tree())? {
+            return Ok(None);
+        }
+        Ok(Some((orig_parent.clone(), new_parent.clone())))
     }
 
     /// Try to rebuild a held-back rewrite whose conflicts are merely *spurious* —
@@ -1217,8 +1467,8 @@ impl Repo {
     /// can't prove safe — leaving jj at the post-mutation state for manual
     /// resolution.
     fn try_auto_resolve_spurious(&mut self, strategy: SpuriousResolve) -> Result<bool> {
-        let (pre_op, old_head_hex) = match self.pending.as_ref() {
-            Some(p) => (p.pre_op.clone(), p.old_head.clone()),
+        let pre_op = match self.pending.as_ref() {
+            Some(p) => p.pre_op.clone(),
             None => return Ok(false),
         };
         // CleanTip peels down from each clean tip; Drop/Restore rebuild forward from
@@ -1228,80 +1478,24 @@ impl Repo {
             SpuriousResolve::CleanTip => false,
             SpuriousResolve::Drop | SpuriousResolve::Restore { .. } => true,
         };
-        let Some(old_head_hex) = old_head_hex else {
+        let Some(pre_tips) = self.pre_rewrite_tips() else {
             return Ok(false); // detached HEAD: no primary tip to anchor on
-        };
-        let Some(orig_primary) = CommitId::try_from_hex(old_head_hex) else {
-            return Ok(false);
         };
         let store = self.repo.store().clone();
         let pre_view = block_on(pre_op.view()).context("reading the pre-rewrite view")?;
 
-        // Each editable branch's pre-rewrite tip — the anchor its `@` delta replays
-        // from. The primary's is the authoritative `old_head`; the extras' come from
-        // the pending pre-rewrite heads map (git was frozen, so it still holds the
-        // pre-rewrite oids).
-        let mut pre_tips: HashMap<String, CommitId> = HashMap::new();
-        if let Some(primary) = self.target_branch_name() {
-            pre_tips.insert(primary.to_string(), orig_primary);
-        }
-        // Only *editable* branches are imported into this session's index, so a
-        // non-editable branch in the (all-branches) pending heads map must be
-        // skipped — walking its history below would fail "not found in index".
-        let editable: HashSet<String> = self.editable_branches().into_iter().collect();
-        if let Some(p) = self.pending.as_ref() {
-            for (full, hex) in &p.heads {
-                let short = full.strip_prefix("refs/heads/").unwrap_or(full);
-                if !editable.contains(short) {
-                    continue;
-                }
-                if let Some(id) = CommitId::try_from_hex(hex) {
-                    pre_tips.entry(short.to_string()).or_insert(id);
-                }
-            }
-        }
-
-        // The original introduced change of every editable branch's pre-rewrite
-        // commit, by change id (a shared ancestor appears once). Drives both the
-        // peel and the forward rebuild. Restore additionally seeds the restored
-        // (orphan) commit, absent from the post-drop histories.
-        // The only changes we reconstruct trees for are the ones in each editable
-        // head's rewritten range — the near-tip commits collect_conflicts scans, not
-        // the whole ancestry. Gather those change ids first, then source each one's
-        // original (clean) diff from the pre-rewrite tips, walking only deep enough to
-        // cover them and loading a tree only for a needed change. Walking every
-        // pre-tip's full history and loading two trees per commit was O(history) and
-        // dominated the cost on a deep repo. A change id we don't locate (a rewrite
-        // reaching further back than the window) just won't be in the map, and
-        // plan_spurious_head then bails that head to manual resolution — safe.
-        let mut needed: HashSet<ChangeId> = HashSet::new();
-        for head in self.editable_heads_in_jj() {
-            for info in self.rewritten_history(&head)? {
-                needed.insert(info.change_id);
-            }
-        }
-        let limit = needed.len() + 64;
+        // The original introduced change of every rewritten change, by change id.
+        // Drives both the peel and the forward rebuild. Restore additionally seeds
+        // the restored (orphan) commit, absent from the post-drop histories.
+        let restored = match &strategy {
+            SpuriousResolve::Restore { commit } => Some(commit),
+            _ => None,
+        };
         let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
-        for orig_tip in pre_tips.values() {
-            for info in crate::history::history_limited(&self.repo, orig_tip, 0, limit)?.0 {
-                if !needed.contains(&info.change_id) || originals.contains_key(&info.change_id) {
-                    continue;
-                }
-                let c = store
-                    .get_commit(&info.id)
-                    .context("loading an original commit")?;
-                let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                    .context("reading an original parent tree")?;
-                originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
-            }
-        }
-        if let SpuriousResolve::Restore { commit } = &strategy {
-            let c = store
-                .get_commit(commit)
-                .context("loading the restored commit")?;
+        for (change_id, c) in self.original_commits(&pre_tips, restored)? {
             let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                .context("reading the restored commit's parent tree")?;
-            originals.insert(c.change_id().clone(), (parent_tree, c.tree()));
+                .context("reading an original parent tree")?;
+            originals.insert(change_id, (parent_tree, c.tree()));
         }
 
         // Plan every editable head's rebuild read-only. Bail the whole attempt on
@@ -1754,6 +1948,47 @@ fn simplify_label(label: &str) -> String {
         Some((core, _)) if rest.ends_with(')') => core.trim().to_string(),
         _ => rest.to_string(),
     }
+}
+
+/// Whether `a` and `b` hold the same content, conflicts included, no matter in
+/// which order a conflict lists its sides. A commit jj rebased in several steps
+/// can list a conflict's terms in another order than a single merge straight
+/// from the original, while meaning the very same thing.
+fn same_merged_content(a: &MergedTree, b: &MergedTree) -> Result<bool> {
+    if a.tree_ids() == b.tree_ids() {
+        return Ok(true);
+    }
+    let entries = block_on(a.diff_stream(b, &EverythingMatcher).collect::<Vec<_>>());
+    for entry in entries {
+        let diff = entry.values.context("comparing trees")?;
+        let (before, after) = (diff.before.simplify(), diff.after.simplify());
+        if !same_items(before.adds(), after.adds())
+            || !same_items(before.removes(), after.removes())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `a` and `b` yield the same items, in any order.
+fn same_items<'a, T: PartialEq + 'a>(
+    a: impl ExactSizeIterator<Item = &'a T>,
+    b: impl ExactSizeIterator<Item = &'a T>,
+) -> bool {
+    let mut rest: Vec<&T> = b.collect();
+    if a.len() != rest.len() {
+        return false;
+    }
+    for x in a {
+        match rest.iter().position(|y| *y == x) {
+            Some(i) => {
+                rest.swap_remove(i);
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]

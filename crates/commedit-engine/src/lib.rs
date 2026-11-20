@@ -9,6 +9,7 @@ pub mod cli;
 pub mod conflict;
 pub mod create;
 pub mod diff;
+mod gitmerge;
 pub mod graph;
 pub mod history;
 pub mod index_cache;

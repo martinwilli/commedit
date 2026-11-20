@@ -1187,6 +1187,83 @@ impl Repo {
         Ok(SaveOutcome::Conflicts { commits: conflicts })
     }
 
+    /// Each editable branch's pre-rewrite tip, by short branch name. The primary's
+    /// is the pending rewrite's authoritative `old_head`; the extras' come from the
+    /// pending pre-rewrite heads map (git was frozen, so it still holds the
+    /// pre-rewrite oids). `None` without a pending rewrite or on a detached HEAD,
+    /// where there is no primary tip to anchor on.
+    fn pre_rewrite_tips(&self) -> Option<HashMap<String, CommitId>> {
+        let p = self.pending.as_ref()?;
+        let orig_primary = CommitId::try_from_hex(p.old_head.as_deref()?)?;
+        let mut pre_tips: HashMap<String, CommitId> = HashMap::new();
+        if let Some(primary) = self.target_branch_name() {
+            pre_tips.insert(primary.to_string(), orig_primary);
+        }
+        // Only *editable* branches are imported into this session's index, so a
+        // non-editable branch in the (all-branches) pending heads map must be
+        // skipped — walking its history for originals would fail "not found in index".
+        let editable: HashSet<String> = self.editable_branches().into_iter().collect();
+        for (full, hex) in &p.heads {
+            let short = full.strip_prefix("refs/heads/").unwrap_or(full);
+            if !editable.contains(short) {
+                continue;
+            }
+            if let Some(id) = CommitId::try_from_hex(hex) {
+                pre_tips.entry(short.to_string()).or_insert(id);
+            }
+        }
+        Some(pre_tips)
+    }
+
+    /// The pre-rewrite commit of every change in each editable head's rewritten
+    /// range, by change id (a shared ancestor appears once), sourced from
+    /// `pre_tips` ([`Self::pre_rewrite_tips`]). These come from the git history the
+    /// rewrite started from, so they are conflict-free. `extra` seeds one more
+    /// commit by its own change id, overriding the walk (a restored orphan, absent
+    /// from the pre-rewrite histories).
+    ///
+    /// The only changes worth an original are the ones in each editable head's
+    /// rewritten range — the near-tip commits [`Self::collect_conflicts`] scans, not
+    /// the whole ancestry. Gather those change ids first, then source each one's
+    /// original from the pre-rewrite tips, walking only deep enough to cover them.
+    /// Walking every pre-tip's full history was O(history) and dominated the cost on
+    /// a deep repo. A change id we don't locate (a rewrite reaching further back
+    /// than the window) just won't be in the map, and the caller bails that change
+    /// to manual resolution — safe.
+    fn original_commits(
+        &self,
+        pre_tips: &HashMap<String, CommitId>,
+        extra: Option<&CommitId>,
+    ) -> Result<HashMap<ChangeId, Commit>> {
+        let store = self.repo.store();
+        let mut needed: HashSet<ChangeId> = HashSet::new();
+        for head in self.editable_heads_in_jj() {
+            for info in self.rewritten_history(&head)? {
+                needed.insert(info.change_id);
+            }
+        }
+        let limit = needed.len() + 64;
+        let mut originals: HashMap<ChangeId, Commit> = HashMap::new();
+        for orig_tip in pre_tips.values() {
+            for info in crate::history::history_limited(&self.repo, orig_tip, 0, limit)?.0 {
+                if !needed.contains(&info.change_id) || originals.contains_key(&info.change_id) {
+                    continue;
+                }
+                let c = store
+                    .get_commit(&info.id)
+                    .context("loading an original commit")?;
+                originals.insert(info.change_id, c);
+            }
+        }
+        if let Some(id) = extra {
+            let c = store
+                .get_commit(id)
+                .context("loading an extra original commit")?;
+            originals.insert(c.change_id().clone(), c);
+        }
+        Ok(originals)
+    }
+
     /// Try to rebuild a held-back rewrite whose conflicts are merely *spurious* —
     /// adjacent-but-independent edits that jj's symmetric 3-way merge can't place,
     /// even though the combined result is well-defined. Generalized over the whole
@@ -1217,8 +1294,8 @@ impl Repo {
     /// can't prove safe — leaving jj at the post-mutation state for manual
     /// resolution.
     fn try_auto_resolve_spurious(&mut self, strategy: SpuriousResolve) -> Result<bool> {
-        let (pre_op, old_head_hex) = match self.pending.as_ref() {
-            Some(p) => (p.pre_op.clone(), p.old_head.clone()),
+        let pre_op = match self.pending.as_ref() {
+            Some(p) => p.pre_op.clone(),
             None => return Ok(false),
         };
         // CleanTip peels down from each clean tip; Drop/Restore rebuild forward from
@@ -1228,80 +1305,24 @@ impl Repo {
             SpuriousResolve::CleanTip => false,
             SpuriousResolve::Drop | SpuriousResolve::Restore { .. } => true,
         };
-        let Some(old_head_hex) = old_head_hex else {
+        let Some(pre_tips) = self.pre_rewrite_tips() else {
             return Ok(false); // detached HEAD: no primary tip to anchor on
-        };
-        let Some(orig_primary) = CommitId::try_from_hex(old_head_hex) else {
-            return Ok(false);
         };
         let store = self.repo.store().clone();
         let pre_view = block_on(pre_op.view()).context("reading the pre-rewrite view")?;
 
-        // Each editable branch's pre-rewrite tip — the anchor its `@` delta replays
-        // from. The primary's is the authoritative `old_head`; the extras' come from
-        // the pending pre-rewrite heads map (git was frozen, so it still holds the
-        // pre-rewrite oids).
-        let mut pre_tips: HashMap<String, CommitId> = HashMap::new();
-        if let Some(primary) = self.target_branch_name() {
-            pre_tips.insert(primary.to_string(), orig_primary);
-        }
-        // Only *editable* branches are imported into this session's index, so a
-        // non-editable branch in the (all-branches) pending heads map must be
-        // skipped — walking its history below would fail "not found in index".
-        let editable: HashSet<String> = self.editable_branches().into_iter().collect();
-        if let Some(p) = self.pending.as_ref() {
-            for (full, hex) in &p.heads {
-                let short = full.strip_prefix("refs/heads/").unwrap_or(full);
-                if !editable.contains(short) {
-                    continue;
-                }
-                if let Some(id) = CommitId::try_from_hex(hex) {
-                    pre_tips.entry(short.to_string()).or_insert(id);
-                }
-            }
-        }
-
-        // The original introduced change of every editable branch's pre-rewrite
-        // commit, by change id (a shared ancestor appears once). Drives both the
-        // peel and the forward rebuild. Restore additionally seeds the restored
-        // (orphan) commit, absent from the post-drop histories.
-        // The only changes we reconstruct trees for are the ones in each editable
-        // head's rewritten range — the near-tip commits collect_conflicts scans, not
-        // the whole ancestry. Gather those change ids first, then source each one's
-        // original (clean) diff from the pre-rewrite tips, walking only deep enough to
-        // cover them and loading a tree only for a needed change. Walking every
-        // pre-tip's full history and loading two trees per commit was O(history) and
-        // dominated the cost on a deep repo. A change id we don't locate (a rewrite
-        // reaching further back than the window) just won't be in the map, and
-        // plan_spurious_head then bails that head to manual resolution — safe.
-        let mut needed: HashSet<ChangeId> = HashSet::new();
-        for head in self.editable_heads_in_jj() {
-            for info in self.rewritten_history(&head)? {
-                needed.insert(info.change_id);
-            }
-        }
-        let limit = needed.len() + 64;
+        // The original introduced change of every rewritten change, by change id.
+        // Drives both the peel and the forward rebuild. Restore additionally seeds
+        // the restored (orphan) commit, absent from the post-drop histories.
+        let restored = match &strategy {
+            SpuriousResolve::Restore { commit } => Some(commit),
+            _ => None,
+        };
         let mut originals: HashMap<ChangeId, (MergedTree, MergedTree)> = HashMap::new();
-        for orig_tip in pre_tips.values() {
-            for info in crate::history::history_limited(&self.repo, orig_tip, 0, limit)?.0 {
-                if !needed.contains(&info.change_id) || originals.contains_key(&info.change_id) {
-                    continue;
-                }
-                let c = store
-                    .get_commit(&info.id)
-                    .context("loading an original commit")?;
-                let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                    .context("reading an original parent tree")?;
-                originals.insert(info.change_id.clone(), (parent_tree, c.tree()));
-            }
-        }
-        if let SpuriousResolve::Restore { commit } = &strategy {
-            let c = store
-                .get_commit(commit)
-                .context("loading the restored commit")?;
+        for (change_id, c) in self.original_commits(&pre_tips, restored)? {
             let parent_tree = block_on(c.parent_tree(self.repo.as_ref()))
-                .context("reading the restored commit's parent tree")?;
-            originals.insert(c.change_id().clone(), (parent_tree, c.tree()));
+                .context("reading an original parent tree")?;
+            originals.insert(change_id, (parent_tree, c.tree()));
         }
 
         // Plan every editable head's rebuild read-only. Bail the whole attempt on

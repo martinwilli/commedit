@@ -1277,15 +1277,50 @@ impl Repo {
         Ok(originals)
     }
 
+    /// The pre-rewrite commit of each worktree's `@`, by change id, read from the
+    /// held rewrite's pre-rewrite view: the launch `@` (only when worktree-bound)
+    /// and each extra worktree's. The `@`s ride a rewrite as rebased commits, but
+    /// sit outside the rewritten ranges [`Self::original_commits`] covers. A split
+    /// `@` chain is left out, as in [`Self::try_auto_resolve_spurious`], since only
+    /// its leaf has a pre-rewrite counterpart to match.
+    fn worktree_originals(&self) -> Result<HashMap<ChangeId, Commit>> {
+        let Some(p) = self.pending.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        let pre_view = block_on(p.pre_op.view()).context("reading the pre-rewrite view")?;
+        let mut names = Vec::new();
+        if self.is_worktree_bound() && self.working_copy_chain_ids().len() <= 1 {
+            names.push(self.workspace.workspace_name().to_owned());
+        }
+        for view in &self.extra_worktrees {
+            if self.worktree_chain_ids(view).len() <= 1 {
+                names.push(view.name.clone());
+            }
+        }
+        let mut originals = HashMap::new();
+        for name in &names {
+            if let Some(id) = pre_view.get_wc_commit_id(name) {
+                let c = self
+                    .repo
+                    .store()
+                    .get_commit(id)
+                    .context("loading the original working copy")?;
+                originals.insert(c.change_id().clone(), c);
+            }
+        }
+        Ok(originals)
+    }
+
     /// Re-merge the conflicted commits of a held rewrite through `git merge-tree`,
     /// the way `git rebase` would. jj merges trees purely by path, so a commit
     /// rebased across a file rename comes out as a modify/delete conflict, where
     /// git's merge-ort carries the change over to the renamed path. Walks the
     /// conflicts oldest first and merges each eligible commit's original change
-    /// (see [`Self::remerge_inputs`]) onto its current parent. A clean result
-    /// replaces the commit's tree in a transaction of its own, rebasing the
-    /// descendants onto it; whatever git can't merge cleanly either stays
-    /// conflicted for manual resolution.
+    /// (see [`Self::remerge_inputs`]) onto its current parent, each worktree's
+    /// `@` included ([`Self::worktree_originals`]). A clean result replaces the
+    /// commit's tree in a transaction of its own, rebasing the descendants onto
+    /// it; whatever git can't merge cleanly stays conflicted for manual
+    /// resolution.
     ///
     /// Returns whether it healed anything. Each commit gets one git run per call,
     /// and since the walk restarts from the oldest conflict after every heal, a
@@ -1298,7 +1333,10 @@ impl Repo {
         let Some(pre_tips) = self.pre_rewrite_tips() else {
             return Ok(false);
         };
-        let originals = self.original_commits(&pre_tips, None)?;
+        let mut originals = self.original_commits(&pre_tips, None)?;
+        for (change_id, c) in self.worktree_originals()? {
+            originals.entry(change_id).or_insert(c);
+        }
         if originals.is_empty() {
             return Ok(false);
         }
@@ -1311,8 +1349,8 @@ impl Repo {
                 if attempted.contains(&cc.change_id) {
                     continue;
                 }
-                // Working-copy commits aren't in the rewritten ranges, so they have
-                // no original here and are left alone.
+                // No original (a split `@` chain, a change beyond the walk): leave
+                // it alone.
                 let Some(orig) = originals.get(&cc.change_id) else {
                     continue;
                 };

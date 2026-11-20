@@ -1,8 +1,8 @@
-//! End-to-end: a rewrite that rebases a commit across a file rename follows the
-//! rename the way `git rebase` does (re-merged through `git merge-tree`), rather
-//! than leaving jj's path-keyed modify/delete conflict. A genuine conflict across
-//! a rename is still held for manual resolution, and a commit that carries more
-//! than a rebase is never re-merged.
+//! End-to-end: a rewrite that rebases a commit (or the uncommitted changes)
+//! across a file rename follows the rename the way `git rebase` does (re-merged
+//! through `git merge-tree`), rather than leaving jj's path-keyed modify/delete
+//! conflict. A genuine conflict across a rename is still held for manual
+//! resolution, and a commit that carries more than a rebase is never re-merged.
 
 mod common;
 
@@ -273,4 +273,43 @@ fn a_commit_carrying_more_than_a_rebase_is_not_re_merged() {
 
     assert_eq!(conflicted_subjects(&outcome), vec!["B"]);
     assert!(repo.is_pending());
+}
+
+#[test]
+fn uncommitted_changes_follow_a_dropped_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // base <- R (renames a.txt to b.txt), with an uncommitted edit of b.txt.
+    // Dropping R rebases the working copy onto base, where the file is called
+    // a.txt again: jj conflicts it as modify/delete, git carries the edit back.
+    init(dir);
+    commit_files(dir, &[("a.txt", &numbers("10"))], "base");
+    commit_rename(dir, "a.txt", "b.txt", "R");
+    std::fs::write(dir.join("b.txt"), numbers("ten")).unwrap();
+    let base = common::git(dir, &["rev-parse", "HEAD~1"]);
+    let mut repo = Repo::open(dir).expect("open");
+
+    let commits = history(&repo.repo, &repo.head_commit_id().expect("head")).expect("history");
+    let target = repo
+        .plan_drop(&commits, row(&repo, "R"))
+        .expect("droppable");
+    let outcome = repo.abandon_commit(&target).expect("drop");
+
+    assert!(
+        matches!(outcome, SaveOutcome::Clean),
+        "expected the uncommitted edit to follow the rename, got {outcome:?}"
+    );
+    assert!(!repo.is_pending());
+    assert_eq!(common::git(dir, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        common::git(dir, &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        numbers("ten")
+    );
+    assert!(!dir.join("b.txt").exists());
+    // Unstaged (" M", trimmed by the helper): the index still matches HEAD.
+    assert_eq!(common::git(dir, &["status", "--porcelain"]), "M a.txt");
 }

@@ -13,8 +13,6 @@ use jj_lib::backend::{CommitId, TreeId};
 use jj_lib::object_id::ObjectId as _;
 
 /// Outcome of [`git_merge_tree`].
-// Unused until the git re-merge pass in settle() consumes it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GitMerge {
     /// git merged cleanly and wrote the result tree to the shared object store.
@@ -37,8 +35,6 @@ pub(crate) enum GitMerge {
 /// `merge.directoryRenames`) apply. Never fails: anything short of a clean
 /// merge or a reported conflict is [`GitMerge::Unavailable`] or
 /// [`GitMerge::Failed`].
-// Unused until the git re-merge pass in settle() consumes it.
-#[allow(dead_code)]
 pub(crate) fn git_merge_tree(
     root: &Path,
     base: &CommitId,

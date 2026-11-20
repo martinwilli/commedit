@@ -63,6 +63,10 @@ pub struct Repo {
     /// A conflicted rewrite held back from git while the user resolves it (see
     /// [`crate::conflict`]). `None` in the normal, conflict-free state.
     pub(crate) pending: Option<crate::conflict::PendingResolution>,
+    /// Set once `git merge-tree` turned out unusable (no git, or one too old for
+    /// `--merge-base`), so the rename-aware re-merge in [`crate::conflict`] stops
+    /// spawning it for the rest of the session.
+    pub(crate) git_merge_unavailable: bool,
     /// The jj operation captured at the end of [`Repo::open`] — the
     /// fully-initialized, pre-session state (working copy included). Cursor index
     /// 0 (the "Edit history" dropdown's floor / [`Repo::revert_all`]) rolls the
@@ -375,6 +379,7 @@ impl Repo {
             edited,
             extra_worktrees: Vec::new(),
             pending: None,
+            git_merge_unavailable: false,
             session_op: None,
             session_head: None,
             session_ops: Vec::new(),

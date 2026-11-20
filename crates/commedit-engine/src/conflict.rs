@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt as _;
 use jj_lib::backend::{
     ChangeId, CommitId, CopyId, MergedTreeValue, MergedTreeValueExt as _, TreeValue,
 };
@@ -25,6 +26,7 @@ use jj_lib::conflicts::{
     materialize_tree_value, resolve_file_executable, update_from_content, ConflictMarkerStyle,
     ConflictMaterializeOptions, MaterializedTreeValue,
 };
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
@@ -34,6 +36,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::transaction::Transaction;
 
+use crate::gitmerge::GitMerge;
 use crate::repo::Repo;
 use crate::tree::{replace_checked, ReplaceError};
 
@@ -1179,6 +1182,16 @@ impl Repo {
             // The chain was rebuilt clean in jj; settle again to export it.
             return self.settle();
         }
+        // A rebase across a file rename conflicts under jj's path-keyed merge,
+        // where git would carry the change over to the new path. Re-merge such
+        // commits through git before bothering the user.
+        let mut conflicts = conflicts;
+        if self.try_git_remerge()? {
+            conflicts = self.collect_conflicts()?;
+            if conflicts.is_empty() {
+                return self.settle(); // export it
+            }
+        }
         let p = self
             .pending
             .as_mut()
@@ -1262,6 +1275,128 @@ impl Repo {
             originals.insert(c.change_id().clone(), c);
         }
         Ok(originals)
+    }
+
+    /// Re-merge the conflicted commits of a held rewrite through `git merge-tree`,
+    /// the way `git rebase` would. jj merges trees purely by path, so a commit
+    /// rebased across a file rename comes out as a modify/delete conflict, where
+    /// git's merge-ort carries the change over to the renamed path. Walks the
+    /// conflicts oldest first and merges each eligible commit's original change
+    /// (see [`Self::remerge_inputs`]) onto its current parent. A clean result
+    /// replaces the commit's tree in a transaction of its own, rebasing the
+    /// descendants onto it; whatever git can't merge cleanly either stays
+    /// conflicted for manual resolution.
+    ///
+    /// Returns whether it healed anything. Each commit gets one git run per call,
+    /// and since the walk restarts from the oldest conflict after every heal, a
+    /// healed commit's parent doesn't move again within the call, so it ends.
+    /// [`GitMerge::Unavailable`] switches the pass off for the session.
+    fn try_git_remerge(&mut self) -> Result<bool> {
+        if self.git_merge_unavailable {
+            return Ok(false);
+        }
+        let Some(pre_tips) = self.pre_rewrite_tips() else {
+            return Ok(false);
+        };
+        let originals = self.original_commits(&pre_tips, None)?;
+        if originals.is_empty() {
+            return Ok(false);
+        }
+        let store = self.repo.store().clone();
+        let root = self.workspace.workspace_root().to_path_buf();
+        let mut attempted: HashSet<ChangeId> = HashSet::new();
+        let mut healed = false;
+        'scan: loop {
+            for cc in self.collect_conflicts()? {
+                if attempted.contains(&cc.change_id) {
+                    continue;
+                }
+                // Working-copy commits aren't in the rewritten ranges, so they have
+                // no original here and are left alone.
+                let Some(orig) = originals.get(&cc.change_id) else {
+                    continue;
+                };
+                let current = store
+                    .get_commit(&cc.commit_id)
+                    .context("loading a conflicted commit")?;
+                let Some((base, ours)) = self.remerge_inputs(&store, &current, orig)? else {
+                    continue;
+                };
+                attempted.insert(cc.change_id.clone());
+                match crate::gitmerge::git_merge_tree(&root, &base, &ours, orig.id()) {
+                    GitMerge::Clean(tree_id) => {
+                        let mut tx = self.repo.start_transaction();
+                        block_on(
+                            tx.repo_mut()
+                                .rewrite_commit(&current)
+                                .set_tree(MergedTree::resolved(store.clone(), tree_id))
+                                .write(),
+                        )
+                        .context("writing a re-merged commit")?;
+                        block_on(tx.repo_mut().rebase_descendants())
+                            .context("rebasing onto a re-merged commit")?;
+                        self.repo = block_on(tx.commit("commedit: rename-aware re-merge"))
+                            .context("committing a re-merged commit")?;
+                        healed = true;
+                        continue 'scan;
+                    }
+                    GitMerge::Conflicted | GitMerge::Failed => {}
+                    GitMerge::Unavailable => {
+                        self.git_merge_unavailable = true;
+                        return Ok(healed);
+                    }
+                }
+            }
+            return Ok(healed);
+        }
+    }
+
+    /// The `(base, ours)` commits to re-merge the conflicted `current` through git,
+    /// `orig` being its pre-rewrite commit: `orig`'s change replays from its
+    /// original parent (base) onto the current one (ours). That only describes a
+    /// pure rebase, so `None` unless `current` is exactly `orig` moved onto a new
+    /// single parent. Ruled out are a merge on either side, an unchanged parent,
+    /// the root commit as a parent (no git commit, so git can't read it), a
+    /// conflicted input, and a commit that carries more than the rebase (a squash
+    /// or an edit landing on a moved commit), whose own change a re-merge would
+    /// silently drop.
+    fn remerge_inputs(
+        &self,
+        store: &std::sync::Arc<jj_lib::store::Store>,
+        current: &Commit,
+        orig: &Commit,
+    ) -> Result<Option<(CommitId, CommitId)>> {
+        let ([new_parent], [orig_parent]) = (current.parent_ids(), orig.parent_ids()) else {
+            return Ok(None);
+        };
+        let root = store.root_commit_id();
+        if new_parent == orig_parent || new_parent == root || orig_parent == root {
+            return Ok(None);
+        }
+        let new_parent_commit = store
+            .get_commit(new_parent)
+            .context("loading a conflicted commit's parent")?;
+        let orig_parent_commit = store
+            .get_commit(orig_parent)
+            .context("loading an original parent")?;
+        if orig.has_conflict()
+            || orig_parent_commit.has_conflict()
+            || new_parent_commit.has_conflict()
+        {
+            return Ok(None);
+        }
+        // jj's own rebase of `orig` onto the new parent, the merge CommitRewriter
+        // runs. `current` must hold exactly that and nothing else.
+        let rebased = block_on(MergedTree::merge(Merge::from_vec(vec![
+            (new_parent_commit.tree(), "rebase destination".to_string()),
+            (orig_parent_commit.tree(), "original parent".to_string()),
+            (orig.tree(), "original commit".to_string()),
+        ])))
+        .context("re-running the rebase merge")?;
+        if !same_merged_content(&rebased, &current.tree())? {
+            return Ok(None);
+        }
+        Ok(Some((orig_parent.clone(), new_parent.clone())))
     }
 
     /// Try to rebuild a held-back rewrite whose conflicts are merely *spurious* —
@@ -1775,6 +1910,47 @@ fn simplify_label(label: &str) -> String {
         Some((core, _)) if rest.ends_with(')') => core.trim().to_string(),
         _ => rest.to_string(),
     }
+}
+
+/// Whether `a` and `b` hold the same content, conflicts included, no matter in
+/// which order a conflict lists its sides. A commit jj rebased in several steps
+/// can list a conflict's terms in another order than a single merge straight
+/// from the original, while meaning the very same thing.
+fn same_merged_content(a: &MergedTree, b: &MergedTree) -> Result<bool> {
+    if a.tree_ids() == b.tree_ids() {
+        return Ok(true);
+    }
+    let entries = block_on(a.diff_stream(b, &EverythingMatcher).collect::<Vec<_>>());
+    for entry in entries {
+        let diff = entry.values.context("comparing trees")?;
+        let (before, after) = (diff.before.simplify(), diff.after.simplify());
+        if !same_items(before.adds(), after.adds())
+            || !same_items(before.removes(), after.removes())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `a` and `b` yield the same items, in any order.
+fn same_items<'a, T: PartialEq + 'a>(
+    a: impl ExactSizeIterator<Item = &'a T>,
+    b: impl ExactSizeIterator<Item = &'a T>,
+) -> bool {
+    let mut rest: Vec<&T> = b.collect();
+    if a.len() != rest.len() {
+        return false;
+    }
+    for x in a {
+        match rest.iter().position(|y| *y == x) {
+            Some(i) => {
+                rest.swap_remove(i);
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
